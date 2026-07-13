@@ -1,0 +1,1362 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dejadb console</title>
+<style>
+  /* Design system: flat colors only (no gradients). One interactive accent.
+     Teal is reserved for content-address hashes. Monospace is reserved for
+     data (hashes, CAL, JSON, rendered context) — everything else is the UI
+     face. Light is canonical; dark mirrors it token for token. */
+  :root {
+    color-scheme: light;
+    --bg:#F5F6F8; --panel:#FFFFFF; --well:#F0F1F4; --raise:#E9EBF0;
+    --line:#E4E7EC; --line2:#D0D5DD;
+    --text:#333A49; --bright:#14181F; --dim:#5D6575; --dimmer:#8A92A6; --muted:#6E7687;
+    --accent:#5B4FE9; --accent-hover:#4A3ED8; --accent-soft:#ECEAFC; --accent-line:#B9B2F5;
+    --green:#188038; --yellow:#9A6700; --red:#CF222E; --teal:#0E8F82; --sky:#2E6CD9; --amber:#9A6700;
+    --green-line:#BFE3CB; --yellow-line:#EBD9A7; --red-line:#F1B8BC;
+    --ok-bg:#E8F5EC; --err-bg:#FCEBEC;
+    --sans:-apple-system,system-ui,"Segoe UI",sans-serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    color-scheme: dark;
+    --bg:#0E1015; --panel:#141822; --well:#10141C; --raise:#1B2029;
+    --line:#252B37; --line2:#39404F;
+    --text:#D5DAE4; --bright:#F2F4F9; --dim:#99A1B3; --dimmer:#646C7E; --muted:#8A93A6;
+    --accent:#8F7DF8; --accent-hover:#9D8DFA; --accent-soft:#26223E; --accent-line:#4A4380;
+    --green:#4FC963; --yellow:#D9AE54; --red:#F27B72; --teal:#58C7B9; --sky:#82B5FF; --amber:#E8C07A;
+    --green-line:#2E4A33; --yellow-line:#4E4020; --red-line:#5A2B2E;
+    --ok-bg:#15251A; --err-bg:#2A181A;
+  } }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg:#F5F6F8; --panel:#FFFFFF; --well:#F0F1F4; --raise:#E9EBF0;
+    --line:#E4E7EC; --line2:#D0D5DD;
+    --text:#333A49; --bright:#14181F; --dim:#5D6575; --dimmer:#8A92A6; --muted:#6E7687;
+    --accent:#5B4FE9; --accent-hover:#4A3ED8; --accent-soft:#ECEAFC; --accent-line:#B9B2F5;
+    --green:#188038; --yellow:#9A6700; --red:#CF222E; --teal:#0E8F82; --sky:#2E6CD9; --amber:#9A6700;
+    --green-line:#BFE3CB; --yellow-line:#EBD9A7; --red-line:#F1B8BC;
+    --ok-bg:#E8F5EC; --err-bg:#FCEBEC;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:#0E1015; --panel:#141822; --well:#10141C; --raise:#1B2029;
+    --line:#252B37; --line2:#39404F;
+    --text:#D5DAE4; --bright:#F2F4F9; --dim:#99A1B3; --dimmer:#646C7E; --muted:#8A93A6;
+    --accent:#8F7DF8; --accent-hover:#9D8DFA; --accent-soft:#26223E; --accent-line:#4A4380;
+    --green:#4FC963; --yellow:#D9AE54; --red:#F27B72; --teal:#58C7B9; --sky:#82B5FF; --amber:#E8C07A;
+    --green-line:#2E4A33; --yellow-line:#4E4020; --red-line:#5A2B2E;
+    --ok-bg:#15251A; --err-bg:#2A181A;
+  }
+
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:13px/1.55 var(--sans); padding:20px 24px 44px; min-height:100vh; }
+  a { color:var(--accent); text-decoration:none; }
+  code { font:12px var(--mono); background:var(--raise); border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+  .hint { color:var(--dimmer); font-size:12px; }
+  kbd { background:var(--raise); border:1px solid var(--line2); border-bottom-width:2px; border-radius:4px; padding:0 5px; font:10.5px var(--mono); color:var(--dim); }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:var(--line2); border-radius:8px; border:3px solid transparent; background-clip:content-box; }
+  :focus-visible { outline:2px solid var(--accent-line); outline-offset:1px; }
+  button, .tab, .fitem, .chip, .fchip, .tgl { transition:background .12s, color .12s, border-color .12s; }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
+
+  /* ---------- header ---------- */
+  header { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:18px; }
+  h1 { display:flex; align-items:center; gap:7px; font:700 16px var(--sans); letter-spacing:-.1px; color:var(--dim); }
+  h1 b { color:var(--accent); }
+  h1 svg { flex-shrink:0; }
+  .db { color:var(--dimmer); font:12px var(--mono); cursor:pointer; }
+  .db:hover { color:var(--accent); }
+  .ro { border:1px solid var(--green-line); color:var(--green); border-radius:20px; padding:2px 11px; font-size:11px; font-weight:500; cursor:help; background:var(--ok-bg); }
+  #chips { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .chip { background:var(--panel); border:1px solid var(--line); border-radius:20px; padding:3px 12px; font-size:12px; color:var(--dim); cursor:pointer; font-variant-numeric:tabular-nums; }
+  .chip:hover { border-color:var(--line2); color:var(--text); }
+  .chip b { color:var(--bright); font-weight:600; margin-left:2px; }
+  #vdot { width:8px; height:8px; border-radius:50%; background:var(--dimmer); display:inline-block; margin-right:6px; vertical-align:0; }
+
+  /* ---------- shell ---------- */
+  main { display:grid; grid-template-columns:216px minmax(0,1fr) 276px; gap:16px; align-items:start; }
+  @media (max-width:1150px){ main { grid-template-columns:204px minmax(0,1fr); } #oplogPanel { display:none; } }
+  @media (max-width:800px){ main { grid-template-columns:1fr; } #side { display:none; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .panel h2 { font-size:11px; text-transform:uppercase; letter-spacing:1.3px; color:var(--dimmer); font-weight:600; margin-bottom:10px; display:flex; align-items:center; }
+
+  input[type=text], #side input { background:var(--well); border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 10px; font:12.5px var(--sans); }
+  input[type=text]:focus, #side input:focus, textarea:focus { outline:none; border-color:var(--accent-line); box-shadow:0 0 0 3px var(--accent-soft); }
+
+  /* ---------- sidebar facets ---------- */
+  #side input { width:100%; margin-bottom:12px; }
+  .fsec { margin-bottom:14px; }
+  .fsec h3 { font-size:10.5px; text-transform:uppercase; letter-spacing:1.2px; color:var(--dimmer); font-weight:600; margin-bottom:5px; }
+  .fitem { display:flex; justify-content:space-between; gap:8px; padding:3px 9px; border-radius:7px; cursor:pointer; font:12.5px var(--sans); color:var(--dim); }
+  .fitem:hover { background:var(--raise); color:var(--bright); }
+  .fitem.on { background:var(--accent-soft); color:var(--accent); font-weight:500; }
+  .fitem .n { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .fitem .c { color:var(--dimmer); font-variant-numeric:tabular-nums; }
+  .fmore { color:var(--dimmer); font-size:11px; padding:3px 9px; cursor:pointer; }
+  .fmore:hover { color:var(--accent); }
+
+  /* ---------- tabs ---------- */
+  #tabs { display:inline-flex; gap:2px; margin-bottom:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:3px; }
+  .tab { background:none; border:0; border-radius:7px; color:var(--dim); padding:5px 15px; font:500 13px var(--sans); cursor:pointer; }
+  .tab:hover { color:var(--bright); }
+  .tab.active { background:var(--raise); color:var(--bright); }
+
+  /* ---------- toolbar ---------- */
+  .toolbar { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:11px; font-size:12px; color:var(--dim); }
+  .toolbar input[type=text] { width:172px; }
+  .tgl { color:var(--dimmer); cursor:pointer; user-select:none; font-size:12px; }
+  .tgl:hover { color:var(--dim); }
+  .tgl.on { color:var(--yellow); }
+  .fchip { background:var(--accent-soft); border:1px solid var(--accent-line); color:var(--accent); border-radius:20px; padding:2px 10px; font:11.5px var(--sans); font-weight:500; cursor:pointer; }
+  .spacer { flex:1; }
+
+  button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:7px 16px; font:600 12.5px var(--sans); cursor:pointer; }
+  button:hover { background:var(--accent-hover); }
+  button:active { transform:translateY(1px); }
+  button.ghost { background:var(--well); color:var(--dim); border:1px solid var(--line2); padding:4px 11px; font-weight:500; font-size:12px; }
+  button.ghost:hover { color:var(--bright); background:var(--raise); }
+  button.ghost.on { color:var(--accent); border-color:var(--accent-line); background:var(--accent-soft); }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--well); }
+  .seg button { background:none; color:var(--dim); border:0; border-radius:0; padding:4px 12px; font:500 12px var(--sans); }
+  .seg button:hover { color:var(--bright); }
+  .seg button.on { background:var(--accent-soft); color:var(--accent); }
+
+  /* ---------- tables ---------- */
+  table { border-collapse:collapse; width:100%; font:13px var(--sans); }
+  th { text-align:left; color:var(--dimmer); font:600 10.5px var(--sans); text-transform:uppercase; letter-spacing:.8px; padding:5px 12px 8px 0; border-bottom:1px solid var(--line2); cursor:pointer; user-select:none; white-space:nowrap; }
+  th:hover { color:var(--bright); }
+  th .arr { color:var(--accent); }
+  td { padding:8px 12px 8px 0; border-bottom:1px solid var(--line); vertical-align:top; max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  tr.rowlink { cursor:pointer; }
+  tr.rowlink:hover td { background:var(--raise); }
+  tr.open td { background:var(--accent-soft); }
+  tr.sup td { opacity:.45; }
+  tr.sup .prev { text-decoration:line-through; }
+  tr.gone td { opacity:.42; }
+  .tag { border-radius:5px; padding:1px 7px; font:500 10.5px var(--sans); border:1px solid; white-space:nowrap; }
+  .tag-cur { color:var(--green); border-color:var(--green-line); }
+  .tag-sup { color:var(--yellow); border-color:var(--yellow-line); }
+  .tag-gone { color:var(--red); border-color:var(--red-line); }
+  .tbadge { display:inline-flex; align-items:center; gap:6px; font:500 11px var(--sans); }
+  .tbadge i { width:7px; height:7px; border-radius:2.5px; background:currentColor; }
+  .age { color:var(--dim); font-size:12px; }
+  .mono { font-family:var(--mono); color:var(--dimmer); font-size:11.5px; }
+  .hash-t { color:var(--teal); }
+  .empty { color:var(--dimmer); padding:30px 0; text-align:center; font:12.5px var(--sans); }
+  .tablewrap { overflow-x:auto; }
+
+  /* ---------- query editor ---------- */
+  .edwrap { position:relative; }
+  .edwrap pre, .edwrap textarea {
+    width:100%; min-height:92px; margin:0; padding:12px 13px; font:13px/1.6 var(--mono);
+    white-space:pre-wrap; word-break:break-word; border:1px solid var(--line); border-radius:10px;
+  }
+  .edwrap pre { position:absolute; inset:0; pointer-events:none; background:var(--well); color:var(--text); overflow:hidden; }
+  .edwrap textarea { position:relative; background:transparent; color:transparent; caret-color:var(--bright); resize:vertical; display:block; }
+  .edwrap textarea::selection { background:var(--accent-soft); }
+  .cal-kw { color:var(--accent); font-weight:600; } .cal-str { color:var(--sky); } .cal-num { color:var(--amber); }
+  .cal-hash { color:var(--teal); } .cal-pipe { color:var(--yellow); }
+
+  /* ---------- error card ---------- */
+  #err { background:var(--err-bg); border:1px solid var(--red-line); border-radius:10px; padding:12px 14px; margin-top:12px; font-size:12.5px; }
+  #err .ecode { color:var(--red); border:1px solid var(--red-line); border-radius:5px; padding:1px 7px; font:10.5px var(--mono); margin-right:9px; }
+  #err pre { margin-top:8px; color:var(--dim); white-space:pre-wrap; font:12.5px/1.6 var(--mono); }
+  #err pre b { color:var(--red); font-weight:normal; }
+  #err .ehint { color:var(--yellow); margin-top:7px; }
+
+  /* ---------- results ---------- */
+  #resBody { background:var(--well); border:1px solid var(--line); border-radius:10px; padding:12px 14px; max-height:58vh; overflow:auto; font-size:12.5px; }
+  .warnline { color:var(--yellow); font-size:12px; margin-top:7px; }
+  .bignum { font:600 36px var(--sans); color:var(--bright); padding:14px 4px; font-variant-numeric:tabular-nums; }
+  pre.rendered { white-space:pre-wrap; word-break:break-word; color:var(--text); font:12.5px/1.65 var(--mono); }
+
+  /* json tree + raw coloring */
+  .jt { line-height:1.6; font:12.5px var(--mono); }
+  .jt .node > .kids { margin-left:19px; }
+  .jt .caret { display:inline-block; width:14px; color:var(--dimmer); cursor:pointer; user-select:none; }
+  .jt .caret:hover { color:var(--bright); }
+  .jt .k { color:var(--dim); cursor:pointer; }
+  .jt .k:hover { text-decoration:underline dotted; }
+  .jt .meta { color:var(--dimmer); font-size:11px; margin-left:6px; }
+  .tok-str { color:var(--sky); } .tok-num { color:var(--amber); } .tok-bool { color:var(--yellow); }
+  .tok-null { color:var(--dimmer); } .tok-punc { color:var(--muted); } .tok-key { color:var(--dim); }
+  .hashlink { color:var(--teal); cursor:pointer; border-bottom:1px dotted var(--teal); font-family:var(--mono); }
+  .hashlink:hover { opacity:.75; }
+
+  /* ---------- graph ---------- */
+  canvas.graph { display:block; width:100%; border:1px solid var(--line); border-radius:10px; background:var(--well); cursor:grab; }
+  canvas.graph:active { cursor:grabbing; }
+
+  /* ---------- op-log ---------- */
+  #log { max-height:64vh; overflow:auto; font:12.5px var(--sans); }
+  .oprow { padding:5px 2px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:baseline; cursor:pointer; border-radius:4px; }
+  .oprow:hover { background:var(--raise); }
+  .oprow .t { color:var(--dimmer); font-size:11px; min-width:42px; font-variant-numeric:tabular-nums; }
+  .op-add { color:var(--green); font-family:var(--mono); } .op-supersede { color:var(--yellow); font-family:var(--mono); } .op-forget { color:var(--red); font-family:var(--mono); }
+  .oprow .what { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); flex:1; }
+
+  /* ---------- drawer ---------- */
+  #shade { position:fixed; inset:0; background:rgba(10,14,22,.45); backdrop-filter:blur(2px); }
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(490px,94vw); background:var(--panel); border-left:1px solid var(--line2); border-radius:14px 0 0 14px; padding:20px; overflow-y:auto; box-shadow:-16px 0 48px rgba(10,14,22,.18); }
+  #drawer h2 { font:600 11px var(--sans); text-transform:uppercase; letter-spacing:1.2px; color:var(--dimmer); margin:18px 0 7px; }
+  #drawer .dhash { color:var(--teal); font:11.5px var(--mono); word-break:break-all; cursor:pointer; }
+  #drawer .dhash:hover { opacity:.75; }
+  .dhead { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+  .dclose { margin-left:auto; }
+  .step { border-left:2px solid var(--line2); margin-left:6px; padding:3px 0 12px 15px; position:relative; }
+  .step:before { content:""; position:absolute; left:-5px; top:8px; width:8px; height:8px; border-radius:50%; background:var(--line2); }
+  .step.cur:before { background:var(--green); }
+  .step.viewing { background:var(--raise); border-radius:0 9px 9px 0; }
+  .step .obj { color:var(--bright); font:13px var(--sans); }
+  .step .sub { color:var(--dimmer); font:11.5px var(--sans); }
+
+  /* ---------- menus / toast ---------- */
+  .menuwrap { position:relative; display:inline-block; }
+  .menu { position:absolute; z-index:30; top:calc(100% + 5px); left:0; background:var(--panel); border:1px solid var(--line2); border-radius:10px; min-width:300px; max-width:460px; max-height:320px; overflow-y:auto; box-shadow:0 12px 36px rgba(10,14,22,.16); padding:4px; }
+  .menu div { padding:6px 11px; cursor:pointer; font:12px var(--sans); color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; border-radius:7px; }
+  .menu div:hover { background:var(--raise); color:var(--bright); }
+  .menu div small { color:var(--dimmer); display:block; font:10.5px var(--mono); }
+  #toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:var(--panel); border:1px solid var(--line2); color:var(--bright); border-radius:9px; padding:8px 18px; font:12.5px var(--sans); z-index:99; box-shadow:0 8px 24px rgba(10,14,22,.18); }
+  .row { display:flex; gap:9px; margin-top:10px; flex-wrap:wrap; align-items:center; }
+</style>
+<script>
+(function () {
+  // apply saved / deep-linked theme before first paint
+  var t = new URLSearchParams(location.search).get('theme') || localStorage.getItem('dejadb.theme');
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+})();
+</script>
+
+<header>
+  <h1><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><rect x="7.5" y="2.5" width="14" height="14" rx="4.5" fill="none" stroke="var(--teal)" stroke-width="2"/><rect x="2.5" y="7.5" width="14" height="14" rx="4.5" fill="var(--accent)"/></svg><b>dejadb</b><span>console</span></h1>
+  <span class="db" onclick="openConfig()" title="view effective configuration">{{DB}}</span>
+  <span class="ro" title="CAL structurally cannot delete data — DELETE/DROP are parse errors by design. Erasure is a host-level op (MCP: dejadb_forget, memory-tool delete).">immutable &middot; no-delete CAL</span>
+  <div id="chips"></div>
+  <button class="ghost" id="themeBtn" onclick="toggleTheme()" title="switch light/dark">&#9681;</button>
+  <button class="ghost" id="verifyBtn" onclick="verify()" title="check store integrity"><span id="vdot"></span>verify</button>
+</header>
+
+<main>
+  <nav class="panel" id="side">
+    <input id="ffilter" placeholder="filter facets&hellip;" oninput="renderFacets()">
+    <div id="facets" class="hint">loading&hellip;</div>
+    <p class="hint" style="margin-top:12px">click a facet to filter; &#8984;-click to build a CAL query</p>
+  </nav>
+
+  <section style="min-width:0">
+    <div id="tabs">
+      <button class="tab active" id="tab-mem" onclick="showTab('mem')">memories</button>
+      <button class="tab" id="tab-graph" onclick="showTab('graph')">graph</button>
+      <button class="tab" id="tab-query" onclick="showTab('query')">query <kbd>&#8984;K</kbd></button>
+    </div>
+
+    <div class="panel" id="pane-mem">
+      <div class="toolbar">
+        <span id="fchips"></span>
+        <input type="text" id="msearch" placeholder="search&hellip;" oninput="renderMem()">
+        <span class="tgl" id="tglSup" onclick="toggle('sup')" title="show superseded versions">&#10227; superseded</span>
+        <span class="tgl on" id="tglGone" onclick="toggle('gone')" title="show tombstoned (forgotten) entries">&#10005; forgotten</span>
+        <span class="spacer"></span>
+        <span id="memCount" class="hint"></span>
+        <button class="ghost" onclick="exportMem('csv')" title="download visible rows as CSV">csv</button>
+        <button class="ghost" onclick="exportMem('json')" title="download visible rows as JSON">json</button>
+        <button class="ghost" onclick="refreshAll()" title="reload from store">&#8635;</button>
+      </div>
+      <div class="tablewrap" id="memTable"><div class="empty">loading&hellip;</div></div>
+    </div>
+
+    <div class="panel" id="pane-graph" hidden>
+      <div class="toolbar">
+        <span id="graphMeta" class="hint"></span>
+        <span class="spacer"></span>
+        <button class="ghost" onclick="fitGraph()" title="fit graph to view">fit</button>
+        <button class="ghost" onclick="renderGraphTab()" title="rebuild layout">&#8635;</button>
+      </div>
+      <div id="graphHost"></div>
+    </div>
+
+    <div class="panel" id="pane-query" hidden>
+      <div class="edwrap">
+        <pre id="hl" aria-hidden="true"></pre>
+        <textarea id="q" spellcheck="false" oninput="syncHl()" onscroll="syncScroll()">RECALL facts WHERE subject = "john"</textarea>
+      </div>
+      <div class="row">
+        <button onclick="runCal()">Run <kbd style="border-color:rgba(255,255,255,.4);color:#fff;background:rgba(255,255,255,.16)">&#8984;&#9166;</kbd></button>
+        <div class="menuwrap"><button class="ghost" onclick="toggleMenu('snips')">snippets &#9662;</button><div class="menu" id="snips" hidden></div></div>
+        <div class="menuwrap"><button class="ghost" onclick="toggleMenu('hist')">history &#9662;</button><div class="menu" id="hist" hidden></div></div>
+        <span class="spacer"></span>
+        <span class="hint">up-arrow on first line recalls history</span>
+      </div>
+      <div id="err" hidden></div>
+      <div id="resCard" hidden>
+        <div class="toolbar" style="margin-top:14px">
+          <span id="resMeta"></span>
+          <span class="spacer"></span>
+          <input type="text" id="rsearch" placeholder="filter rows&hellip;" oninput="renderRes()" hidden>
+          <span class="seg" id="viewSeg"></span>
+          <button class="ghost" onclick="treeAll(true)" id="expAll" hidden title="expand all">+</button>
+          <button class="ghost" onclick="treeAll(false)" id="colAll" hidden title="collapse all">&minus;</button>
+          <button class="ghost" onclick="copyRes()" title="copy result JSON">copy</button>
+          <button class="ghost" onclick="downloadRes()" title="download result JSON">json</button>
+          <button class="ghost" id="csvBtn" onclick="downloadResCsv()" title="download rows as CSV" hidden>csv</button>
+        </div>
+        <div id="resBody"></div>
+        <div id="warns"></div>
+      </div>
+      <p class="hint" style="margin-top:12px">CAL cannot delete data &mdash; DELETE/DROP are parse errors by design. Erasure is host-level only (MCP <code>dejadb_forget</code>, memory-tool <code>delete</code>).</p>
+    </div>
+  </section>
+
+  <aside class="panel" id="oplogPanel">
+    <h2>op-log <span class="spacer" style="flex:1"></span><button class="ghost" onclick="loadLog()">&#8635;</button></h2>
+    <div id="log" class="hint">loading&hellip;</div>
+  </aside>
+</main>
+
+<div id="drawerWrap" hidden>
+  <div id="shade" onclick="closeDrawer()"></div>
+  <div id="drawer"></div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+const DBKEY = document.querySelector('.db').textContent || 'db';
+
+/* ---------- theme ---------- */
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t) return t;
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function toggleTheme() {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('dejadb.theme', next);
+  // repaint everything that carries theme-dependent inline color
+  renderFacets(); renderMem(); loadLog();
+  if (lastRes) renderRes();
+  if (ACTIVETAB === 'graph') renderGraphTab();
+}
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+/* ---------- api (bearer-aware for dejad hub mode) ---------- */
+let TOKEN = sessionStorage.getItem('dejadb.token') || '';
+async function api(url, opts) {
+  opts = opts || {};
+  if (TOKEN) { opts.headers = Object.assign({}, opts.headers, {Authorization: 'Bearer ' + TOKEN}); }
+  const r = await fetch(url, opts);
+  if (r.status === 401) {
+    const t = window.prompt('dejad hub mode: bearer token required');
+    if (t) { TOKEN = t; sessionStorage.setItem('dejadb.token', t); return api(url, opts); }
+  }
+  return r.json();
+}
+
+/* ---------- shared helpers ---------- */
+const TYPE_COLORS = {
+  light: { fact:'#2E6CD9', event:'#B45309', observation:'#0E7490', goal:'#2F9E44',
+    skill:'#7048E8', state:'#9A6700', tool:'#C2255C', workflow:'#1971C2', reasoning:'#6741D9',
+    consent:'#0E8F82', consensus:'#B08800' },
+  dark: { fact:'#82B5FF', event:'#E8A265', observation:'#5CC9DD', goal:'#63D278',
+    skill:'#B49AFB', state:'#D9AE54', tool:'#F491C2', workflow:'#8FC7FF', reasoning:'#A88FF6',
+    consent:'#58C7B9', consensus:'#EECB7E' },
+};
+const typeColor = t => TYPE_COLORS[currentTheme()][t] || cssVar('--dim');
+function badge(type) {
+  return '<span class="tbadge" style="color:' + typeColor(type) + '"><i></i>' + esc(type || '?') + '</span>';
+}
+function relTime(ms) {
+  if (!ms) return '';
+  const d = Date.now() - ms;
+  if (d < 0) return 'now';
+  const s = Math.floor(d / 1000);
+  if (s < 5) return 'now'; if (s < 60) return s + 's';
+  const m = Math.floor(s / 60); if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h';
+  const dd = Math.floor(h / 24); if (dd < 30) return dd + 'd';
+  return Math.floor(dd / 30) + 'mo';
+}
+const isoTitle = ms => ms ? new Date(ms).toISOString() : '';
+const hlcMs = hlc => Math.floor(hlc / 65536);
+const shortHash = h => h ? h.slice(0, 12) + '…' : '';
+const HASH_RE = /^(sha256:)?[0-9a-f]{64}$/;
+function toast(msg) {
+  let t = $('toast');
+  if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast._h); toast._h = setTimeout(() => { t.style.display = 'none'; }, 1400);
+}
+function copyText(s, label) {
+  navigator.clipboard.writeText(s).then(() => toast((label || 'copied') + ' ✓'), () => toast('copy failed'));
+}
+function download(name, text, mime) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], {type: mime || 'application/json'}));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+function toCsv(rows, cols) {
+  const cell = v => { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  return [cols.join(',')].concat(rows.map(r => cols.map(c => cell(r[c])).join(','))).join('\n');
+}
+function preview(fields) {
+  if (!fields) return '';
+  const v = fields.object != null ? fields.object
+    : fields.content != null ? fields.content
+    : fields.description != null ? fields.description
+    : fields.data != null ? JSON.stringify(fields.data) : '';
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  return s.length > 120 ? s.slice(0, 120) + '…' : s;
+}
+
+/* ---------- state ---------- */
+let BROWSE = { grains: [], total: 0 };
+let BYHASH = {};
+const filters = { type: null, subject: null, relation: null, namespace: null, sup: false, gone: true };
+let memSort = { key: 'op_seq', dir: -1 };
+let facetExpanded = {};
+let lastRes = null, viewMode = 'tree', lastRows = null, lastCols = null;
+let resSort = { key: null, dir: 1 };
+let ACTIVETAB = 'mem';
+
+/* ---------- boot / refresh ---------- */
+async function refreshAll() { loadChips(); loadBrowse(); loadLog(); }
+async function loadChips() {
+  const s = await api('/api/stats');
+  const el = $('chips'); el.innerHTML = '';
+  [['grains','grains'],['current','current'],['triples','triples'],['ops','ops']].forEach(([k, label]) => {
+    const c = document.createElement('span');
+    c.className = 'chip'; c.title = 'open memories';
+    c.innerHTML = label + ' <b></b>'; c.querySelector('b').textContent = s[k];
+    c.onclick = () => showTab('mem');
+    el.appendChild(c);
+  });
+}
+async function loadBrowse() {
+  const r = await api('/api/browse?limit=500');
+  if (!r.ok) { $('memTable').innerHTML = '<div class="empty">' + esc(r.error || 'browse failed') + '</div>'; return; }
+  BROWSE = { grains: r.grains, total: r.total_ops };
+  BYHASH = {};
+  for (const g of BROWSE.grains) BYHASH[g.hash] = g;
+  renderFacets(); renderMem(); buildSnippets();
+  if (ACTIVETAB === 'graph') renderGraphTab();
+}
+async function verify() {
+  const v = await api('/api/verify');
+  const ok = v.integrity === 'ok';
+  $('vdot').style.background = ok ? 'var(--green)' : 'var(--red)';
+  $('verifyBtn').title = 'integrity ' + v.integrity + ' · ' + v.grains + ' grains · '
+    + v.hash_mismatches + ' mismatches · ' + v.undecodable + ' undecodable';
+  toast(ok ? 'integrity ok ✓ (' + v.grains + ' grains)' : 'INTEGRITY FAILED — see verify tooltip');
+}
+
+/* ---------- facets ---------- */
+const isCurrent = g => g.op !== 'forget' && !g.forgotten && !g.superseded_by && !g.missing;
+function computeFacets() {
+  const f = { type: {}, subject: {}, relation: {}, namespace: {} };
+  const bump = (m, k) => { if (k) m[k] = (m[k] || 0) + 1; };
+  for (const g of BROWSE.grains) {
+    if (!isCurrent(g)) continue;
+    bump(f.type, g.type);
+    const fl = g.fields || {};
+    bump(f.subject, fl.subject); bump(f.relation, fl.relation); bump(f.namespace, fl.namespace);
+  }
+  return f;
+}
+function renderFacets() {
+  const f = computeFacets();
+  const needle = $('ffilter').value.toLowerCase();
+  let html = '';
+  for (const sec of ['type', 'subject', 'relation', 'namespace']) {
+    let items = Object.entries(f[sec]).sort((a, b) => b[1] - a[1]);
+    if (needle) items = items.filter(([k]) => k.toLowerCase().includes(needle));
+    if (!items.length) continue;
+    const cap = facetExpanded[sec] ? 200 : 8;
+    html += '<div class="fsec"><h3>' + sec + 's</h3>';
+    for (const [k, n] of items.slice(0, cap)) {
+      const on = filters[sec] === k;
+      html += '<div class="fitem' + (on ? ' on' : '') + '" data-sec="' + sec + '" data-k="' + esc(k)
+        + '"><span class="n">' + esc(k) + '</span><span class="c">' + n + '</span></div>';
+    }
+    if (items.length > cap) html += '<div class="fmore" data-sec="' + sec + '">+ ' + (items.length - cap) + ' more</div>';
+    html += '</div>';
+  }
+  $('facets').innerHTML = html || '<span class="hint">no memories yet — run an ADD in the query tab</span>';
+  $('facets').querySelectorAll('.fitem').forEach(el => {
+    el.onclick = e => {
+      const sec = el.dataset.sec, k = el.dataset.k;
+      if (e.metaKey || e.ctrlKey) { calForFacet(sec, k); return; }
+      filters[sec] = filters[sec] === k ? null : k;
+      renderFacets(); renderMem();
+      if (ACTIVETAB === 'graph') renderGraphTab(); else showTab('mem');
+    };
+  });
+  $('facets').querySelectorAll('.fmore').forEach(el => {
+    el.onclick = () => { facetExpanded[el.dataset.sec] = true; renderFacets(); };
+  });
+}
+function calForFacet(sec, k) {
+  const qs = {
+    subject: 'RECALL facts WHERE subject = "' + k + '"',
+    relation: 'RECALL facts WHERE subject = "' + topSubject() + '" AND relation = "' + k + '"',
+    type: 'RECALL ' + k + 's WHERE subject = "' + topSubject() + '"',
+    namespace: 'RECALL facts WHERE subject = "' + topSubject() + '" AND namespace = "' + k + '"',
+  };
+  setQ(qs[sec]); showTab('query'); runCal();
+}
+function topSubject() {
+  const s = computeFacets().subject;
+  const top = Object.entries(s).sort((a, b) => b[1] - a[1])[0];
+  return top ? top[0] : 'john';
+}
+
+/* ---------- memories table ---------- */
+function toggle(which) {
+  filters[which === 'sup' ? 'sup' : 'gone'] = !filters[which === 'sup' ? 'sup' : 'gone'];
+  $('tglSup').classList.toggle('on', filters.sup);
+  $('tglGone').classList.toggle('on', filters.gone);
+  renderMem();
+}
+function memRows() {
+  const needle = ($('msearch').value || '').toLowerCase();
+  return BROWSE.grains.filter(g => {
+    if (g.superseded_by && !filters.sup) return false;
+    if ((g.forgotten || g.missing || g.op === 'forget') && !filters.gone) return false;
+    const fl = g.fields || {};
+    if (filters.type && g.type !== filters.type) return false;
+    if (filters.subject && fl.subject !== filters.subject) return false;
+    if (filters.relation && fl.relation !== filters.relation) return false;
+    if (filters.namespace && fl.namespace !== filters.namespace) return false;
+    if (needle) {
+      const hay = (g.hash + ' ' + (g.type || '') + ' ' + JSON.stringify(fl)).toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+}
+function renderMem() {
+  // active filter chips
+  let chips = '';
+  for (const sec of ['type', 'subject', 'relation', 'namespace']) {
+    if (filters[sec]) chips += '<span class="fchip" onclick="clearFilter(\'' + sec + '\')">' + esc(filters[sec]) + ' ×</span> ';
+  }
+  $('fchips').innerHTML = chips;
+
+  const rows = memRows();
+  const acc = {
+    type: g => g.type || '', subject: g => (g.fields || {}).subject || '',
+    relation: g => (g.fields || {}).relation || '', preview: g => preview(g.fields),
+    age: g => g.hlc, op_seq: g => g.op_seq,
+  };
+  const key = acc[memSort.key] || acc.op_seq;
+  rows.sort((a, b) => { const x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : 0) * memSort.dir; });
+  $('memCount').textContent = rows.length + ' of ' + BROWSE.grains.length + ' shown'
+    + (BROWSE.total > BROWSE.grains.length ? ' (latest ' + BROWSE.grains.length + ' of ' + BROWSE.total + ' ops)' : '');
+
+  if (!rows.length) { $('memTable').innerHTML = '<div class="empty">nothing here — adjust filters or add a memory</div>'; return; }
+  const th = (label, k) => '<th data-k="' + k + '">' + label
+    + (memSort.key === k ? ' <span class="arr">' + (memSort.dir > 0 ? '▴' : '▾') + '</span>' : '') + '</th>';
+  let html = '<table><thead><tr>' + th('type','type') + th('subject','subject') + th('relation','relation')
+    + th('object / content','preview') + th('age','age') + '<th>hash</th><th></th></tr></thead><tbody>';
+  for (const g of rows) {
+    const fl = g.fields || {};
+    const gone = g.forgotten || g.missing || g.op === 'forget';
+    const cls = gone ? 'gone rowlink' : g.superseded_by ? 'sup rowlink' : 'rowlink';
+    const status = gone ? '<span class="tag tag-gone">forgotten</span>'
+      : g.superseded_by ? '<span class="tag tag-sup">superseded</span>' : '';
+    html += '<tr class="' + cls + '" data-h="' + esc(g.hash) + '"><td>' + badge(g.type) + '</td><td>'
+      + esc(fl.subject || '') + '</td><td>' + esc(fl.relation || '') + '</td><td class="prev" title="' + esc(preview(fl)) + '">'
+      + esc(preview(fl)) + '</td><td class="age" title="' + isoTitle(hlcMs(g.hlc)) + '">' + relTime(hlcMs(g.hlc))
+      + '</td><td class="mono hash-t">' + shortHash(g.hash) + '</td><td>' + status + '</td></tr>';
+  }
+  $('memTable').innerHTML = html + '</tbody></table>';
+  $('memTable').querySelectorAll('th[data-k]').forEach(el => {
+    el.onclick = () => {
+      const k = el.dataset.k;
+      if (memSort.key === k) memSort.dir *= -1; else memSort = { key: k, dir: k === 'age' || k === 'op_seq' ? -1 : 1 };
+      renderMem();
+    };
+  });
+  $('memTable').querySelectorAll('tr.rowlink').forEach(el => { el.onclick = () => openDrawer(el.dataset.h); });
+}
+function clearFilter(sec) {
+  filters[sec] = null; renderFacets(); renderMem();
+  if (ACTIVETAB === 'graph') renderGraphTab();
+}
+function exportMem(kind) {
+  const rows = memRows().map(g => Object.assign({ hash: g.hash, type: g.type,
+    status: g.forgotten || g.op === 'forget' ? 'forgotten' : g.superseded_by ? 'superseded' : 'current',
+    at: isoTitle(hlcMs(g.hlc)) }, g.fields || {}));
+  if (kind === 'json') { download('dejadb-memories.json', JSON.stringify(rows, null, 2)); return; }
+  const cols = ['hash', 'type', 'status', 'at', 'namespace', 'subject', 'relation', 'object', 'content', 'confidence', 'created_at'];
+  download('dejadb-memories.csv', toCsv(rows, cols), 'text/csv');
+}
+
+/* ---------- tabs ---------- */
+function showTab(t) {
+  ACTIVETAB = t;
+  $('pane-mem').hidden = t !== 'mem'; $('pane-query').hidden = t !== 'query';
+  $('pane-graph').hidden = t !== 'graph';
+  $('tab-mem').classList.toggle('active', t === 'mem');
+  $('tab-query').classList.toggle('active', t === 'query');
+  $('tab-graph').classList.toggle('active', t === 'graph');
+  if (t === 'query') $('q').focus();
+  if (t === 'graph') renderGraphTab();
+}
+
+/* ---------- CAL editor: highlight overlay ---------- */
+const CAL_KW = 'RECALL|ASSEMBLE|WHERE|AND|OR|NOT|IN|BETWEEN|LIMIT|OFFSET|ORDER|BY|ASC|DESC|WITH|EXPLAIN|SCOPE|UNION|INTERSECT|EXCEPT|SELECT|COUNT|FIRST|GROUP|SUBJECTS|OBJECTS|HASHES|PROJECT|INCLUDE|EXCLUDE|IS|NULL|TRUE|FALSE|EXISTS|HISTORY|DESCRIBE|BATCH|COALESCE|ABOUT|RECENT|SINCE|UNTIL|LIKE|MY|CONTRADICTIONS|AS|FOR|FROM|BUDGET|PRIORITY|FORMAT|LET|THREAD|DIFF|STREAM|TEMPLATE|DEFINE|QUERY|RUN|OF|ADD|ACCUMULATE|SUPERSEDE|REVERT|FORGET|PURGE|SET|REASON|BECAUSE|CAPABILITIES|MARKDOWN|JSON|YAML|TEXT|SML|TOON|TRIPLES|ALL|CAL';
+const CAL_RE = new RegExp('("(?:[^"\\\\]|\\\\.)*"?)|\\b(sha256:[0-9a-fA-F]+|[0-9a-fA-F]{64})\\b|\\b(\\d+(?:\\.\\d+)?)\\b|(\\|)|\\b(' + CAL_KW + ')\\b', 'gi');
+function highlightCal(src) {
+  return esc(src).replace(CAL_RE, (m, str, hash, num, pipe, kw) => {
+    if (str) return '<span class="cal-str">' + str + '</span>';
+    if (hash) return '<span class="cal-hash">' + hash + '</span>';
+    if (num) return '<span class="cal-num">' + num + '</span>';
+    if (pipe) return '<span class="cal-pipe">|</span>';
+    return '<span class="cal-kw">' + kw.toUpperCase() + '</span>';
+  });
+}
+function syncHl() { $('hl').innerHTML = highlightCal($('q').value) + '\n'; syncScroll(); }
+function syncScroll() { $('hl').scrollTop = $('q').scrollTop; }
+function setQ(s) { $('q').value = s; syncHl(); }
+
+/* ---------- query history + snippets ---------- */
+const HKEY = 'dejadb.qh.' + DBKEY;
+let hIdx = -1;
+const getHist = () => { try { return JSON.parse(localStorage.getItem(HKEY)) || []; } catch (e) { return []; } };
+function pushHist(qs) {
+  const h = getHist().filter(x => x !== qs); h.unshift(qs);
+  localStorage.setItem(HKEY, JSON.stringify(h.slice(0, 50))); hIdx = -1;
+}
+function toggleMenu(id) {
+  const el = $(id); const was = el.hidden;
+  $('snips').hidden = $('hist').hidden = true;
+  if (was) { if (id === 'hist') buildHist(); el.hidden = false; }
+}
+function buildHist() {
+  const h = getHist();
+  $('hist').innerHTML = h.length
+    ? h.map(qs => '<div title="' + esc(qs) + '">' + esc(qs) + '</div>').join('')
+    : '<div class="hint">no queries yet</div>';
+  Array.prototype.forEach.call($('hist').children, (el, i) => {
+    el.onclick = () => { setQ(h[i]); $('hist').hidden = true; $('q').focus(); };
+  });
+}
+function buildSnippets() {
+  const s = topSubject();
+  const snips = [
+    ['recall about a subject', 'RECALL facts WHERE subject = "' + s + '"'],
+    ['everything about a subject', 'RECALL grains WHERE subject = "' + s + '"'],
+    ['free-text search', 'RECALL LIKE "tea"'],
+    ['count', 'RECALL facts WHERE subject = "' + s + '" | COUNT'],
+    ['group by relation', 'RECALL facts WHERE subject = "' + s + '" | GROUP BY relation'],
+    ['version history of one fact', 'HISTORY WHERE subject = "' + s + '" AND relation = "prefers"'],
+    ['exists by hash?', 'EXISTS sha256:…'],
+    ['context preview (what the model sees)', 'ASSEMBLE "prompt" FROM profile: (RECALL facts WHERE subject = "' + s + '") FORMAT SML'],
+    ['add a fact', 'ADD fact SET subject = "' + s + '" SET relation = "prefers" SET object = "tea" REASON "console"'],
+    ['supersede (edit = new version)', 'SUPERSEDE sha256:… SET object = "coffee" REASON "changed mind"'],
+    ['capabilities', 'DESCRIBE CAPABILITIES'],
+  ];
+  $('snips').innerHTML = snips.map(([t, qs]) =>
+    '<div><b style="color:var(--bright);font-weight:normal">' + esc(t) + '</b><small>' + esc(qs) + '</small></div>').join('');
+  Array.prototype.forEach.call($('snips').children, (el, i) => {
+    el.onclick = () => { setQ(snips[i][1]); $('snips').hidden = true; $('q').focus(); };
+  });
+}
+
+/* ---------- run CAL ---------- */
+async function runCal() {
+  const qs = $('q').value.trim();
+  if (!qs) return;
+  $('err').hidden = true;
+  $('resCard').hidden = false;
+  $('resBody').innerHTML = '<span class="hint">running…</span>';
+  $('resMeta').textContent = '';
+  let res;
+  try { res = await api('/api/cal', { method: 'POST', body: JSON.stringify({ query: qs }) }); }
+  catch (e) { $('resBody').innerHTML = '<div class="empty">request failed: ' + esc(e) + '</div>'; return; }
+  pushHist(qs);
+  if (!res.ok) { $('resCard').hidden = true; showCalError(qs, res); return; }
+  lastRes = res;
+  viewMode = defaultView(res.result);
+  renderRes();
+  const mut = ['add', 'supersede', 'accumulate', 'batch'].includes(res.statement);
+  if (mut) refreshAll(); else loadLog();
+}
+function showCalError(qs, res) {
+  let html = '<span class="ecode">' + esc(res.code || 'CAL') + '</span>' + esc(res.error || 'error');
+  if (res.span && res.span.line) {
+    const lines = qs.split('\n');
+    const ln = lines[res.span.line - 1] || '';
+    const col = Math.max(1, res.span.col || 1);
+    const width = Math.max(1, (res.span.end || 0) - (res.span.start || 0));
+    html += '<pre>' + esc(ln) + '\n' + ' '.repeat(col - 1) + '<b>' + '^'.repeat(Math.min(width, Math.max(1, ln.length - col + 1))) + '</b></pre>';
+  }
+  if (res.suggestion) html += '<div class="ehint">hint: ' + esc(res.suggestion) + '</div>';
+  $('err').innerHTML = html;
+  $('err').hidden = false;
+}
+
+/* ---------- result rendering ---------- */
+function resultFacts(r) {
+  if (!r || r.type !== 'grains') return [];
+  return (r.grains || [])
+    .filter(g => g.grain_type === 'fact' && g.fields && g.fields.subject && g.fields.relation && typeof g.fields.object === 'string')
+    .map(g => ({ subject: g.fields.subject, relation: g.fields.relation, object: g.fields.object, hash: g.hash }));
+}
+function defaultView(r) {
+  if (r && r.type === 'grains') return 'table';
+  if (r && r.type === 'history') return 'chain';
+  if (r && r.type === 'formatted') return 'rendered';
+  if (r && r.type === 'count') return 'count';
+  return 'tree';
+}
+function viewsFor(r) {
+  const v = ['tree', 'raw'];
+  if (r && r.type === 'grains') {
+    v.unshift('table');
+    if (resultFacts(r).length) v.splice(1, 0, 'graph');
+  }
+  if (r && r.type === 'history') { v.unshift('chain'); }
+  if (r && r.type === 'formatted') v.unshift('rendered');
+  if (r && r.type === 'count') v.unshift('count');
+  return v;
+}
+function renderRes() {
+  if (!lastRes) return;
+  const r = lastRes.result;
+  // meta line
+  let meta = (lastRes.statement || '') + ' · ' + (lastRes.elapsed_ms != null ? lastRes.elapsed_ms + 'ms' : '');
+  if (r && r.type === 'grains') meta += ' · ' + (r.grains || []).length + (r.total_available != null ? ' of ' + r.total_available : '') + ' grains';
+  if (r && r.type === 'history') meta += ' · ' + (r.versions || []).length + ' versions';
+  $('resMeta').textContent = meta;
+  // view segment buttons
+  const views = viewsFor(r);
+  if (!views.includes(viewMode)) viewMode = views[0];
+  $('viewSeg').innerHTML = views.map(v => '<button class="' + (v === viewMode ? 'on' : '') + '" data-v="' + v + '">' + v + '</button>').join('');
+  $('viewSeg').querySelectorAll('button').forEach(b => { b.onclick = () => { viewMode = b.dataset.v; renderRes(); }; });
+  $('expAll').hidden = $('colAll').hidden = viewMode !== 'tree';
+  $('rsearch').hidden = viewMode !== 'table';
+  $('csvBtn').hidden = viewMode !== 'table';
+
+  const body = $('resBody');
+  lastRows = null; lastCols = null;
+  if (viewMode === 'count') {
+    body.innerHTML = '<div class="bignum">' + esc(r.count != null ? r.count : JSON.stringify(r)) + '</div>';
+  } else if (viewMode === 'rendered') {
+    body.innerHTML = '<div class="hint" style="margin-bottom:6px">format: ' + esc(r.format || '') + ' · ' + (r.grain_count != null ? r.grain_count + ' grains · ' : '') + '~' + Math.ceil((r.text || '').length / 4) + ' tokens (est)</div><pre class="rendered">' + esc(r.text || '') + '</pre>';
+  } else if (viewMode === 'chain') {
+    body.innerHTML = ''; body.appendChild(chainView(r.versions || []));
+  } else if (viewMode === 'graph') {
+    body.innerHTML = '';
+    const host = document.createElement('div');
+    body.appendChild(host);
+    graphMount(host, resultFacts(r), 400);
+  } else if (viewMode === 'table') {
+    renderResTable(r, body);
+  } else if (viewMode === 'raw') {
+    body.innerHTML = '<pre style="white-space:pre-wrap;word-break:break-word;font-family:var(--mono)">' + rawJsonHtml(r) + '</pre>';
+  } else {
+    body.innerHTML = ''; body.appendChild(jsonTree(r, '$', 0));
+  }
+  // warnings
+  $('warns').innerHTML = (lastRes.warnings || []).map(w => '<div class="warnline">⚠ ' + esc(w) + '</div>').join('');
+}
+function flattenResult(r) {
+  let rows = [];
+  if (r && r.type === 'grains') {
+    rows = (r.grains || []).map(g => Object.assign({ hash: g.hash, type: g.grain_type, score: g.score }, g.fields || {}));
+  } else if (r && r.type === 'history') {
+    rows = (r.versions || []).map(v => ({ hash: v.hash, object: v.object, created_at: v.created_at, confidence: v.confidence, superseded_by: v.superseded_by }));
+  } else if (Array.isArray(r)) {
+    rows = r.map(x => (x && typeof x === 'object') ? x : { value: x });
+  }
+  const pri = ['type', 'namespace', 'subject', 'relation', 'object', 'content', 'created_at', 'confidence', 'score', 'hash', 'superseded_by'];
+  const seen = new Set();
+  rows.forEach(row => Object.keys(row).forEach(k => seen.add(k)));
+  const cols = pri.filter(c => seen.has(c)).concat([...seen].filter(c => !pri.includes(c)).slice(0, 6));
+  return { rows, cols };
+}
+function renderResTable(r, body) {
+  const { rows, cols } = flattenResult(r);
+  if (!rows.length) { body.innerHTML = '<div class="empty">no rows</div>'; return; }
+  const needle = ($('rsearch').value || '').toLowerCase();
+  let vis = needle ? rows.filter(row => JSON.stringify(row).toLowerCase().includes(needle)) : rows.slice();
+  if (resSort.key) {
+    vis.sort((a, b) => { const x = a[resSort.key], y = b[resSort.key]; return (x < y ? -1 : x > y ? 1 : 0) * resSort.dir; });
+  }
+  lastRows = vis; lastCols = cols;
+  let html = '<div class="tablewrap"><table><thead><tr>' + cols.map(c => '<th data-k="' + esc(c) + '">' + esc(c)
+    + (resSort.key === c ? ' <span class="arr">' + (resSort.dir > 0 ? '▴' : '▾') + '</span>' : '') + '</th>').join('') + '</tr></thead><tbody>';
+  for (const row of vis) {
+    html += '<tr' + (row.hash ? ' class="rowlink" data-h="' + esc(row.hash) + '"' : '') + '>';
+    for (const c of cols) {
+      let v = row[c];
+      let cell;
+      if (v == null) cell = '';
+      else if (c === 'created_at' && typeof v === 'number') cell = '<span class="age" title="' + isoTitle(v) + '">' + relTime(v) + '</span>';
+      else if (typeof v === 'string' && HASH_RE.test(v)) cell = '<span class="mono hash-t">' + shortHash(v) + '</span>';
+      else if (c === 'type') cell = badge(v);
+      else { const s = typeof v === 'object' ? JSON.stringify(v) : String(v); cell = '<span title="' + esc(s) + '">' + esc(s.length > 80 ? s.slice(0, 80) + '…' : s) + '</span>'; }
+      html += '<td>' + cell + '</td>';
+    }
+    html += '</tr>';
+  }
+  body.innerHTML = html + '</tbody></table></div>';
+  body.querySelectorAll('th[data-k]').forEach(el => {
+    el.onclick = () => {
+      const k = el.dataset.k;
+      if (resSort.key === k) resSort.dir *= -1; else resSort = { key: k, dir: 1 };
+      renderRes();
+    };
+  });
+  body.querySelectorAll('tr.rowlink').forEach(el => { el.onclick = () => openDrawer(el.dataset.h); });
+}
+function chainView(versions) {
+  const wrap = document.createElement('div');
+  if (!versions.length) { wrap.innerHTML = '<div class="empty">no versions</div>'; return wrap; }
+  versions.forEach(v => {
+    const cur = !v.superseded_by;
+    const d = document.createElement('div');
+    d.className = 'step' + (cur ? ' cur' : '');
+    d.innerHTML = '<div class="obj">' + esc(v.object) + (cur ? ' <span class="tag tag-cur">current</span>'
+        : ' <span class="tag tag-sup">superseded</span>') + '</div>'
+      + '<div class="sub"><span title="' + isoTitle(v.created_at) + '">' + relTime(v.created_at) + '</span>'
+      + ' · conf ' + esc(v.confidence) + ' · <span class="hashlink" data-h="' + esc(v.hash) + '">' + shortHash(v.hash) + '</span></div>';
+    wrap.appendChild(d);
+  });
+  wrap.querySelectorAll('.hashlink').forEach(el => { el.onclick = () => openDrawer(el.dataset.h); });
+  return wrap;
+}
+function copyRes() { if (lastRes) copyText(JSON.stringify(lastRes.result, null, 2), 'result JSON'); }
+function downloadRes() { if (lastRes) download('dejadb-result.json', JSON.stringify(lastRes.result, null, 2)); }
+function downloadResCsv() {
+  if (!lastRows || !lastCols) return;
+  const flat = lastRows.map(r => { const o = {}; lastCols.forEach(c => { o[c] = typeof r[c] === 'object' ? JSON.stringify(r[c]) : r[c]; }); return o; });
+  download('dejadb-result.csv', toCsv(flat, lastCols), 'text/csv');
+}
+
+/* ---------- JSON tree viewer ---------- */
+function scalarSpan(v) {
+  const s = document.createElement('span');
+  if (typeof v === 'string') {
+    if (HASH_RE.test(v)) {
+      s.className = 'hashlink'; s.textContent = shortHash(v.replace(/^sha256:/, ''));
+      s.title = v + ' — click to inspect grain';
+      s.onclick = e => { e.stopPropagation(); openDrawer(v.replace(/^sha256:/, '')); };
+    } else { s.className = 'tok-str'; s.textContent = JSON.stringify(v); }
+  } else if (typeof v === 'number') { s.className = 'tok-num'; s.textContent = String(v); }
+  else if (typeof v === 'boolean') { s.className = 'tok-bool'; s.textContent = String(v); }
+  else { s.className = 'tok-null'; s.textContent = 'null'; }
+  return s;
+}
+function jsonTree(val, path, depth) {
+  if (val === null || typeof val !== 'object') {
+    const d = document.createElement('div'); d.className = 'jt'; d.appendChild(scalarSpan(val)); return d;
+  }
+  const root = document.createElement('div'); root.className = 'jt';
+  root.appendChild(treeNode(val, path, depth));
+  return root;
+}
+function treeNode(val, path, depth) {
+  const isArr = Array.isArray(val);
+  const entries = isArr ? val.map((v, i) => [i, v]) : Object.entries(val);
+  const node = document.createElement('div'); node.className = 'node';
+  const head = document.createElement('div');
+  const caret = document.createElement('span'); caret.className = 'caret';
+  const punc = document.createElement('span'); punc.className = 'tok-punc';
+  punc.textContent = isArr ? '[' : '{';
+  const meta = document.createElement('span'); meta.className = 'meta';
+  meta.textContent = isArr ? entries.length + ' item' + (entries.length === 1 ? '' : 's') : entries.length + ' key' + (entries.length === 1 ? '' : 's');
+  head.append(caret, punc, meta);
+  const kids = document.createElement('div'); kids.className = 'kids';
+  const tail = document.createElement('div');
+  tail.innerHTML = '<span class="tok-punc" style="margin-left:14px">' + (isArr ? ']' : '}') + '</span>';
+  let open = depth < 2 && entries.length <= 30;
+  let built = false;
+  const build = () => {
+    if (built) return; built = true;
+    for (const [k, v] of entries) {
+      const row = document.createElement('div');
+      const key = document.createElement('span'); key.className = 'k';
+      key.textContent = isArr ? k : JSON.stringify(k);
+      const p = path + (isArr ? '[' + k + ']' : '.' + k);
+      key.title = p + ' — click to copy value';
+      key.onclick = e => { e.stopPropagation(); copyText(typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v), p); };
+      row.appendChild(key);
+      row.insertAdjacentHTML('beforeend', '<span class="tok-punc">: </span>');
+      if (v !== null && typeof v === 'object') row.appendChild(treeNode(v, p, depth + 1));
+      else row.appendChild(scalarSpan(v));
+      kids.appendChild(row);
+    }
+  };
+  const sync = () => {
+    caret.textContent = open ? '▾' : '▸';
+    if (open) build();
+    kids.style.display = open ? '' : 'none';
+    tail.style.display = open ? '' : 'none';
+    meta.style.display = open ? 'none' : '';
+    if (!open) meta.textContent = (isArr ? entries.length + ' item' + (entries.length === 1 ? '' : 's') : entries.length + ' key' + (entries.length === 1 ? '' : 's')) + ' ' + (isArr ? ']' : '}');
+  };
+  caret.onclick = () => { open = !open; sync(); };
+  punc.onclick = caret.onclick; punc.style.cursor = 'pointer';
+  node._setOpen = o => { open = o; sync(); };
+  sync();
+  node.append(head, kids, tail);
+  return node;
+}
+function treeAll(open) {
+  $('resBody').querySelectorAll('.node').forEach(n => { if (n._setOpen) n._setOpen(open); });
+}
+
+/* ---------- raw JSON with syntax colors ---------- */
+function rawJsonHtml(obj) {
+  const json = esc(JSON.stringify(obj, null, 2));
+  return json.replace(/(&quot;(?:[^&]|&(?!quot;))*?&quot;)(\s*:)?|\b(true|false)\b|\bnull\b|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g,
+    (m, str, colon, bool) => {
+      if (str) return colon ? '<span class="tok-key">' + str + '</span>' + colon : '<span class="tok-str">' + str + '</span>';
+      if (bool) return '<span class="tok-bool">' + bool + '</span>';
+      if (m === 'null') return '<span class="tok-null">null</span>';
+      return '<span class="tok-num">' + m + '</span>';
+    });
+}
+
+/* ---------- graph visualization ----------
+   Hand-rolled force layout on canvas: nodes are subjects/objects of current
+   facts, edges are relations. Colors are read from the active theme's CSS
+   variables on every render. No dependencies, hi-DPI aware.               */
+let GR = null;
+function graphData(facts) {
+  const nodes = new Map(), edges = [];
+  const add = (id, kind) => {
+    if (!nodes.has(id)) nodes.set(id, { id, kind, deg: 0, x: 0, y: 0, vx: 0, vy: 0 });
+    const n = nodes.get(id);
+    if (kind === 'subject') n.kind = 'subject';
+    n.deg++;
+    return n;
+  };
+  for (const f of facts) {
+    add(f.subject, 'subject'); add(f.object, 'value');
+    edges.push({ s: f.subject, t: f.object, rel: f.relation, hash: f.hash });
+  }
+  const arr = [...nodes.values()];
+  const byId = new Map(arr.map(n => [n.id, n]));
+  for (const e of edges) { e.a = byId.get(e.s); e.b = byId.get(e.t); }
+  return { nodes: arr, edges };
+}
+function currentFacts() {
+  return BROWSE.grains.filter(g => {
+    if (!isCurrent(g) || g.type !== 'fact') return false;
+    const fl = g.fields || {};
+    if (!fl.subject || !fl.relation || typeof fl.object !== 'string') return false;
+    if (filters.subject && fl.subject !== filters.subject && fl.object !== filters.subject) return false;
+    if (filters.relation && fl.relation !== filters.relation) return false;
+    if (filters.namespace && fl.namespace !== filters.namespace) return false;
+    return true;
+  }).map(g => ({ subject: g.fields.subject, relation: g.fields.relation, object: g.fields.object, hash: g.hash }));
+}
+function renderGraphTab() {
+  const facts = currentFacts();
+  const active = ['subject', 'relation', 'namespace'].filter(k => filters[k]).map(k => filters[k]);
+  $('graphMeta').textContent = facts.length + ' facts' + (active.length ? ' · filtered: ' + active.join(', ') : '')
+    + ' — scroll to zoom · drag to pan or move · click an edge to open its grain · double-click a node to filter memories';
+  graphMount($('graphHost'), facts, Math.max(420, window.innerHeight - 330));
+}
+function fitGraph() { if (GR) GR.fit(); }
+function graphMount(host, facts, height) {
+  if (GR) {
+    if (GR.raf) cancelAnimationFrame(GR.raf);
+    window.removeEventListener('mouseup', GR.onUp);
+    GR = null;
+  }
+  host.innerHTML = '';
+  if (!facts.length) { host.innerHTML = '<div class="empty">no facts to graph — subject → object edges appear here</div>'; return; }
+  const { nodes, edges } = graphData(facts);
+  const canvas = document.createElement('canvas');
+  canvas.className = 'graph';
+  host.appendChild(canvas);
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(320, host.clientWidth), H = height;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d');
+
+  // initial layout on a circle, radius scaled to node count
+  const N = nodes.length;
+  const R = 34 * Math.sqrt(N);
+  nodes.forEach((n, i) => {
+    const a = (i / N) * Math.PI * 2;
+    n.x = Math.cos(a) * R; n.y = Math.sin(a) * R;
+  });
+
+  const view = { s: 1, x: W / 2, y: H / 2 };
+  const K = 92;
+  let heat = 300, hover = null, hoverEdge = null, selected = null;
+  const drag = { node: null, panning: false, active: false, mx: 0, my: 0, moved: 0 };
+
+  const world = (mx, my) => ({ x: (mx - view.x) / view.s, y: (my - view.y) / view.s });
+  const radius = n => 4.5 + 2.2 * Math.sqrt(n.deg);
+
+  function step() {
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy; if (d2 < 1) d2 = 1;
+        const d = Math.sqrt(d2);
+        const f = (K * K / d2) * 0.9;
+        dx /= d; dy /= d;
+        a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+      }
+    }
+    for (const e of edges) {
+      let dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - K) / d * 0.06;
+      e.a.vx += dx * f; e.a.vy += dy * f; e.b.vx -= dx * f; e.b.vy -= dy * f;
+    }
+    for (const n of nodes) {
+      n.vx -= n.x * 0.0012; n.vy -= n.y * 0.0012;
+      if (n === drag.node) { n.vx = 0; n.vy = 0; continue; }
+      n.vx *= 0.82; n.vy *= 0.82;
+      n.x += Math.max(-14, Math.min(14, n.vx));
+      n.y += Math.max(-14, Math.min(14, n.vy));
+    }
+  }
+
+  function connected(n) {
+    const set = new Set();
+    for (const e of edges) { if (e.a === n) set.add(e.b); if (e.b === n) set.add(e.a); }
+    return set;
+  }
+
+  function render() {
+    // theme colors, read live so a toggle repaints correctly
+    const C = {
+      accent: cssVar('--accent'), line2: cssVar('--line2'), dimmer: cssVar('--dimmer'),
+      dim: cssVar('--dim'), bright: cssVar('--bright'), panel: cssVar('--panel'),
+      teal: cssVar('--teal'),
+    };
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.translate(view.x, view.y); ctx.scale(view.s, view.s);
+    const focus = hover || selected;
+    const near = focus ? connected(focus) : null;
+    // edges
+    for (const e of edges) {
+      const lit = focus && (e.a === focus || e.b === focus);
+      const isHover = e === hoverEdge;
+      ctx.strokeStyle = isHover ? C.teal : lit ? C.accent : C.line2;
+      ctx.lineWidth = (isHover ? 2 : lit ? 1.5 : 1) / view.s;
+      ctx.beginPath(); ctx.moveTo(e.a.x, e.a.y); ctx.lineTo(e.b.x, e.b.y); ctx.stroke();
+      if (lit || isHover || view.s > 1.7 || edges.length <= 25) {
+        const mx = (e.a.x + e.b.x) / 2, my = (e.a.y + e.b.y) / 2;
+        ctx.font = (10 / view.s) + 'px ' + '-apple-system,system-ui,sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = isHover ? C.teal : lit ? C.accent : C.dimmer;
+        ctx.fillText(e.rel, mx, my - 4 / view.s);
+      }
+    }
+    // nodes
+    for (const n of nodes) {
+      const r = radius(n);
+      const lit = n === focus || (near && near.has(n));
+      const faded = focus && !lit;
+      ctx.globalAlpha = faded ? 0.35 : 1;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      if (n.kind === 'subject') {
+        ctx.fillStyle = C.accent;
+        ctx.fill();
+        if (n === focus) {
+          ctx.strokeStyle = C.panel; ctx.lineWidth = 2 / view.s; ctx.stroke();
+          ctx.beginPath(); ctx.arc(n.x, n.y, r + 2.5 / view.s, 0, Math.PI * 2);
+          ctx.strokeStyle = C.accent; ctx.lineWidth = 1.5 / view.s; ctx.stroke();
+        }
+      } else {
+        ctx.fillStyle = C.line2;
+        ctx.fill();
+        ctx.strokeStyle = C.dimmer;
+        ctx.lineWidth = 1 / view.s; ctx.stroke();
+      }
+      // label
+      const label = n.id.length > 26 ? n.id.slice(0, 26) + '…' : n.id;
+      ctx.font = (n.kind === 'subject' ? '600 ' : '') + (n.kind === 'subject' ? 11 : 10) / view.s + 'px -apple-system,system-ui,sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = lit ? C.bright : n.kind === 'subject' ? C.accent : C.dim;
+      ctx.fillText(label, n.x, n.y + r + 12 / view.s);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function loop() {
+    GR.raf = requestAnimationFrame(loop);
+    if (!canvas.isConnected) {
+      cancelAnimationFrame(GR.raf);
+      window.removeEventListener('mouseup', onUp);
+      GR = null;
+      return;
+    }
+    if (canvas.offsetParent === null) return;   // pane hidden: idle cheaply
+    if (heat > 0) { step(); step(); heat -= 2; render(); }
+  }
+
+  function hit(mx, my) {
+    const w = world(mx, my);
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i];
+      const dx = w.x - n.x, dy = w.y - n.y;
+      if (dx * dx + dy * dy <= Math.pow(radius(n) + 4 / view.s, 2)) return { node: n };
+    }
+    let best = null, bestD = 7 / view.s;
+    for (const e of edges) {
+      const d = segDist(w.x, w.y, e.a.x, e.a.y, e.b.x, e.b.y);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    return best ? { edge: best } : {};
+  }
+  function segDist(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const l2 = dx * dx + dy * dy || 1;
+    let t = ((px - x1) * dx + (py - y1) * dy) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const qx = x1 + t * dx - px, qy = y1 + t * dy - py;
+    return Math.sqrt(qx * qx + qy * qy);
+  }
+
+  canvas.onmousedown = e => {
+    const m = mouse(e);
+    const h = hit(m.x, m.y);
+    drag.mx = m.x; drag.my = m.y; drag.moved = 0; drag.active = true;
+    if (h.node) { drag.node = h.node; heat = Math.max(heat, 90); }
+    else drag.panning = true;
+  };
+  canvas.onmousemove = e => {
+    const m = mouse(e);
+    if (drag.node) {
+      const w = world(m.x, m.y);
+      drag.node.x = w.x; drag.node.y = w.y;
+      drag.moved += Math.abs(m.x - drag.mx) + Math.abs(m.y - drag.my);
+      drag.mx = m.x; drag.my = m.y;
+      heat = Math.max(heat, 60); render();
+      return;
+    }
+    if (drag.panning) {
+      view.x += m.x - drag.mx; view.y += m.y - drag.my;
+      drag.moved += Math.abs(m.x - drag.mx) + Math.abs(m.y - drag.my);
+      drag.mx = m.x; drag.my = m.y;
+      render();
+      return;
+    }
+    const h = hit(m.x, m.y);
+    const nh = h.node || null, ne = h.edge || null;
+    if (nh !== hover || ne !== hoverEdge) {
+      hover = nh; hoverEdge = ne;
+      canvas.style.cursor = nh || ne ? 'pointer' : 'grab';
+      canvas.title = ne ? (ne.s + ' —' + ne.rel + '→ ' + ne.t + '  (click: open grain)') : nh ? nh.id : '';
+      render();
+    }
+  };
+  const onUp = () => {
+    if (!drag.active) return;
+    if (drag.moved < 4) {
+      if (hoverEdge) openDrawer(hoverEdge.hash);
+      else selected = hover === selected ? null : hover;
+      render();
+    }
+    drag.node = null; drag.panning = false; drag.active = false;
+  };
+  window.addEventListener('mouseup', onUp);
+  canvas.ondblclick = e => {
+    const m = mouse(e);
+    const h = hit(m.x, m.y);
+    if (h.node) {
+      filters.subject = h.node.id;
+      renderFacets(); renderMem(); showTab('mem');
+    }
+  };
+  canvas.onwheel = e => {
+    e.preventDefault();
+    const m = mouse(e);
+    const w = world(m.x, m.y);
+    view.s = Math.max(0.2, Math.min(3.5, view.s * Math.exp(-e.deltaY * 0.0012)));
+    view.x = m.x - w.x * view.s; view.y = m.y - w.y * view.s;
+    render();
+  };
+  function mouse(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  GR = {
+    raf: 0,
+    onUp,
+    fit() {
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const n of nodes) { x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y); x1 = Math.max(x1, n.x); y1 = Math.max(y1, n.y); }
+      const pad = 60;
+      const s = Math.min(2, Math.min(W / (x1 - x0 + pad * 2 || 1), H / (y1 - y0 + pad * 2 || 1)));
+      view.s = Math.max(0.2, s);
+      view.x = W / 2 - ((x0 + x1) / 2) * view.s;
+      view.y = H / 2 - ((y0 + y1) / 2) * view.s;
+      render();
+    },
+  };
+  // settle the layout a little before first paint, then fit
+  for (let i = 0; i < 120; i++) step();
+  heat = 180;
+  GR.fit();
+  loop();
+}
+
+/* ---------- op-log ---------- */
+async function loadLog() {
+  const ops = await api('/api/log?limit=200');
+  const el = $('log'); el.innerHTML = ''; el.classList.remove('hint');
+  if (!Array.isArray(ops) || !ops.length) { el.innerHTML = '<span class="hint">no operations yet — run an ADD</span>'; return; }
+  ops.reverse();
+  for (const o of ops) {
+    const d = document.createElement('div'); d.className = 'oprow';
+    const known = BYHASH[o.hash];
+    const fl = known && known.fields || {};
+    const what = known && known.type
+      ? known.type + ' · ' + (fl.subject || '') + (fl.relation ? ' ' + fl.relation : '')
+      : shortHash(o.hash);
+    const sym = o.op === 'add' ? '+' : o.op === 'supersede' ? '±' : '×';
+    d.innerHTML = '<span class="t" title="' + isoTitle(hlcMs(o.hlc)) + '">' + relTime(hlcMs(o.hlc)) + '</span>'
+      + '<span class="op-' + esc(o.op) + '" title="' + esc(o.op) + '">' + sym + '</span>'
+      + '<span class="what" title="' + esc(o.hash) + '">' + esc(what) + '</span>';
+    d.onclick = () => openDrawer(o.hash);
+    el.appendChild(d);
+  }
+}
+
+/* ---------- grain drawer ---------- */
+async function openDrawer(hash) {
+  hash = hash.replace(/^sha256:/, '');
+  // mark the row whose grain is open (memories table + results table)
+  document.querySelectorAll('tr.open').forEach(el => el.classList.remove('open'));
+  document.querySelectorAll('tr.rowlink[data-h="' + hash + '"]').forEach(el => el.classList.add('open'));
+  $('drawerWrap').hidden = false;
+  const dr = $('drawer');
+  dr.innerHTML = '<span class="hint">loading ' + esc(shortHash(hash)) + '…</span>';
+  const g = await api('/api/grain?hash=' + hash);
+  const known = BYHASH[hash];
+  if (g.ok === false) {
+    dr.innerHTML = '<div class="dhead">' + badge('erased') + '<button class="ghost dclose" onclick="closeDrawer()">× esc</button></div>'
+      + '<p style="margin-top:12px" class="hint">grain not in hot store — '
+      + (known && (known.forgotten || known.op === 'forget') ? 'it was <b style="color:var(--red)">forgotten</b> (tombstoned); only the op-log entry remains.' : esc(g.error || 'not found'))
+      + '</p><h2>hash</h2><div class="dhash">' + esc(hash) + '</div>';
+    return;
+  }
+  const status = known && known.forgotten ? '<span class="tag tag-gone">forgotten</span>'
+    : known && known.superseded_by ? '<span class="tag tag-sup hashlink" data-h="' + esc(known.superseded_by) + '">superseded → ' + shortHash(known.superseded_by) + '</span>'
+    : '<span class="tag tag-cur">current</span>';
+  let html = '<div class="dhead">' + badge(g.type) + status + '<button class="ghost dclose" onclick="closeDrawer()">× esc</button></div>';
+  html += '<h2>hash</h2><div class="dhash" title="click to copy" onclick="copyText(\'' + g.hash + '\',\'hash\')">' + g.hash + '</div>';
+  html += '<h2>fields</h2><div id="dfields"></div>';
+  html += '<div id="dchain"></div>';
+  html += '<div class="row" style="margin-top:16px"><button class="ghost" id="dcopy">copy grain JSON</button>'
+    + (g.fields && g.fields.subject ? '<button class="ghost" id="drecall">CAL: recall subject</button>' : '') + '</div>';
+  dr.innerHTML = html;
+  dr.querySelector('#dfields').appendChild(jsonTree(g.fields, '$', 1));
+  dr.querySelectorAll('.hashlink[data-h]').forEach(el => { el.onclick = () => openDrawer(el.dataset.h); });
+  dr.querySelector('#dcopy').onclick = () => copyText(JSON.stringify(g, null, 2), 'grain JSON');
+  const dre = dr.querySelector('#drecall');
+  if (dre) dre.onclick = () => { closeDrawer(); setQ('RECALL facts WHERE subject = "' + g.fields.subject + '"'); showTab('query'); runCal(); };
+  // supersession chain (facts have subject+relation heads)
+  if (g.type === 'fact' && g.fields && g.fields.subject && g.fields.relation) {
+    const hq = 'HISTORY WHERE subject = "' + g.fields.subject + '" AND relation = "' + g.fields.relation + '"';
+    const res = await api('/api/cal', { method: 'POST', body: JSON.stringify({ query: hq }) });
+    if (res.ok && res.result && res.result.type === 'history' && (res.result.versions || []).length > 1) {
+      const box = dr.querySelector('#dchain');
+      box.innerHTML = '<h2>version history · ' + res.result.versions.length + '</h2>';
+      const cv = chainView(res.result.versions);
+      cv.querySelectorAll('.step').forEach((st, i) => {
+        if (res.result.versions[i].hash === g.hash) st.classList.add('viewing');
+      });
+      box.appendChild(cv);
+    }
+  }
+}
+function closeDrawer() {
+  $('drawerWrap').hidden = true;
+  document.querySelectorAll('tr.open').forEach(el => el.classList.remove('open'));
+}
+
+/* ---------- configuration drawer (read-only) ---------- */
+async function openConfig() {
+  $('drawerWrap').hidden = false;
+  const dr = $('drawer');
+  dr.innerHTML = '<span class="hint">loading configuration…</span>';
+  const c = await api('/api/config');
+  if (c.ok === false) { dr.innerHTML = '<div class="empty">' + esc(c.error || 'unavailable') + '</div>'; return; }
+  const onoff = v => v
+    ? '<span class="tag tag-cur">on</span>'
+    : '<span class="tag" style="color:var(--dimmer);border-color:var(--line2)">off</span>';
+  let html = '<div class="dhead"><span style="font:600 13px var(--sans);color:var(--bright)">configuration</span>'
+    + '<span class="tag" style="color:var(--dimmer);border-color:var(--line2)">read-only</span>'
+    + '<button class="ghost dclose" onclick="closeDrawer()">× esc</button></div>';
+  html += '<p class="hint" style="margin-top:10px">The file carries its own declarations (meta table); '
+    + 'the host supplies capabilities and policy. Values below are the reconciled result for this process.</p>';
+  if (c.warnings && c.warnings.length) {
+    html += '<h2>warnings</h2>' + c.warnings.map(w =>
+      '<div style="color:var(--red);font:12.5px var(--sans);margin-bottom:4px">⚠ ' + esc(w) + '</div>').join('');
+  }
+  html += '<h2>file declares</h2><div style="font:12.5px var(--sans)">text index '
+    + onoff(c.file.text_index)
+    + (c.file.embedding
+        ? ' &nbsp;·&nbsp; vectors <span class="mono" style="color:var(--text)">' + esc(c.file.embedding.model) + '</span> @ ' + c.file.embedding.dim
+        : ' &nbsp;·&nbsp; no vectors recorded') + '</div>';
+  html += '<h2>recall legs</h2><div style="display:flex;gap:14px;flex-wrap:wrap;font:12.5px var(--sans)">'
+    + '<span>structural ' + onoff(true) + '</span>'
+    + '<span>bm25 ' + onoff(c.recall.legs.bm25) + '</span>'
+    + '<span>vector ' + onoff(c.recall.legs.vector) + '</span></div>';
+  html += '<p class="hint" style="margin-top:6px">'
+    + (c.store.embedder ? 'embedder installed · dim ' + c.store.embedder.dim
+                        : 'no embedding backend installed — inject one via EmbedBackend / set_embedder')
+    + ' · fusion ' + esc(c.recall.fusion.toUpperCase()) + ' (k₀ ' + c.recall.rrf_k0 + ')'
+    + ' · over-fetch ×' + c.recall.overfetch_factor + '</p>';
+  html += '<h2>writes</h2><div style="font:12.5px var(--sans)">CAL tier-1 (ADD / SUPERSEDE) '
+    + onoff(c.executor.tier1_writes)
+    + ' &nbsp;·&nbsp; limits ' + c.executor.default_limit + ' default / ' + c.executor.max_limit + ' max</div>';
+  html += '<h2>raw</h2><div id="cfgtree"></div>';
+  dr.innerHTML = html;
+  dr.querySelector('#cfgtree').appendChild(jsonTree(c, '$', 1));
+}
+
+/* ---------- keyboard ---------- */
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { runCal(); e.preventDefault(); return; }
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { showTab('query'); e.preventDefault(); return; }
+  if (e.key === 'Escape') {
+    if (!$('drawerWrap').hidden) { closeDrawer(); return; }
+    $('snips').hidden = $('hist').hidden = true;
+  }
+  if (e.target === $('q') && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+    const ta = $('q');
+    const firstLine = ta.value.indexOf('\n') === -1 || ta.selectionStart <= ta.value.indexOf('\n');
+    const lastLine = ta.value.lastIndexOf('\n') === -1 || ta.selectionStart > ta.value.lastIndexOf('\n');
+    const h = getHist();
+    if (e.key === 'ArrowUp' && firstLine && hIdx < h.length - 1) { hIdx++; setQ(h[hIdx]); e.preventDefault(); }
+    else if (e.key === 'ArrowDown' && lastLine && hIdx > -1) { hIdx--; setQ(hIdx === -1 ? '' : h[hIdx]); e.preventDefault(); }
+  }
+});
+document.addEventListener('click', e => {
+  if (!e.target.closest('.menuwrap')) { $('snips').hidden = $('hist').hidden = true; }
+});
+
+/* ---------- boot ---------- */
+syncHl();
+buildSnippets();
+refreshAll();
+// deep links: /?q=RECALL… runs a query; /?grain=<hash> opens the inspector;
+// /?tab=graph|mem|query selects a tab; /?theme=light|dark forces a theme
+const params = new URLSearchParams(location.search);
+if (params.get('tab')) showTab(params.get('tab'));
+if (params.get('q')) { setQ(params.get('q')); showTab('query'); runCal(); }
+if (params.get('grain')) openDrawer(params.get('grain'));
+if (params.has('config')) openConfig();
+</script>

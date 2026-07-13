@@ -1,0 +1,22 @@
+[package]
+name = "dejadb-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Internal benchmark harness for DejaDB (not published)."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+dejadb-core = { path = "../dejadb-core" }
+dejadb-store = { path = "../dejadb-store" }
+dejadb-cal = { path = "../dejadb-cal" }
+dejadb-context = { path = "../dejadb-context" }
+dejadb-server = { path = "../dejadb-server" }
+serde_json = "1"
+turso = "0.6.1"
+tokio = { version = "1", features = ["rt"] }
+tempfile = "3"

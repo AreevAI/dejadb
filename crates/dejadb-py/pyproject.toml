@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dejadb"
+version = "0.1.0"
+description = "Python bindings for DejaDB, the embedded memory engine for AI agents."
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "MindGryd Software Private Limited" }]
+keywords = ["memory", "python", "ai-agents", "llm", "bindings"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/AreevAI/dejadb"
+Repository = "https://github.com/AreevAI/dejadb"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+# The Rust extension module is named `dejadb` (`[lib] name` in Cargo.toml and
+# the `#[pymodule] fn dejadb` in src/lib.rs). abi3-py39 is enabled via the
+# pyo3 feature in Cargo.toml, so a single wheel works on CPython >= 3.9.
+[tool.maturin]
+module-name = "dejadb"

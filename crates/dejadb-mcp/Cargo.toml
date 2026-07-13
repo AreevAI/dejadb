@@ -1,0 +1,23 @@
+[package]
+name = "dejadb-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Model Context Protocol (MCP) stdio server for DejaDB."
+readme = "README.md"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["mcp", "memory", "ai-agents", "llm", "protocol"]
+categories = ["api-bindings"]
+publish = false
+
+[dependencies]
+dejadb-core = { path = "../dejadb-core" }
+dejadb-store = { path = "../dejadb-store" }
+dejadb-cal = { path = "../dejadb-cal" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,271 @@
+# MCP Server Reference
+
+DejaDB ships a built-in **Model Context Protocol (MCP)** server that exposes
+memory-semantic tools to any MCP client (Claude Code, Claude Desktop, Cursor,
+and others). It is *not* SQL-over-MCP: the tools speak grains, recall ranking,
+supersession, and CAL — the vocabulary of agent memory.
+
+Run it over stdio:
+
+```bash
+deja serve --mcp --db <memory.db> [--ns <namespace>]
+```
+
+`--db` is optional (falls back to `$DEJADB_DB`, then `~/.dejadb/default.db`).
+One server serves exactly **one writable memory file**. To read across files in
+a single `dejadb_cal` `ASSEMBLE`, add read-only mounts:
+
+```bash
+deja serve --mcp --db user.db --mount org=~/.dejadb/org.db,team=~/.dejadb/team.db
+```
+
+Each mount is exposed under a namespace prefix (`org.<inner>`), is **read-only**
+(writes always land on the primary `--db`), and lets one statement pull the
+user's memory plus shared org/team knowledge:
+
+```
+ASSEMBLE "prompt" FROM
+  policy:  (RECALL facts WHERE namespace = "org.policies"),
+  profile: (RECALL facts WHERE subject = "john")
+```
+
+For where the MCP server sits in the system, see
+[ARCHITECTURE.md](../ARCHITECTURE.md#8-crate-layout). For trust boundaries, see
+the [security model](security-model.md#trust-model-at-a-glance).
+
+---
+
+## Protocol
+
+| Property | Value |
+|---|---|
+| Transport | **stdio** — one JSON-RPC message per line (newline-delimited) |
+| RPC | **JSON-RPC 2.0** |
+| Protocol revision | **`2025-06-18`** |
+| Server name / version | `dejadb` / the crate version |
+
+The server reads one JSON object per line from stdin and writes one JSON object
+per line to stdout. It handles these methods:
+
+| Method | Behavior |
+|---|---|
+| `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
+| `ping` | Returns an empty result |
+| `tools/list` | Returns the six tool definitions (with input schemas) |
+| `tools/call` | Invokes a tool by `name` with `arguments` |
+
+Conventions:
+
+- **Notifications get no response.** A message with no `id` (or `id: null`) is a
+  notification and produces no reply.
+- **Protocol errors are JSON-RPC errors.** A malformed line returns
+  `-32700` (parse error); an unknown method returns `-32601` (method not found).
+- **Tool failures are results, not errors.** A `tools/call` whose tool fails
+  (missing argument, bad hash, store error) returns a normal JSON-RPC **result**
+  with `isError: true` and the error text in the content. This is per the MCP
+  spec — the model sees the failure as tool output it can react to, not as a
+  transport-level fault. Only protocol-level problems become JSON-RPC errors.
+
+A successful tool call returns:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [{ "type": "text", "text": "<tool output, usually JSON>" }],
+    "isError": false
+  }
+}
+```
+
+A failed tool call returns the same shape with `"isError": true` and the error
+message as the text.
+
+### Namespace resolution
+
+Every tool accepts an optional `namespace` argument. When omitted, the server
+uses its **session namespace**, resolved once as: explicit `--ns` flag → the
+facade's capability default → `"shared"`. This scopes an MCP session to a
+namespace by default so a client need not repeat it on every call.
+
+By default a `namespace` argument is a *filter*, not a boundary — a client may
+name any namespace. To make it a boundary, start the server with
+`--lock-ns <NS>`: per-call `namespace` arguments (and `namespace` set inside
+`fields`) are ignored, and `dejadb_cal` queries are namespace-overridden, so an
+agent handed the session cannot read or write outside `<NS>`. Use this when a
+multi-tenant host gives an agent a session it must not escape.
+
+---
+
+## The six tools
+
+### `dejadb_recall`
+
+Recall current memories about a subject (structural, microsecond-class). Returns
+grains newest-first.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | **yes** | Entity to recall about, e.g. `"caller:john"` |
+| `relation` | string | no | Optional relation filter, e.g. `"prefers"` |
+| `namespace` | string | no | Defaults to the session namespace |
+| `k` | integer | no | Max results (default 16) |
+
+Returns a JSON array of `{ hash, type, fields }` objects.
+
+```json
+{ "name": "dejadb_recall",
+  "arguments": { "subject": "john", "relation": "prefers", "k": 8 } }
+```
+
+### `dejadb_add`
+
+Add a durable memory grain (append-only, content-addressed). Use `type: "fact"`
+with `subject`/`relation`/`object` fields for structured knowledge.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `fields` | object | **yes** | Grain fields, e.g. `{subject, relation, object, confidence}` |
+| `type` | string | no | Grain type: `fact` (default), `event`, `state`, `goal`, `observation`, … |
+| `namespace` | string | no | Optional namespace (injected into `fields` if absent) |
+
+Returns `{ "hash": "<content address>" }`.
+
+```json
+{ "name": "dejadb_add",
+  "arguments": { "type": "fact",
+    "fields": { "subject": "john", "relation": "prefers",
+                "object": "window seat", "confidence": 0.9 } } }
+```
+
+### `dejadb_supersede`
+
+Evolve a memory: write a new version that supersedes `old_hash`. The old version
+is preserved as append-only history — never deleted.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `old_hash` | string | **yes** | Content address (64-hex) of the version to supersede |
+| `fields` | object | **yes** | Fields of the new version |
+| `type` | string | no | Grain type of the new version (default `fact`) |
+| `namespace` | string | no | Optional namespace |
+
+Returns `{ "hash": "<new>", "supersedes": "<old>" }`.
+
+### `dejadb_forget`
+
+Erase a grain from the hot store (tombstoned in the op-log). This is the same
+single-grain tombstone as CAL `FORGET <hash>`; both paths are gated by the
+server's destructive-ops flag (on by default — disable with
+`--no-destructive-ops`).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `hash` | string | **yes** | Content address (64-hex) to forget |
+
+Returns `{ "forgotten": "<hash>" }`.
+
+### `dejadb_remember`
+
+Store raw conversational content as an **Event** grain (a transcript entry).
+Distill durable knowledge from it afterwards with `dejadb_add`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `content` | string | **yes** | The utterance/observation text |
+| `session_id` | string | no | Session/thread id |
+| `role` | string | no | `user` \| `assistant` \| `system` \| `tool` |
+| `namespace` | string | no | Optional namespace |
+
+Returns `{ "hash": "<hash>", "stored_as": "event", "note": "distill durable facts with dejadb_add" }`.
+
+### `dejadb_cal`
+
+Execute a CAL statement (`RECALL` / `ASSEMBLE` / `EXISTS` / `HISTORY` / `ADD` /
+`SUPERSEDE` / …). **CAL is structurally incapable of deleting data** — see the
+[non-destructive guarantee](cal-reference.md#8-the-non-destructive-guarantee).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | **yes** | CAL text, e.g. `RECALL facts WHERE subject = "alice" \| COUNT` |
+
+Returns the CAL result payload as JSON. Bulk-destructive tokens (`DELETE`,
+`DROP`, …) are rejected — the call returns `isError: true` with the parse
+error, not a crash. `FORGET <hash>` parses and, by default, **executes** (the
+server runs with destructive ops enabled); launch with `--no-destructive-ops`
+to gate it off for both this tool and `dejadb_forget`.
+
+```json
+{ "name": "dejadb_cal",
+  "arguments": { "query": "RECALL facts WHERE subject = \"john\" | COUNT" } }
+```
+
+---
+
+## Wiring it into a client
+
+### Claude Code (one line)
+
+```bash
+claude mcp add deja -- deja serve --mcp --db ~/.dejadb/code.db --ns claude-code
+```
+
+This registers a stdio MCP server named `dejadb` that Claude Code spawns on
+demand. The `--db` path is the memory file (created if absent); `--ns` scopes
+the session namespace.
+
+### Generic MCP client config
+
+Any MCP client that speaks stdio can launch the server with a command entry.
+The typical `mcpServers` config block:
+
+```json
+{
+  "mcpServers": {
+    "dejadb": {
+      "command": "dejadb",
+      "args": ["serve", "--mcp", "--db", "/path/to/memory.db", "--ns", "myagent"]
+    }
+  }
+}
+```
+
+Only the stdio (`--mcp`) transport is available; the server refuses any other
+`serve` transport. Because the server inherits the trust boundary of the process
+that spawns it (see the [security model](security-model.md)), run it under a
+parent you trust.
+
+---
+
+## Example session
+
+A minimal scripted session over stdio (requests in, responses out; one JSON
+object per line):
+
+```jsonc
+// → initialize
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+// ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18",
+//     "capabilities":{"tools":{}},"serverInfo":{"name":"dejadb","version":"..."}}}
+
+// → list tools
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+// ← 6 tool definitions
+
+// → add a fact
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dejadb_add",
+  "arguments":{"fields":{"subject":"john","relation":"prefers","object":"window seat"}}}}
+// ← {"...":"...","result":{"content":[{"type":"text","text":"{\"hash\":\"...\"}"}],"isError":false}}
+
+// → recall
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"dejadb_recall",
+  "arguments":{"subject":"john"}}}
+// ← result: JSON array of grains
+
+// → a destructive CAL query is rejected as a tool error, not a crash
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"dejadb_cal",
+  "arguments":{"query":"DELETE facts WHERE subject = \"john\""}}}
+// ← result with "isError": true and the parse error text
+```
+</content>

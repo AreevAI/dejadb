@@ -1,0 +1,10 @@
+# Code owners for DejaDB.
+#
+# Lines are matched last-to-first: the last matching pattern takes precedence.
+# Listed owners are automatically requested for review on matching pull
+# requests.
+#
+# NOTE: `@AreevAI/maintainers` is a placeholder. Before launch, replace it with
+# the real GitHub team or user handles that should own the repository.
+
+* @AreevAI/maintainers
