@@ -1,0 +1,30 @@
+[package]
+name = "dejadb-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Content-addressed embedded store with hybrid recall (Turso/SQLite) for DejaDB."
+readme = "README.md"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["memory", "database", "embedded", "recall", "ai-agents"]
+categories = ["database-implementations", "caching"]
+
+[dependencies]
+dejadb-core = { path = "../dejadb-core", version = "1.0.0" }
+# Pinned exactly: encryption-at-rest rides turso's experimental AES-256-GCM,
+# so the audited version is fixed until a deliberate, tested bump.
+turso = "=0.7.0"
+tokio = { version = "1", features = ["rt"] }
+# Passphrase key derivation (Argon2id) + zeroization of key material.
+argon2 = "0.5"
+zeroize = "1"
+getrandom = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

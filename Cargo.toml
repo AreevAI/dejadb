@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/dejadb-core", "crates/dejadb-store", "crates/dejadb-cal", "crates/dejadb-cli", "crates/dejadb-mcp", "crates/dejadb-context", "crates/dejadb-server", "crates/dejadb-py", "crates/dejadb-bench"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["MindGryd Software Private Limited"]
+repository = "https://github.com/AreevAI/dejadb"
+homepage = "https://github.com/AreevAI/dejadb"
+rust-version = "1.90.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
