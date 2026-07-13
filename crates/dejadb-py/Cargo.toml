@@ -1,0 +1,26 @@
+[package]
+name = "dejadb-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Python bindings for DejaDB, the embedded memory engine for AI agents."
+readme = "README.md"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["memory", "python", "ai-agents", "llm", "bindings"]
+categories = ["api-bindings"]
+publish = false
+
+[lib]
+name = "dejadb"
+crate-type = ["cdylib"]
+
+[dependencies]
+dejadb-core = { path = "../dejadb-core", version = "1.0.0" }
+dejadb-store = { path = "../dejadb-store", version = "1.0.0" }
+dejadb-cal = { path = "../dejadb-cal", version = "1.0.0" }
+dejadb-context = { path = "../dejadb-context", version = "1.0.0" }
+serde_json = "1"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
