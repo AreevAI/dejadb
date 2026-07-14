@@ -23,8 +23,7 @@ where a network memory call can't. **Your agent's memory is a file you own.**
 > grains *are* content-addressed immutable objects.
 
 *Status: `1.0.0` — the `.mg` format and CAL are stable and documented (conformant
-with the Open Memory Spec, OMS). Built and tested; not yet published to
-crates.io / PyPI / npm.*
+with the Open Memory Spec, OMS).*
 
 ## Screenshots
 
@@ -91,7 +90,7 @@ embed**, built so memory *can't* rot silently.
 
 ## Install
 
-Install from source until the packages publish (Rust 1.90+):
+Install from source (Rust 1.90+):
 
 ```bash
 git clone https://github.com/AreevAI/dejadb
@@ -109,9 +108,6 @@ bindings with [napi-rs](https://napi.rs):
 pip install maturin && maturin develop -m crates/dejadb-py/Cargo.toml
 cd crates/dejadb-js && npm ci && npm run build     # Node native addon
 ```
-
-Published `crates.io`, `PyPI` (`pip install dejadb`), and `npm` packages are
-reserved and land with the `1.0.0` release.
 
 ## Quickstart (CLI)
 
@@ -176,6 +172,42 @@ point-in-time restore (checkpoint first — the recipe shows the flow). Even a
 lesson so the harness supersedes it instead of adding a near-duplicate
 (advise-only — it never drops a write itself). Full loop:
 [cookbook §10](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn).
+
+### Rust
+
+Embed the store in-process. Add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+dejadb-store = "1"
+dejadb-core  = "1"
+```
+
+Most agent hosts are async (Tokio, axum). Use `AsyncDejaDB` there — it runs each
+operation on the blocking pool and tears the store down off the async worker, so
+neither a call nor a drop can panic inside a runtime:
+
+```rust
+use dejadb_store::AsyncDejaDB;
+use dejadb_core::types::Fact;
+
+let db = AsyncDejaDB::open("agent.db").await?;
+db.add(Fact::new("john", "prefers", "dark mode")).await?;
+let latest = db.latest("caller", "john", "prefers").await?;
+```
+
+In synchronous code (a CLI, a script, a test) use `DejaDB` directly:
+
+```rust
+use dejadb_store::DejaDB;
+use dejadb_core::types::Fact;
+
+let mut db = DejaDB::open("agent.db")?;
+db.add(&Fact::new("john", "prefers", "dark mode"))?;
+```
+
+> `DejaDB` is blocking and drives its own runtime, so it must not be called — or
+> dropped — from inside an async runtime. Reach for `AsyncDejaDB` in async code.
 
 ### Python
 

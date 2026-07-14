@@ -3606,8 +3606,11 @@ impl DejaDB {
     }
 }
 
+pub mod asyncdb;
 pub mod memory_tool;
 pub mod migrate;
+
+pub use asyncdb::AsyncDejaDB;
 
 /// Object-safe serialization adapter so `add_batch` can take mixed grain types.
 pub trait AddableDyn {
