@@ -26,11 +26,14 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: ubuntu-latest,   target: x86_64 }
-          - { runner: ubuntu-latest,   target: aarch64 }
-          - { runner: macos-latest,    target: x86_64 }
-          - { runner: macos-latest,    target: aarch64 }
-          - { runner: windows-latest,  target: x64 }
+          # aarch64-linux needs manylinux_2_28 (gcc 12) — the older `auto`
+          # (manylinux2014) cross-gcc can't compile turso's mimalloc C dep
+          # ("no option -Wdate-time"). x86_64 stays on `auto` for broad compat.
+          - { runner: ubuntu-latest,   target: x86_64,  manylinux: auto }
+          - { runner: ubuntu-latest,   target: aarch64, manylinux: "2_28" }
+          - { runner: macos-latest,    target: x86_64,  manylinux: auto }
+          - { runner: macos-latest,    target: aarch64, manylinux: auto }
+          - { runner: windows-latest,  target: x64,     manylinux: auto }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,7 +45,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           # abi3-py39 is set in Cargo.toml, so one wheel covers CPython >= 3.9.
           args: --release --out dist -m crates/dejadb-py/Cargo.toml
-          manylinux: auto
+          manylinux: ${{ matrix.platform.manylinux }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
