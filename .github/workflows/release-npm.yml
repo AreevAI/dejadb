@@ -91,8 +91,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: crates/dejadb-js/artifacts
+      - name: Create platform package dirs
+        run: npx napi create-npm-dirs
       - name: Collect per-platform binaries into npm/ dirs
-        run: npx napi artifacts --output-dir ./artifacts
+        run: npx napi artifacts
       - name: Prepare platform packages + optionalDependencies
         run: npx napi prepublish -t npm --skip-gh-release
       - name: Publish platform packages + main
