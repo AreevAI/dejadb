@@ -95,14 +95,11 @@ jobs:
         run: npx napi create-npm-dirs
       - name: Collect per-platform binaries into npm/ dirs
         run: npx napi artifacts
-      - name: Prepare platform packages + optionalDependencies
-        # gh-release is opt-in (--gh-release); omitting it skips the GitHub release.
-        run: npx napi prepublish -t npm
-      - name: Publish platform packages + main
-        run: |
-          for dir in npm/*/; do
-            [ -f "$dir/package.json" ] && npm publish "$dir" --access public || true
-          done
-          npm publish --access public
+      - name: Publish platform packages + main to npm
+        # `napi prepublish` updates versions + optionalDependencies AND publishes
+        # every package (platform packages + the thin main). --no-gh-release skips
+        # napi's own GitHub release (this repo's release is created separately).
+        run: npx napi prepublish -t npm --no-gh-release
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
