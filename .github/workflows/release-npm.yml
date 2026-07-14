@@ -96,7 +96,8 @@ jobs:
       - name: Collect per-platform binaries into npm/ dirs
         run: npx napi artifacts
       - name: Prepare platform packages + optionalDependencies
-        run: npx napi prepublish -t npm --skip-gh-release
+        # gh-release is opt-in (--gh-release); omitting it skips the GitHub release.
+        run: npx napi prepublish -t npm
       - name: Publish platform packages + main
         run: |
           for dir in npm/*/; do
