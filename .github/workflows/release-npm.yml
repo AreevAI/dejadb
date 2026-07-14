@@ -45,7 +45,14 @@ jobs:
             build: npx napi build --platform --release --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            build: npx napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross
+            # Use Ubuntu's modern cross-gcc (not `--use-napi-cross`, whose
+            # bundled gcc is too old to compile the C deps — mimalloc/zstd).
+            setup: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            build: |
+              export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+              export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              npx napi build --platform --release --target aarch64-unknown-linux-gnu
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: npx napi build --platform --release --target x86_64-pc-windows-msvc
@@ -58,6 +65,9 @@ jobs:
         with:
           targets: ${{ matrix.settings.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Setup cross toolchain
+        if: matrix.settings.setup
+        run: ${{ matrix.settings.setup }}
       - run: npm install
       - name: Build
         run: ${{ matrix.settings.build }}
