@@ -1,0 +1,95 @@
+# Publish the Node bindings (crates/dejadb-js) to npm as `dejadb`.
+#
+# napi-rs ships a native addon per platform. This builds the `.node` for each
+# target, then publishes one small platform package per target
+# (`dejadb-<platform>`) plus the thin main package that loads the right one at
+# runtime via optionalDependencies (the layout the review flagged as missing).
+#
+# Trigger: on a published GitHub Release (tag `vX.Y.Z`) or manual dispatch.
+# Prerequisite secret: `NPM_TOKEN` (an npm automation token for the `dejadb`
+# package / the account that owns it).
+#
+# NOTE: native cross-platform CI is finicky — watch the first release run and
+# adjust the target matrix / napi flags to your installed @napi-rs/cli (v3) if a
+# leg fails. The set of targets here must match `napi.targets` in package.json.
+name: release-npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: crates/dejadb-js
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: npx napi build --platform --release --target x86_64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: npx napi build --platform --release --target aarch64-apple-darwin
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: npx napi build --platform --release --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: npx napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: npx napi build --platform --release --target x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: npm install
+      - name: Build
+        run: ${{ matrix.settings.build }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: crates/dejadb-js/*.node
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - run: npm install
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/dejadb-js/artifacts
+      - name: Collect per-platform binaries into npm/ dirs
+        run: npx napi artifacts --output-dir ./artifacts
+      - name: Prepare platform packages + optionalDependencies
+        run: npx napi prepublish -t npm --skip-gh-release
+      - name: Publish platform packages + main
+        run: |
+          for dir in npm/*/; do
+            [ -f "$dir/package.json" ] && npm publish "$dir" --access public || true
+          done
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
