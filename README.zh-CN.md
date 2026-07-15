@@ -20,7 +20,7 @@
 > 以及加密增量同步 —— 全部内建于数据模型之中，因为 grain *本身就是*
 > 内容寻址的不可变对象。
 
-*状态：`1.0.0` —— `.mg` 格式与 CAL 已稳定并有完整文档（符合开放记忆规范
+*状态：`1.0.1` —— `.mg` 格式与 CAL 已稳定并有完整文档（符合开放记忆规范
 Open Memory Spec，OMS）。已构建并测试；尚未发布到 crates.io / PyPI / npm。*
 
 ## 截图
@@ -91,16 +91,23 @@ cargo build --release                       # builds the `deja` binary
 cargo install --path crates/dejadb-cli
 ```
 
-Python 绑定通过 [maturin](https://github.com/PyO3/maturin) 构建，Node 绑定通过
-[napi-rs](https://napi.rs) 构建：
+DejaDB 已发布到三大注册表，按需安装：
+
+```bash
+cargo install dejadb          # `deja` 命令行
+pip install dejadb            # Python 绑定
+npm install dejadb            # Node 绑定（macOS/Linux；Windows 原生二进制待发布）
+```
+
+在 Rust 项目中嵌入存储时，改为添加库 crate：`cargo add dejadb-store dejadb-core`。
+
+也可从本地检出用 [maturin](https://github.com/PyO3/maturin) / [napi-rs](https://napi.rs)
+构建 Python / Node 绑定：
 
 ```bash
 pip install maturin && maturin develop -m crates/dejadb-py/Cargo.toml
 cd crates/dejadb-js && npm ci && npm run build     # Node 原生插件
 ```
-
-已发布到 `crates.io`、`PyPI`（`pip install dejadb`）和 `npm` 的软件包均已预留名称，
-将随 `1.0.0` 版本一同上线。
 
 ## 快速开始（CLI）
 

@@ -164,6 +164,8 @@ deja repl --db john.db          # interactive CAL shell
 
 ### How do I use DejaDB from Python?
 
+`pip install dejadb` (Node: `npm install dejadb`), then:
+
 ```python
 import dejadb, json
 m = dejadb.DejaDB("john.db", ns="caller")

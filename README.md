@@ -22,7 +22,7 @@ where a network memory call can't. **Your agent's memory is a file you own.**
 > merges, and encrypted incremental sync — built into the data model, because
 > grains *are* content-addressed immutable objects.
 
-*Status: `1.0.0` — the `.mg` format and CAL are stable and documented (conformant
+*Status: `1.0.1` — the `.mg` format and CAL are stable and documented (conformant
 with the Open Memory Spec, OMS).*
 
 ## Screenshots
@@ -90,23 +90,34 @@ embed**, built so memory *can't* rot silently.
 
 ## Install
 
-Install from source (Rust 1.90+):
+DejaDB ships on all three registries — install the surface you need:
+
+```bash
+cargo install dejadb          # the `deja` CLI
+pip install dejadb            # Python bindings
+npm install dejadb            # Node bindings
+```
+
+Embedding the store in a Rust project? Add the library crates instead of the CLI:
+
+```bash
+cargo add dejadb-store dejadb-core
+```
+
+> **npm on Windows:** the `dejadb-win32-x64-msvc` prebuilt binary isn't on npm yet
+> (package name under review); macOS and Linux install cleanly today, and Windows
+> resolves automatically once it publishes. `pip install dejadb` and
+> `cargo install dejadb` already work on Windows.
+
+Or build from source (Rust 1.90+):
 
 ```bash
 git clone https://github.com/AreevAI/dejadb
 cd dejadb
 cargo build --release                       # builds the `deja` binary
 ./target/release/deja --help
-# or install the CLI onto your PATH:
-cargo install --path crates/dejadb-cli
-```
-
-Python bindings build with [maturin](https://github.com/PyO3/maturin), Node
-bindings with [napi-rs](https://napi.rs):
-
-```bash
-pip install maturin && maturin develop -m crates/dejadb-py/Cargo.toml
-cd crates/dejadb-js && npm ci && npm run build     # Node native addon
+# Python bindings (maturin):  maturin develop -m crates/dejadb-py/Cargo.toml
+# Node bindings (napi-rs):    cd crates/dejadb-js && npm ci && npm run build
 ```
 
 ## Quickstart (CLI)
@@ -217,6 +228,18 @@ m = dejadb.DejaDB("john.db", ns="caller")
 m.add_fact("john", "prefers", "tea", confidence=0.95)
 m.cal('RECALL facts WHERE subject = "john"')
 m.memory_tool(json.dumps({"command": "view", "path": "/memories"}))  # Anthropic memory-tool backend
+```
+
+### Node
+
+```js
+const { DejaDb } = require('dejadb')
+
+const mem = new DejaDb('john.db', 'caller')                  // 3rd arg: passphrase for AES-256 at rest
+mem.addFact('john', 'prefers', 'tea', 0.95)
+mem.recall('john')                                           // JSON string, newest-first
+mem.cal('RECALL facts WHERE subject = "john"')
+mem.memoryTool('{"command": "view", "path": "/memories"}')  // Anthropic memory-tool backend
 ```
 
 ### Encryption at rest

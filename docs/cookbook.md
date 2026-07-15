@@ -222,7 +222,13 @@ provisional head rather than lost writes.
 
 ## 7. Use the Python bindings
 
-Build and install the module with [maturin](https://github.com/PyO3/maturin):
+Install the published package:
+
+```bash
+pip install dejadb
+```
+
+Or build from a local checkout with [maturin](https://github.com/PyO3/maturin):
 
 ```bash
 pip install maturin
