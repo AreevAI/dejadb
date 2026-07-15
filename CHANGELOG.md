@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-15
+
+### Added
+
+- **`AsyncDejaDB` — a runtime-safe handle for async callers.** DejaDB owns a
+  Tokio runtime and drives every operation with `block_on`; calling the
+  blocking store from inside an async runtime panics (Tokio forbids a runtime
+  within a runtime). `AsyncDejaDB` owns that workaround: operations run on the
+  blocking pool where `block_on` is legal, `Drop` hands teardown to a plain OS
+  thread (Drop cannot await), a one-permit semaphore queues callers so N
+  concurrent operations can't starve the blocking pool, `close()` awaits
+  teardown, and `with()` is an escape hatch for any op not mirrored on the
+  async surface. Purely additive — the blocking API is untouched, no `unsafe`,
+  and `tokio` is pulled in with only `rt` + `sync`.
+
+### Fixed
+
+- **MSRV badge** corrected (1.82 → 1.90) to match `rust-version`; README now
+  documents Rust installation.
+
+### Packaging
+
+- PyPI and npm release workflows (`release-pypi.yml`, `release-npm.yml`):
+  abi3 wheels across the platform matrix, and per-platform napi prebuilds
+  (`dejadb-<platform>`) plus the thin main package wired via
+  `optionalDependencies`. The npm Windows platform package
+  (`dejadb-win32-x64-msvc`) is temporarily deferred pending an npm
+  name-registration review; non-Windows platforms and PyPI ship in this release.
+
 ## [1.0.0] - 2026-07-13
 
 _The first public release. The on-disk `.mg` format and CAL syntax are stable

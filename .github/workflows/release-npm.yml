@@ -95,11 +95,38 @@ jobs:
         run: npx napi create-npm-dirs
       - name: Collect per-platform binaries into npm/ dirs
         run: npx napi artifacts
-      - name: Publish platform packages + main to npm
-        # `napi prepublish` updates versions + optionalDependencies AND publishes
-        # every package (platform packages + the thin main). --no-gh-release skips
-        # napi's own GitHub release (this repo's release is created separately).
-        run: npx napi prepublish -t npm --no-gh-release
+      - name: Publish platform packages (Windows deferred) + main to npm
+        # We do NOT use `napi prepublish` here: it publishes every platform
+        # package in one shot and aborts the whole release if one fails. The
+        # Windows platform package name (dejadb-win32-x64-msvc) currently trips
+        # npm's spam filter (403 on publish; support ticket open), which would
+        # take the whole release down with it.
+        #
+        # Instead `prepare-npm.mjs` stamps versions, wires the main package's
+        # optionalDependencies to ALL platforms (incl. the deferred win32, so a
+        # later same-version publish resolves for installs), and prints the dirs
+        # to publish now (win32 excluded). We publish each, skipping anything
+        # already on the registry so re-runs are idempotent — including a later
+        # run that un-defers win32, which then publishes only the missing package.
+        run: |
+          set -euo pipefail
+          publish_if_absent() { # $1 = package name, $2 = version, $3 = dir
+            if [ "$(npm view "$1@$2" version 2>/dev/null || true)" = "$2" ]; then
+              echo "$1@$2 already on npm — skipping"
+            else
+              echo "Publishing $1@$2"
+              (cd "$3" && npm publish --access public)
+            fi
+          }
+          mapfile -t DIRS < <(node scripts/prepare-npm.mjs)
+          for dir in "${DIRS[@]}"; do
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            publish_if_absent "$name" "$ver" "$dir"
+          done
+          main_name=$(node -p "require('./package.json').name")
+          main_ver=$(node -p "require('./package.json').version")
+          publish_if_absent "$main_name" "$main_ver" "."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
