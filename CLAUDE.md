@@ -6,10 +6,13 @@ package built outside the workspace). Memories are immutable
 content-addressed grains in per-file Turso databases, queried with CAL, and
 rendered into model-ready context in-process (no server in the recall path).
 
-**Status**: 1.0.0; nothing published yet (all crates inherit the workspace
-version `1.0.0`, `publish = false`). `ARCHITECTURE.md` is the design source of truth —
-the architecture and the numbered design decisions. `CHANGELOG.md` summarizes
-what exists; `crates/dejadb-bench/RESULTS.md` has the benchmark numbers.
+**Status**: published — the library crates + the `deja` binary on crates.io,
+`dejadb` on PyPI and npm (`dejadb-py` and `dejadb-bench` stay `publish = false`).
+The version lives in `[workspace.package]` in the root `Cargo.toml` (all crates
+inherit it) and `CHANGELOG.md` records each release — don't restate the number
+here (it goes stale). `ARCHITECTURE.md` is the design source of truth — the
+architecture and the numbered design decisions; `CHANGELOG.md` summarizes what
+exists; `crates/dejadb-bench/RESULTS.md` has the benchmark numbers.
 
 ## Commands
 
