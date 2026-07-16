@@ -303,11 +303,13 @@ mounted stores:
 
 ```rust
 facade.mount("org", org_replica);   // read-only
-// CAL reaches the mount via a namespaced query:
+// CAL reaches the mount via the `alias.inner` namespace inside a source:
 //   ASSEMBLE "prompt" FROM
-//     org.policies  BUDGET 800,
-//     user.profile  BUDGET 600,
-//     user.session  RECENT 10
+//     policies: (RECALL facts  WHERE namespace = "org.policies" RECENT 10),
+//     profile:  (RECALL facts  WHERE subject = "john"),
+//     session:  (RECALL events WHERE session_id = "call-42" RECENT 10)
+//   BUDGET 1500 tokens
+//   PRIORITY profile: 0.5, session: 0.3, policies: 0.2
 //   FORMAT sml
 ```
 

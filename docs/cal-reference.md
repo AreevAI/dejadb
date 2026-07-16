@@ -135,10 +135,18 @@ sha256:y` compares two versions.
 #### `ASSEMBLE` — compose context
 
 ```
-ASSEMBLE "<topic>" FROM <sources> [WHERE ...] [BUDGET <n> [tokens|grains]]
-         [PRIORITY label: weight, ...] [FOR "<audience>"]
-         [WITH dedup(<field>)] [FORMAT <spec>]
+ASSEMBLE "<topic>" [FOR "<audience>"] FROM <sources> [WHERE ...]
+         [BUDGET <n> [tokens|grains]]
+         [PRIORITY label: weight, ... | PRIORITY a > b > c]
+         [FORMAT <spec>] [WITH dedup(<field>)]
 ```
+
+Clause order is fixed (it is the OMS §8.2 order): `FOR` directly after the topic,
+`BUDGET` before `PRIORITY`, and `FORMAT` before `WITH dedup`. A clause written out
+of order is not attached to the statement (e.g. `BUDGET` after `FORMAT` is
+silently dropped — see the golden-test notes). `WHERE` applies to the
+single-source form only. `PRIORITY` accepts weighted labels (`a: 0.5, b: 0.3`) or
+an ordering chain (`a > b > c`, mapped to evenly spaced weights).
 
 Single-source:
 
@@ -150,19 +158,21 @@ Multi-source with per-source budgets and priorities:
 
 ```sql
 ASSEMBLE "session prompt" FROM
-  org.policies:  (RECALL facts  WHERE namespace = "org.policies" RECENT 10),
-  profile:       (RECALL facts  WHERE subject = "john"),
-  recent:        (RECALL events WHERE session_id = "call-42" RECENT 10)
-PRIORITY profile: 0.5, recent: 0.3, org.policies: 0.2
+  policies: (RECALL facts  WHERE namespace = "org.policies" RECENT 10),
+  profile:  (RECALL facts  WHERE subject = "john"),
+  recent:   (RECALL events WHERE session_id = "call-42" RECENT 10)
 BUDGET 1500 tokens
-WITH dedup(object)
+PRIORITY profile: 0.5, recent: 0.3, policies: 0.2
 FORMAT sml
+WITH dedup(object)
 ```
 
-`ASSEMBLE` is CAL's context-composition statement: it pulls from labeled
-sources (including read-only [facade mounts](../ARCHITECTURE.md#54-assemble-and-facade-mounts)
-via `alias.namespace` labels), applies per-source token budgets and priorities,
-deduplicates, and renders one budgeted block. `STREAM ASSEMBLE ...` enables
+Source labels are plain identifiers; `PRIORITY` labels must match them
+(`CAL-E035`). `ASSEMBLE` is CAL's context-composition statement: it pulls from
+labeled sources (including read-only [facade mounts](../ARCHITECTURE.md#54-assemble-and-facade-mounts),
+addressed by the `alias.inner` *namespace string* inside a source's `RECALL` —
+e.g. `WHERE namespace = "org.policies"`), applies per-source token budgets and
+priorities, deduplicates, and renders one budgeted block. `STREAM ASSEMBLE ...` enables
 streamed output. There is a 2000-grain post-dedup cap across all sources.
 
 #### `COALESCE` — first non-empty fallback chain
