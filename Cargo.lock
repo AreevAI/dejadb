@@ -671,8 +671,10 @@ dependencies = [
  "dejadb-cal",
  "dejadb-core",
  "dejadb-store",
+ "dejadb-waiser",
  "serde_json",
  "tempfile",
+ "waiser",
 ]
 
 [[package]]
@@ -683,8 +685,10 @@ dependencies = [
  "dejadb-context",
  "dejadb-core",
  "dejadb-store",
+ "dejadb-waiser",
  "pyo3",
  "serde_json",
+ "waiser",
 ]
 
 [[package]]

@@ -8,9 +8,38 @@ use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{Hash, DejaDbError};
 use dejadb_store::memory_tool::MemoryTool;
 use dejadb_store::{CommandEmbed, EmbedBackend, FactDraft, DejaDB as RustDejaDB};
+use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde_json::json;
+use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+
+/// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
+fn parse_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: i64 = s[..split].parse().ok()?;
+    let mult = match &s[split..] {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+fn status_from_str(s: &str) -> Option<RecStatus> {
+    match s {
+        "pending" => Some(RecStatus::Pending),
+        "approved" => Some(RecStatus::Approved),
+        "rejected" => Some(RecStatus::Rejected),
+        "applied" => Some(RecStatus::Applied),
+        "rolled_back" => Some(RecStatus::RolledBack),
+        "expired" => Some(RecStatus::Expired),
+        _ => None,
+    }
+}
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
@@ -57,13 +86,15 @@ impl EmbedBackend for PyEmbed {
 struct DejaDB {
     facade: DejaDbFacade,
     ns: String,
+    /// Host-asserted actor label stamped on every waiser audit grain (§6.6).
+    actor: String,
 }
 
 #[pymethods]
 impl DejaDB {
     #[new]
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None))]
-    fn new(path: String, ns: String, passphrase: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string()))]
+    fn new(path: String, ns: String, passphrase: Option<String>, actor: String) -> PyResult<Self> {
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Same key rules as the
         // CLI's --passphrase-env: host-supplied, never stored in the file.
@@ -72,7 +103,7 @@ impl DejaDB {
             None => RustDejaDB::open(&path).map_err(err)?,
         };
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
-        Ok(DejaDB { facade, ns })
+        Ok(DejaDB { facade, ns, actor })
     }
 
     /// Reconciliation warnings from open (file-vs-host declaration changes,
@@ -437,6 +468,110 @@ impl DejaDB {
             ))));
         }
         Ok(json!({"integrity": r.integrity, "grains": r.grains}).to_string())
+    }
+
+    // ── Waiser: the governed self-improvement loop (§6.6) ────────────────────
+
+    /// Record a tool call as a Tool grain — the flagship analyzer's food. One
+    /// line per call in the agent's tool loop. `thread` groups a session.
+    #[pyo3(signature = (name, result, is_error = false, thread = None))]
+    fn record_tool_call(
+        &self,
+        name: String,
+        result: String,
+        is_error: bool,
+        thread: Option<String>,
+    ) -> PyResult<String> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("tool_name".into(), json!(name));
+        fields.insert("content".into(), json!(result));
+        fields.insert("is_error".into(), json!(is_error));
+        fields.insert("namespace".into(), json!(self.ns));
+        if let Some(t) = thread {
+            fields.insert("session_id".into(), json!(t));
+        }
+        let h = self.facade.cal_add("tool", &fields).map_err(err)?;
+        Ok(h.to_hex())
+    }
+
+    /// Run one analysis pass. Bare (all args `None`) it never gates — an
+    /// evaluator's first call always runs. Returns the run-outcome JSON.
+    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None))]
+    fn waiser_run(
+        &self,
+        min_new: Option<u64>,
+        min_new_errors: Option<u64>,
+        if_stale: Option<String>,
+    ) -> PyResult<String> {
+        let opts = RunOptions {
+            min_new,
+            min_new_errors,
+            if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
+            namespaces: Vec::new(),
+        };
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        let res = Engine::with_builtins()
+            .run(&mut sub, &opts, now_ms())
+            .map_err(err)?;
+        serde_json::to_string(&res).map_err(err)
+    }
+
+    /// List recommendations. `filter` is optional JSON, e.g. `{"status":
+    /// "pending"}`; omit or `{"status":"all"}` for every status. JSON list.
+    #[pyo3(signature = (filter = None))]
+    fn recommendations(&self, filter: Option<String>) -> PyResult<String> {
+        let status = filter
+            .and_then(|f| serde_json::from_str::<serde_json::Value>(&f).ok())
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .filter(|s| s != "all")
+            .and_then(|s| status_from_str(&s))
+            .or(Some(RecStatus::Pending)); // default: pending
+        // `{"status":"all"}` clears the filter; anything else defaults to pending.
+        let sub = BorrowedSubstrate::new(&self.facade);
+        let recs = Engine::with_builtins().recommendations(&sub, status).map_err(err)?;
+        let rows: Vec<_> = recs
+            .iter()
+            .map(|r| {
+                json!({
+                    "hash": r.hash,
+                    "status": r.status.as_str(),
+                    "severity": r.severity.as_str(),
+                    "analyzer": r.analyzer,
+                    "summary": r.summary.render(),
+                    "target_ref": r.target_ref,
+                    "destructive": r.destructive,
+                })
+            })
+            .collect();
+        serde_json::to_string(&rows).map_err(err)
+    }
+
+    /// Approve and apply a recommendation in one audited step (§6.6). The
+    /// `because` reason is mandatory. Non-rollbackable (destructive) payloads
+    /// are rejected unless `allow_destructive=True`.
+    #[pyo3(signature = (hash, because, allow_destructive = false))]
+    fn apply_recommendation(&self, hash: String, because: String, allow_destructive: bool) -> PyResult<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        let engine = Engine::with_builtins();
+        let now = now_ms();
+        let scopes = ScopeSet::all();
+        engine
+            .review(&mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human, &scopes, &because, now)
+            .map_err(err)?;
+        let applied = engine
+            .apply(&mut sub, &hash, &self.actor, ObserverType::Human, &scopes, &because, allow_destructive, now)
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "rollbackable": applied.rollbackable}).to_string())
+    }
+
+    /// Reject a recommendation with a reason (the library-friendly name for
+    /// `deja waiser reject`).
+    fn dismiss_recommendation(&self, hash: String, why: String) -> PyResult<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        Engine::with_builtins()
+            .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "status": "rejected"}).to_string())
     }
 }
 

@@ -14,7 +14,9 @@ use dejadb_cal::store_types::RecallParams;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::Hash;
 use dejadb_core::types::{Event, Role};
+use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
+use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
 pub const SERVER_NAME: &str = "dejadb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -290,9 +292,95 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 serde_json::to_string(&res.result).map_err(|e| e.to_string())
             }
+            "dejadb_waiser" => {
+                let opts = RunOptions {
+                    min_new: args.get("min_new").and_then(Value::as_u64),
+                    min_new_errors: args.get("min_new_errors").and_then(Value::as_u64),
+                    if_stale_ms: None,
+                    namespaces: Vec::new(),
+                };
+                let mut sub = BorrowedSubstrate::new(&self.facade);
+                let engine = Engine::with_builtins();
+                let res = engine.run(&mut sub, &opts, now_ms()).map_err(|e| e.to_string())?;
+                let pending = engine
+                    .recommendations(&sub, Some(RecStatus::Pending))
+                    .map_err(|e| e.to_string())?;
+                let list: Vec<Value> = pending.iter().map(rec_json).collect();
+                Ok(json!({ "run": res, "pending": list }).to_string())
+            }
+            "dejadb_recommendations" => {
+                let engine = Engine::with_builtins();
+                let action = args.get("action").and_then(Value::as_str);
+                if let Some(action) = action {
+                    let hash = args
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .ok_or("dejadb_recommendations action requires 'hash'")?;
+                    let because = args
+                        .get("because")
+                        .and_then(Value::as_str)
+                        .ok_or("dejadb_recommendations action requires 'because'")?;
+                    let actor = "agent:mcp";
+                    let scopes = ScopeSet::all();
+                    let mut sub = BorrowedSubstrate::new(&self.facade);
+                    let now = now_ms();
+                    match action {
+                        "apply" => {
+                            engine
+                                .review(&mut sub, hash, Decision::Approve, actor, ObserverType::Agent, &scopes, because, now)
+                                .map_err(|e| e.to_string())?;
+                            engine
+                                .apply(&mut sub, hash, actor, ObserverType::Agent, &scopes, because, false, now)
+                                .map_err(|e| e.to_string())?;
+                        }
+                        "approve" => engine
+                            .review(&mut sub, hash, Decision::Approve, actor, ObserverType::Agent, &scopes, because, now)
+                            .map_err(|e| e.to_string())?,
+                        "reject" | "dismiss" => engine
+                            .review(&mut sub, hash, Decision::Reject, actor, ObserverType::Agent, &scopes, because, now)
+                            .map_err(|e| e.to_string())?,
+                        other => return Err(format!("unknown action '{other}' (apply|approve|reject)")),
+                    }
+                    Ok(json!({ "hash": hash, "action": action }).to_string())
+                } else {
+                    let status = args
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .filter(|s| *s != "all")
+                        .map(status_or_pending)
+                        .or(Some(RecStatus::Pending));
+                    let sub = BorrowedSubstrate::new(&self.facade);
+                    let recs = engine.recommendations(&sub, status).map_err(|e| e.to_string())?;
+                    let list: Vec<Value> = recs.iter().map(rec_json).collect();
+                    Ok(serde_json::to_string(&list).unwrap_or_default())
+                }
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
+}
+
+fn status_or_pending(s: &str) -> RecStatus {
+    match s {
+        "approved" => RecStatus::Approved,
+        "rejected" => RecStatus::Rejected,
+        "applied" => RecStatus::Applied,
+        "rolled_back" => RecStatus::RolledBack,
+        "expired" => RecStatus::Expired,
+        _ => RecStatus::Pending,
+    }
+}
+
+fn rec_json(r: &waiser::Recommendation) -> Value {
+    json!({
+        "hash": r.hash,
+        "status": r.status.as_str(),
+        "severity": r.severity.as_str(),
+        "analyzer": r.analyzer,
+        "summary": r.summary.render(),
+        "target_ref": r.target_ref,
+        "destructive": r.destructive,
+    })
 }
 
 fn tool_defs() -> Vec<Value> {
@@ -351,6 +439,24 @@ fn tool_defs() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "query": s("CAL text, e.g. RECALL facts WHERE subject = \"alice\" | COUNT")
             }, "required": ["query"]}
+        }),
+        json!({
+            "name": "dejadb_waiser",
+            "description": "Run one governed self-improvement pass (deterministic, no LLM) and return the run outcome plus the pending recommendation queue. Call at session start; review pending recommendations before acting.",
+            "inputSchema": {"type": "object", "properties": {
+                "min_new": {"type": "integer", "description": "only run if at least this many new grains since the last run (optional)"},
+                "min_new_errors": {"type": "integer", "description": "or this many new tool failures (optional)"}
+            }}
+        }),
+        json!({
+            "name": "dejadb_recommendations",
+            "description": "List recommendations, or act on one. Without 'action', lists by status (default pending). With action=apply|approve|reject and a 'hash' + mandatory 'because' reason, performs the audited transition (self-approval of an agent's own proposals is blocked).",
+            "inputSchema": {"type": "object", "properties": {
+                "status": s("filter: pending|approved|applied|all (default pending)"),
+                "action": s("apply|approve|reject (omit to list)"),
+                "hash": s("recommendation hash (required for an action)"),
+                "because": s("mandatory written reason for the decision")
+            }}
         }),
     ]
 }

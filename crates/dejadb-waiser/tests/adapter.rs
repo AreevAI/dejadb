@@ -2,7 +2,7 @@
 //! `.db`: grain round-trip, liveness, state persistence, and the full
 //! run → review → apply loop through `waiser::Engine`.
 
-use dejadb_core::types::{Fact, Grain};
+use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::DejaDB;
 use dejadb_waiser::DejaDbSubstrate;
 use waiser::{
@@ -145,6 +145,81 @@ fn end_to_end_run_review_apply() {
         applied.status,
         RecStatus::Applied,
         "status persisted as applied"
+    );
+}
+
+#[test]
+fn tool_failure_clusters_from_tool_grains_and_applies() {
+    let (_d, mut store) = open_temp();
+    // Record tool calls as real Tool grains (what record_tool_call / the
+    // tool-log importer produce). Content compacts to `cnt` → `tool_content`.
+    for _ in 0..4 {
+        store
+            .add(
+                &Tool::new("stripe_refund")
+                    .content("rate_limited 429")
+                    .is_error(true)
+                    .namespace("caller"),
+            )
+            .unwrap();
+    }
+    store
+        .add(
+            &Tool::new("stripe_refund")
+                .content("ok")
+                .is_error(false)
+                .namespace("caller"),
+        )
+        .unwrap();
+    let mut sub = DejaDbSubstrate::new(store, None);
+    let engine = Engine::with_builtins();
+    engine.run(&mut sub, &RunOptions::default(), NOW).unwrap();
+
+    let recs = engine
+        .recommendations(&sub, Some(RecStatus::Pending))
+        .unwrap();
+    let tf = recs
+        .iter()
+        .find(|r| r.analyzer.starts_with("waiser.tool_failure"))
+        .expect("a tool-failure recommendation");
+    // The error signature (hence the lesson's object) must be non-empty.
+    assert!(
+        tf.summary.render().contains("rate_limited"),
+        "signature must be present, got: {}",
+        tf.summary.render()
+    );
+
+    // Apply must succeed — an empty object would trip VAL-E001.
+    let hash = tf.hash.clone();
+    let scopes = ScopeSet::all();
+    engine
+        .review(
+            &mut sub,
+            &hash,
+            Decision::Approve,
+            "user:alice",
+            ObserverType::Human,
+            &scopes,
+            "ok",
+            NOW + 1,
+        )
+        .unwrap();
+    engine
+        .apply(
+            &mut sub,
+            &hash,
+            "user:alice",
+            ObserverType::Human,
+            &scopes,
+            "apply",
+            false,
+            NOW + 2,
+        )
+        .unwrap();
+    let after = engine.recommendations(&sub, None).unwrap();
+    assert_eq!(
+        after.iter().find(|r| r.hash == hash).unwrap().status,
+        RecStatus::Applied
     );
 }
 

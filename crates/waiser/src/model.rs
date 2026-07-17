@@ -73,9 +73,12 @@ impl GrainRecord {
     pub fn is_error(&self) -> bool {
         self.bool_field("is_error").unwrap_or(false)
     }
-    /// The tool result text used for error-signature extraction.
+    /// The tool result text used for error-signature extraction. Tool grains
+    /// carry it as `tool_content` (compact `cnt`, distinct from Event's
+    /// uncompacted `content`); other shapes fall back.
     pub fn tool_content(&self) -> Option<&str> {
-        self.str_field("content")
+        self.str_field("tool_content")
+            .or_else(|| self.str_field("content"))
             .or_else(|| self.str_field("result"))
             .or_else(|| self.str_field("error"))
             .or_else(|| self.str_field("body"))

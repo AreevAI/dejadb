@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
-use dejadb_core::types::{Fact, Grain};
+use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::DejaDB;
 use dejadb_waiser::{now_ms, DejaDbSubstrate};
 use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet, Severity};
@@ -47,8 +47,9 @@ COMMANDS:
   migrate  --from SRC --file PATH [--history PATH]   import another system's
            export: mem0 | mem0-history | langgraph | letta | letta-archival |
            zep | basic-memory (PATH = vault dir) | jsonl (generic
-           {subject,relation,object}|{content} lines). Re-runs skip what is
-           already imported. See docs/migrate.md for per-source dump commands.
+           {subject,relation,object}|{content} lines) | tool-log (OpenAI-style
+           tool-call JSONL → Tool grains, feeds tool-failure clustering).
+           Re-runs skip what is already imported; see docs/migrate.md.
   reindex                             backfill + rebuild the BM25 text index
                                       (e.g. after --index-text true on a file
                                       written with indexing off)
@@ -288,6 +289,30 @@ fn run_migrate(
             mig::migrate_zep(m, ns, &v)
         }
         "jsonl" => mig::migrate_jsonl(m, ns, &read(file)?),
+        // Generic tool-call log (OpenAI-style JSONL) → Tool grains, so the
+        // flagship analyzer can cluster failures from history that predates
+        // DejaDB. One line per record; assistant `tool_calls` arrays expand.
+        "tool-log" | "openai-tools" => {
+            let mut rep = mig::MigrateReport::default();
+            for (i, line) in read(file)?.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|e| format!("{file}:{}: bad JSON: {e}", i + 1))?;
+                for (name, content, is_err) in extract_tool_records(&v) {
+                    let mut t = Tool::new(&name).is_error(is_err);
+                    if !content.is_empty() {
+                        t = t.content(&content);
+                    }
+                    let t = t.namespace(ns);
+                    m.add(&t).map_err(|e| e.to_string())?;
+                    rep.added += 1;
+                }
+            }
+            Ok(rep)
+        }
         "basic-memory" => {
             let root = std::path::PathBuf::from(file);
             if !root.is_dir() {
@@ -331,11 +356,62 @@ fn run_migrate(
         other => {
             return Err(format!(
                 "unknown --from '{other}' — sources: mem0, mem0-history, langgraph, letta, \
-                 letta-archival, zep, basic-memory, jsonl"
+                 letta-archival, zep, basic-memory, jsonl, tool-log"
             ))
         }
     };
     rep.map_err(|e| e.to_string())
+}
+
+/// Extract `(tool_name, content, is_error)` records from one tool-log JSONL
+/// line: a direct `{tool_name, content, is_error}` record, an OpenAI
+/// `role:"tool"` result, or an assistant message carrying a `tool_calls` array.
+fn extract_tool_records(v: &serde_json::Value) -> Vec<(String, String, bool)> {
+    let stringify = |x: &serde_json::Value| match x {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    // Assistant message with a tool_calls array: one record per call.
+    if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+        return calls
+            .iter()
+            .filter_map(|c| {
+                let name = c
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .or_else(|| c.get("name").and_then(|n| n.as_str()))?;
+                let args = c
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .map(&stringify)
+                    .unwrap_or_default();
+                Some((name.to_string(), args, false))
+            })
+            .collect();
+    }
+    // A single tool record / tool-result message.
+    let name = v
+        .get("tool_name")
+        .and_then(|n| n.as_str())
+        .or_else(|| v.get("name").and_then(|n| n.as_str()))
+        .or_else(|| v.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()));
+    match name {
+        Some(name) => {
+            let content = v
+                .get("content")
+                .or_else(|| v.get("output"))
+                .or_else(|| v.get("result"))
+                .map(&stringify)
+                .unwrap_or_default();
+            let is_error = v
+                .get("is_error")
+                .and_then(|e| e.as_bool())
+                .unwrap_or_else(|| v.get("error").is_some());
+            vec![(name.to_string(), content, is_error)]
+        }
+        None => Vec::new(),
+    }
 }
 
 fn run() -> Result<(), String> {

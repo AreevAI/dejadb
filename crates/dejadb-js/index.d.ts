@@ -2,7 +2,7 @@
 /* eslint-disable */
 /** One memory = one file. Open with `new DejaDb("caller.db", "caller")`. */
 export declare class DejaDb {
-  constructor(path: string, ns?: string | undefined | null, passphrase?: string | undefined | null)
+  constructor(path: string, ns?: string | undefined | null, passphrase?: string | undefined | null, actor?: string | undefined | null)
   /**
    * Reconciliation warnings from open (file-vs-host declaration changes,
    * embedding-model mismatches). JSON list string.
@@ -83,4 +83,20 @@ export declare class DejaDb {
   importBundle(path: string): number
   /** Integrity + content-address verification. Throws on failure. */
   verify(): string
+  /** Record a tool call as a Tool grain — the flagship analyzer's food. */
+  recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null): string
+  /** Run one analysis pass. Bare it never gates. Returns run-outcome JSON. */
+  waiserRun(minNew?: number | undefined | null, minNewErrors?: number | undefined | null, ifStale?: string | undefined | null): string
+  /**
+   * List recommendations. `filter` is optional JSON, e.g. `{"status":
+   * "pending"}`; `{"status":"all"}` clears the filter. JSON list.
+   */
+  recommendations(filter?: string | undefined | null): string
+  /**
+   * Approve and apply a recommendation in one audited step (§6.6). The
+   * `because` reason is mandatory.
+   */
+  applyRecommendation(hash: string, because: string, allowDestructive?: boolean | undefined | null): string
+  /** Reject a recommendation with a reason (library-friendly `reject`). */
+  dismissRecommendation(hash: string, why: string): string
 }

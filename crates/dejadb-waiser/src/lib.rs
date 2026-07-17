@@ -18,7 +18,7 @@
 
 mod substrate;
 
-pub use substrate::DejaDbSubstrate;
+pub use substrate::{BorrowedSubstrate, DejaDbSubstrate};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

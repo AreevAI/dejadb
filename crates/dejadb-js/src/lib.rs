@@ -10,11 +10,40 @@ use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_store::memory_tool::MemoryTool;
 use dejadb_store::{CommandEmbed, DejaDB as RustDejaDB, FactDraft};
+use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use napi_derive::napi;
 use serde_json::json;
+use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
 fn err<E: std::fmt::Display>(e: E) -> napi::Error {
     napi::Error::from_reason(e.to_string())
+}
+
+/// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
+fn parse_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: i64 = s[..split].parse().ok()?;
+    let mult = match &s[split..] {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+fn status_from_str(s: &str) -> Option<RecStatus> {
+    match s {
+        "pending" => Some(RecStatus::Pending),
+        "approved" => Some(RecStatus::Approved),
+        "rejected" => Some(RecStatus::Rejected),
+        "applied" => Some(RecStatus::Applied),
+        "rolled_back" => Some(RecStatus::RolledBack),
+        "expired" => Some(RecStatus::Expired),
+        _ => None,
+    }
 }
 
 fn parse_hash(hex: &str) -> napi::Result<Hash> {
@@ -26,13 +55,21 @@ fn parse_hash(hex: &str) -> napi::Result<Hash> {
 pub struct DejaDb {
     facade: DejaDbFacade,
     ns: String,
+    /// Host-asserted actor label stamped on every waiser audit grain (§6.6).
+    actor: String,
 }
 
 #[napi]
 impl DejaDb {
     #[napi(constructor)]
-    pub fn new(path: String, ns: Option<String>, passphrase: Option<String>) -> napi::Result<Self> {
+    pub fn new(
+        path: String,
+        ns: Option<String>,
+        passphrase: Option<String>,
+        actor: Option<String>,
+    ) -> napi::Result<Self> {
         let ns = ns.unwrap_or_else(|| "shared".to_string());
+        let actor = actor.unwrap_or_else(|| "user:local".to_string());
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Host-supplied, never
         // stored in the file — same rules as the CLI's --passphrase-env.
@@ -41,7 +78,7 @@ impl DejaDb {
             None => RustDejaDB::open(&path).map_err(err)?,
         };
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
-        Ok(DejaDb { facade, ns })
+        Ok(DejaDb { facade, ns, actor })
     }
 
     /// Reconciliation warnings from open (file-vs-host declaration changes,
@@ -413,5 +450,108 @@ impl DejaDb {
             ))));
         }
         Ok(json!({"integrity": r.integrity, "grains": r.grains}).to_string())
+    }
+
+    // ── Waiser: the governed self-improvement loop (§6.6) ────────────────────
+
+    /// Record a tool call as a Tool grain — the flagship analyzer's food.
+    #[napi]
+    pub fn record_tool_call(
+        &self,
+        name: String,
+        result: String,
+        is_error: Option<bool>,
+        thread: Option<String>,
+    ) -> napi::Result<String> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("tool_name".into(), json!(name));
+        fields.insert("content".into(), json!(result));
+        fields.insert("is_error".into(), json!(is_error.unwrap_or(false)));
+        fields.insert("namespace".into(), json!(self.ns));
+        if let Some(t) = thread {
+            fields.insert("session_id".into(), json!(t));
+        }
+        let h = self.facade.cal_add("tool", &fields).map_err(err)?;
+        Ok(h.to_hex())
+    }
+
+    /// Run one analysis pass. Bare it never gates. Returns run-outcome JSON.
+    #[napi]
+    pub fn waiser_run(
+        &self,
+        min_new: Option<u32>,
+        min_new_errors: Option<u32>,
+        if_stale: Option<String>,
+    ) -> napi::Result<String> {
+        let opts = RunOptions {
+            min_new: min_new.map(|n| n as u64),
+            min_new_errors: min_new_errors.map(|n| n as u64),
+            if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
+            namespaces: Vec::new(),
+        };
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        let res = Engine::with_builtins().run(&mut sub, &opts, now_ms()).map_err(err)?;
+        serde_json::to_string(&res).map_err(err)
+    }
+
+    /// List recommendations. `filter` is optional JSON, e.g. `{"status":
+    /// "pending"}`; `{"status":"all"}` clears the filter. JSON list.
+    #[napi]
+    pub fn recommendations(&self, filter: Option<String>) -> napi::Result<String> {
+        let status = filter
+            .and_then(|f| serde_json::from_str::<serde_json::Value>(&f).ok())
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .filter(|s| s != "all")
+            .and_then(|s| status_from_str(&s))
+            .or(Some(RecStatus::Pending));
+        let sub = BorrowedSubstrate::new(&self.facade);
+        let recs = Engine::with_builtins().recommendations(&sub, status).map_err(err)?;
+        let rows: Vec<_> = recs
+            .iter()
+            .map(|r| {
+                json!({
+                    "hash": r.hash,
+                    "status": r.status.as_str(),
+                    "severity": r.severity.as_str(),
+                    "analyzer": r.analyzer,
+                    "summary": r.summary.render(),
+                    "target_ref": r.target_ref,
+                    "destructive": r.destructive,
+                })
+            })
+            .collect();
+        serde_json::to_string(&rows).map_err(err)
+    }
+
+    /// Approve and apply a recommendation in one audited step (§6.6). The
+    /// `because` reason is mandatory.
+    #[napi]
+    pub fn apply_recommendation(
+        &self,
+        hash: String,
+        because: String,
+        allow_destructive: Option<bool>,
+    ) -> napi::Result<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        let engine = Engine::with_builtins();
+        let now = now_ms();
+        let scopes = ScopeSet::all();
+        engine
+            .review(&mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human, &scopes, &because, now)
+            .map_err(err)?;
+        let applied = engine
+            .apply(&mut sub, &hash, &self.actor, ObserverType::Human, &scopes, &because, allow_destructive.unwrap_or(false), now)
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "rollbackable": applied.rollbackable}).to_string())
+    }
+
+    /// Reject a recommendation with a reason (library-friendly `reject`).
+    #[napi]
+    pub fn dismiss_recommendation(&self, hash: String, why: String) -> napi::Result<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        Engine::with_builtins()
+            .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "status": "rejected"}).to_string())
     }
 }

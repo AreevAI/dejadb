@@ -171,3 +171,25 @@ test('passphrase constructor rejects a wrong key on reopen', () => {
   const m = new DejaDb(path, 'caller', 'correct horse battery staple')
   assert.equal(JSON.parse(m.recall('john')).length, 1)
 })
+
+test('waiser: record tool calls, run, review, apply', () => {
+  const m = makeDb('caller')
+  // 4 failures + 1 success for one tool → tool-failure clustering fires.
+  for (let i = 0; i < 4; i++) m.recordToolCall('stripe_refund', 'rate_limited 429', true)
+  m.recordToolCall('stripe_refund', 'ok', false)
+
+  const run = JSON.parse(m.waiserRun())
+  assert.equal(run.outcome, 'ran')
+  assert.ok(run.stored >= 1)
+
+  const pending = JSON.parse(m.recommendations())
+  const tf = pending.find((r) => r.analyzer.startsWith('waiser.tool_failure'))
+  assert.ok(tf, 'a tool-failure recommendation')
+  assert.ok(tf.summary.includes('rate_limited'), 'signature is non-empty')
+
+  const applied = JSON.parse(m.applyRecommendation(tf.hash, 'retries belong in the client'))
+  assert.equal(applied.hash, tf.hash)
+
+  // A second bare run is idempotent (dedup).
+  assert.equal(JSON.parse(m.waiserRun()).stored, 0)
+})

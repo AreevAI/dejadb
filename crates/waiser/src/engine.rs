@@ -736,8 +736,14 @@ fn existing_dedup_keys<S: SubstrateRead>(sub: &S, p: &WaiserPersisted) -> Result
             .get(&g.hash)
             .copied()
             .unwrap_or(RecStatus::Pending);
-        // Only live (pending/approved) recommendations suppress re-proposal.
-        if matches!(status, RecStatus::Pending | RecStatus::Approved) {
+        // Pending/approved (still open) and applied (already handled)
+        // recommendations suppress re-proposal of the same finding. Rejected
+        // is handled by cooldowns; rolled_back/expired may legitimately
+        // re-propose (the situation returned).
+        if matches!(
+            status,
+            RecStatus::Pending | RecStatus::Approved | RecStatus::Applied
+        ) {
             if let Some(key) = g.str_field("dedup_key") {
                 set.insert(key.to_string());
             }
