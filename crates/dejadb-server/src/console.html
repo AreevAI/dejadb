@@ -311,6 +311,10 @@
 
     <div class="panel" id="pane-waiser" hidden>
       <div class="toolbar">
+        <span class="seg" id="waiserNav">
+          <button class="on" data-w="queue" onclick="waiserView('queue')">queue</button>
+          <button data-w="analyzers" onclick="waiserView('analyzers')">analyzers</button>
+        </span>
         <button onclick="waiserRun()">Run analysis</button>
         <span class="spacer"></span>
         <span id="waiserHealth" class="hint"></span>
@@ -624,7 +628,14 @@ function showTab(t) {
 
 /* ---------- Waiser: the governed self-improvement queue ---------- */
 const SEV_COLOR = { high: '#e5484d', medium: '#f5a623', low: '#3b82f6', info: '#8b8b8b' };
+let WAISER_VIEW = 'queue';
+function waiserView(v) {
+  WAISER_VIEW = v;
+  for (const b of $('waiserNav').querySelectorAll('button')) b.classList.toggle('on', b.dataset.w === v);
+  loadWaiser();
+}
 async function loadWaiser() {
+  if (WAISER_VIEW === 'analyzers') return loadAnalyzers();
   const [health, recs] = await Promise.all([
     api('/api/waiser/health'),
     api('/api/waiser/recommendations?status=pending'),
@@ -698,12 +709,32 @@ function actBtn(label, fn) {
   b.onclick = fn;
   return b;
 }
+async function loadAnalyzers() {
+  const res = await api('/api/waiser/analyzers');
+  const host = $('waiserTable');
+  host.textContent = '';
+  const list = (res && res.analyzers) || [];
+  const tbl = document.createElement('table');
+  tbl.style.cssText = 'width:100%;border-collapse:collapse';
+  for (const a of list) {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid var(--line,#333)';
+    td(tr).textContent = a.id;
+    td(tr).textContent = a.tier;
+    const on = td(tr);
+    on.textContent = a.default_on ? 'on' : 'off';
+    on.style.color = a.default_on ? '#3fb950' : 'var(--dim,#888)';
+    td(tr).textContent = a.title;
+    tbl.appendChild(tr);
+  }
+  host.appendChild(tbl);
+}
 async function waiserRun() {
   $('waiserHealth').textContent = 'running…';
   const res = await api('/api/waiser/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   if (res && res.ok) toast('ran — ' + res.run.stored + ' proposed, ' + res.run.auto_applied + ' auto-applied');
   else toast('run failed: ' + ((res && res.error) || 'read-only? add --token-env'));
-  loadWaiser();
+  waiserView('queue');
 }
 async function waiserAct(hash, action) {
   const because = window.prompt(action + ' — reason (BECAUSE, required):');
