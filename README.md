@@ -184,6 +184,32 @@ lesson so the harness supersedes it instead of adding a near-duplicate
 (advise-only — it never drops a write itself). Full loop:
 [cookbook §10](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn).
 
+### Waiser — governed self-improvement (deterministic, no LLM)
+
+The section above is the loop *by hand*. **Waiser** governs it: it turns your
+agent's history into recommendations — evidence-cited, reviewable, undoable,
+measured — with **zero model calls**. The fastest way to see it needs no
+agent and no waiting:
+
+```python
+import dejadb, json
+db = dejadb.DejaDB("proof.db", actor="user:me")
+for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
+db.waiser_run()                                             # deterministic; never gated when bare
+for r in json.loads(db.recommendations('{"status":"pending"}')): print(r["severity"], r["summary"])
+# → high  Tool "stripe_refund" failed 5 times (71% of calls): rate_limited
+db.apply_recommendation(<hash>, because="retries belong in the client")   # audited, undoable
+```
+
+Or from a fresh install: `deja init --db demo.db --template demo` seeds a
+corpus, `deja waiser run` proposes across analyzers, and `deja ui` shows the
+governed queue. Six deterministic analyzers (tool-failure clustering,
+duplicate/contradiction/staleness sweeps, fork surfacing, outcome review),
+four gates (propose → review → apply → verify), a mandatory reason on every
+decision, and an undo for every apply. Auto-apply is off unless a host policy
+file grants it. Full guide: [docs/waiser.md](docs/waiser.md).
+
 ### Rust
 
 Embed the store in-process. Add it to your `Cargo.toml`:
@@ -317,8 +343,9 @@ embedding it.
 | Doc | For |
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | How DejaDB works: grains, `.mg` format, CAL, recall, sync |
+| [`docs/waiser.md`](docs/waiser.md) | Waiser — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
 | [`docs/cal-reference.md`](docs/cal-reference.md) | The CAL query language reference |
-| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 6 tools |
+| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 8 tools |
 | [`docs/migrate.md`](docs/migrate.md) | Importing from mem0, Zep, Letta, LangMem, Basic Memory, JSONL |
 | [`docs/memory-tool.md`](docs/memory-tool.md) | The Anthropic memory-tool backend (Python / Node / CLI) |
 | [`docs/cookbook.md`](docs/cookbook.md) | Task-oriented recipes |
