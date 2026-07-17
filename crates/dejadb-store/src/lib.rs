@@ -2986,6 +2986,12 @@ impl DejaDB {
     /// Verify store integrity: Turso's own integrity check plus a full
     /// content-address re-verification (every blob re-hashed and compared
     /// to its stored hash — the tamper-evidence read).
+    ///
+    /// Scope: this detects *modification* of readable grains, not *removal*.
+    /// WAL corruption makes the engine roll back to the last consistent
+    /// state, and a truncated-but-consistent store verifies `ok`; detecting
+    /// that requires an external anchor (stream segments, bundles, a
+    /// replica). See docs/security-model.md "Known limitations".
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let conn = &self.conn;
         let (integrity, fts_notes, rows) = self.rt.block_on(async {

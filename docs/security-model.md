@@ -96,6 +96,15 @@ top of that.
   tampering, but does **not** verify *who* authored a grain. There is dormant
   scaffolding for COSE signing, but signature verification is not yet enforced
   on import. **Only sync with peers you trust.**
+- ⚠️ **`verify` detects modification, not removal.** `deja verify` re-hashes
+  every grain it can read, so an in-place edit of stored bytes is caught. But
+  whole-file tampering that corrupts the WAL makes the storage engine roll the
+  file back to its last consistent state — grains written since then silently
+  vanish, and `verify` reports `ok` on the smaller, self-consistent survivor
+  set. Truncation of a consistent store is indistinguishable from
+  "never written" using the file alone; to detect it, compare against an
+  **external anchor** — the op high-water mark of a `deja stream` segment
+  directory, a bundle, or a hub replica.
 
 ## Input handling
 

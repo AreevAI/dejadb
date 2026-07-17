@@ -141,6 +141,10 @@ struct Parser {
     nesting_depth: usize,
     /// Original input text — used by `reconstruct_body_text` for DEFINE QUERY bodies.
     input: String,
+    /// Non-dedup options from an ASSEMBLE `WITH dedup, ...` list, parsed
+    /// inside `parse_assemble` but belonging to the statement-level WITH
+    /// options. Drained by `parse_statement_full`.
+    pending_with_options: Vec<WithOption>,
 }
 
 impl Parser {
@@ -151,6 +155,7 @@ impl Parser {
             warnings: vec![],
             nesting_depth: 0,
             input: input.to_string(),
+            pending_with_options: vec![],
         }
     }
 
@@ -590,9 +595,10 @@ impl Parser {
                             found: s.clone(),
                             span: Some(self.prev_span()),
                             suggestion: Some(
-                                "CAL does not support destructive operations. \
-                                 Use the REST/gRPC API for erasure, key rotation, \
-                                 or schema changes."
+                                "CAL cannot destroy data in bulk. The only \
+                                 destructive CAL statement is FORGET <hash>; \
+                                 erasure, key rotation, and schema changes are \
+                                 host-level operations."
                                     .into(),
                             ),
                         });
@@ -892,6 +898,26 @@ impl Parser {
         let (statement, inline_pipeline, inline_with, inline_format, user_vars) =
             self.parse_statement_full()?;
 
+        // A query is exactly one statement and must consume ALL input.
+        // Trailing semicolons are tolerated (SQL habit), but any other
+        // trailing token is an error — silently dropping it would partially
+        // execute what the caller sent (e.g. `RECALL ...; <second stmt>`).
+        while self.at_exact(&Token::Semicolon) {
+            self.advance();
+        }
+        if let Some(st) = self.peek() {
+            let found = st.token.description();
+            let span = st.span;
+            return Err(CalError::UnexpectedToken {
+                expected: "end of query".into(),
+                found,
+                span: Some(span),
+                suggestion: Some(
+                    "a query is one statement; use BATCH { stmt1 ; stmt2 } to run several".into(),
+                ),
+            });
+        }
+
         Ok(CalQuery {
             version,
             statement,
@@ -1079,8 +1105,9 @@ impl Parser {
         let mut pipeline = self.parse_pipeline()?;
 
         // Parse trailing clauses in any order: WITH options, FORMAT, WITH VARS,
-        // and post-pipeline WHERE filters.
-        let mut with_options = vec![];
+        // and post-pipeline WHERE filters. Start from any statement-level
+        // options an ASSEMBLE `WITH dedup, ...` list already surfaced.
+        let mut with_options = std::mem::take(&mut self.pending_with_options);
         let mut format = None;
         let mut user_vars = HashMap::new();
 
@@ -1132,12 +1159,13 @@ impl Parser {
                 let word = word.clone();
                 let span = *span;
                 return Err(CalError::UnexpectedToken {
-                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, FORGET, PURGE, DROP, DEFINE, or STREAM".into(),
+                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, FORGET, DEFINE, DROP, or STREAM".into(),
                     found: word,
                     span: Some(span),
                     suggestion: Some(
-                        "CAL does not support destructive operations. \
-                         Use the REST/gRPC API for erasure, key rotation, or schema changes."
+                        "CAL cannot destroy data in bulk. The only destructive \
+                         CAL statement is FORGET <hash>; erasure, key rotation, \
+                         and schema changes are host-level operations."
                             .into(),
                     ),
                 });
@@ -1209,12 +1237,13 @@ impl Parser {
             }) => {
                 let span = *span;
                 Err(CalError::UnexpectedToken {
-                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, DEFINE, DROP, or STREAM".into(),
+                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, FORGET, DEFINE, DROP, or STREAM".into(),
                     found: "PURGE".into(),
                     span: Some(span),
                     suggestion: Some(
-                        "PURGE is not part of CAL grammar. \
-                         Use the REST API for namespace cleanup."
+                        "PURGE is not part of CAL grammar. Use FORGET <hash> to \
+                         tombstone a single grain; bulk erasure is a host-level \
+                         operation."
                             .into(),
                     ),
                 })
@@ -1246,8 +1275,7 @@ impl Parser {
                 let span = st.span;
                 Err(CalError::UnexpectedToken {
                     expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, \
-                         COALESCE, ADD, SUPERSEDE, REVERT, DELETE, FORGET, PURGE, \
-                         DEFINE, DROP, or RUN"
+                         COALESCE, ADD, SUPERSEDE, REVERT, FORGET, DEFINE, DROP, or RUN"
                         .into(),
                     found,
                     span: Some(span),
@@ -3403,6 +3431,13 @@ impl Parser {
         // Issue 1: only consume WITH if the next token is `dedup` (an
         // ASSEMBLE-specific WITH option).  Otherwise leave WITH for the
         // top-level WITH parser to handle (e.g. `WITH rerank`).
+        //
+        // The list may mix dedup with general options
+        // (`WITH dedup, recency_weight(0.7)`), so parse it with the full
+        // WITH parser and keep only dedup here; the rest go to
+        // `pending_with_options` for `parse_statement_full`. The old
+        // dedup-only loop stopped at the first non-dedup option and the
+        // remainder of the list was silently dropped.
         let assemble_with = if self.at_exact(&Token::With)
             && matches!(
                 self.peek_ahead(1),
@@ -3411,7 +3446,16 @@ impl Parser {
                     ..
                 })
             ) {
-            self.parse_assemble_with()?
+            let mut aw = Vec::new();
+            for opt in self.parse_with_clause()? {
+                match opt {
+                    WithOption::Dedup { field } => {
+                        aw.push(AssembleWithOption::Dedup { field });
+                    }
+                    other => self.pending_with_options.push(other),
+                }
+            }
+            aw
         } else {
             Vec::new()
         };
@@ -3493,31 +3537,6 @@ impl Parser {
     }
 
     /// Parse ASSEMBLE-specific WITH options (dedup).
-    fn parse_assemble_with(&mut self) -> CalResult<Vec<AssembleWithOption>> {
-        self.expect_exact(&Token::With)?;
-        let mut options = vec![];
-        while let Some(SpannedToken {
-            token: Token::Dedup,
-            ..
-        }) = self.peek()
-        {
-            self.advance();
-            let field = if self.at_exact(&Token::LParen) {
-                self.advance();
-                let f = self.parse_identifier()?;
-                self.expect_exact(&Token::RParen)?;
-                Some(f)
-            } else {
-                None
-            };
-            options.push(AssembleWithOption::Dedup { field });
-            if !self.eat_exact(&Token::Comma) {
-                break;
-            }
-        }
-        Ok(options)
-    }
-
     fn parse_assemble_source(&mut self) -> CalResult<Source> {
         match self.peek() {
             Some(SpannedToken {
@@ -5555,6 +5574,58 @@ mod tests {
         }
     }
 
+    // ── 0. Whole-input consumption ────────────────────────────────────────
+
+    #[test]
+    fn test_trailing_garbage_rejected() {
+        let e = pe(r#"RECALL facts WHERE subject = "john" banana banana"#);
+        assert!(e.to_string().contains("end of query"), "{e}");
+    }
+
+    #[test]
+    fn test_trailing_second_statement_rejected() {
+        // A smuggled second statement must be an error, never silently dropped.
+        let e = pe(r#"RECALL facts WHERE subject = "john"; RECALL facts WHERE subject = "mary""#);
+        assert!(e.to_string().contains("end of query"), "{e}");
+        let e = pe(r#"RECALL facts WHERE subject = "john"; DELETE FROM facts"#);
+        assert!(e.to_string().contains("end of query"), "{e}");
+    }
+
+    #[test]
+    fn test_trailing_semicolons_allowed() {
+        p(r#"RECALL facts WHERE subject = "john";"#);
+        p(r#"RECALL facts WHERE subject = "john";;"#);
+    }
+
+    #[test]
+    fn test_assemble_with_mixed_dedup_list_keeps_all_options() {
+        // `WITH dedup, <general options>` on ASSEMBLE used to silently drop
+        // everything after dedup (the tail parsed as ignored trailing input).
+        let q = p("ASSEMBLE \"ctx\" FROM a: (RECALL facts), b: (RECALL events) \
+                   BUDGET 400 tokens FORMAT sml \
+                   WITH dedup, recency_weight(0.7), provenance");
+        match &q.statement {
+            CalStatement::Assemble(a) => {
+                assert_eq!(a.assemble_with.len(), 1, "dedup stays assemble-scoped");
+            }
+            other => panic!("expected Assemble, got {:?}", other),
+        }
+        assert!(
+            q.with_options
+                .iter()
+                .any(|o| matches!(o, WithOption::RecencyWeight { .. })),
+            "recency_weight must survive: {:?}",
+            q.with_options
+        );
+        assert!(
+            q.with_options
+                .iter()
+                .any(|o| matches!(o, WithOption::Provenance)),
+            "provenance must survive: {:?}",
+            q.with_options
+        );
+    }
+
     // ── 1. Simple RECALL ──────────────────────────────────────────────────
 
     #[test]
@@ -7514,7 +7585,12 @@ mod tests {
         assert!(matches!(err, CalError::UnexpectedToken { .. }));
         assert!(err.suggestion().is_some());
         let sug = err.suggestion().unwrap();
-        assert!(sug.contains("CAL does not support destructive operations"));
+        assert!(sug.contains("CAL cannot destroy data in bulk"));
+        // FORGET <hash> is real grammar and may be advertised; blocked
+        // keywords and PURGE (token, but not text grammar) must not be.
+        let msg = err.to_string();
+        assert!(!msg.contains("PURGE"), "{msg}");
+        assert!(!msg.contains("DELETE"), "{msg}");
     }
 
     // ── 23. Error: unknown grain type ─────────────────────────────────────

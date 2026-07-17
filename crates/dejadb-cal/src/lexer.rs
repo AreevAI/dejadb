@@ -80,8 +80,10 @@ pub fn nfc_normalize(input: &str) -> String {
 /// Return `true` if `word` (compared case-insensitively) is one of the
 /// blocked destructive-operation identifiers.
 ///
-/// CAL is a read-oriented language.  Destructive operations (erasure, schema
-/// changes, key rotation, etc.) are only available through the REST/gRPC API.
+/// CAL is a read-oriented language.  Its only destructive statement is the
+/// execution-gated `FORGET <hash>`; everything else (bulk erasure, schema
+/// changes, key rotation, etc.) is host-level only — the `forget` API or the
+/// MCP `dejadb_forget` tool.
 /// Giving these words a hard block at the lexer level ensures that even a
 /// future grammar extension cannot accidentally expose a write path.
 pub fn is_destructive_keyword(word: &str) -> bool {

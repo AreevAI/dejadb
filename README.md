@@ -127,8 +127,8 @@ Store a fact, recall it, hand it to a model — three commands, no ceremony
 
 ```bash
 deja add    john prefers "window seat"     # subject relation object
-deja recall john                           # → window seat
-deja recall john --render sml              # model-ready context block
+deja recall john                           # → the stored fact, one JSON grain per line
+deja recall john --render sml              # → "john prefers window seat" as a model-ready block
 ```
 
 Point it at a specific file with `-d mem.db` (or `export DEJADB_DB=mem.db`).
