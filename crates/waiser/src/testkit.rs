@@ -78,7 +78,7 @@ impl TestSubstrate {
         })
     }
 
-    pub fn add_event(&mut self, tool: &str, is_error: bool, content: &str) -> String {
+    pub fn add_tool_call(&mut self, tool: &str, is_error: bool, content: &str) -> String {
         let created = self.tick();
         let mut fields = Map::new();
         fields.insert("tool_name".into(), json!(tool));
@@ -87,7 +87,7 @@ impl TestSubstrate {
         fields.insert("namespace".into(), json!("test"));
         self.inner.insert(GrainRecord {
             hash: String::new(),
-            grain_type: "event".into(),
+            grain_type: "tool".into(),
             namespace: "test".into(),
             created_at_ms: created,
             valid_to_ms: None,

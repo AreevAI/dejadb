@@ -707,12 +707,14 @@ fn count_new<S: SubstrateRead>(sub: &S, watermark: Option<i64>) -> Result<(u64, 
     for t in [
         crate::model::grain_type::FACT,
         crate::model::grain_type::EVENT,
+        crate::model::grain_type::TOOL,
         crate::model::grain_type::OBSERVATION,
     ] {
         let g = sub.grains_of_type(t, None, opts)?;
         new_grains += g.len() as u64;
-        if t == crate::model::grain_type::EVENT {
-            new_errors += g.iter().filter(|e| e.event_is_error()).count() as u64;
+        // The error gate (--min-new-errors) watches captured tool failures.
+        if t == crate::model::grain_type::TOOL {
+            new_errors += g.iter().filter(|e| e.is_error()).count() as u64;
         }
     }
     Ok((new_grains, new_errors))

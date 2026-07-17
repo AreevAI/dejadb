@@ -19,9 +19,9 @@ fn seed_all(sub: &mut TestSubstrate) {
     sub.add_fact_valid_to("promo", "active", "true", 500);
     // a dominant tool-failure cluster
     for _ in 0..5 {
-        sub.add_event("stripe_refund", true, "rate_limited 429");
+        sub.add_tool_call("stripe_refund", true, "rate_limited 429");
     }
-    sub.add_event("stripe_refund", false, "ok");
+    sub.add_tool_call("stripe_refund", false, "ok");
 }
 
 #[test]
@@ -52,9 +52,9 @@ fn run_proposes_across_analyzers_and_is_idempotent() {
 fn review_apply_rollback_on_nondestructive() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
-        sub.add_event("stripe_refund", true, "rate_limited 429");
+        sub.add_tool_call("stripe_refund", true, "rate_limited 429");
     }
-    sub.add_event("stripe_refund", false, "ok");
+    sub.add_tool_call("stripe_refund", false, "ok");
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 10_000)
         .unwrap();
@@ -178,7 +178,7 @@ fn destructive_apply_requires_admin_and_flag() {
 fn apply_on_pending_is_rejected() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
-        sub.add_event("s", true, "boom 1");
+        sub.add_tool_call("s", true, "boom 1");
     }
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 10_000)
@@ -207,7 +207,7 @@ fn apply_on_pending_is_rejected() {
 fn self_approval_blocked_against_creator() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
-        sub.add_event("s", true, "boom 1");
+        sub.add_tool_call("s", true, "boom 1");
     }
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 10_000)
@@ -249,7 +249,7 @@ fn self_approval_blocked_against_creator() {
 fn review_requires_review_scope() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
-        sub.add_event("s", true, "boom 1");
+        sub.add_tool_call("s", true, "boom 1");
     }
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 10_000)
@@ -278,7 +278,7 @@ fn review_requires_review_scope() {
 fn empty_because_is_rejected() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
-        sub.add_event("s", true, "boom 1");
+        sub.add_tool_call("s", true, "boom 1");
     }
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 10_000)
@@ -337,7 +337,7 @@ fn min_new_errors_wakes_a_run() {
     e.run(&mut sub.inner, &RunOptions::default(), 1_000)
         .unwrap();
     for _ in 0..4 {
-        sub.add_event("s", true, "boom 1");
+        sub.add_tool_call("s", true, "boom 1");
     }
     // min_new very high (won't trip) but min_new_errors low (will).
     let opts = RunOptions {

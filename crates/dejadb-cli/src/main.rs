@@ -9,6 +9,8 @@ use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
 use dejadb_core::types::{Fact, Grain};
 use dejadb_store::DejaDB;
+use dejadb_waiser::{now_ms, DejaDbSubstrate};
+use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet, Severity};
 
 const USAGE: &str = "\
 deja — embedded memory engine for AI agents (OMS + CAL on Turso)
@@ -19,6 +21,13 @@ USAGE:
   deja help | --help | -h             show this help
 
 COMMANDS:
+  init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
+           print the Claude Code hook snippet (never writes your settings)
+  waiser   <run|list|show|approve|reject|apply|rollback|analyzers>   the
+           governed self-improvement loop (deterministic, no LLM):
+           run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
+           list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
+           show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
            [--idempotent]   no-op if this exact value is already the head
@@ -1188,9 +1197,308 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 );
             }
         }
+        "init" => {
+            run_init(m, &ns, &flags, &positional)?;
+        }
+        "waiser" => {
+            run_waiser(m, &ns, &flags, &positional)?;
+        }
         other => return Err(format!("unknown command '{other}' — try `deja help`")),
     }
     Ok(())
+}
+
+/// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: i64 = s[..split].parse().ok()?;
+    let mult = match &s[split..] {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+fn parse_severity(s: &str) -> Severity {
+    match s.to_ascii_lowercase().as_str() {
+        "high" => Severity::High,
+        "medium" => Severity::Medium,
+        "low" => Severity::Low,
+        _ => Severity::Info,
+    }
+}
+
+/// `--status` filter; default is `pending`, `all` clears the filter.
+fn status_filter(flags: &HashMap<String, String>) -> Option<RecStatus> {
+    match flag(flags, "status").as_deref() {
+        Some("approved") => Some(RecStatus::Approved),
+        Some("rejected") => Some(RecStatus::Rejected),
+        Some("applied") => Some(RecStatus::Applied),
+        Some("rolled_back") => Some(RecStatus::RolledBack),
+        Some("expired") => Some(RecStatus::Expired),
+        Some("all") => None,
+        _ => Some(RecStatus::Pending),
+    }
+}
+
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+/// Resolve a git-style unique hash prefix to a full recommendation hash.
+fn resolve_hash(engine: &Engine, sub: &DejaDbSubstrate, prefix: &str) -> Result<String, String> {
+    let recs = engine.recommendations(sub, None).map_err(|e| e.to_string())?;
+    let matches: Vec<&str> = recs
+        .iter()
+        .map(|r| r.hash.as_str())
+        .filter(|h| h.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no recommendation matches '{prefix}'")),
+        1 => Ok(matches[0].to_string()),
+        n => Err(format!("'{prefix}' is ambiguous ({n} matches) — use more characters")),
+    }
+}
+
+/// `deja waiser <run|list|show|approve|reject|apply|rollback|analyzers|status>`.
+fn run_waiser(
+    m: DejaDB,
+    ns: &str,
+    flags: &HashMap<String, String>,
+    positional: &[String],
+) -> Result<(), String> {
+    let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("status");
+    let mut sub = DejaDbSubstrate::new(m, Some(ns.to_string()));
+    let engine = Engine::with_builtins();
+    let now = now_ms();
+    let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());
+    let observer = ObserverType::Human;
+    let scopes = ScopeSet::all(); // the CLI is the local root of trust
+    let json = flag(flags, "format").as_deref() == Some("json");
+
+    match sub_cmd {
+        "run" => {
+            let opts = RunOptions {
+                min_new: flag(flags, "min-new").and_then(|v| v.parse().ok()),
+                min_new_errors: flag(flags, "min-new-errors").and_then(|v| v.parse().ok()),
+                if_stale_ms: flag(flags, "if-stale").and_then(|v| parse_duration(&v)),
+                namespaces: Vec::new(),
+            };
+            let res = engine.run(&mut sub, &opts, now).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string(&res).map_err(|e| e.to_string())?);
+            } else if res.ran() {
+                if !flags.contains_key("quiet") {
+                    eprintln!(
+                        "waiser: ran — proposed {} ({} deduped) across {} analyzer(s)",
+                        res.stored,
+                        res.deduped,
+                        res.analyzers_run.len()
+                    );
+                }
+                if res.stored > 0 {
+                    eprintln!("waiser: {} new — deja waiser list", res.stored);
+                }
+            } else if !flags.contains_key("quiet") {
+                eprintln!("waiser: skipped ({:?})", res.skip_reason);
+            }
+        }
+        "list" => {
+            let filter = status_filter(flags);
+            let recs = engine.recommendations(&sub, filter).map_err(|e| e.to_string())?;
+            if json {
+                let rows: Vec<_> = recs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "hash": r.hash,
+                            "status": r.status.as_str(),
+                            "severity": r.severity.as_str(),
+                            "analyzer": r.analyzer,
+                            "destructive": r.destructive,
+                            "summary": r.summary.render(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&rows).map_err(|e| e.to_string())?);
+            } else if recs.is_empty() {
+                eprintln!("no recommendations — run `deja waiser run` first");
+            } else {
+                for r in &recs {
+                    println!(
+                        "{}  {:<6}  {:<28}  {}",
+                        short(&r.hash),
+                        r.severity.as_str(),
+                        r.analyzer,
+                        r.summary.render()
+                    );
+                }
+            }
+            // CI gate: exit 2 if any pending recommendation meets --fail-on.
+            if let Some(sev) = flag(flags, "fail-on") {
+                let threshold = parse_severity(&sev);
+                let hit = recs
+                    .iter()
+                    .any(|r| r.status == RecStatus::Pending && r.severity >= threshold);
+                if hit {
+                    eprintln!("waiser: pending recommendation(s) at or above severity '{sev}'");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "show" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser show <hash>".to_string())?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
+            let r = recs.iter().find(|r| r.hash == hash).unwrap();
+            let out = serde_json::json!({
+                "hash": r.hash,
+                "status": r.status.as_str(),
+                "severity": r.severity.as_str(),
+                "analyzer": r.analyzer,
+                "target_ref": r.target_ref,
+                "summary": r.summary.render(),
+                "destructive": r.destructive,
+                "rollbackable": r.rollbackable,
+                "evidence": r.evidence,
+                "dedup_key": r.dedup_key,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+        }
+        "approve" | "reject" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| format!("usage: deja waiser {sub_cmd} <hash> --because \"...\""))?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let decision = if sub_cmd == "approve" { Decision::Approve } else { Decision::Reject };
+            engine
+                .review(&mut sub, &hash, decision, &actor, observer, &scopes, &because, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!("{sub_cmd}d {}", short(&hash));
+        }
+        "apply" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser apply <hash> --because \"...\"".to_string())?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let allow_destructive = flags.contains_key("allow-destructive");
+            let applied = engine
+                .apply(&mut sub, &hash, &actor, observer, &scopes, &because, allow_destructive, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "applied {} ({})",
+                short(&hash),
+                if applied.rollbackable { "rollbackable" } else { "non-rollbackable" }
+            );
+        }
+        "rollback" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser rollback <hash> --because \"...\"".to_string())?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            engine
+                .rollback(&mut sub, &hash, &actor, observer, &scopes, &because, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!("rolled back {}", short(&hash));
+        }
+        "analyzers" => {
+            for a in engine.analyzers() {
+                let m = a.manifest();
+                println!(
+                    "{:<28}  {:?}  on={}  {}",
+                    m.id, m.tier, m.default_on, m.title
+                );
+            }
+        }
+        // Bare `deja waiser` (or an unknown subcommand) prints a health summary.
+        _ => {
+            let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
+            let mut pending = 0;
+            let mut applied = 0;
+            for r in &recs {
+                match r.status {
+                    RecStatus::Pending => pending += 1,
+                    RecStatus::Applied => applied += 1,
+                    _ => {}
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "total": recs.len(), "pending": pending, "applied": applied })
+                );
+            } else {
+                println!("waiser: {} recommendation(s) — {pending} pending, {applied} applied", recs.len());
+                if pending > 0 {
+                    println!("  review with: deja waiser list");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `deja init --db <file> [--template blank|demo|coding-agent] [--ns N]` —
+/// seed a working backend and print the wiring snippet (never writes settings).
+fn run_init(
+    m: DejaDB,
+    ns: &str,
+    flags: &HashMap<String, String>,
+    _positional: &[String],
+) -> Result<(), String> {
+    let template = flag(flags, "template").unwrap_or_else(|| "blank".to_string());
+    let mut m = m;
+    let seeded = match template.as_str() {
+        "blank" => 0,
+        "demo" => seed_demo(&mut m, ns)?,
+        "coding-agent" | "support-agent" => {
+            m.add(&Fact::new("agent", "instruction", "review pending recommendations before acting").namespace(ns))
+                .map_err(|e| e.to_string())?;
+            1
+        }
+        other => return Err(format!("unknown --template '{other}' (blank|demo|coding-agent|support-agent)")),
+    };
+
+    println!("initialized backend (template: {template}, seeded {seeded} grain(s))");
+    if template == "demo" {
+        println!("next: deja waiser run --db <file>   # ~4 recommendations across analyzers");
+    }
+    // Print the Claude Code hook snippet — deja never edits your settings.
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "deja".to_string());
+    eprintln!("\nClaude Code hooks (paste into settings.json — absolute path baked in):");
+    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns}");
+    eprintln!("  Stop             → {exe} capture-stop --ns {ns}");
+    eprintln!("  SessionEnd       → {exe} waiser run --min-new 20 --min-new-errors 3 --quiet --ns {ns}");
+    Ok(())
+}
+
+/// Seed the demo corpus: planted duplicates, a contradiction, and a stale
+/// grain, so the first `deja waiser run` fires several analyzers at once.
+fn seed_demo(m: &mut DejaDB, ns: &str) -> Result<usize, String> {
+    let past = 1_000_000_000_000; // year 2001 — safely elapsed
+    let grains = [
+        Fact::new("acme", "tier", "Enterprise").namespace(ns),
+        Fact::new("acme", "tier", "Enterprise").namespace(ns),
+        Fact::new("acme", "deploy_target", "us-east-1").namespace(ns),
+        Fact::new("acme", "deploy_target", "eu-west-1").namespace(ns),
+        Fact::new("promo", "active", "true").namespace(ns).valid_to(past),
+    ];
+    for g in &grains {
+        m.add(g).map_err(|e| e.to_string())?;
+    }
+    Ok(grains.len())
 }
 
 fn main() -> ExitCode {

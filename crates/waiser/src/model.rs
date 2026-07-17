@@ -13,6 +13,9 @@ use serde_json::{Map, Value};
 pub mod grain_type {
     pub const FACT: &str = "fact";
     pub const EVENT: &str = "event";
+    /// OMS Tool grain (0x05) — how a captured tool call is stored, carrying
+    /// `tool_name`/`is_error`/`content` natively (the flagship analyzer's food).
+    pub const TOOL: &str = "tool";
     pub const OBSERVATION: &str = "observation";
     pub const RECOMMENDATION: &str = "recommendation";
 }
@@ -62,19 +65,19 @@ impl GrainRecord {
         self.str_field("object")
     }
 
-    // --- Event accessors (tool calls / results) ---
-    pub fn event_tool_name(&self) -> Option<&str> {
-        // Capture stores the tool name under `tool_name`; fall back to `name`.
+    // --- Tool-grain accessors (captured tool calls / results) ---
+    pub fn tool_name(&self) -> Option<&str> {
         self.str_field("tool_name")
             .or_else(|| self.str_field("name"))
     }
-    pub fn event_is_error(&self) -> bool {
+    pub fn is_error(&self) -> bool {
         self.bool_field("is_error").unwrap_or(false)
     }
-    /// The event body / result text used for error-signature extraction.
-    pub fn event_content(&self) -> Option<&str> {
+    /// The tool result text used for error-signature extraction.
+    pub fn tool_content(&self) -> Option<&str> {
         self.str_field("content")
             .or_else(|| self.str_field("result"))
+            .or_else(|| self.str_field("error"))
             .or_else(|| self.str_field("body"))
     }
 }

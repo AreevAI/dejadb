@@ -94,10 +94,11 @@ impl<'a> AnalyzeCtx<'a> {
         self.grains_of_type(crate::model::grain_type::OBSERVATION, ReadOpts::default())
     }
 
-    /// Event grains, optionally windowed by a `since` watermark, live only.
-    pub fn events_since(&self, since_ms: Option<i64>) -> Result<Vec<GrainRecord>> {
+    /// Tool grains (captured tool calls), optionally windowed by a `since`
+    /// watermark, live only. The flagship analyzer's input.
+    pub fn tools_since(&self, since_ms: Option<i64>) -> Result<Vec<GrainRecord>> {
         self.grains_of_type(
-            crate::model::grain_type::EVENT,
+            crate::model::grain_type::TOOL,
             ReadOpts {
                 live_only: true,
                 since_ms,

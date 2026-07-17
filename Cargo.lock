@@ -591,8 +591,10 @@ dependencies = [
  "dejadb-mcp",
  "dejadb-server",
  "dejadb-store",
+ "dejadb-waiser",
  "serde_json",
  "tempfile",
+ "waiser",
  "zeroize",
 ]
 
@@ -711,6 +713,19 @@ dependencies = [
  "tokio",
  "turso",
  "zeroize",
+]
+
+[[package]]
+name = "dejadb-waiser"
+version = "1.0.1"
+dependencies = [
+ "dejadb-cal",
+ "dejadb-core",
+ "dejadb-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "waiser",
 ]
 
 [[package]]

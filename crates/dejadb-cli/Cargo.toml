@@ -26,6 +26,8 @@ zeroize = "1"
 dejadb-mcp = { path = "../dejadb-mcp", version = "1.0.0" }
 dejadb-context = { path = "../dejadb-context", version = "1.0.0" }
 dejadb-server = { path = "../dejadb-server", version = "1.0.0" }
+waiser = { path = "../waiser" }
+dejadb-waiser = { path = "../dejadb-waiser" }
 
 [dev-dependencies]
 tempfile = "3"

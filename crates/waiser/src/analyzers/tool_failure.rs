@@ -1,5 +1,6 @@
-//! Tool-failure clustering (T0) — the flagship analyzer. Groups error Events
-//! by (tool_name, normalized error signature) and fires when a cluster is both
+//! Tool-failure clustering (T0) — the flagship analyzer. Groups error Tool
+//! grains (captured tool calls) by (tool_name, normalized error signature) and
+//! fires when a cluster is both
 //! frequent (≥ min_count) and a meaningful share of that tool's calls
 //! (≥ min_rate). Emits a memory lesson. Because the signature is derived from
 //! attacker-influenceable tool output, this analyzer never auto-applies
@@ -79,18 +80,18 @@ impl Analyzer for ToolFailureClustering {
         let window_ms = ctx.params().get_int("window_days") * 86_400_000;
         let since = Some(ctx.now_ms() - window_ms);
 
-        let events = ctx.events_since(since)?;
+        let tools = ctx.tools_since(since)?;
 
         // Per-tool total calls, and per (tool, signature) error clusters.
         let mut tool_totals: BTreeMap<String, usize> = BTreeMap::new();
         let mut clusters: BTreeMap<(String, String), Vec<(String, i64)>> = BTreeMap::new();
-        for e in &events {
-            let Some(tool) = e.event_tool_name() else {
+        for e in &tools {
+            let Some(tool) = e.tool_name() else {
                 continue;
             };
             *tool_totals.entry(tool.to_string()).or_default() += 1;
-            if e.event_is_error() {
-                let sig = normalize_signature(e.event_content().unwrap_or(""));
+            if e.is_error() {
+                let sig = normalize_signature(e.tool_content().unwrap_or(""));
                 clusters
                     .entry((tool.to_string(), sig))
                     .or_default()
@@ -149,7 +150,7 @@ impl Analyzer for ToolFailureClustering {
                     unit: "ratio".into(),
                     n: total as u64,
                     window: format!("{}d", ctx.params().get_int("window_days")),
-                    query: format!("RECALL events WHERE tool_name = \"{tool}\" AND is_error"),
+                    query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error"),
                     review_after_ms: 14 * 86_400_000,
                 }),
             );
@@ -209,9 +210,9 @@ mod tests {
     fn fires_on_frequent_and_dominant_cluster() {
         let mut sub = TestSubstrate::new();
         for _ in 0..5 {
-            sub.add_event("stripe_refund", true, "rate_limited 429");
+            sub.add_tool_call("stripe_refund", true, "rate_limited 429");
         }
-        sub.add_event("stripe_refund", false, "ok");
+        sub.add_tool_call("stripe_refund", false, "ok");
         let drafts = sub.analyze(&ToolFailureClustering::new(), 10_000);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].action_kind, ActionKind::ClusterFailure);
@@ -221,10 +222,10 @@ mod tests {
     #[test]
     fn silent_below_rate_threshold() {
         let mut sub = TestSubstrate::new();
-        sub.add_event("search", true, "boom 500");
-        sub.add_event("search", true, "boom 500");
+        sub.add_tool_call("search", true, "boom 500");
+        sub.add_tool_call("search", true, "boom 500");
         for _ in 0..20 {
-            sub.add_event("search", false, "ok");
+            sub.add_tool_call("search", false, "ok");
         }
         // 2 errors of 22 calls = 9% < 40%.
         assert!(sub
