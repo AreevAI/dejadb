@@ -1,0 +1,153 @@
+//! Test-only conveniences over `ReferenceSubstrate`: grain builders and a
+//! params-resolving `analyze` helper so each analyzer runs with its manifest
+//! defaults (not empty params). Compiled only under `cfg(test)`.
+
+use crate::analyzer::{AnalyzeCtx, Analyzer, OutcomeInput};
+use crate::model::GrainRecord;
+use crate::recommendation::RecDraft;
+use crate::reference::ReferenceSubstrate;
+use serde_json::{json, Map, Value};
+
+pub struct TestSubstrate {
+    pub inner: ReferenceSubstrate,
+    namespaces: Vec<String>,
+    outcomes: Vec<OutcomeInput>,
+    clock: i64,
+}
+
+impl TestSubstrate {
+    pub fn new() -> Self {
+        TestSubstrate {
+            inner: ReferenceSubstrate::new(),
+            namespaces: vec![],
+            outcomes: vec![],
+            clock: 0,
+        }
+    }
+
+    fn tick(&mut self) -> i64 {
+        self.clock += 1;
+        self.clock * 1000
+    }
+
+    pub fn add_fact(&mut self, subject: &str, relation: &str, object: &str) -> String {
+        let created = self.tick();
+        self.push_fact("test", subject, relation, object, created, None)
+    }
+
+    pub fn add_fact_valid_to(
+        &mut self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        valid_to_ms: i64,
+    ) -> String {
+        let created = self.tick();
+        self.push_fact(
+            "test",
+            subject,
+            relation,
+            object,
+            created,
+            Some(valid_to_ms),
+        )
+    }
+
+    fn push_fact(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        created: i64,
+        valid_to: Option<i64>,
+    ) -> String {
+        let mut fields = Map::new();
+        fields.insert("subject".into(), json!(subject));
+        fields.insert("relation".into(), json!(relation));
+        fields.insert("object".into(), json!(object));
+        fields.insert("namespace".into(), json!(ns));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "fact".into(),
+            namespace: ns.into(),
+            created_at_ms: created,
+            valid_to_ms: valid_to,
+            superseded_by: None,
+            fields,
+        })
+    }
+
+    pub fn add_event(&mut self, tool: &str, is_error: bool, content: &str) -> String {
+        let created = self.tick();
+        let mut fields = Map::new();
+        fields.insert("tool_name".into(), json!(tool));
+        fields.insert("is_error".into(), json!(is_error));
+        fields.insert("content".into(), json!(content));
+        fields.insert("namespace".into(), json!("test"));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "event".into(),
+            namespace: "test".into(),
+            created_at_ms: created,
+            valid_to_ms: None,
+            superseded_by: None,
+            fields,
+        })
+    }
+
+    pub fn add_observation(&mut self, ns: &str, body: &str) -> String {
+        let created = self.tick();
+        let mut fields = Map::new();
+        fields.insert("body".into(), json!(body));
+        fields.insert("namespace".into(), json!(ns));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "observation".into(),
+            namespace: ns.into(),
+            created_at_ms: created,
+            valid_to_ms: None,
+            superseded_by: None,
+            fields,
+        })
+    }
+
+    pub fn add_fork(&mut self, entity: &str, heads: &[&str]) {
+        self.inner.register_fork(entity, heads);
+    }
+
+    pub fn set_outcome_inputs(&mut self, outcomes: Vec<OutcomeInput>) {
+        self.outcomes = outcomes;
+    }
+
+    /// Run an analyzer with its manifest-default params.
+    pub fn analyze(&self, analyzer: &dyn Analyzer, now_ms: i64) -> Vec<RecDraft> {
+        self.analyze_with(analyzer, now_ms, &[])
+    }
+
+    /// Run an analyzer with parameter overrides.
+    pub fn analyze_with(
+        &self,
+        analyzer: &dyn Analyzer,
+        now_ms: i64,
+        overrides: &[(&str, Value)],
+    ) -> Vec<RecDraft> {
+        let mut ov = Map::new();
+        for (k, v) in overrides {
+            ov.insert((*k).to_string(), v.clone());
+        }
+        let params = analyzer
+            .manifest()
+            .resolve_params(&ov)
+            .expect("valid params");
+        let ctx = AnalyzeCtx::new(
+            &self.inner,
+            &params,
+            &self.namespaces,
+            None,
+            now_ms,
+            &self.outcomes,
+        );
+        analyzer.analyze(&ctx).expect("analyze ok")
+    }
+}

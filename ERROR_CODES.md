@@ -38,11 +38,15 @@ structured logging and interface envelopes.
 | `VAL` | Request / input validation (cross-cutting) | `DejaDbError` |
 | `CAL` | CAL language: lexer, parser, executor, ASSEMBLE, templates, saved queries | `CalError` — `dejadb-cal/src/errors.rs` |
 | `SYS` | Internal / unexpected engine faults | `DejaDbError` |
+| `WSR` | Waiser self-improvement engine: analyzers, recommendation lifecycle, governance gates | `waiser::Error` — `crates/waiser/src/error.rs` |
 
 The MCP server, HTTP console, CLI, and Python binding do not mint their own
 codes — they surface the underlying `DejaDbError` / `CalError` (and thus its
 code) through their own envelopes (MCP `isError` result, HTTP body, stderr,
-`PyValueError`).
+`PyValueError`). The `waiser` engine crate is the exception: it has zero
+dejadb dependencies, so it owns the `WSR` domain. REVIEW/APPLY *syntax*
+errors stay in the substrate's `CAL` domain; `WSR` covers engine semantics
+(lifecycle, gates, analyzers).
 
 ## Registry — non-CAL codes
 
@@ -62,6 +66,25 @@ code) through their own envelopes (MCP `isError` result, HTTP body, stderr,
 | `CAL-E083` | `AccumulateRetryExhausted` | ACCUMULATE retry budget exhausted (CAL-domain, bubbles through the store) |
 | `CAL-E084` | `AccumulateInternal` | ACCUMULATE internal failure |
 | `CAL-E085` | `AccumulateBackpressureRejected` | ACCUMULATE inflight cap exceeded |
+
+`waiser::Error` — Waiser engine (`crates/waiser/src/error.rs`), append-only:
+
+| Code | Variant | Meaning |
+|------|---------|---------|
+| `WSR-E001` | `Substrate` | A substrate call (grain read/write, CAL) failed |
+| `WSR-E002` | `CalUnsupported` | The substrate cannot execute the given CAL |
+| `WSR-E010` | `InvalidTargetRef` | A `target_ref` did not parse to a known scheme |
+| `WSR-E011` | `InvalidProposal` | A proposal payload failed validation (incl. missing BECAUSE) |
+| `WSR-E012` | `InvalidRecommendation` | A recommendation draft/grain is malformed |
+| `WSR-E020` | `LifecycleViolation` | An illegal lifecycle transition was attempted |
+| `WSR-E021` | `SelfApproval` | The approving actor authored the recommendation |
+| `WSR-E022` | `ScopeDenied` | The caller lacks a required scope (review/apply) |
+| `WSR-E023` | `DestructiveGated` | Destructive apply without admin + allow_destructive |
+| `WSR-E030` | `AnalyzerFailed` | One analyzer's run failed (its findings are dropped) |
+| `WSR-E031` | `ParamInvalid` | An analyzer parameter is outside its `ParamSpec` |
+| `WSR-E032` | `CapabilityMissing` | A required substrate capability (forks/telemetry/embeddings) is absent |
+| `WSR-E040` | `NotFound` | No recommendation at the given hash |
+| `WSR-E099` | `Internal` | Unexpected internal fault (should not happen — file a bug) |
 
 `SchemaSubsetError` — portable tool-schema (bind-tool) validation
 (`dejadb-core/src/types/json_schema_subset.rs`):

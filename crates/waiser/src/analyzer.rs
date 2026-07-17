@@ -1,0 +1,167 @@
+//! The `Analyzer` trait and `AnalyzeCtx` — the SDK seam. `AnalyzeCtx` is a
+//! struct (not a trait) so the engine can add methods without breaking
+//! implementors. It exposes only read-only substrate access plus resolved
+//! params, the watermark, and `now` — analyzers cannot write (trust floor),
+//! enforced by holding `&dyn SubstrateRead`.
+
+use crate::error::Result;
+use crate::manifest::{AnalyzerManifest, Params};
+use crate::model::GrainRecord;
+use crate::recommendation::RecDraft;
+use crate::substrate::{HeadGroup, ReadOpts, SubstrateRead};
+
+/// One applied recommendation due for outcome review, with its metric already
+/// re-measured by the engine (which owns the `&mut` substrate). The outcome
+/// analyzer makes the deterministic changed/regressed decision over this — I/O
+/// in the engine, judgment in the analyzer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeInput {
+    pub rec_hash: String,
+    pub target_ref: String,
+    pub metric: String,
+    pub baseline: f64,
+    pub current: f64,
+    pub unit: String,
+}
+
+/// The context handed to `analyze`. Read-only by construction.
+pub struct AnalyzeCtx<'a> {
+    reader: &'a dyn SubstrateRead,
+    params: &'a Params,
+    namespaces: &'a [String],
+    watermark_ms: Option<i64>,
+    now_ms: i64,
+    outcome_inputs: &'a [OutcomeInput],
+}
+
+impl<'a> AnalyzeCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        reader: &'a dyn SubstrateRead,
+        params: &'a Params,
+        namespaces: &'a [String],
+        watermark_ms: Option<i64>,
+        now_ms: i64,
+        outcome_inputs: &'a [OutcomeInput],
+    ) -> Self {
+        AnalyzeCtx {
+            reader,
+            params,
+            namespaces,
+            watermark_ms,
+            now_ms,
+            outcome_inputs,
+        }
+    }
+
+    pub fn params(&self) -> &Params {
+        self.params
+    }
+    pub fn now_ms(&self) -> i64 {
+        self.now_ms
+    }
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.watermark_ms
+    }
+    pub fn capabilities(&self) -> crate::substrate::Capabilities {
+        self.reader.capabilities()
+    }
+    pub fn outcome_inputs(&self) -> &[OutcomeInput] {
+        self.outcome_inputs
+    }
+
+    /// All grains of a type across the configured namespaces (or all namespaces
+    /// when none are configured).
+    pub fn grains_of_type(&self, grain_type: &str, opts: ReadOpts) -> Result<Vec<GrainRecord>> {
+        if self.namespaces.is_empty() {
+            self.reader.grains_of_type(grain_type, None, opts)
+        } else {
+            let mut out = Vec::new();
+            for ns in self.namespaces {
+                out.extend(self.reader.grains_of_type(grain_type, Some(ns), opts)?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Live facts across configured namespaces.
+    pub fn facts(&self) -> Result<Vec<GrainRecord>> {
+        self.grains_of_type(crate::model::grain_type::FACT, ReadOpts::default())
+    }
+
+    /// Live observations across configured namespaces.
+    pub fn observations(&self) -> Result<Vec<GrainRecord>> {
+        self.grains_of_type(crate::model::grain_type::OBSERVATION, ReadOpts::default())
+    }
+
+    /// Event grains, optionally windowed by a `since` watermark, live only.
+    pub fn events_since(&self, since_ms: Option<i64>) -> Result<Vec<GrainRecord>> {
+        self.grains_of_type(
+            crate::model::grain_type::EVENT,
+            ReadOpts {
+                live_only: true,
+                since_ms,
+            },
+        )
+    }
+
+    /// Entities with more than one live head (requires the forks capability).
+    pub fn heads(&self) -> Result<Vec<HeadGroup>> {
+        let ns = if self.namespaces.len() == 1 {
+            Some(self.namespaces[0].as_str())
+        } else {
+            None
+        };
+        self.reader.heads(ns)
+    }
+}
+
+/// An analysis unit. Object-safe so `builtin_analyzers()` yields trait objects.
+pub trait Analyzer: Send + Sync {
+    fn manifest(&self) -> &AnalyzerManifest;
+
+    /// Produce recommendation drafts. `dedup_key`, `origin`, and the params
+    /// snapshot are stamped by the engine afterward, not here. Returning an
+    /// error drops *this* analyzer's findings for the run; other analyzers are
+    /// unaffected.
+    fn analyze(&self, ctx: &AnalyzeCtx) -> Result<Vec<RecDraft>>;
+}
+
+/// The default-registered built-in analyzers. Count is test-pinned (§11).
+pub fn builtin_analyzers() -> Vec<Box<dyn Analyzer>> {
+    vec![
+        Box::new(crate::analyzers::tool_failure::ToolFailureClustering::new()),
+        Box::new(crate::analyzers::duplicate_sweep::DuplicateSweep::new()),
+        Box::new(crate::analyzers::contradiction_sweep::ContradictionSweep::new()),
+        Box::new(crate::analyzers::fork_surfacing::ForkSurfacing::new()),
+        Box::new(crate::analyzers::staleness::Staleness::new()),
+        Box::new(crate::analyzers::outcome_review::OutcomeReview::new()),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn there_are_six_builtins_with_unique_ids() {
+        let a = builtin_analyzers();
+        assert_eq!(a.len(), 6, "the first release ships exactly six analyzers");
+        let mut ids: Vec<&str> = a.iter().map(|x| x.manifest().id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "analyzer ids must be unique");
+    }
+
+    #[test]
+    fn all_builtins_are_trust_class_builtin() {
+        for a in builtin_analyzers() {
+            assert_eq!(
+                a.manifest().trust_class,
+                crate::manifest::TrustClass::Builtin,
+                "{} must be builtin trust class",
+                a.manifest().id
+            );
+        }
+    }
+}

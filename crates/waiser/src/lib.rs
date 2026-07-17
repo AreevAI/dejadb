@@ -1,0 +1,57 @@
+//! # Waiser
+//!
+//! The governed self-improvement engine for AI-agent memory. Waiser turns an
+//! agent's own history into **recommendations** — evidence-cited, reviewable,
+//! undoable, measured — and governs every change through four gates (propose,
+//! review, apply, verify). The deterministic core produces useful
+//! recommendations with **zero model calls** by computing over declared grain
+//! semantics, never raw prose.
+//!
+//! This crate is a **standalone engine over an [`OmsSubstrate`]** (CAL text +
+//! grains) with zero DejaDB dependencies (serde only). DejaDB is the first
+//! substrate; [`ReferenceSubstrate`] lets tests run with no store at all.
+//!
+//! ```
+//! use waiser::{Engine, ReferenceSubstrate, RunOptions};
+//!
+//! let mut store = ReferenceSubstrate::new();
+//! let engine = Engine::with_builtins();
+//! let result = engine.run(&mut store, &RunOptions::default(), 1_000).unwrap();
+//! assert!(result.ran());
+//! ```
+//!
+//! See the design proposal (`docs/waiser-proposal.md`) for the full model.
+
+pub mod analyzer;
+pub mod analyzers;
+pub mod cal;
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod manifest;
+pub mod model;
+pub mod recommendation;
+pub mod reference;
+pub mod substrate;
+
+#[cfg(test)]
+mod integration;
+#[cfg(test)]
+mod testkit;
+
+pub use analyzer::{builtin_analyzers, AnalyzeCtx, Analyzer, OutcomeInput};
+pub use engine::{
+    Decision, Engine, RunOptions, RunOutcome, RunResult, Scope, ScopeSet, SkipReason, WAISER_NS,
+};
+pub use error::{Error, Result};
+pub use manifest::{
+    analyzer_family, AnalyzerManifest, AutoApplyClass, CadenceClass, Capability, ParamSpec, Params,
+    TargetClass, Tier, TrustClass,
+};
+pub use model::{ActionKind, GrainRecord, Origin, Severity, TargetRef};
+pub use recommendation::{
+    dedup_key, AuditRecord, MetricSnapshot, ObserverType, Proposal, RecDraft, RecStatus,
+    Recommendation, Summary,
+};
+pub use reference::ReferenceSubstrate;
+pub use substrate::{Capabilities, GrainSpec, HeadGroup, OmsSubstrate, ReadOpts, SubstrateRead};
