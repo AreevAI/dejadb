@@ -16,3 +16,6 @@ __pycache__/
 # cargo-mutants output
 mutants.out/
 mutants.out.old/
+
+# scratch/draft lineage (kept local, not for the repo)
+docs/tmp/
