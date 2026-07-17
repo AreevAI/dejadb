@@ -95,19 +95,19 @@ jobs:
         run: npx napi create-npm-dirs
       - name: Collect per-platform binaries into npm/ dirs
         run: npx napi artifacts
-      - name: Publish platform packages (Windows deferred) + main to npm
+      - name: Publish platform packages + main to npm
         # We do NOT use `napi prepublish` here: it publishes every platform
-        # package in one shot and aborts the whole release if one fails. The
-        # Windows platform package name (dejadb-win32-x64-msvc) currently trips
-        # npm's spam filter (403 on publish; support ticket open), which would
-        # take the whole release down with it.
+        # package in one shot and aborts the whole release if one fails —
+        # useful if any single platform name ever trips npm's spam filter
+        # (403 on publish) and needs to be deferred without taking the whole
+        # release down with it.
         #
         # Instead `prepare-npm.mjs` stamps versions, wires the main package's
-        # optionalDependencies to ALL platforms (incl. the deferred win32, so a
+        # optionalDependencies to ALL platforms (incl. any deferred one, so a
         # later same-version publish resolves for installs), and prints the dirs
-        # to publish now (win32 excluded). We publish each, skipping anything
-        # already on the registry so re-runs are idempotent — including a later
-        # run that un-defers win32, which then publishes only the missing package.
+        # to publish now. We publish each, skipping anything already on the
+        # registry so re-runs are idempotent — including a later run that
+        # un-defers a package, which then publishes only the missing one.
         run: |
           set -euo pipefail
           publish_if_absent() { # $1 = package name, $2 = version, $3 = dir

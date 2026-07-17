@@ -9,15 +9,18 @@
 //   3. prints — one per line on stdout — the platform package dirs that should be
 //      published now (everything except the deferred names).
 //
-// `dejadb-win32-x64-msvc` is deferred: its npm name currently trips npm's spam
-// filter (403 on publish; support ticket open). Its build still runs and its
-// binary is collected, so once the name is unblocked it can be published at the
-// same version — either `cd npm/win32-x64-msvc && npm publish`, or by removing it
-// from DEFER below and re-running release-npm (the publish step skips packages
-// already on the registry, so only win32 goes out).
+// DEFER lists platform package names to skip on this publish run (e.g. a name
+// currently tripping npm's spam filter). A deferred package's build still
+// runs and its binary is collected, so once the name is unblocked it can be
+// published at the same version by removing it from DEFER and re-running
+// release-npm (the publish step skips packages already on the registry, so
+// only the newly-undeferred one goes out).
+//
+// `dejadb-win32-x64-msvc` was deferred here (403 on publish; support ticket
+// open) and unblocked 2026-07-17 — npm whitelisted the name.
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 
-const DEFER = new Set(['dejadb-win32-x64-msvc']);
+const DEFER = new Set();
 
 const mainPath = 'package.json';
 const main = JSON.parse(readFileSync(mainPath, 'utf8'));
