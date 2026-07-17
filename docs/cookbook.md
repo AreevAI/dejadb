@@ -322,7 +322,14 @@ deja memtool '{"command":"create","path":"/memories/notes.md","file_text":"prefe
   --db john.db --ns caller
 ```
 
-## 10. Build an agent that learns (and can unlearn)
+## 10. Build an agent that learns (and can unlearn) — by hand
+
+> This section builds the loop **manually** — you drive reflection and the
+> writes. For the same loop **governed** — deterministic analyzers that find
+> duplicates, contradictions, recurring tool failures, and stale lessons, each
+> as a reviewable, undoable, audited recommendation — see
+> [§12 Self-improve with Waiser](#12-self-improve-with-waiser-governed-deterministic)
+> and [docs/waiser.md](waiser.md). Waiser sits on exactly the substrate below.
 
 A self-improvement loop is: **act → log experience → reflect → distill lessons
 → recall them next time**. DejaDB is the substrate for that loop, not the loop
@@ -527,6 +534,58 @@ deja memtool '{"command":"view","path":"/memories"}' --db mine.db
 To embed while importing (vector recall), add
 `--embed-cmd 'python3 my_embedder.py'` — the command reads text on stdin and
 prints a JSON array of floats.
+
+---
+
+## 12. Self-improve with Waiser (governed, deterministic)
+
+[§10](#10-build-an-agent-that-learns-and-can-unlearn--by-hand) builds the loop
+by hand. **Waiser** governs it: it turns your agent's history into
+recommendations — evidence-cited, reviewable, undoable, measured — with **no
+model calls**. The 60-second proof needs no agent:
+
+```python
+import dejadb, json
+db = dejadb.DejaDB("proof.db", actor="user:me")
+for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
+db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
+db.add_fact("acme", "deploy_target", "eu-west-1", 0.9)     # a contradiction
+
+db.waiser_run()                                            # deterministic; bare = never gated
+pending = json.loads(db.recommendations('{"status":"pending"}'))
+for r in pending: print(r["severity"], r["summary"])
+
+# model judgment — apply one with a reason, dismiss one with a reason
+db.apply_recommendation(pending[0]["hash"], because="retries belong in the client")
+db.dismiss_recommendation(pending[1]["hash"], "kept the newer region intentionally")
+```
+
+From the CLI, the same loop against a seeded demo backend:
+
+```bash
+deja init --db demo.db --template demo --ns caller     # plants dupes, a contradiction, a stale grain
+deja waiser run  --db demo.db --ns caller
+deja waiser list --db demo.db --ns caller              # the queue
+deja waiser approve <hash> --db demo.db --ns caller --because "confirmed"
+deja waiser apply   <hash> --db demo.db --ns caller --because "consolidating"
+deja ui --db demo.db --token-env DEJA_TOKEN            # the Waiser tab (token-less = read-only)
+```
+
+Ops without a daemon — a run is a cheap idempotent command hosts trigger
+however they already do (hook, cron, CI):
+
+```bash
+deja waiser run  --db agent.db --min-new 20 --min-new-errors 3 --if-stale 6h --quiet   # cheap no-op off a watermark
+deja waiser list --db agent.db --fail-on high --format json                            # CI gate: exit 2 on match
+```
+
+Import history that predates DejaDB, auto-apply structural curation via a
+policy file, and the multi-agent supervisor pattern each have a runnable
+example under [`../examples/`](../examples/). Auto-apply is off unless a host
+`waiser-policy.json` grants it, and even then it is limited to non-destructive
+structural curation with no model- or tool-derived free text. Full guide:
+[docs/waiser.md](waiser.md).
 
 ---
 
