@@ -30,6 +30,7 @@ pub mod engine;
 pub mod error;
 pub mod manifest;
 pub mod model;
+pub mod policy;
 pub mod recommendation;
 pub mod reference;
 pub mod substrate;
@@ -49,6 +50,7 @@ pub use manifest::{
     TargetClass, Tier, TrustClass,
 };
 pub use model::{ActionKind, GrainRecord, Origin, Severity, TargetRef};
+pub use policy::{AutoApplyGrant, Policy, TelemetryMode};
 pub use recommendation::{
     dedup_key, AuditRecord, MetricSnapshot, ObserverType, Proposal, RecDraft, RecStatus,
     Recommendation, Summary,

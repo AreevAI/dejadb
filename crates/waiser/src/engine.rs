@@ -104,6 +104,9 @@ pub struct RunResult {
     pub proposed: u64,
     pub deduped: u64,
     pub stored: u64,
+    /// Of the stored recommendations, how many were auto-applied by policy.
+    #[serde(default)]
+    pub auto_applied: u64,
     #[serde(default)]
     pub analyzers_run: Vec<String>,
     #[serde(default)]
@@ -120,6 +123,7 @@ impl RunResult {
             proposed: 0,
             deduped: 0,
             stored: 0,
+            auto_applied: 0,
             analyzers_run: vec![],
             analyzers_skipped: vec![],
         }
@@ -130,22 +134,38 @@ impl RunResult {
     }
 }
 
-/// The engine holds the registered analyzers.
+/// The engine holds the registered analyzers and the host policy.
 pub struct Engine {
     analyzers: Vec<Box<dyn Analyzer>>,
+    policy: crate::policy::Policy,
 }
 
 impl Engine {
-    /// An engine with the six default built-ins.
+    /// An engine with the six default built-ins and a default (fully closed)
+    /// policy — nothing auto-applies.
     pub fn with_builtins() -> Self {
         Engine {
             analyzers: crate::analyzer::builtin_analyzers(),
+            policy: crate::policy::Policy::default(),
         }
     }
 
     /// An engine with no analyzers (register your own).
     pub fn empty() -> Self {
-        Engine { analyzers: vec![] }
+        Engine {
+            analyzers: vec![],
+            policy: crate::policy::Policy::default(),
+        }
+    }
+
+    /// Install a host policy (the only place auto-apply is granted).
+    pub fn with_policy(mut self, policy: crate::policy::Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> &crate::policy::Policy {
+        &self.policy
     }
 
     /// Register an additional analyzer (the linked-Rust seam).
@@ -193,6 +213,13 @@ impl Engine {
                 analyzers_skipped.push(AnalyzerSkip {
                     id: m.id.clone(),
                     reason: "disabled".into(),
+                });
+                continue;
+            }
+            if self.policy.denies(m.family()) {
+                analyzers_skipped.push(AnalyzerSkip {
+                    id: m.id.clone(),
+                    reason: "denied by host policy".into(),
                 });
                 continue;
             }
@@ -255,7 +282,13 @@ impl Engine {
         let mut seen = BTreeSet::new();
         let mut survivors = Vec::new();
         for c in candidates {
-            if let Some(floor) = severity_floor_for(&persisted, &c.analyzer) {
+            // Effective floor = the stricter of the file config and host policy.
+            let family = crate::manifest::analyzer_family(&c.analyzer);
+            let floor = [severity_floor_for(&persisted, &c.analyzer), self.policy.severity_floor(family)]
+                .into_iter()
+                .flatten()
+                .max();
+            if let Some(floor) = floor {
                 if c.severity < floor {
                     continue;
                 }
@@ -275,8 +308,10 @@ impl Engine {
         }
         let deduped = proposed - survivors.len() as u64;
 
-        // Phase 3 (needs &mut): store survivors + propose audit.
+        // Phase 3 (needs &mut): store survivors + propose audit, then
+        // auto-apply the ones the host policy grants (all gates in §6.3).
         let mut stored = 0u64;
+        let mut auto_applied = 0u64;
         for mut rec in survivors {
             let spec = rec.to_grain_spec(WAISER_NS)?;
             let hash = sub.put_grain(&spec)?;
@@ -297,8 +332,13 @@ impl Engine {
                 .status_index
                 .insert(hash.clone(), RecStatus::Pending);
             persisted.creators.insert(hash.clone(), actor);
-            persisted.audit_heads.insert(hash, audit_hash);
+            persisted.audit_heads.insert(hash.clone(), audit_hash);
             stored += 1;
+
+            if self.can_auto_apply(&rec) {
+                self.auto_apply(sub, &mut persisted, &rec, now_ms)?;
+                auto_applied += 1;
+            }
         }
 
         persisted.state.last_run_ms = Some(now_ms);
@@ -313,9 +353,81 @@ impl Engine {
             proposed,
             deduped,
             stored,
+            auto_applied,
             analyzers_run,
             analyzers_skipped,
         })
+    }
+
+    /// Evaluate the auto-apply gate (§6.3) — ALL preconditions must hold:
+    /// host opt-in + policy grant, builtin origin, memory/query target,
+    /// non-destructive, and engine-side shape verification (SUPERSEDE-only
+    /// structural curation — never an ADD that introduces evidence-derived
+    /// text). A default (closed) policy never grants, so nothing auto-applies.
+    fn can_auto_apply(&self, rec: &Recommendation) -> bool {
+        if !rec.origin.auto_apply_eligible() || rec.destructive {
+            return false;
+        }
+        let Ok(target) = TargetRef::parse(&rec.target_ref) else {
+            return false;
+        };
+        let family = crate::manifest::analyzer_family(&rec.analyzer);
+        if !self.policy.grants_auto_apply(family, target.target_class(), rec.severity) {
+            return false;
+        }
+        // Shape verification: only a CAL batch of pure SUPERSEDE statements is
+        // structural curation. An ADD (introducing content) or FORGET
+        // (destructive) disqualifies.
+        match &rec.proposal {
+            Proposal::Cal { cal } => cal
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .all(|l| l.len() >= 9 && l[..9].eq_ignore_ascii_case("SUPERSEDE")),
+            _ => false,
+        }
+    }
+
+    /// Apply a recommendation as `policy:auto` (the only `pending → applied`
+    /// path). Records the applied inverse + a hash-chained audit grain.
+    fn auto_apply<S: OmsSubstrate>(
+        &self,
+        sub: &mut S,
+        p: &mut WaiserPersisted,
+        rec: &Recommendation,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut created = Vec::new();
+        if let Proposal::Cal { cal } = &rec.proposal {
+            for r in sub.execute_cal(cal)? {
+                if let Some(h) = r.get("hash").and_then(Value::as_str) {
+                    created.push(h.to_string());
+                }
+            }
+        }
+        let applied = AppliedRecord {
+            applied_at_ms: now_ms,
+            target_ref: rec.target_ref.clone(),
+            rollbackable: rec.rollbackable,
+            created_hashes: created,
+            metric: rec.metric.clone(),
+        };
+        let prev = p.audit_heads.get(&rec.hash).cloned();
+        let audit = AuditRecord {
+            rec_hash: rec.hash.clone(),
+            from: Some(RecStatus::Pending),
+            to: RecStatus::Applied,
+            actor: "policy:auto".into(),
+            observer_type: ObserverType::Policy,
+            because: "auto-applied per host policy".into(),
+            previous_audit_hash: prev,
+            at_ms: now_ms,
+        };
+        let audit_hash = sub.put_grain(&audit.to_grain_spec(WAISER_NS))?;
+        p.audit_heads.insert(rec.hash.clone(), audit_hash);
+        p.status_index.insert(rec.hash.clone(), RecStatus::Applied);
+        p.applied.insert(rec.hash.clone(), applied);
+        Ok(())
     }
 
     /// Approve or reject a pending recommendation. Requires the `review` scope,

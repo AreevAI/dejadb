@@ -208,6 +208,17 @@ impl TargetRef {
         )
     }
 
+    /// The policy target class: `memory` (grain/entity), `query`
+    /// (query/template), `prompt` (doc), or `host`.
+    pub fn target_class(&self) -> &'static str {
+        match self.scheme.as_str() {
+            "grain" | "entity" => "memory",
+            "query" | "template" => "query",
+            "doc" => "prompt",
+            _ => "host",
+        }
+    }
+
     pub fn as_string(&self) -> String {
         format!("{}:{}", self.scheme, self.opaque)
     }

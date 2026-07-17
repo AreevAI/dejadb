@@ -5,6 +5,7 @@
 
 use crate::engine::{Decision, Engine, RunOptions, RunOutcome, Scope, ScopeSet, SkipReason};
 use crate::error::Error;
+use crate::policy::Policy;
 use crate::recommendation::{ObserverType, RecStatus};
 use crate::testkit::TestSubstrate;
 
@@ -348,6 +349,74 @@ fn min_new_errors_wakes_a_run() {
     assert!(
         e.run(&mut sub.inner, &opts, 2_000).unwrap().ran(),
         "error gate wakes the run"
+    );
+}
+
+#[test]
+fn default_policy_auto_applies_nothing() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "Enterprise");
+    let e = Engine::with_builtins();
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 0, "a closed policy applies nothing");
+    assert!(e
+        .recommendations(&sub.inner, None)
+        .unwrap()
+        .iter()
+        .all(|x| x.status == RecStatus::Pending));
+}
+
+#[test]
+fn policy_grant_auto_applies_structural_consolidation() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "Enterprise"); // exact dup → SUPERSEDE-only proposal
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 1, "the consolidation is auto-applied");
+    let applied = e.recommendations(&sub.inner, Some(RecStatus::Applied)).unwrap();
+    assert_eq!(applied.len(), 1);
+    assert!(applied[0].analyzer.starts_with("waiser.duplicate_sweep"));
+}
+
+#[test]
+fn auto_apply_never_touches_free_text_add() {
+    // tool-failure proposes an ADD carrying an evidence-derived signature —
+    // shape verification rejects it even when the policy names it.
+    let mut sub = TestSubstrate::new();
+    for _ in 0..5 {
+        sub.add_tool_call("s", true, "boom 1");
+    }
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.tool_failure", "targets": ["memory"], "max_severity": "high"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 0, "an ADD-with-text proposal never auto-applies");
+}
+
+#[test]
+fn policy_deny_disables_an_analyzer() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "Enterprise");
+    let policy = Policy::from_json(r#"{"deny": ["waiser.duplicate_sweep"]}"#).unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert!(
+        e.recommendations(&sub.inner, None)
+            .unwrap()
+            .iter()
+            .all(|x| !x.analyzer.starts_with("waiser.duplicate_sweep")),
+        "a denied analyzer produces nothing"
     );
 }
 

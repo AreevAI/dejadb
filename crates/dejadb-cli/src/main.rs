@@ -10,7 +10,7 @@ use dejadb_core::error::Hash;
 use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::DejaDB;
 use dejadb_waiser::{now_ms, DejaDbSubstrate};
-use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet, Severity};
+use waiser::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
 
 const USAGE: &str = "\
 deja — embedded memory engine for AI agents (OMS + CAL on Turso)
@@ -23,11 +23,12 @@ USAGE:
 COMMANDS:
   init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
            print the Claude Code hook snippet (never writes your settings)
-  waiser   <run|list|show|approve|reject|apply|rollback|analyzers>   the
+  waiser   <run|list|show|approve|reject|apply|rollback|analyzers|policy>  the
            governed self-improvement loop (deterministic, no LLM):
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
+           [--policy FILE] grants auto-apply (else $WAISER_POLICY); `policy` prints it
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
            [--idempotent]   no-op if this exact value is already the head
@@ -1340,7 +1341,19 @@ fn resolve_hash(engine: &Engine, sub: &DejaDbSubstrate, prefix: &str) -> Result<
     }
 }
 
-/// `deja waiser <run|list|show|approve|reject|apply|rollback|analyzers|status>`.
+/// Load the host policy from `--policy FILE` or `$WAISER_POLICY` (§6.2).
+fn load_policy(flags: &HashMap<String, String>) -> Result<Option<Policy>, String> {
+    let path = flag(flags, "policy").or_else(|| std::env::var("WAISER_POLICY").ok());
+    match path {
+        Some(p) => {
+            let s = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
+            Ok(Some(Policy::from_json(&s).map_err(|e| e.to_string())?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `deja waiser <run|list|show|approve|reject|apply|rollback|analyzers|policy|status>`.
 fn run_waiser(
     m: DejaDB,
     ns: &str,
@@ -1349,7 +1362,13 @@ fn run_waiser(
 ) -> Result<(), String> {
     let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("status");
     let mut sub = DejaDbSubstrate::new(m, Some(ns.to_string()));
-    let engine = Engine::with_builtins();
+    // Host policy (--policy FILE or $WAISER_POLICY) — the only place
+    // auto-apply is granted. Absent → a closed default (nothing auto-applies).
+    let policy = load_policy(flags)?;
+    let engine = match policy {
+        Some(p) => Engine::with_builtins().with_policy(p),
+        None => Engine::with_builtins(),
+    };
     let now = now_ms();
     let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());
     let observer = ObserverType::Human;
@@ -1370,9 +1389,10 @@ fn run_waiser(
             } else if res.ran() {
                 if !flags.contains_key("quiet") {
                     eprintln!(
-                        "waiser: ran — proposed {} ({} deduped) across {} analyzer(s)",
+                        "waiser: ran — proposed {} ({} deduped, {} auto-applied) across {} analyzer(s)",
                         res.stored,
                         res.deduped,
+                        res.auto_applied,
                         res.analyzers_run.len()
                     );
                 }
@@ -1494,6 +1514,13 @@ fn run_waiser(
                     m.id, m.tier, m.default_on, m.title
                 );
             }
+        }
+        // Config reporting: the effective host policy (read-only).
+        "policy" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(engine.policy()).map_err(|e| e.to_string())?
+            );
         }
         // Bare `deja waiser` (or an unknown subcommand) prints a health summary.
         _ => {
