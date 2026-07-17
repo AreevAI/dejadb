@@ -250,6 +250,7 @@
       <button class="tab active" id="tab-mem" onclick="showTab('mem')">memories</button>
       <button class="tab" id="tab-graph" onclick="showTab('graph')">graph</button>
       <button class="tab" id="tab-query" onclick="showTab('query')">query <kbd>&#8984;K</kbd></button>
+      <button class="tab" id="tab-waiser" onclick="showTab('waiser')">waiser<span id="waiserChip"></span></button>
     </div>
 
     <div class="panel" id="pane-mem">
@@ -306,6 +307,17 @@
         <div id="warns"></div>
       </div>
       <p class="hint" style="margin-top:12px">CAL has no bulk destruction &mdash; DELETE/DROP are parse errors by design. The only destructive statement is a gated single-grain <code>FORGET &lt;hash&gt;</code> (on by default); bulk erasure stays a host-level op (MCP <code>dejadb_forget</code>, memory-tool <code>delete</code>).</p>
+    </div>
+
+    <div class="panel" id="pane-waiser" hidden>
+      <div class="toolbar">
+        <button onclick="waiserRun()">Run analysis</button>
+        <span class="spacer"></span>
+        <span id="waiserHealth" class="hint"></span>
+        <button class="ghost" onclick="loadWaiser()" title="reload">&#8635;</button>
+      </div>
+      <div class="tablewrap" id="waiserTable"><div class="empty">loading&hellip;</div></div>
+      <p class="hint" style="margin-top:12px">Every recommendation cites its evidence; every apply is audited and (unless it's a <code>FORGET</code>) undoable; the analyzers are deterministic &mdash; no model runs here. A read-only console (no <code>--token-env</code>) can browse the queue but not act.</p>
     </div>
   </section>
 
@@ -600,11 +612,110 @@ function showTab(t) {
   ACTIVETAB = t;
   $('pane-mem').hidden = t !== 'mem'; $('pane-query').hidden = t !== 'query';
   $('pane-graph').hidden = t !== 'graph';
+  $('pane-waiser').hidden = t !== 'waiser';
   $('tab-mem').classList.toggle('active', t === 'mem');
   $('tab-query').classList.toggle('active', t === 'query');
   $('tab-graph').classList.toggle('active', t === 'graph');
+  $('tab-waiser').classList.toggle('active', t === 'waiser');
   if (t === 'query') $('q').focus();
   if (t === 'graph') renderGraphTab();
+  if (t === 'waiser') loadWaiser();
+}
+
+/* ---------- Waiser: the governed self-improvement queue ---------- */
+const SEV_COLOR = { high: '#e5484d', medium: '#f5a623', low: '#3b82f6', info: '#8b8b8b' };
+async function loadWaiser() {
+  const [health, recs] = await Promise.all([
+    api('/api/waiser/health'),
+    api('/api/waiser/recommendations?status=pending'),
+  ]);
+  if (health && health.ok) {
+    const bs = health.by_status || {};
+    $('waiserHealth').textContent =
+      (bs.pending || 0) + ' pending · ' + (bs.applied || 0) + ' applied · ' + (health.total || 0) + ' total';
+    $('waiserChip').textContent = bs.pending ? ' (' + bs.pending + ')' : '';
+  }
+  renderWaiserQueue((recs && recs.recommendations) || []);
+}
+function renderWaiserQueue(recs) {
+  const host = $('waiserTable');
+  host.textContent = '';
+  if (!recs.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = 'no pending recommendations — click Run analysis';
+    host.appendChild(e);
+    return;
+  }
+  const tbl = document.createElement('table');
+  tbl.style.cssText = 'width:100%;border-collapse:collapse';
+  for (const r of recs) {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid var(--line,#333)';
+    // severity
+    const sev = td(tr);
+    const dot = document.createElement('span');
+    dot.style.cssText =
+      'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle;background:' +
+      (SEV_COLOR[r.severity] || '#888');
+    sev.appendChild(dot);
+    sev.appendChild(document.createTextNode(r.severity || ''));
+    // analyzer
+    td(tr).textContent = (r.analyzer || '').replace('waiser.', '');
+    // summary (+ destructive marker)
+    const sm = td(tr);
+    sm.style.width = '55%';
+    sm.textContent = r.summary || '';
+    if (r.destructive) {
+      const d = document.createElement('span');
+      d.textContent = ' ⚠ destructive';
+      d.style.color = '#e5484d';
+      sm.appendChild(d);
+    }
+    // actions
+    const act = td(tr);
+    act.style.whiteSpace = 'nowrap';
+    act.append(
+      actBtn('approve', () => waiserAct(r.hash, 'approve')),
+      actBtn('apply', () => waiserAct(r.hash, 'apply')),
+      actBtn('reject', () => waiserAct(r.hash, 'reject')),
+    );
+    tbl.appendChild(tr);
+  }
+  host.appendChild(tbl);
+}
+function td(tr) {
+  const c = document.createElement('td');
+  c.style.cssText = 'padding:8px 10px;vertical-align:top';
+  tr.appendChild(c);
+  return c;
+}
+function actBtn(label, fn) {
+  const b = document.createElement('button');
+  b.className = 'ghost';
+  b.textContent = label;
+  b.style.marginRight = '4px';
+  b.onclick = fn;
+  return b;
+}
+async function waiserRun() {
+  $('waiserHealth').textContent = 'running…';
+  const res = await api('/api/waiser/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (res && res.ok) toast('ran — ' + res.run.stored + ' proposed, ' + res.run.auto_applied + ' auto-applied');
+  else toast('run failed: ' + ((res && res.error) || 'read-only? add --token-env'));
+  loadWaiser();
+}
+async function waiserAct(hash, action) {
+  const because = window.prompt(action + ' — reason (BECAUSE, required):');
+  if (!because) return;
+  let url, body;
+  if (action === 'apply') { url = '/api/waiser/apply'; body = { hash, because }; }
+  else if (action === 'rollback') { url = '/api/waiser/rollback'; body = { hash, because }; }
+  else { url = '/api/waiser/review'; body = { hash, decision: action === 'reject' ? 'reject' : 'approve', because }; }
+  const res = await api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (res && res.ok) toast(action + ' ✓');
+  else toast(action + ' failed: ' + ((res && res.error) || '?') + (res && res.code ? ' [' + res.code + ']' : ''));
+  loadWaiser();
 }
 
 /* ---------- CAL editor: highlight overlay ---------- */
