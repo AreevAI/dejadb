@@ -84,6 +84,7 @@ errors stay in the substrate's `CAL` domain; `WSR` covers engine semantics
 | `WSR-E031` | `ParamInvalid` | An analyzer parameter is outside its `ParamSpec` |
 | `WSR-E032` | `CapabilityMissing` | A required substrate capability (forks/telemetry/embeddings) is absent |
 | `WSR-E040` | `NotFound` | No recommendation at the given hash |
+| `WSR-E050` | `LlmBackend` | The optional LLM enrichment backend (`--llm-cmd`) is misconfigured or failed (never fatal — the contribution is dropped) |
 | `WSR-E099` | `Internal` | Unexpected internal fault (should not happen — file a bug) |
 
 `SchemaSubsetError` — portable tool-schema (bind-tool) validation

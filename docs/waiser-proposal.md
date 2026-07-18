@@ -1007,12 +1007,15 @@ analysis works here and text-blob memory products cannot do it.
    changed/unchanged with values, propose revert on regression. Closes the
    honesty loop; makes approve and auto-apply accountable.
 
-**Deferred until 2–4 weeks of telemetry exist**: dead queries (saved
-queries nothing ever runs), cold grains (stored but never recalled), budget
-pressure (assembly budgets consistently overflowing), coverage-gap
-clustering (recurring questions with no matching memories; T1). **Evaluated
-and cut**: fact churn (facts superseded unusually often) — no reliable
-deterministic signal.
+**Telemetry-fed (now built).** The recall-telemetry sidecar shipped, and with
+it three of the deferred analyzers: `cold_grains` (stored but never recalled),
+`coverage_gap` (recurring questions with no matching memory), and
+`budget_pressure` (assembly budgets overflowing — opt-in until the ASSEMBLE
+overflow signal is wired). `cold_grains`/`coverage_gap` are default-on at 1.00
+fixture precision. **Still deferred**: dead queries (needs a saved-query
+execution registry) and coverage-gap *clustering* (the T1 embedding-grouped
+form; the exact-question form ships now). **Evaluated and cut**: fact churn
+(facts superseded unusually often) — no reliable deterministic signal.
 
 **Added post-review (peer review Q2/Q3).** Two grain-type analyzers were
 reconsidered against their **field-based** (not event-based) form and shipped:
@@ -1023,8 +1026,10 @@ the precision fixture) and `goal_stagnation` (an active Goal with low
 legitimate long-running work is genuinely ambiguous). Both are advisory
 (`Flag`) and never auto-apply. The earlier cut evaluated only the weaker
 event-based forms ("failure counts trend upward" / "no progress events");
-the field-based forms are cleaner. This makes eight built-in analyzers (seven
-default-on); `skill_stall` is the first that distills a *capability* signal
+the field-based forms are cleaner. With the three telemetry-fed analyzers this
+makes **eleven built-in analyzers (nine default-on**; goal-stagnation and
+budget-pressure opt-in); `skill_stall` is the first that distills a *capability*
+signal, and `cold_grains`/`coverage_gap` are the first that measure *utility*
 rather than pure memory hygiene.
 
 **Precision rule (brand-critical)**: NO invented precision percentages

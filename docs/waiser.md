@@ -56,7 +56,7 @@ deja ui --db demo.db --token-env DEJA_TOKEN   # the Waiser tab shows the queue
 
 ```
 capture  (tool calls, facts, events)        — record_tool_call / add / import
-  → analyze   (deterministic, typed)         — eight analyzers over grain semantics
+  → analyze   (deterministic, typed)         — eleven analyzers over grain semantics
   → recommend (recommendation + evidence)    — dedup'd, template-rendered, cited
   → govern    (review / policy auto-apply)   — four gates, hash-chained audit
   → apply     (undoable supersession)        — scope-checked at execution
@@ -87,9 +87,12 @@ syncs with the file and is queryable.
 
 ## The analyzers
 
-Eight built-in analyzers, all deterministic (T0/T1), computing over typed
-grains — never raw prose. Seven are default-on; goal stagnation is opt-in
-(see the table):
+Eleven built-in analyzers, all deterministic (T0/T1), computing over typed
+grains — never raw prose. Nine are default-on; goal stagnation and budget
+pressure are opt-in (see the table). The last three are **telemetry-fed** —
+they read the recall-telemetry sidecar (below) and move Waiser from *hygiene*
+(is memory internally correct?) to *utility* (is memory used, and does it
+help?):
 
 | Analyzer | Fires on | Proposes |
 |---|---|---|
@@ -100,15 +103,63 @@ grains — never raw prose. Seven are default-on; goal stagnation is opt-in
 | `staleness` | a grain past its declared `valid_to` | a single-grain `FORGET` (destructive, never auto-applies) |
 | `skill_stall` | a Skill practiced ≥N times whose proficiency stays low — doing it, not getting better at it | an advisory flag (never auto-applies) |
 | `goal_stagnation` | an active Goal with little progress that's gone stale (**opt-in** — "stalled" is ambiguous; enable per file) | an advisory flag |
+| `cold_grains` *(telemetry)* | a live fact never recalled past a grace window — memory not earning its place | a retire-candidate flag (advisory; cold ≠ wrong) |
+| `coverage_gap` *(telemetry)* | a recurring recall question that keeps returning nothing — knowledge the memory should hold | a gap flag (advisory; the fix is to *add* memory) |
+| `budget_pressure` *(telemetry)* | context assembly repeatedly overflowing its token budget (**opt-in** — until the ASSEMBLE overflow signal is wired) | a flag: raise the budget or curate |
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin
 waiser_precision` scores each analyzer against a labeled fixture and gates
-CI at 0.90. On the current fixture the five default-on analyzers it covers —
-contradiction, duplicate, staleness, tool-failure, skill-stall — each score
-**1.00** precision and recall; `fork_surfacing` and `outcome_review` need
-concurrent heads / applied history and are covered by the crate tests
-instead. See `crates/dejadb-bench/RESULTS.md` for the table.
+CI at 0.90. On the current fixture the seven default-on analyzers it covers —
+contradiction, duplicate, staleness, tool-failure, skill-stall, **cold-grains,
+and coverage-gap** — each score **1.00** precision and recall; `fork_surfacing`
+and `outcome_review` need concurrent heads / applied history, and
+`budget_pressure` is a global signal, so those three are covered by the crate
+tests instead. See `crates/dejadb-bench/RESULTS.md` for the table.
+
+## Recall telemetry (the utility signal)
+
+Telemetry is what lets the last three analyzers exist. A disposable
+`<file>.telemetry.db` sidecar records what recall actually surfaced — which
+grains were retrieved, which questions came back empty, how often — so Waiser
+can see memory *utility*, not just internal consistency.
+
+- **Host-only; off in the library, `aggregate` for agent hosts.** The `deja`
+  CLI (`--telemetry off|aggregate|full`, default aggregate) and the Python/Node
+  constructors (`telemetry="aggregate"`) turn it on; a bare library `open()`
+  records nothing. It is never a file-truth.
+- **Buffered and non-blocking.** The recall hot path only pushes an in-memory
+  event — no SQLite I/O touches the ~136µs recall / 50ms voice budgets (proven:
+  voice-loop recall p50 stays ~82µs with telemetry on). The buffer drains
+  off-path.
+- **Encrypted under the same key** as the main file (crypto-erasure covers it),
+  **never syncs** (the hub carries the memory file only), **rebuildable** —
+  losing it costs evidence detail, never state. `FORGET` synchronously scrubs
+  it. Modes: `off` | `aggregate` (rollups) | `full` (+ a per-recall ring log).
+
+The console **Sessions** view visualizes it; `GET /api/waiser/telemetry` serves it.
+
+## LLM enrichment (optional)
+
+The deterministic loop closes with no model. Attach one with `deja waiser run
+--llm-cmd 'CMD'` and the pipeline gains two **strictly additive** stages —
+`ANALYZE → DISCOVER → ENRICH → VALIDATE+DEDUP → STORE` — that are the identity
+when no backend is set:
+
+- **DISCOVER** — the model proposes *additional* findings determinism can't see
+  (a semantic contradiction, a stale assumption). Every draft must **cite
+  evidence** from the request bundle (uncited → dropped) and target a memory
+  entity; it is stamped `origin = llm`, so it can **never auto-apply**, and it
+  is advisory. The deterministic findings are unchanged — the LLM only adds.
+- **ENRICH** — a whitelisted one-line `guidance` note on a deterministic
+  finding; the engine-templated summary is always kept.
+- **Fail-soft**: a failed/garbled/slow backend drops the contribution, never
+  the run. Instructions never interleave with (untrusted) evidence text.
+
+`CommandLlm` mirrors `--embed-cmd`: a JSON request on stdin → a JSON response on
+stdout, one process per call, probed at construction. CLI-only, never persisted.
+Ready-to-run backends live in `examples/llm/` (`claude -p`, OpenAI, ollama, and
+a dependency-free mock) with the protocol documented.
 
 ## Surfaces
 
@@ -116,7 +167,7 @@ instead. See `crates/dejadb-bench/RESULTS.md` for the table.
 
 ```
 deja init   [--template blank|demo|coding-agent] [--ns NS]   seed a backend + print hooks
-deja waiser run     [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
+deja waiser run     [--min-new N --min-new-errors N --if-stale 6h --llm-cmd 'CMD' --format json --quiet]
 deja waiser list    [--status pending|applied|all] [--fail-on high]   (exit 2 on match → CI gate)
 deja waiser show <hash>
 deja waiser approve|reject|apply|rollback <hash> --because "…" [--actor A] [--allow-destructive]
@@ -261,17 +312,26 @@ Existing write callers add `--token-env`; a token unlocks review + apply.
 - **Tool grains.** The flagship analyzer reads Tool grains (0x05), which
   carry `tool_name`/`is_error`/`content` natively. `record_tool_call` and
   `deja migrate --from tool-log` both produce them.
-- **Determinism.** A waiser run's recommendations are a pure function of
-  (store state, params) — the same finding yields the same `dedup_key` on any
-  host, so a synced file behaves identically on its next host.
+- **Determinism.** A waiser run's *deterministic* recommendations are a pure
+  function of (store state, params, now) — the same finding yields the same
+  `dedup_key` on any host, so a synced file behaves identically on its next
+  host. The optional LLM layer only *adds* `origin = llm` drafts; it never
+  changes the deterministic set.
 
 ## Status
 
-Built and tested: the engine (eight analyzers, lifecycle, dedup, gating,
-auto-apply, the multi-horizon Verify gate), the DejaDB adapter, the
-`deja waiser` CLI + `deja init`, the
-Python/Node bindings, the MCP tools, the tool-log importer, the policy file,
-the `/api/waiser/*` API, the read-only-token-less auth change, the Waiser
-console tab, and the precision bench. Not yet built: the optional LLM
-enrichment layer, the telemetry sidecar and its analyzers, and the console's
-Sessions/Setup editors. See `waiser-proposal.md` for the full plan.
+Built and tested: the engine (eleven analyzers, lifecycle, dedup, gating,
+auto-apply, the multi-horizon Verify gate, the optional LLM DISCOVER/ENRICH
+stages), the recall-telemetry sidecar and its three telemetry-fed analyzers,
+the DejaDB adapter, the `deja waiser` CLI + `deja init` (incl. `--telemetry`
+and `--llm-cmd`), the Python/Node bindings (telemetry-enabled), the MCP tools,
+the tool-log importer, the policy file, the `/api/waiser/*` API (incl.
+`/telemetry`), the read-only-token-less auth, the Waiser console tab (queue /
+analyzers / **sessions** / outcomes / **setup**), the `examples/llm/` backends,
+and the precision bench.
+
+Remaining follow-ups (documented, not blockers): wiring the ASSEMBLE
+overflow signal into `budget_pressure` (opt-in until then); console config
+*editing* (the Setup view is read-only today); the LLM operator-taste history
+(20 recent approvals/rejections, currently passed empty); and `--llm-cmd` on
+the bindings. See `waiser-proposal.md` for the full plan.

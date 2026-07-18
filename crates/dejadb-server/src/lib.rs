@@ -646,9 +646,9 @@ impl UiServer {
                     match (access, queries, budget) {
                         (Ok(mut a), Ok(mut q), Ok(b)) => {
                             // Most-recalled first; recurring-gap questions first.
-                            a.sort_by(|x, y| y.recall_count.cmp(&x.recall_count));
+                            a.sort_by_key(|x| std::cmp::Reverse(x.recall_count));
                             a.truncate(200);
-                            q.sort_by(|x, y| y.run_count.cmp(&x.run_count));
+                            q.sort_by_key(|x| std::cmp::Reverse(x.run_count));
                             q.truncate(200);
                             ok_json(json!({
                                 "ok": true,

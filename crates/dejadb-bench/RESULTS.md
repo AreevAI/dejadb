@@ -248,18 +248,23 @@ regressions in CI.
 
 | analyzer | proposed | TP | FP | precision | recall |
 |---|---|---|---|---|---|
+| waiser.cold_grains | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.contradiction_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
+| waiser.coverage_gap | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.duplicate_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.skill_stall | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.staleness | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.tool_failure | 6 | 6 | 0 | 1.00 | 1.00 |
 
-(`waiser.goal_stagnation` is default-**off** — "stalled" is ambiguous — so it
-does not appear in the default-on bench; it is unit-tested separately.)
+(`waiser.goal_stagnation` and `waiser.budget_pressure` are default-**off** —
+"stalled" is ambiguous, and budget pressure awaits its ASSEMBLE datasource — so
+they don't appear in the default-on bench; both are unit-tested separately. The
+two telemetry-fed fixtures, `cold_grains` and `coverage_gap`, run over an
+injected telemetry snapshot in the same harness.)
 
 This is a **synthetic floor**, not a field number: it proves the analyzers
 don't fire on obvious look-alikes and catch obvious positives. Real-world
 precision needs a real telemetry + labels corpus (fork_surfacing and
 outcome_review need concurrent heads / applied history and are exercised by
-the crate tests, not this fixture). All five fixture analyzers clear the
+the crate tests, not this fixture). All seven fixture analyzers clear the
 0.90 default-on bar.

@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Waiser recall-telemetry sidecar (§8).** A disposable, never-syncing
+  `<file>.telemetry.db` records what recall actually surfaced — grain access,
+  query outcomes, assembly-budget pressure — so Waiser can see memory *utility*,
+  not just internal consistency. Encrypted under the main file's key,
+  `FORGET`-scrubbed, rebuildable. Capture on the recall path is buffered and
+  non-blocking (voice-loop recall p50 stays ~82µs with telemetry on). Host-only
+  mode `off | aggregate | full`: `deja --telemetry`, `telemetry=` on the
+  Python/Node constructors (default `aggregate`); a bare library `open()`
+  records nothing.
+- **Three telemetry-fed analyzers** (11 built-ins total): `cold_grains` (facts
+  never recalled), `coverage_gap` (recurring questions the memory can't answer),
+  and `budget_pressure` (assembly overflow, opt-in until its ASSEMBLE datasource
+  is wired). `cold_grains`/`coverage_gap` are default-on at 1.00 fixture
+  precision.
+- **Optional LLM enrichment (§9).** `deja waiser run --llm-cmd 'CMD'` attaches a
+  subprocess backend (`CommandLlm`, mirroring `--embed-cmd`) that only *adds* —
+  DISCOVER proposes cited `origin=llm` drafts (never auto-applied), ENRICH adds
+  a whitelisted guidance note; with no backend the stages are the identity, so
+  the deterministic output is unchanged. Backends in `examples/llm/`. New error
+  `WSR-E050`.
+- **Console Sessions + Setup views** and `GET /api/waiser/telemetry`: visualize
+  recall activity, coverage gaps, and the effective configuration.
+
 ## [1.0.1] - 2026-07-15
 
 ### Added
