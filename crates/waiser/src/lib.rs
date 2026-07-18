@@ -57,4 +57,7 @@ pub use recommendation::{
     RecStatus, Recommendation, Summary,
 };
 pub use reference::ReferenceSubstrate;
-pub use substrate::{Capabilities, GrainSpec, HeadGroup, OmsSubstrate, ReadOpts, SubstrateRead};
+pub use substrate::{
+    BudgetUsage, Capabilities, GrainAccess, GrainSpec, HeadGroup, OmsSubstrate, QueryUsage,
+    ReadOpts, SubstrateRead, TelemetryView,
+};

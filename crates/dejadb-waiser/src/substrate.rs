@@ -27,12 +27,13 @@ use dejadb_cal::{parse, CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFa
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_core::format::deserialize::DeserializedGrain;
 use dejadb_core::types::{Fact, Grain, GrainType};
-use dejadb_store::{DejaDB, OP_FORGET};
+use dejadb_store::{DejaDB, TelemetryMode, OP_FORGET};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use waiser::error::{Error as WErr, Result as WResult};
 use waiser::{
-    Capabilities, GrainRecord, GrainSpec, HeadGroup, OmsSubstrate, ReadOpts, SubstrateRead,
+    BudgetUsage, Capabilities, GrainAccess, GrainRecord, GrainSpec, HeadGroup, OmsSubstrate,
+    QueryUsage, ReadOpts, SubstrateRead, TelemetryView,
 };
 
 /// The namespace waiser's own grains live in (mirrors `waiser::WAISER_NS`).
@@ -113,6 +114,9 @@ macro_rules! impl_substrate {
             }
             fn heads(&self, namespace: Option<&str>) -> WResult<Vec<HeadGroup>> {
                 heads(self.facade_ref(), namespace)
+            }
+            fn telemetry(&self, namespace: Option<&str>) -> WResult<Option<TelemetryView>> {
+                telemetry(self.facade_ref(), namespace)
             }
         }
 
@@ -242,9 +246,42 @@ fn read_waiser(
 fn caps(f: &DejaDbFacade) -> Capabilities {
     Capabilities {
         forks: true,
-        telemetry: false,
+        // On iff the host attached a telemetry sidecar (`aggregate`/`full`).
+        telemetry: f.with_store(|m| m.telemetry_mode()) != TelemetryMode::Off,
         embeddings: f.with_store(|m| m.declared_embedding().is_some()),
     }
+}
+
+/// Read the recall-telemetry sidecar rollups into waiser's substrate-agnostic
+/// [`TelemetryView`]. `None` when no sidecar is attached, so telemetry-fed
+/// analyzers degrade cleanly.
+fn telemetry(f: &DejaDbFacade, namespace: Option<&str>) -> WResult<Option<TelemetryView>> {
+    if f.with_store(|m| m.telemetry_mode()) == TelemetryMode::Off {
+        return Ok(None);
+    }
+    let access = f.with_store(|m| m.telemetry_access_stats(namespace)).map_err(we)?;
+    let queries = f.with_store(|m| m.telemetry_query_stats(namespace)).map_err(we)?;
+    let budget = f.with_store(|m| m.telemetry_budget_stats()).map_err(we)?;
+    Ok(Some(TelemetryView {
+        access: access
+            .into_iter()
+            .map(|a| GrainAccess { hash: a.hash, recall_count: a.recall_count, last_ms: a.last_ms })
+            .collect(),
+        queries: queries
+            .into_iter()
+            .map(|q| QueryUsage {
+                sample: q.sample,
+                run_count: q.run_count,
+                empty_count: q.empty_count,
+                sum_results: q.sum_results,
+                last_ms: q.last_ms,
+            })
+            .collect(),
+        budget: BudgetUsage {
+            sample_count: budget.sample_count,
+            overflow_count: budget.overflow_count,
+        },
+    }))
 }
 
 fn grains_of_type(

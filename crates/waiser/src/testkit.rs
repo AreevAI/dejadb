@@ -6,6 +6,7 @@ use crate::analyzer::{AnalyzeCtx, Analyzer, OutcomeInput};
 use crate::model::GrainRecord;
 use crate::recommendation::RecDraft;
 use crate::reference::ReferenceSubstrate;
+use crate::substrate::{BudgetUsage, GrainAccess, QueryUsage, TelemetryView};
 use serde_json::{json, Map, Value};
 
 pub struct TestSubstrate {
@@ -13,6 +14,7 @@ pub struct TestSubstrate {
     namespaces: Vec<String>,
     outcomes: Vec<OutcomeInput>,
     clock: i64,
+    tel: TelemetryView,
 }
 
 impl TestSubstrate {
@@ -22,6 +24,7 @@ impl TestSubstrate {
             namespaces: vec![],
             outcomes: vec![],
             clock: 0,
+            tel: TelemetryView::default(),
         }
     }
 
@@ -171,6 +174,39 @@ impl TestSubstrate {
 
     pub fn set_outcome_inputs(&mut self, outcomes: Vec<OutcomeInput>) {
         self.outcomes = outcomes;
+    }
+
+    /// Mark a grain as recalled `recall_count` times (feeds `cold_grains`: a
+    /// grain absent from telemetry has never been recalled). Turns on the
+    /// `telemetry` capability.
+    pub fn telemetry_recall(&mut self, hash: &str, recall_count: i64) {
+        self.tel.access.push(GrainAccess {
+            hash: hash.to_string(),
+            recall_count,
+            last_ms: self.clock * 1000,
+        });
+        self.inner.set_telemetry(self.tel.clone());
+    }
+
+    /// Record a recurring recall question (feeds `coverage_gap`).
+    pub fn telemetry_query(&mut self, sample: &str, run_count: i64, empty_count: i64) {
+        self.tel.queries.push(QueryUsage {
+            sample: sample.to_string(),
+            run_count,
+            empty_count,
+            sum_results: 0,
+            last_ms: self.clock * 1000,
+        });
+        self.inner.set_telemetry(self.tel.clone());
+    }
+
+    /// Set the assembly-budget rollup (feeds `budget_pressure`).
+    pub fn telemetry_budget(&mut self, sample_count: i64, overflow_count: i64) {
+        self.tel.budget = BudgetUsage {
+            sample_count,
+            overflow_count,
+        };
+        self.inner.set_telemetry(self.tel.clone());
     }
 
     /// Run an analyzer with its manifest-default params.

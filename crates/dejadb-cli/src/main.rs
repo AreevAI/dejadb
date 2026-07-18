@@ -495,6 +495,15 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         None => None,
     };
 
+    // Recall-telemetry sidecar (host capability, §8): the agent-host default is
+    // `aggregate`; `--telemetry off|aggregate|full` overrides. It is NOT a
+    // file-truth, so it never re-stamps the file's declarations.
+    let tel_mode = match flag(&flags, "telemetry") {
+        Some(v) => dejadb_store::TelemetryMode::parse(&v)
+            .ok_or_else(|| format!("--telemetry: unknown mode '{v}' (off|aggregate|full)"))?,
+        None => dejadb_store::TelemetryMode::Aggregate,
+    };
+
     // Files carry their own declarations (meta table); a bare open honors
     // them. --index-text is an explicit, deliberate re-stamp; encryption is a
     // host-supplied capability that also requires open_with.
@@ -507,7 +516,11 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         if let Some(key) = &enc_key {
             o.encryption_key = Some(**key);
         }
+        o.telemetry = tel_mode;
         DejaDB::open_with(&db, o)
+    } else if tel_mode != dejadb_store::TelemetryMode::Off {
+        // Honor the file's declarations AND attach the telemetry sidecar.
+        DejaDB::open_with_telemetry(&db, tel_mode)
     } else {
         DejaDB::open(&db)
     }

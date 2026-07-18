@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::manifest::{AnalyzerManifest, Params};
 use crate::model::GrainRecord;
 use crate::recommendation::RecDraft;
-use crate::substrate::{HeadGroup, ReadOpts, SubstrateRead};
+use crate::substrate::{HeadGroup, ReadOpts, SubstrateRead, TelemetryView};
 
 /// One applied recommendation due for outcome review, with its metric already
 /// re-measured by the engine (which owns the `&mut` substrate). The outcome
@@ -125,6 +125,18 @@ impl<'a> AnalyzeCtx<'a> {
         };
         self.reader.heads(ns)
     }
+
+    /// A snapshot of the recall-telemetry rollups (requires the `telemetry`
+    /// capability). `None` when the substrate has no sidecar — a telemetry-fed
+    /// analyzer then degrades to an activation-ladder entry.
+    pub fn telemetry(&self) -> Result<Option<TelemetryView>> {
+        let ns = if self.namespaces.len() == 1 {
+            Some(self.namespaces[0].as_str())
+        } else {
+            None
+        };
+        self.reader.telemetry(ns)
+    }
 }
 
 /// An analysis unit. Object-safe so `builtin_analyzers()` yields trait objects.
@@ -148,6 +160,9 @@ pub fn builtin_analyzers() -> Vec<Box<dyn Analyzer>> {
         Box::new(crate::analyzers::staleness::Staleness::new()),
         Box::new(crate::analyzers::skill_stall::SkillStall::new()),
         Box::new(crate::analyzers::goal_stagnation::GoalStagnation::new()),
+        Box::new(crate::analyzers::cold_grains::ColdGrains::new()),
+        Box::new(crate::analyzers::coverage_gap::CoverageGap::new()),
+        Box::new(crate::analyzers::budget_pressure::BudgetPressure::new()),
         Box::new(crate::analyzers::outcome_review::OutcomeReview::new()),
     ]
 }
@@ -159,11 +174,15 @@ mod tests {
     #[test]
     fn builtins_have_unique_ids() {
         let a = builtin_analyzers();
-        assert_eq!(a.len(), 8, "six hygiene analyzers + skill/goal trajectory");
+        assert_eq!(
+            a.len(),
+            11,
+            "6 hygiene + skill/goal trajectory + 3 telemetry-fed (cold/coverage/budget)"
+        );
         let mut ids: Vec<&str> = a.iter().map(|x| x.manifest().id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 8, "analyzer ids must be unique");
+        assert_eq!(ids.len(), 11, "analyzer ids must be unique");
     }
 
     #[test]

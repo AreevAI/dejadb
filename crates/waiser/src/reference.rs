@@ -9,7 +9,9 @@
 
 use crate::error::{Error, Result};
 use crate::model::GrainRecord;
-use crate::substrate::{Capabilities, GrainSpec, HeadGroup, OmsSubstrate, ReadOpts, SubstrateRead};
+use crate::substrate::{
+    Capabilities, GrainSpec, HeadGroup, OmsSubstrate, ReadOpts, SubstrateRead, TelemetryView,
+};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -23,6 +25,8 @@ pub struct ReferenceSubstrate {
     clock: i64,
     /// Entity → competing head hashes (fork surfacing input).
     heads_index: HashMap<String, Vec<String>>,
+    /// Injected recall-telemetry snapshot (turns on the `telemetry` capability).
+    telemetry: Option<TelemetryView>,
 }
 
 impl ReferenceSubstrate {
@@ -44,6 +48,12 @@ impl ReferenceSubstrate {
             entity.to_string(),
             heads.iter().map(|s| s.to_string()).collect(),
         );
+    }
+
+    /// Inject a telemetry snapshot (turns on the `telemetry` capability).
+    pub fn set_telemetry(&mut self, view: TelemetryView) {
+        self.caps.telemetry = true;
+        self.telemetry = Some(view);
     }
 
     /// Insert a fully-formed grain record; returns its assigned hash.
@@ -132,6 +142,10 @@ impl SubstrateRead for ReferenceSubstrate {
             .collect();
         groups.sort_by(|a, b| a.entity.cmp(&b.entity));
         Ok(groups)
+    }
+
+    fn telemetry(&self, _namespace: Option<&str>) -> Result<Option<TelemetryView>> {
+        Ok(self.telemetry.clone())
     }
 }
 

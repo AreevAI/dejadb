@@ -3,7 +3,10 @@
 //! works with zero models. All produce *pending* drafts; the engine stamps
 //! identity/origin and runs the governance gates.
 
+pub mod budget_pressure;
+pub mod cold_grains;
 pub mod contradiction_sweep;
+pub mod coverage_gap;
 pub mod duplicate_sweep;
 pub mod fork_surfacing;
 pub mod goal_stagnation;

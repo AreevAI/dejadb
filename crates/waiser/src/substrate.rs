@@ -74,6 +74,50 @@ pub struct HeadGroup {
     pub heads: Vec<String>,
 }
 
+/// A snapshot of the recall-telemetry sidecar's rollups (§8). Telemetry-fed
+/// analyzers (`cold_grains`, `coverage_gap`, `budget_pressure`) read this via
+/// [`crate::analyzer::AnalyzeCtx::telemetry`]. It is an owned snapshot, not a
+/// live handle — analyzers stay read-only and can't reach the sidecar. A
+/// substrate without a sidecar returns `None`, so the analyzer degrades to an
+/// activation-ladder entry rather than firing on absent evidence.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TelemetryView {
+    /// Per-grain recall rollups. A grain **absent** here has never been
+    /// recalled (the `cold_grains` signal).
+    pub access: Vec<GrainAccess>,
+    /// Per-question rollups over free-text recalls (the `coverage_gap` signal).
+    pub queries: Vec<QueryUsage>,
+    /// Assembly-budget pressure rollup (the `budget_pressure` signal).
+    pub budget: BudgetUsage,
+}
+
+/// How often one grain has been surfaced by recall.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrainAccess {
+    pub hash: String,
+    pub recall_count: i64,
+    pub last_ms: i64,
+}
+
+/// How a recurring recall question has fared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryUsage {
+    /// A short human-readable sample of the query intent.
+    pub sample: String,
+    pub run_count: i64,
+    /// How many of those runs returned nothing — the coverage-gap signal.
+    pub empty_count: i64,
+    pub sum_results: i64,
+    pub last_ms: i64,
+}
+
+/// Assembly-budget pressure rollup.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BudgetUsage {
+    pub sample_count: i64,
+    pub overflow_count: i64,
+}
+
 /// The read-only slice of the substrate. Analyzers receive this (via
 /// `AnalyzeCtx`) and nothing else — the trust floor's "analyzers execute
 /// read-only" is enforced by the type system: a `&dyn SubstrateRead` cannot
@@ -100,6 +144,13 @@ pub trait SubstrateRead {
     /// cleanly rather than pretend.
     fn heads(&self, _namespace: Option<&str>) -> Result<Vec<HeadGroup>> {
         Err(crate::error::Error::CapabilityMissing("forks".into()))
+    }
+
+    /// A snapshot of the recall-telemetry rollups (§8). Requires the
+    /// `telemetry` capability; the default returns `None` so substrates without
+    /// a sidecar degrade cleanly. `namespace` scopes the snapshot when set.
+    fn telemetry(&self, _namespace: Option<&str>) -> Result<Option<TelemetryView>> {
+        Ok(None)
     }
 }
 

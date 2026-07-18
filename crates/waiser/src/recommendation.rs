@@ -61,6 +61,15 @@ fn builtin_template(id: &str) -> Option<&'static str> {
             "Skill \"{skill}\" isn't improving: practiced {practice_count}× but proficiency is still {proficiency}"
         }
         "goal.stagnation" => "Goal \"{goal}\" is stalled: active {age_days}d with {progress} progress",
+        "cold.grain" => {
+            "Cold memory: \"{subject}\" ({age_days}d old) has never been recalled — retire candidate"
+        }
+        "coverage.gap" => {
+            "Recurring question with no matching memory: \"{query}\" asked {count}× ({empty_rate}% empty)"
+        }
+        "budget.pressure" => {
+            "Assembly budget overflowed on {overflow_rate}% of {samples} recalls — raise the budget or curate memory"
+        }
         "outcome.regression" => {
             "Applied recommendation regressed: {metric} moved {baseline} → {current}"
         }

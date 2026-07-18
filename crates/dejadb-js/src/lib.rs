@@ -9,7 +9,7 @@
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_store::memory_tool::MemoryTool;
-use dejadb_store::{CommandEmbed, DejaDB as RustDejaDB, FactDraft};
+use dejadb_store::{CommandEmbed, DejaDB as RustDejaDB, FactDraft, TelemetryMode};
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use napi_derive::napi;
 use serde_json::json;
@@ -67,15 +67,22 @@ impl DejaDb {
         ns: Option<String>,
         passphrase: Option<String>,
         actor: Option<String>,
+        telemetry: Option<String>,
     ) -> napi::Result<Self> {
         let ns = ns.unwrap_or_else(|| "shared".to_string());
         let actor = actor.unwrap_or_else(|| "user:local".to_string());
+        // Recall-telemetry sidecar (host capability, §8): agents are the main
+        // telemetry producers, so the binding default is `aggregate`; pass
+        // telemetry="off" to disable. Never a file-truth.
+        let telemetry = telemetry.unwrap_or_else(|| "aggregate".to_string());
+        let tel = TelemetryMode::parse(&telemetry)
+            .ok_or_else(|| err(format!("unknown telemetry mode '{telemetry}' (off|aggregate|full)")))?;
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Host-supplied, never
         // stored in the file — same rules as the CLI's --passphrase-env.
         let store = match passphrase {
-            Some(p) => RustDejaDB::open_with_passphrase(&path, &p).map_err(err)?,
-            None => RustDejaDB::open(&path).map_err(err)?,
+            Some(p) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?,
+            None => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
         };
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
         Ok(DejaDb { facade, ns, actor })

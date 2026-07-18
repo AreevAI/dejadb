@@ -7,7 +7,7 @@
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{Hash, DejaDbError};
 use dejadb_store::memory_tool::MemoryTool;
-use dejadb_store::{CommandEmbed, EmbedBackend, FactDraft, DejaDB as RustDejaDB};
+use dejadb_store::{CommandEmbed, EmbedBackend, FactDraft, TelemetryMode, DejaDB as RustDejaDB};
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -93,14 +93,25 @@ struct DejaDB {
 #[pymethods]
 impl DejaDB {
     #[new]
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string()))]
-    fn new(path: String, ns: String, passphrase: Option<String>, actor: String) -> PyResult<Self> {
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string()))]
+    fn new(
+        path: String,
+        ns: String,
+        passphrase: Option<String>,
+        actor: String,
+        telemetry: String,
+    ) -> PyResult<Self> {
+        // Recall-telemetry sidecar (host capability, §8): agents are the main
+        // telemetry producers, so the binding default is `aggregate`; pass
+        // telemetry="off" to disable. It is never a file-truth.
+        let tel = TelemetryMode::parse(&telemetry)
+            .ok_or_else(|| err(format!("unknown telemetry mode '{telemetry}' (off|aggregate|full)")))?;
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Same key rules as the
         // CLI's --passphrase-env: host-supplied, never stored in the file.
         let store = match passphrase {
-            Some(p) => RustDejaDB::open_with_passphrase(&path, &p).map_err(err)?,
-            None => RustDejaDB::open(&path).map_err(err)?,
+            Some(p) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?,
+            None => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
         };
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
         Ok(DejaDB { facade, ns, actor })
