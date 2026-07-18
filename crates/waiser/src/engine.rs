@@ -1,19 +1,21 @@
-//! The engine: the analyze → validate/dedup → store pipeline, the run-outcome
-//! contract, and the review/apply/rollback lifecycle with the governance
-//! gates. Deterministic given (store state, params, now) — the LLM path (§9)
-//! is not in this increment; auto-apply execution is gated behind a
-//! conservative shape check and stays off by default (build order: manage +
-//! debug are the trust core; auto-apply lands with per-draft verification).
+//! The engine: the analyze → DISCOVER → ENRICH → validate/dedup → store
+//! pipeline, the run-outcome contract, and the review/apply/rollback lifecycle
+//! with the governance gates. The DETERMINISTIC output is a pure function of
+//! (store state, params, now); the optional LLM stages (§9) only *add* cited
+//! drafts (origin=llm, never auto-apply) and whitelisted guidance — with no
+//! backend they are the identity, so the deterministic path is unchanged.
+//! Auto-apply execution is gated behind a conservative shape check and stays
+//! off by default.
 
 use crate::analyzer::{AnalyzeCtx, Analyzer, OutcomeInput};
 use crate::cal;
 use crate::config::{AppliedRecord, WaiserPersisted};
 use crate::error::{Error, Result};
 use crate::manifest::{AnalyzerManifest, Capability};
-use crate::model::{Origin, Severity, TargetRef};
+use crate::model::{ActionKind, GrainRecord, Origin, Severity, TargetRef};
 use crate::recommendation::{
-    dedup_key, AuditRecord, ObserverType, Proposal, RecStatus, Recommendation, MAX_BECAUSE,
-    MAX_EVIDENCE,
+    dedup_key, AuditRecord, ObserverType, Proposal, RecStatus, Recommendation, Summary,
+    MAX_BECAUSE, MAX_EVIDENCE,
 };
 use crate::substrate::{Capabilities, OmsSubstrate, ReadOpts, SubstrateRead};
 use serde::{Deserialize, Serialize};
@@ -134,19 +136,24 @@ impl RunResult {
     }
 }
 
-/// The engine holds the registered analyzers and the host policy.
+/// The engine holds the registered analyzers, the host policy, and an optional
+/// LLM enrichment backend (§9).
 pub struct Engine {
     analyzers: Vec<Box<dyn Analyzer>>,
     policy: crate::policy::Policy,
+    /// Optional LLM backend. `None` → the DISCOVER/ENRICH stages are the
+    /// identity, so the pipeline is byte-for-byte the deterministic path.
+    llm: Option<Box<dyn crate::llm::LlmBackend>>,
 }
 
 impl Engine {
-    /// An engine with the six default built-ins and a default (fully closed)
-    /// policy — nothing auto-applies.
+    /// An engine with the default built-ins and a default (fully closed)
+    /// policy — nothing auto-applies, no LLM.
     pub fn with_builtins() -> Self {
         Engine {
             analyzers: crate::analyzer::builtin_analyzers(),
             policy: crate::policy::Policy::default(),
+            llm: None,
         }
     }
 
@@ -155,12 +162,22 @@ impl Engine {
         Engine {
             analyzers: vec![],
             policy: crate::policy::Policy::default(),
+            llm: None,
         }
     }
 
     /// Install a host policy (the only place auto-apply is granted).
     pub fn with_policy(mut self, policy: crate::policy::Policy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Attach an optional LLM enrichment backend (§9). Only ever *adds* cited
+    /// draft recommendations (stamped `origin = llm`, never auto-applied) and
+    /// whitelisted guidance notes — it can never gate or rewrite deterministic
+    /// output.
+    pub fn with_llm(mut self, backend: Box<dyn crate::llm::LlmBackend>) -> Self {
+        self.llm = Some(backend);
         self
     }
 
@@ -278,6 +295,14 @@ impl Engine {
             }
         }
 
+        // DISCOVER (§9, optional): the LLM proposes additional cited drafts,
+        // stamped origin=llm (never auto-apply). Identity when no backend; a
+        // failed/garbled call drops the contribution, never the run.
+        if self.llm.is_some() {
+            let discovered = self.discover(&*sub, &candidates, now_ms);
+            candidates.extend(discovered);
+        }
+
         // Phase 2: validate/dedup.
         let proposed = candidates.len() as u64;
         let mut seen = BTreeSet::new();
@@ -308,6 +333,12 @@ impl Engine {
             survivors.push(c);
         }
         let deduped = proposed - survivors.len() as u64;
+
+        // ENRICH (§9, optional): the LLM adds a whitelisted guidance note to
+        // deterministic survivors. The engine-templated summary is untouched.
+        if self.llm.is_some() {
+            self.enrich(&mut survivors);
+        }
 
         // Phase 3 (needs &mut): store survivors + propose audit, then
         // auto-apply the ones the host policy grants (all gates in §6.3).
@@ -358,6 +389,143 @@ impl Engine {
             analyzers_run,
             analyzers_skipped,
         })
+    }
+
+    /// DISCOVER (§9): ask the LLM for additional draft recommendations, given
+    /// the deterministic findings as *context* and a bounded, provenance-tagged
+    /// evidence bundle. Every returned draft must cite evidence present in the
+    /// bundle and target a memory/query surface; it is stamped `origin = llm`
+    /// (so it can never auto-apply) and enters the ordinary dedup/store path. A
+    /// failed or garbled response yields no drafts — never a failed run.
+    fn discover<S: OmsSubstrate>(
+        &self,
+        sub: &S,
+        candidates: &[Recommendation],
+        now_ms: i64,
+    ) -> Vec<Recommendation> {
+        let Some(llm) = &self.llm else {
+            return Vec::new();
+        };
+        let findings: Vec<crate::llm::FindingBrief> = candidates
+            .iter()
+            .take(32)
+            .map(|c| crate::llm::FindingBrief {
+                analyzer: c.analyzer.clone(),
+                summary: c.summary.render(),
+                target: c.target_ref.clone(),
+                severity: c.severity.as_str().to_string(),
+            })
+            .collect();
+        // Evidence bundle: the grains the deterministic findings cite.
+        let mut evidence = Vec::new();
+        let mut bundle: BTreeSet<String> = BTreeSet::new();
+        for c in candidates {
+            for h in &c.evidence {
+                if evidence.len() >= 64 {
+                    break;
+                }
+                if bundle.insert(h.clone()) {
+                    if let Ok(Some(g)) = sub.grain(h) {
+                        evidence.push(crate::llm::EvidenceItem {
+                            hash: h.clone(),
+                            grain_type: g.grain_type.clone(),
+                            text: crate::llm::cap(&grain_brief(&g), 400),
+                        });
+                    }
+                }
+            }
+        }
+        if evidence.is_empty() {
+            return Vec::new(); // nothing to ground a discovery on
+        }
+        let request = crate::llm::LlmRequest {
+            waiser: 1,
+            op: "discover",
+            instructions: DISCOVER_INSTRUCTIONS,
+            findings,
+            evidence,
+            rejected: Vec::new(),
+            approved: Vec::new(),
+        };
+        let Ok(body) = serde_json::to_string(&request) else {
+            return Vec::new();
+        };
+        let raw = match llm.complete(&body) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(), // fail-soft
+        };
+        let mut out = Vec::new();
+        for d in crate::llm::parse_discover(&raw)
+            .recommendations
+            .into_iter()
+            .take(crate::llm::MAX_LLM_DRAFTS)
+        {
+            // Cite-check: keep only evidence present in the bundle; drop uncited.
+            let cited: Vec<String> =
+                d.evidence.iter().filter(|h| bundle.contains(*h)).cloned().collect();
+            if cited.is_empty() {
+                continue;
+            }
+            // Target must be a memory/query surface (never prompt/host).
+            let Ok(target) = TargetRef::parse(&d.target) else {
+                continue;
+            };
+            let tc = target.target_class();
+            if tc != "memory" && tc != "query" {
+                continue;
+            }
+            out.push(stamp_llm(llm.model(), &d, target, cited, now_ms));
+        }
+        out
+    }
+
+    /// ENRICH (§9): ask the LLM to add a short guidance note to the surviving
+    /// deterministic recommendations. Whitelist-only — only `guidance` is
+    /// merged (capped), and only onto recs that don't already have one; the
+    /// engine-templated summary is never touched. Fail-soft.
+    fn enrich(&self, survivors: &mut [Recommendation]) {
+        let Some(llm) = &self.llm else {
+            return;
+        };
+        if survivors.is_empty() {
+            return;
+        }
+        let findings: Vec<crate::llm::FindingBrief> = survivors
+            .iter()
+            .map(|r| crate::llm::FindingBrief {
+                analyzer: r.analyzer.clone(),
+                summary: r.summary.render(),
+                target: r.target_ref.clone(),
+                severity: r.severity.as_str().to_string(),
+            })
+            .collect();
+        let request = crate::llm::LlmRequest {
+            waiser: 1,
+            op: "enrich",
+            instructions: ENRICH_INSTRUCTIONS,
+            findings,
+            evidence: Vec::new(),
+            rejected: Vec::new(),
+            approved: Vec::new(),
+        };
+        let Ok(body) = serde_json::to_string(&request) else {
+            return;
+        };
+        let raw = match llm.complete(&body) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for note in crate::llm::parse_enrich(&raw).notes {
+            if note.guidance.trim().is_empty() {
+                continue;
+            }
+            if let Some(r) = survivors
+                .iter_mut()
+                .find(|r| r.target_ref == note.target && r.guidance.is_none())
+            {
+                r.guidance = Some(crate::llm::cap(&note.guidance, crate::llm::MAX_GUIDANCE_LEN));
+            }
+        }
     }
 
     /// Evaluate the auto-apply gate (§6.3) — ALL preconditions must hold:
@@ -829,6 +997,83 @@ fn measure_metric<S: SubstrateRead>(
 
 // --- free helpers ---
 
+/// The fixed DISCOVER instruction. Kept in its own request field so it never
+/// interleaves with (attacker-influenced) evidence text.
+const DISCOVER_INSTRUCTIONS: &str = "You review an agent's memory for quality. \
+Given deterministic findings and the evidence they cite, propose at most a few \
+ADDITIONAL findings the deterministic checks would miss (e.g. a semantic \
+contradiction, a stale assumption, a duplicated meaning). Every proposal MUST \
+cite one or more evidence hashes from the bundle and target a memory entity. \
+Return JSON: {\"recommendations\":[{\"summary\":\"...\",\"target\":\"entity:<ns>/<subject>\",\
+\"guidance\":\"...\",\"evidence\":[\"<hash>\"]}]}. Propose nothing you cannot ground in the evidence.";
+
+/// The fixed ENRICH instruction.
+const ENRICH_INSTRUCTIONS: &str = "For each finding, optionally add a one-sentence \
+guidance note to help a human reviewer decide. Do not restate the finding. Return \
+JSON: {\"notes\":[{\"target\":\"<target_ref>\",\"guidance\":\"...\"}]}.";
+
+/// A short human-readable projection of a grain for the evidence bundle.
+fn grain_brief(g: &GrainRecord) -> String {
+    if let (Some(s), Some(r), Some(o)) = (g.fact_subject(), g.fact_relation(), g.fact_object()) {
+        return format!("{s} {r} {o}");
+    }
+    for key in ["content", "body", "text", "summary"] {
+        if let Some(v) = g.fields.get(key).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Stamp a validated DISCOVER draft as an `origin = llm` recommendation. LLM
+/// drafts are always advisory `Flag`s carrying `Proposal::Data` (never an
+/// executable CAL mutation), lower-confidence, and — via `Origin::Llm` and a
+/// no-manifest analyzer id — structurally ineligible for auto-apply.
+fn stamp_llm(
+    model: &str,
+    d: &crate::llm::LlmDraft,
+    target: TargetRef,
+    cited: Vec<String>,
+    now_ms: i64,
+) -> Recommendation {
+    let summary_text = crate::llm::cap(&d.summary, crate::llm::MAX_SUMMARY_LEN);
+    let mut args = serde_json::Map::new();
+    args.insert("text".into(), Value::from(summary_text));
+    let guidance = if d.guidance.trim().is_empty() {
+        None
+    } else {
+        Some(crate::llm::cap(&d.guidance, crate::llm::MAX_GUIDANCE_LEN))
+    };
+    let target_str = target.as_string();
+    let action = ActionKind::Flag;
+    let mut data = serde_json::Map::new();
+    data.insert("source".into(), Value::from("llm"));
+    Recommendation {
+        hash: String::new(),
+        analyzer: "waiser.llm/1".to_string(),
+        params_snapshot: serde_json::Map::new(),
+        origin: Origin::Llm { model: model.to_string() },
+        target_ref: target_str.clone(),
+        action_kind: action,
+        dedup_key: dedup_key("llm", &target_str, action),
+        summary: Summary::new("llm.discover", args),
+        severity: Severity::Low,
+        proposal: Proposal::Data { data },
+        destructive: false,
+        rollbackable: false,
+        evidence: cited,
+        evidence_query: None,
+        metric: None,
+        confidence: 0.5,
+        importance: 0.3,
+        created_at_ms: now_ms,
+        guidance,
+        status: RecStatus::Pending,
+    }
+}
+
 fn stamp(
     m: &AnalyzerManifest,
     params: &crate::manifest::Params,
@@ -867,6 +1112,7 @@ fn stamp(
         confidence: d.confidence,
         importance: d.importance,
         created_at_ms: now_ms,
+        guidance: None,
         status: RecStatus::Pending,
     })
 }

@@ -37,6 +37,9 @@ pub enum Error {
     ParamInvalid(String),
     /// A required substrate capability (forks, telemetry, embeddings) is absent.
     CapabilityMissing(String),
+    /// The optional LLM enrichment backend (`--llm-cmd`) is misconfigured or
+    /// failed. Never fatal to a run — the LLM contribution is dropped.
+    LlmBackend(String),
     /// No recommendation exists at the given hash.
     NotFound(String),
     /// An unexpected internal fault (should not happen — file a bug).
@@ -59,6 +62,7 @@ impl Error {
             Error::AnalyzerFailed { .. } => "WSR-E030",
             Error::ParamInvalid(_) => "WSR-E031",
             Error::CapabilityMissing(_) => "WSR-E032",
+            Error::LlmBackend(_) => "WSR-E050",
             Error::NotFound(_) => "WSR-E040",
             Error::Internal(_) => "WSR-E099",
         }
@@ -83,6 +87,7 @@ impl fmt::Display for Error {
             }
             Error::ParamInvalid(m) => write!(f, "{code} analyzer parameter invalid: {m}"),
             Error::CapabilityMissing(m) => write!(f, "{code} required capability missing: {m}"),
+            Error::LlmBackend(m) => write!(f, "{code} LLM backend error: {m}"),
             Error::NotFound(m) => write!(f, "{code} recommendation not found: {m}"),
             Error::Internal(m) => write!(f, "{code} internal error: {m}"),
         }

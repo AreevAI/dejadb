@@ -73,6 +73,9 @@ fn builtin_template(id: &str) -> Option<&'static str> {
         "outcome.regression" => {
             "Applied recommendation regressed: {metric} moved {baseline} → {current}"
         }
+        // origin=llm drafts carry free text (clearly marked llm) rather than a
+        // deterministic template — the model's proposed summary rides in {text}.
+        "llm.discover" => "{text}",
         _ => return None,
     })
 }
@@ -398,6 +401,11 @@ pub struct Recommendation {
     pub confidence: f64,
     pub importance: f64,
     pub created_at_ms: i64,
+    /// Optional LLM guidance: an ENRICH note on a deterministic recommendation,
+    /// or an `origin = llm` draft's own rationale (§9). Whitelisted, capped
+    /// text — it never replaces the engine-templated `summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
     #[serde(skip)]
     pub status: RecStatus,
 }
@@ -500,6 +508,7 @@ mod tests {
             confidence: 0.9,
             importance: 0.4,
             created_at_ms: 1000,
+            guidance: None,
             status: RecStatus::Pending,
         };
         let spec = rec.to_grain_spec("ns").unwrap();

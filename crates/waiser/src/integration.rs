@@ -49,6 +49,85 @@ fn run_proposes_across_analyzers_and_is_idempotent() {
     assert_eq!(r2.stored, 0, "no re-proposals");
 }
 
+/// A canned LLM backend: returns a fixed DISCOVER or ENRICH body by op.
+struct MockLlm {
+    discover: String,
+    enrich: String,
+}
+impl crate::llm::LlmBackend for MockLlm {
+    fn model(&self) -> &str {
+        "mock-llm"
+    }
+    fn complete(&self, request: &str) -> crate::error::Result<String> {
+        Ok(if request.contains("\"op\":\"discover\"") {
+            self.discover.clone()
+        } else {
+            self.enrich.clone()
+        })
+    }
+}
+
+#[test]
+fn llm_discover_adds_only_cited_rec_and_enrich_adds_guidance() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    // A contradiction gives a deterministic finding whose cited evidence seeds
+    // the DISCOVER bundle.
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+
+    // One draft cites a real evidence hash (kept); one cites a bogus hash
+    // (dropped as uncited — the trust floor).
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"]}},
+          {{"summary":"uncited nonsense","target":"entity:test/acme","evidence":["deadbeef"]}}
+        ]}}"#
+    );
+    let enrich =
+        r#"{"notes":[{"target":"entity:test/acme","guidance":"resolve to latest"}]}"#.to_string();
+
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, enrich }));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+
+    // Exactly one llm-origin rec — the cited one; the uncited draft was dropped.
+    let llm: Vec<_> = recs
+        .iter()
+        .filter(|r| matches!(r.origin, Origin::Llm { .. }))
+        .collect();
+    assert_eq!(llm.len(), 1, "only the cited LLM draft survives");
+    assert!(llm[0].summary.render().contains("ambiguous"));
+    assert_eq!(llm[0].evidence, vec![h1.clone()]);
+    // An llm-origin rec is never auto-applied and never destructive.
+    assert!(!llm[0].destructive);
+    assert_eq!(llm[0].status, RecStatus::Pending);
+
+    // ENRICH added a whitelisted guidance note to the deterministic finding
+    // without touching its templated summary.
+    let det = recs
+        .iter()
+        .find(|r| r.analyzer.starts_with("waiser.contradiction"))
+        .expect("a contradiction recommendation");
+    assert_eq!(det.guidance.as_deref(), Some("resolve to latest"));
+    assert!(det.summary.render().contains("deploy_target"));
+}
+
+#[test]
+fn no_llm_backend_is_the_identity() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "deploy_target", "us-east-1");
+    sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let e = Engine::with_builtins(); // no LLM attached
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    assert!(
+        recs.iter().all(|r| !matches!(r.origin, Origin::Llm { .. })),
+        "no llm-origin recs without a backend"
+    );
+}
+
 #[test]
 fn review_apply_rollback_on_nondestructive() {
     let mut sub = TestSubstrate::new();

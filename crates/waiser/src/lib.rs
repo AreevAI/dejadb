@@ -28,6 +28,7 @@ pub mod cal;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod llm;
 pub mod manifest;
 pub mod model;
 pub mod policy;
@@ -46,6 +47,7 @@ pub use engine::{
     WAISER_NS,
 };
 pub use error::{Error, Result};
+pub use llm::{CommandLlm, LlmBackend};
 pub use manifest::{
     analyzer_family, AnalyzerManifest, AutoApplyClass, CadenceClass, Capability, ParamSpec, Params,
     TargetClass, Tier, TrustClass,

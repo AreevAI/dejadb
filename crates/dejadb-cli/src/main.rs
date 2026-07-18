@@ -1379,10 +1379,19 @@ fn run_waiser(
     // Host policy (--policy FILE or $WAISER_POLICY) — the only place
     // auto-apply is granted. Absent → a closed default (nothing auto-applies).
     let policy = load_policy(flags)?;
-    let engine = match policy {
+    let mut engine = match policy {
         Some(p) => Engine::with_builtins().with_policy(p),
         None => Engine::with_builtins(),
     };
+    // Optional LLM enrichment (§9): `--llm-cmd 'CMD'` installs a subprocess
+    // backend (probed at construction, fail-loud). It can only ADD cited drafts
+    // (origin=llm, never auto-applied) and whitelisted guidance — never gate or
+    // rewrite the deterministic output. Never persisted; CLI-only by design.
+    if let Some(cmd) = flag(flags, "llm-cmd") {
+        let model = flag(flags, "llm-model");
+        let llm = waiser::CommandLlm::new(&cmd, model.as_deref()).map_err(|e| e.to_string())?;
+        engine = engine.with_llm(Box::new(llm));
+    }
     let now = now_ms();
     let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());
     let observer = ObserverType::Human;
