@@ -261,5 +261,5 @@ This is a **synthetic floor**, not a field number: it proves the analyzers
 don't fire on obvious look-alikes and catch obvious positives. Real-world
 precision needs a real telemetry + labels corpus (fork_surfacing and
 outcome_review need concurrent heads / applied history and are exercised by
-the crate tests, not this fixture). All four fixture analyzers clear the
+the crate tests, not this fixture). All five fixture analyzers clear the
 0.90 default-on bar.

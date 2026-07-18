@@ -56,7 +56,7 @@ deja ui --db demo.db --token-env DEJA_TOKEN   # the Waiser tab shows the queue
 
 ```
 capture  (tool calls, facts, events)        — record_tool_call / add / import
-  → analyze   (deterministic, typed)         — six analyzers over grain semantics
+  → analyze   (deterministic, typed)         — eight analyzers over grain semantics
   → recommend (recommendation + evidence)    — dedup'd, template-rendered, cited
   → govern    (review / policy auto-apply)   — four gates, hash-chained audit
   → apply     (undoable supersession)        — scope-checked at execution
@@ -87,8 +87,9 @@ syncs with the file and is queryable.
 
 ## The analyzers
 
-All deterministic (T0/T1), computing over typed grains — never raw prose.
-Seven are default-on; goal stagnation is opt-in (see the table):
+Eight built-in analyzers, all deterministic (T0/T1), computing over typed
+grains — never raw prose. Seven are default-on; goal stagnation is opt-in
+(see the table):
 
 | Analyzer | Fires on | Proposes |
 |---|---|---|
@@ -103,7 +104,11 @@ Seven are default-on; goal stagnation is opt-in (see the table):
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin
 waiser_precision` scores each analyzer against a labeled fixture and gates
-CI at 0.90.
+CI at 0.90. On the current fixture the five default-on analyzers it covers —
+contradiction, duplicate, staleness, tool-failure, skill-stall — each score
+**1.00** precision and recall; `fork_surfacing` and `outcome_review` need
+concurrent heads / applied history and are covered by the crate tests
+instead. See `crates/dejadb-bench/RESULTS.md` for the table.
 
 ## Surfaces
 
@@ -262,8 +267,9 @@ Existing write callers add `--token-env`; a token unlocks review + apply.
 
 ## Status
 
-Built and tested: the engine (six analyzers, lifecycle, dedup, gating,
-auto-apply), the DejaDB adapter, the `deja waiser` CLI + `deja init`, the
+Built and tested: the engine (eight analyzers, lifecycle, dedup, gating,
+auto-apply, the multi-horizon Verify gate), the DejaDB adapter, the
+`deja waiser` CLI + `deja init`, the
 Python/Node bindings, the MCP tools, the tool-log importer, the policy file,
 the `/api/waiser/*` API, the read-only-token-less auth change, the Waiser
 console tab, and the precision bench. Not yet built: the optional LLM
