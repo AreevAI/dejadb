@@ -17,6 +17,11 @@ pub mod grain_type {
     /// `tool_name`/`is_error`/`content` natively (the flagship analyzer's food).
     pub const TOOL: &str = "tool";
     pub const OBSERVATION: &str = "observation";
+    /// OMS Skill grain (0x0B) — `proficiency` (aliases `confidence`) +
+    /// `practice_count`; the chain is the learning history.
+    pub const SKILL: &str = "skill";
+    /// OMS Goal grain (0x07) — `goal_state` + `progress`.
+    pub const GOAL: &str = "goal";
     pub const RECOMMENDATION: &str = "recommendation";
 }
 
@@ -83,6 +88,33 @@ impl GrainRecord {
             .or_else(|| self.str_field("error"))
             .or_else(|| self.str_field("body"))
     }
+
+    fn f64_field(&self, key: &str) -> Option<f64> {
+        self.fields.get(key).and_then(Value::as_f64)
+    }
+    fn i64_field(&self, key: &str) -> Option<i64> {
+        self.fields.get(key).and_then(Value::as_i64)
+    }
+
+    // --- Skill accessors ---
+    pub fn skill_name(&self) -> Option<&str> {
+        self.str_field("name").or_else(|| self.str_field("skill_name"))
+    }
+    /// Skill proficiency (dedicated `proficiency` key; aliases `confidence`).
+    pub fn skill_proficiency(&self) -> Option<f64> {
+        self.f64_field("proficiency").or_else(|| self.f64_field("confidence"))
+    }
+    pub fn skill_practice_count(&self) -> i64 {
+        self.i64_field("practice_count").unwrap_or(0)
+    }
+
+    // --- Goal accessors ---
+    pub fn goal_state(&self) -> Option<&str> {
+        self.str_field("goal_state").or_else(|| self.str_field("state"))
+    }
+    pub fn goal_progress(&self) -> f64 {
+        self.f64_field("progress").unwrap_or(0.0)
+    }
 }
 
 /// Severity ranks proposals for review triage. Ordering is
@@ -147,6 +179,9 @@ pub enum ActionKind {
     MergeHeads,
     /// Revert an applied recommendation whose outcome regressed.
     Revert,
+    /// Surface an advisory finding for human attention (no automatic fix) —
+    /// e.g. a stalled skill or goal.
+    Flag,
 }
 
 impl ActionKind {
@@ -158,6 +193,7 @@ impl ActionKind {
             ActionKind::Expire => "expire",
             ActionKind::MergeHeads => "merge_heads",
             ActionKind::Revert => "revert",
+            ActionKind::Flag => "flag",
         }
     }
 }

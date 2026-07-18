@@ -94,6 +94,16 @@ impl<'a> AnalyzeCtx<'a> {
         self.grains_of_type(crate::model::grain_type::OBSERVATION, ReadOpts::default())
     }
 
+    /// Live Skill grains across configured namespaces.
+    pub fn skills(&self) -> Result<Vec<GrainRecord>> {
+        self.grains_of_type(crate::model::grain_type::SKILL, ReadOpts::default())
+    }
+
+    /// Live Goal grains across configured namespaces.
+    pub fn goals(&self) -> Result<Vec<GrainRecord>> {
+        self.grains_of_type(crate::model::grain_type::GOAL, ReadOpts::default())
+    }
+
     /// Tool grains (captured tool calls), optionally windowed by a `since`
     /// watermark, live only. The flagship analyzer's input.
     pub fn tools_since(&self, since_ms: Option<i64>) -> Result<Vec<GrainRecord>> {
@@ -136,6 +146,8 @@ pub fn builtin_analyzers() -> Vec<Box<dyn Analyzer>> {
         Box::new(crate::analyzers::contradiction_sweep::ContradictionSweep::new()),
         Box::new(crate::analyzers::fork_surfacing::ForkSurfacing::new()),
         Box::new(crate::analyzers::staleness::Staleness::new()),
+        Box::new(crate::analyzers::skill_stall::SkillStall::new()),
+        Box::new(crate::analyzers::goal_stagnation::GoalStagnation::new()),
         Box::new(crate::analyzers::outcome_review::OutcomeReview::new()),
     ]
 }
@@ -145,13 +157,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn there_are_six_builtins_with_unique_ids() {
+    fn builtins_have_unique_ids() {
         let a = builtin_analyzers();
-        assert_eq!(a.len(), 6, "the first release ships exactly six analyzers");
+        assert_eq!(a.len(), 8, "six hygiene analyzers + skill/goal trajectory");
         let mut ids: Vec<&str> = a.iter().map(|x| x.manifest().id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 6, "analyzer ids must be unique");
+        assert_eq!(ids.len(), 8, "analyzer ids must be unique");
     }
 
     #[test]

@@ -85,9 +85,10 @@ The **audit trail is grains**: one immutable Observation per transition,
 hash-chained per recommendation, carrying the actor label and the reason. It
 syncs with the file and is queryable.
 
-## The six analyzers
+## The analyzers
 
-All deterministic (T0/T1), default-on, computing over typed grains:
+All deterministic (T0/T1), computing over typed grains — never raw prose.
+Seven are default-on; goal stagnation is opt-in (see the table):
 
 | Analyzer | Fires on | Proposes |
 |---|---|---|
@@ -96,6 +97,8 @@ All deterministic (T0/T1), default-on, computing over typed grains:
 | `contradiction_sweep` | ≥2 live values under a functional relation (seeded list: `deploy_target`, `lives_in`, `tier`, … — extendable per domain via `extra_relations`) | resolve to the latest value |
 | `fork_surfacing` | an entity with >1 live head | a merge (approval-required — a merge is lossy, never auto-applies) |
 | `staleness` | a grain past its declared `valid_to` | a single-grain `FORGET` (destructive, never auto-applies) |
+| `skill_stall` | a Skill practiced ≥N times whose proficiency stays low — doing it, not getting better at it | an advisory flag (never auto-applies) |
+| `goal_stagnation` | an active Goal with little progress that's gone stale (**opt-in** — "stalled" is ambiguous; enable per file) | an advisory flag |
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin

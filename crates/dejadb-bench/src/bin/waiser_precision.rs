@@ -60,6 +60,14 @@ fn main() {
         m.insert("namespace".into(), json!("bench"));
         m
     };
+    let skill = |name: &str, proficiency: f64, practice: i64| -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("name".into(), json!(name));
+        m.insert("proficiency".into(), json!(proficiency));
+        m.insert("practice_count".into(), json!(practice));
+        m.insert("namespace".into(), json!("bench"));
+        m
+    };
 
     for i in 0..N {
         // --- duplicate_sweep ---
@@ -96,6 +104,14 @@ fn main() {
             mk(&mut sub, &mut clock, "tool", tool(&format!("neg_tool_{i}"), false, "ok"), None);
         }
         *expected.entry("tool_failure").or_default() += 1;
+
+        // --- skill_stall ---
+        // positive: practiced a lot, proficiency still low. decoys: proficient,
+        // and barely-practiced.
+        mk(&mut sub, &mut clock, "skill", skill(&format!("pos_skill_{i}"), 0.2, 12), None);
+        mk(&mut sub, &mut clock, "skill", skill(&format!("neg_skill_prof_{i}"), 0.9, 12), None);
+        mk(&mut sub, &mut clock, "skill", skill(&format!("neg_skill_new_{i}"), 0.2, 1), None);
+        *expected.entry("skill_stall").or_default() += 1;
     }
 
     let engine = Engine::with_builtins();

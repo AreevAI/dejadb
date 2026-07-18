@@ -204,9 +204,10 @@ file can never arrive pre-armed.
    bar, never a printed claim — §18.)
 9. **Extension, flexibility, easy integration** are design axes on every
    surface: analyzers, capture, policy, UI, bindings, protocol.
-10. Discipline: this scope adds **no** new default-on analyzers beyond the
-    six defined in §8, no daemon/scheduler, no new dependencies, and no
-    weakening of the trust floor. Growth is UI, governance ergonomics, and
+10. Discipline: this scope launched with the six analyzers defined in §8
+    (peer review later added the field-based `skill_stall` default-on and
+    `goal_stagnation` opt-in — §8), no daemon/scheduler, no new dependencies,
+    and no weakening of the trust floor. Growth is UI, governance ergonomics, and
     integration.
 
 ### 2.6 Naming: two words
@@ -1009,11 +1010,22 @@ analysis works here and text-blob memory products cannot do it.
 **Deferred until 2–4 weeks of telemetry exist**: dead queries (saved
 queries nothing ever runs), cold grains (stored but never recalled), budget
 pressure (assembly budgets consistently overflowing), coverage-gap
-clustering (recurring questions with no matching memories; T1), skill
-trajectory (skills whose failure counts trend upward). **Evaluated and
-cut**: goal stagnation (goals with no progress events) and fact churn
-(facts superseded unusually often) — neither has a reliable deterministic
-signal, and coin-flip precision poisons approval trust.
+clustering (recurring questions with no matching memories; T1). **Evaluated
+and cut**: fact churn (facts superseded unusually often) — no reliable
+deterministic signal.
+
+**Added post-review (peer review Q2/Q3).** Two grain-type analyzers were
+reconsidered against their **field-based** (not event-based) form and shipped:
+`skill_stall` (a Skill practiced ≥N times whose `proficiency` stays low —
+computed from the grain's own fields, no telemetry; **default-on**, 1.00 on
+the precision fixture) and `goal_stagnation` (an active Goal with low
+`progress` gone stale — **default-off / opt-in**, because "stalled" vs.
+legitimate long-running work is genuinely ambiguous). Both are advisory
+(`Flag`) and never auto-apply. The earlier cut evaluated only the weaker
+event-based forms ("failure counts trend upward" / "no progress events");
+the field-based forms are cleaner. This makes eight built-in analyzers (seven
+default-on); `skill_stall` is the first that distills a *capability* signal
+rather than pure memory hygiene.
 
 **Precision rule (brand-critical)**: NO invented precision percentages
 anywhere — design docs, spec, marketing. dejadb-bench gains
@@ -1471,7 +1483,7 @@ recorded reason.
 | FORGET allowed inside proposals, but triple-gated and non-rollbackable | Staleness sweeps need tombstones; destruction stays gated per the standing DejaDB invariant. |
 | Built-in analyzers take params/namespaces/windows — not custom CAL | Built-ins read typed internals (heads table, telemetry); accepting stored queries there is fake generality. Custom CAL is real in command-analyzer manifests. |
 | No invented precision numbers, ever | Default-on status is decided by measured `waiser_precision` fixture runs, published RESULTS.md-style. |
-| Analyzer count stays at six for the first release | New value this cycle is UI + governance + integration, not more detectors; goal-stagnation and fact-churn analyzers are cut outright (coin-flip precision poisons approval trust). |
+| Analyzer count launched at six; +2 added on peer review | New value that cycle was UI + governance + integration, not more detectors. Peer review (Q2/Q3) then reconsidered the *field-based* Skill/Goal analyzers (vs. the weaker event-based forms): `skill_stall` ships default-on, `goal_stagnation` opt-in. Fact-churn stays cut (no reliable signal). |
 | The engine never writes outside the memory file | Host-apply contract (§12.3) keeps recommendations-beyond-blast-radius safe. |
 | Token-less console becomes read-only (breaking) | An unauthenticated write path would let any local process bypass the review queue; the auth change is load-bearing for governance. |
 | No `deja waiser watch` verb — time triggers are the OS scheduler's job; we print its config (`schedule --print`) | A foreground `watch` respects the letter of no-daemon but not the spirit — users `nohup` it and then want pidfiles, logs, restart-on-crash, i.e. scheduler creep with worse reliability than the OS scheduler already on every platform. Reopen on sustained Windows Task Scheduler friction. |

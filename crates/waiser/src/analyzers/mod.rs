@@ -6,7 +6,9 @@
 pub mod contradiction_sweep;
 pub mod duplicate_sweep;
 pub mod fork_surfacing;
+pub mod goal_stagnation;
 pub mod outcome_review;
+pub mod skill_stall;
 pub mod staleness;
 pub mod tool_failure;
 

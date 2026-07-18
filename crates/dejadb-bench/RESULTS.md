@@ -250,8 +250,12 @@ regressions in CI.
 |---|---|---|---|---|---|
 | waiser.contradiction_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.duplicate_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
+| waiser.skill_stall | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.staleness | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.tool_failure | 6 | 6 | 0 | 1.00 | 1.00 |
+
+(`waiser.goal_stagnation` is default-**off** — "stalled" is ambiguous — so it
+does not appear in the default-on bench; it is unit-tested separately.)
 
 This is a **synthetic floor**, not a field number: it proves the analyzers
 don't fire on obvious look-alikes and catch obvious positives. Real-world

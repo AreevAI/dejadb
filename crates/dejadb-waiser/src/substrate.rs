@@ -259,6 +259,8 @@ fn grains_of_type(
         "event" => read_user_type(f, GrainType::Event, namespace, opts),
         "tool" => read_user_type(f, GrainType::Tool, namespace, opts),
         "observation" => read_user_type(f, GrainType::Observation, namespace, opts),
+        "skill" => read_user_type(f, GrainType::Skill, namespace, opts),
+        "goal" => read_user_type(f, GrainType::Goal, namespace, opts),
         other => Err(WErr::Substrate(format!("unsupported grain type {other:?}"))),
     }
 }

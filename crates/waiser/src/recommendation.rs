@@ -57,6 +57,10 @@ fn builtin_template(id: &str) -> Option<&'static str> {
         }
         "staleness.expired" => "Expire \"{subject}\": past its declared valid_to ({age_days}d ago)",
         "fork.multi_head" => "Entity \"{entity}\" has {count} competing heads",
+        "skill.stall" => {
+            "Skill \"{skill}\" isn't improving: practiced {practice_count}× but proficiency is still {proficiency}"
+        }
+        "goal.stagnation" => "Goal \"{goal}\" is stalled: active {age_days}d with {progress} progress",
         "outcome.regression" => {
             "Applied recommendation regressed: {metric} moved {baseline} → {current}"
         }

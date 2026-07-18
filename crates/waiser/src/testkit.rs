@@ -134,6 +134,41 @@ impl TestSubstrate {
         self.inner.register_fork(entity, heads);
     }
 
+    pub fn add_skill(&mut self, name: &str, proficiency: f64, practice_count: i64) -> String {
+        let created = self.tick();
+        let mut fields = Map::new();
+        fields.insert("name".into(), json!(name));
+        fields.insert("proficiency".into(), json!(proficiency));
+        fields.insert("practice_count".into(), json!(practice_count));
+        fields.insert("namespace".into(), json!("test"));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "skill".into(),
+            namespace: "test".into(),
+            created_at_ms: created,
+            valid_to_ms: None,
+            superseded_by: None,
+            fields,
+        })
+    }
+
+    pub fn add_goal(&mut self, subject: &str, state: &str, progress: f64, created_at: i64) -> String {
+        let mut fields = Map::new();
+        fields.insert("subject".into(), json!(subject));
+        fields.insert("goal_state".into(), json!(state));
+        fields.insert("progress".into(), json!(progress));
+        fields.insert("namespace".into(), json!("test"));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "goal".into(),
+            namespace: "test".into(),
+            created_at_ms: created_at,
+            valid_to_ms: None,
+            superseded_by: None,
+            fields,
+        })
+    }
+
     pub fn set_outcome_inputs(&mut self, outcomes: Vec<OutcomeInput>) {
         self.outcomes = outcomes;
     }
