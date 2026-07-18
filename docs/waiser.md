@@ -166,18 +166,32 @@ records a **measured outcome** — `held` or `regressed`:
   supposed to stop it. If the failure recurs, the outcome is `regressed` and
   outcome review proposes a **revert**; if it doesn't, the outcome is `held`.
 
+Crucially, it re-measures on a **schedule of checkpoints** (1d / 7d / 30d), not
+once — so an outcome that looked fine early can be caught regressing later. A
+single fixed window would freeze a false "held"; the time series doesn't:
+
 ```bash
 deja waiser outcomes --db agent.db
-#   57607a4  tool_error_recurrence  baseline 0 → current 0  [held]       ← the lesson worked
-#   a6f8133  tool_error_recurrence  baseline 0 → current 3  [regressed]  ← it didn't; revert proposed
+#   a6f8133  tool_error_recurrence  @1d    baseline 0 → current 0  [held]
+#   a6f8133  tool_error_recurrence  @7d    baseline 0 → current 0  [held]
+#   a6f8133  tool_error_recurrence  @30d   baseline 0 → current 2  [regressed]  ← late recurrence caught; revert proposed
 ```
 
 The re-measurement is a typed read over subsequent history (no LLM, no
 guessing), recorded as a file-truth so it syncs and accumulates. That is the
 difference between "governed memory hygiene" and self-improvement that proves
-its own advice — the record is the evidence. (Outcomes accrue over real time as
-review windows elapse; the mechanism is exercised end-to-end by the engine test
-suite, which controls the clock.)
+its own advice — the record is the evidence.
+
+**The honest boundary.** This works for **internal, bounded, attributable**
+outcomes — facts about data Waiser owns (did this tool fail again, does this
+duplicate still exist). It does **not** measure open-ended, confounded,
+world-facing outcomes (was a generated post good, is a patient happier). Those
+depend on signals outside DejaDB and on a hundred factors that aren't the
+change, so the honest output is a **monitored trend a human judges**, never a
+machine verdict — the design suppresses causal claims at low sample sizes on
+purpose. Waiser improves the agent's *memory*, not its *outputs* (§2.4).
+Outcomes accrue over real calendar time as checkpoints elapse; the loop is
+exercised end-to-end by the engine test suite, which controls the clock.
 
 ## Triggers — no daemon, anywhere
 

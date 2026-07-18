@@ -420,12 +420,10 @@ fn policy_deny_disables_an_analyzer() {
     );
 }
 
-/// The Verify gate, end to end: apply a tool-failure lesson, let the failure
-/// RECUR afterward, and confirm outcome review measures a regression and
-/// proposes a revert — the "how do we know it worked?" evidence.
-#[test]
-fn outcome_review_flags_regression_when_failure_recurs() {
-    const DAY: i64 = 86_400_000;
+const DAY: i64 = 86_400_000;
+
+/// Apply a tool-failure lesson; return (engine, sub, rec_hash) at apply time T.
+fn apply_lesson(now: i64) -> (Engine, TestSubstrate, String) {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
         sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 1_000);
@@ -433,7 +431,6 @@ fn outcome_review_flags_regression_when_failure_recurs() {
     sub.add_tool_call_at("stripe_refund", false, "ok", 1_100);
     let e = Engine::with_builtins();
     e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
-
     let hash = e
         .recommendations(&sub.inner, Some(RecStatus::Pending))
         .unwrap()
@@ -442,64 +439,66 @@ fn outcome_review_flags_regression_when_failure_recurs() {
         .expect("a tool-failure lesson")
         .hash;
     let scopes = ScopeSet::all();
-    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", 2_000_000).unwrap();
-    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply the rule", false, 2_000_000).unwrap();
+    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", now).unwrap();
+    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply the rule", false, now).unwrap();
+    (e, sub, hash)
+}
 
-    // The exact failure recurs after the fix was applied.
+/// The multi-horizon Verify gate: a LATE recurrence that early checkpoints miss
+/// is caught at a later one — held at 1d, held at 7d, regressed at 30d.
+#[test]
+fn outcome_time_series_catches_a_late_regression() {
+    let t = 2_000_000;
+    let (e, mut sub, hash) = apply_lesson(t);
+
+    // Measure the 1d and 7d checkpoints — no recurrence yet.
+    e.run(&mut sub.inner, &RunOptions::default(), t + 2 * DAY).unwrap();
+    e.run(&mut sub.inner, &RunOptions::default(), t + 8 * DAY).unwrap();
+
+    // The failure recurs at day 20 — after the early checkpoints.
     for _ in 0..2 {
-        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 3_000_000);
+        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", t + 20 * DAY);
     }
 
-    // Re-measure past the 14-day review window.
-    e.run(&mut sub.inner, &RunOptions::default(), 2_000_000 + 15 * DAY).unwrap();
+    // Measure the 30d checkpoint.
+    e.run(&mut sub.inner, &RunOptions::default(), t + 31 * DAY).unwrap();
 
-    let outcomes = e.outcomes(&sub.inner).unwrap();
-    let o = outcomes.iter().find(|o| o.rec_hash == hash).expect("a measured outcome");
-    assert_eq!(o.verdict, "regressed");
-    assert_eq!(o.current, 2.0, "two recurrences measured (baseline 0)");
+    let series: Vec<_> = e
+        .outcomes(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.rec_hash == hash)
+        .collect();
+    let verdict_at = |h: i64| series.iter().find(|o| o.horizon_ms == h).map(|o| o.verdict.as_str());
+    assert_eq!(verdict_at(DAY), Some("held"), "no recurrence at day 1");
+    assert_eq!(verdict_at(7 * DAY), Some("held"), "still held at day 7");
+    assert_eq!(verdict_at(30 * DAY), Some("regressed"), "the late recurrence is caught at day 30");
     assert!(
         e.recommendations(&sub.inner, Some(RecStatus::Pending))
             .unwrap()
             .iter()
             .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
-        "a revert is proposed"
+        "a revert is proposed once the regression appears"
     );
 }
 
-/// The other side: no recurrence → the fix held, no revert.
+/// No recurrence at any checkpoint → the fix held across the whole series, no
+/// revert ever proposed.
 #[test]
-fn outcome_review_records_held_when_fix_works() {
-    const DAY: i64 = 86_400_000;
-    let mut sub = TestSubstrate::new();
-    for _ in 0..5 {
-        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 1_000);
-    }
-    sub.add_tool_call_at("stripe_refund", false, "ok", 1_100);
-    let e = Engine::with_builtins();
-    e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
-    let hash = e
-        .recommendations(&sub.inner, Some(RecStatus::Pending))
-        .unwrap()
-        .into_iter()
-        .find(|r| r.analyzer.starts_with("waiser.tool_failure"))
-        .unwrap()
-        .hash;
-    let scopes = ScopeSet::all();
-    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", 2_000_000).unwrap();
-    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply the rule", false, 2_000_000).unwrap();
+fn outcome_time_series_holds_when_fix_works() {
+    let t = 2_000_000;
+    let (e, mut sub, hash) = apply_lesson(t);
+    sub.add_tool_call_at("stripe_refund", false, "ok", t + 10 * DAY); // only a success
+    e.run(&mut sub.inner, &RunOptions::default(), t + 31 * DAY).unwrap();
 
-    // Only a success afterward — the failure did not recur.
-    sub.add_tool_call_at("stripe_refund", false, "ok", 3_000_000);
-    e.run(&mut sub.inner, &RunOptions::default(), 2_000_000 + 15 * DAY).unwrap();
-
-    let o = e
+    let series: Vec<_> = e
         .outcomes(&sub.inner)
         .unwrap()
         .into_iter()
-        .find(|o| o.rec_hash == hash)
-        .expect("a measured outcome");
-    assert_eq!(o.verdict, "held");
-    assert_eq!(o.current, 0.0);
+        .filter(|o| o.rec_hash == hash)
+        .collect();
+    assert_eq!(series.len(), 3, "all three checkpoints measured");
+    assert!(series.iter().all(|o| o.verdict == "held"), "held throughout");
     assert!(
         !e.recommendations(&sub.inner, Some(RecStatus::Pending))
             .unwrap()

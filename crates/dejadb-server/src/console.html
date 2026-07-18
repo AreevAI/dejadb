@@ -749,6 +749,8 @@ async function loadOutcomes() {
     const tr = document.createElement('tr');
     tr.style.borderTop = '1px solid var(--line,#333)';
     td(tr).textContent = o.metric;
+    const hz = o.horizon_ms % 86400000 === 0 ? (o.horizon_ms / 86400000) + 'd' : (o.horizon_ms / 3600000) + 'h';
+    td(tr).textContent = '@' + hz;
     td(tr).textContent = 'baseline ' + o.baseline + ' → current ' + o.current;
     const v = td(tr);
     v.textContent = o.verdict;
@@ -758,7 +760,7 @@ async function loadOutcomes() {
   const cap = document.createElement('p');
   cap.className = 'hint';
   cap.style.marginTop = '10px';
-  cap.textContent = 'Measured history from re-running each applied recommendation’s metric — the honest answer to “did it work?”';
+  cap.textContent = 'Re-measured at each checkpoint (a time series) — “held at 1d” can flip to “regressed at 30d”. The honest answer to “did it work?”';
   host.appendChild(tbl);
   host.appendChild(cap);
 }

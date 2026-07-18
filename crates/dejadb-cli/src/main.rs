@@ -1528,10 +1528,16 @@ fn run_waiser(
                 );
             } else {
                 for o in &outcomes {
+                    let horizon = if o.horizon_ms % 86_400_000 == 0 {
+                        format!("{}d", o.horizon_ms / 86_400_000)
+                    } else {
+                        format!("{}h", o.horizon_ms / 3_600_000)
+                    };
                     println!(
-                        "{}  {:<24}  baseline {} → current {}  [{}]",
+                        "{}  {:<22}  @{:<4}  baseline {} → current {}  [{}]",
                         short(&o.rec_hash),
                         o.metric,
+                        horizon,
                         o.baseline,
                         o.current,
                         o.verdict

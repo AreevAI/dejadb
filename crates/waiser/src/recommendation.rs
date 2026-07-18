@@ -114,13 +114,34 @@ pub struct MetricSnapshot {
     /// CAL that recomputes the metric at verify time (reproducibility /
     /// documentation; the engine re-measures with typed reads).
     pub query: String,
-    /// How long after apply to re-measure, in epoch-ms delta.
+    /// How long after apply to re-measure, in epoch-ms delta (the first / only
+    /// checkpoint when `horizons_ms` is empty).
     pub review_after_ms: i64,
+    /// A schedule of checkpoints (ms after apply) to re-measure at. An outcome
+    /// that `held` at an early checkpoint can `regress` at a later one, so a
+    /// verdict is never final until the last horizon. Empty → `[review_after_ms]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub horizons_ms: Vec<i64>,
 }
 
-/// A measured outcome for an applied recommendation — the Verify gate's
-/// output. `held` = the metric did not regress; `regressed` = it got worse
-/// (a revert is proposed).
+impl MetricSnapshot {
+    /// The measurement schedule, sorted — `horizons_ms` if set, else the single
+    /// `review_after_ms`.
+    pub fn horizons(&self) -> Vec<i64> {
+        let mut h = if self.horizons_ms.is_empty() {
+            vec![self.review_after_ms]
+        } else {
+            self.horizons_ms.clone()
+        };
+        h.sort_unstable();
+        h
+    }
+}
+
+/// A measured outcome for an applied recommendation at one checkpoint — the
+/// Verify gate's output. `held` = the metric did not regress at this horizon;
+/// `regressed` = it got worse (a revert is proposed). A recommendation
+/// accumulates one of these per horizon, forming a time series.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeResult {
     pub rec_hash: String,
@@ -128,6 +149,9 @@ pub struct OutcomeResult {
     pub baseline: f64,
     pub current: f64,
     pub verdict: String,
+    /// Which checkpoint this measurement is for (ms after apply).
+    #[serde(default)]
+    pub horizon_ms: i64,
     pub measured_at_ms: i64,
 }
 

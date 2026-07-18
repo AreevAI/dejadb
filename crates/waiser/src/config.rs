@@ -37,12 +37,14 @@ pub struct WaiserPersisted {
     /// Applied-recommendation records (inverse plan, metric, timing).
     #[serde(default)]
     pub applied: BTreeMap<String, AppliedRecord>,
-    /// Recommendation hashes whose outcome has been measured (measure-once).
+    /// Per-recommendation set of horizons (ms after apply) already measured, so
+    /// each checkpoint is measured exactly once.
     #[serde(default)]
-    pub measured: std::collections::BTreeSet<String>,
-    /// Measured outcomes (the Verify gate's output), keyed by recommendation.
+    pub measured: BTreeMap<String, Vec<i64>>,
+    /// Measured outcome time series (the Verify gate's output), keyed by
+    /// recommendation — one entry per horizon checkpoint.
     #[serde(default)]
-    pub outcomes: BTreeMap<String, crate::recommendation::OutcomeResult>,
+    pub outcomes: BTreeMap<String, Vec<crate::recommendation::OutcomeResult>>,
 }
 
 fn default_schema_version() -> u32 {
@@ -60,7 +62,7 @@ impl Default for WaiserPersisted {
             creators: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
             applied: BTreeMap::new(),
-            measured: std::collections::BTreeSet::new(),
+            measured: BTreeMap::new(),
             outcomes: BTreeMap::new(),
         }
     }

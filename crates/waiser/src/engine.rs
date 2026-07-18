@@ -674,64 +674,71 @@ impl Engine {
         Ok(out)
     }
 
-    /// The measured outcomes recorded so far (the Verify gate's history),
-    /// newest-measured last. Read from the persisted state.
+    /// The measured outcome time series (the Verify gate's history) across all
+    /// recommendations, ordered by when each checkpoint was measured.
     pub fn outcomes<S: OmsSubstrate>(&self, sub: &S) -> Result<Vec<crate::recommendation::OutcomeResult>> {
         let p = WaiserPersisted::from_value(sub.load_state()?)?;
-        let mut out: Vec<_> = p.outcomes.into_values().collect();
-        out.sort_by_key(|o| o.measured_at_ms);
+        let mut out: Vec<_> = p.outcomes.into_values().flatten().collect();
+        out.sort_by_key(|o| (o.measured_at_ms, o.horizon_ms));
         Ok(out)
     }
 }
 
-/// Re-measure every applied recommendation past its `review_after` (once), via
-/// the engine's typed reads — no CAL-scalar round-trip. Records an
-/// `OutcomeResult` (held / regressed) and returns the inputs the outcome
-/// analyzer judges. Unknown metric kinds are skipped, never faked.
+/// Re-measure applied recommendations at each **checkpoint** past due, via the
+/// engine's typed reads — no CAL-scalar round-trip. A recommendation
+/// accumulates one `OutcomeResult` per horizon (measured once each), forming a
+/// time series, so a late regression (held at 1d, regressed at 30d) is caught.
+/// Only *regressed* checkpoints feed the outcome analyzer (→ a revert).
+/// Unknown metric kinds are skipped, never faked.
 fn measure_outcomes<S: OmsSubstrate>(
     sub: &S,
     p: &mut WaiserPersisted,
     now_ms: i64,
 ) -> Result<Vec<OutcomeInput>> {
-    let mut out = Vec::new();
-    // Collect first (can't hold &p.applied while mutating p).
-    let due: Vec<(String, crate::config::AppliedRecord)> = p
-        .applied
-        .iter()
-        .filter(|(h, a)| {
-            p.status_index.get(*h) == Some(&RecStatus::Applied)
-                && a.metric.as_ref().is_some_and(|m| now_ms - a.applied_at_ms >= m.review_after_ms)
-                && !p.measured.contains(*h)
-        })
-        .map(|(h, a)| (h.clone(), a.clone()))
-        .collect();
+    // Collect all due (recommendation, horizon) checkpoints first.
+    let mut due: Vec<(String, crate::config::AppliedRecord, i64)> = Vec::new();
+    for (h, a) in &p.applied {
+        if p.status_index.get(h) != Some(&RecStatus::Applied) {
+            continue;
+        }
+        let Some(metric) = &a.metric else { continue };
+        let done = p.measured.get(h).cloned().unwrap_or_default();
+        for horizon in metric.horizons() {
+            if now_ms - a.applied_at_ms >= horizon && !done.contains(&horizon) {
+                due.push((h.clone(), a.clone(), horizon));
+            }
+        }
+    }
 
-    for (rec_hash, applied) in due {
+    let mut out = Vec::new();
+    for (rec_hash, applied, horizon) in due {
         let metric = applied.metric.as_ref().unwrap();
         let Some(current) = measure_metric(sub, metric, applied.applied_at_ms)? else {
             continue; // metric kind not yet re-measurable
         };
         let regressed = current > metric.baseline + f64::EPSILON;
-        p.outcomes.insert(
-            rec_hash.clone(),
+        p.outcomes.entry(rec_hash.clone()).or_default().push(
             crate::recommendation::OutcomeResult {
                 rec_hash: rec_hash.clone(),
                 metric: metric.metric.clone(),
                 baseline: metric.baseline,
                 current,
                 verdict: if regressed { "regressed" } else { "held" }.into(),
+                horizon_ms: horizon,
                 measured_at_ms: now_ms,
             },
         );
-        p.measured.insert(rec_hash.clone());
-        out.push(OutcomeInput {
-            rec_hash,
-            target_ref: applied.target_ref.clone(),
-            metric: metric.metric.clone(),
-            baseline: metric.baseline,
-            current,
-            unit: metric.unit.clone(),
-        });
+        p.measured.entry(rec_hash.clone()).or_default().push(horizon);
+        if regressed {
+            out.push(OutcomeInput {
+                rec_hash,
+                target_ref: applied.target_ref.clone(),
+                metric: metric.metric.clone(),
+                baseline: metric.baseline,
+                current,
+                unit: metric.unit.clone(),
+            });
+        }
     }
     Ok(out)
 }

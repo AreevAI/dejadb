@@ -155,7 +155,10 @@ impl Analyzer for ToolFailureClustering {
                     window: format!("{}d", ctx.params().get_int("window_days")),
                     subject: Some(tool.clone()),
                     query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error SINCE <applied_at> | COUNT"),
-                    review_after_ms: 14 * 86_400_000,
+                    review_after_ms: 86_400_000,
+                    // Re-measure at 1 day, 1 week, 1 month — a late recurrence
+                    // (held at 1d, regressed at 30d) is caught by the schedule.
+                    horizons_ms: vec![86_400_000, 7 * 86_400_000, 30 * 86_400_000],
                 }),
             );
         }
