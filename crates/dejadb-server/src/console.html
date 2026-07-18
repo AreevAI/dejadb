@@ -314,7 +314,9 @@
         <span class="seg" id="waiserNav">
           <button class="on" data-w="queue" onclick="waiserView('queue')">queue</button>
           <button data-w="analyzers" onclick="waiserView('analyzers')">analyzers</button>
+          <button data-w="sessions" onclick="waiserView('sessions')">sessions</button>
           <button data-w="outcomes" onclick="waiserView('outcomes')">outcomes</button>
+          <button data-w="setup" onclick="waiserView('setup')">setup</button>
         </span>
         <button onclick="waiserRun()">Run analysis</button>
         <span class="spacer"></span>
@@ -637,6 +639,8 @@ function waiserView(v) {
 }
 async function loadWaiser() {
   if (WAISER_VIEW === 'analyzers') return loadAnalyzers();
+  if (WAISER_VIEW === 'sessions') return loadSessions();
+  if (WAISER_VIEW === 'setup') return loadSetup();
   if (WAISER_VIEW === 'outcomes') return loadOutcomes();
   const [health, recs] = await Promise.all([
     api('/api/waiser/health'),
@@ -764,6 +768,89 @@ async function loadOutcomes() {
   cap.textContent = 'Re-measured at each checkpoint (a time series) — “held at 1d” can flip to “regressed at 30d”. The honest answer to “did it work?”';
   host.appendChild(tbl);
   host.appendChild(cap);
+}
+/* small render helpers shared by the sessions/setup views */
+function wEmpty(host, txt) { const e = document.createElement('div'); e.className = 'empty'; e.textContent = txt; host.appendChild(e); }
+function wSection(txt) { const h = document.createElement('div'); h.style.cssText = 'margin:14px 0 6px;font-weight:600;color:var(--dim,#aaa)'; h.textContent = txt; return h; }
+function wTable() { const t = document.createElement('table'); t.style.cssText = 'width:100%;border-collapse:collapse'; return t; }
+function wRow(t) { const tr = document.createElement('tr'); tr.style.borderTop = '1px solid var(--line,#333)'; t.appendChild(tr); return tr; }
+/* Sessions: what recall actually surfaced — the telemetry view (§8). */
+async function loadSessions() {
+  const res = await api('/api/waiser/telemetry');
+  const host = $('waiserTable');
+  host.textContent = '';
+  if (!res || !res.ok) { wEmpty(host, 'telemetry unavailable'); return; }
+  if (!res.enabled) {
+    wEmpty(host, 'telemetry is off — open with --telemetry aggregate (CLI) or telemetry="aggregate" (bindings) to record recall activity, then cold-grain and coverage-gap analysis lights up');
+    return;
+  }
+  const access = res.access || [], queries = res.queries || [];
+  const gaps = queries.filter(q => q.run_count >= 3 && q.empty_count > 0);
+  const sum = document.createElement('p');
+  sum.className = 'hint';
+  sum.textContent = 'mode ' + res.mode + ' · ' + access.length + ' grains recalled · ' + queries.length + ' distinct questions · ' + gaps.length + ' recurring gap(s)';
+  host.appendChild(sum);
+
+  if (gaps.length) {
+    host.appendChild(wSection('Recurring questions returning little or nothing'));
+    const t = wTable();
+    for (const q of gaps.sort((a, b) => b.empty_count - a.empty_count).slice(0, 50)) {
+      const tr = wRow(t);
+      td(tr).textContent = q.sample || '(subject recall)';
+      td(tr).textContent = 'asked ' + q.run_count + '×';
+      const e = td(tr);
+      e.textContent = q.empty_count + ' empty';
+      e.style.color = q.empty_count >= q.run_count ? '#e5484d' : 'var(--dim,#888)';
+    }
+    host.appendChild(t);
+  }
+
+  host.appendChild(wSection('Most-recalled grains (memory earning its place)'));
+  if (!access.length) { wEmpty(host, 'no recalls recorded yet'); }
+  else {
+    const t = wTable();
+    for (const a of access.slice(0, 50)) {
+      const tr = wRow(t);
+      const h = td(tr); h.textContent = (a.hash || '').slice(0, 12); h.style.fontFamily = 'monospace';
+      td(tr).textContent = a.recall_count + '× recalled';
+    }
+    host.appendChild(t);
+  }
+
+  if (res.budget && res.budget.sample_count) {
+    const b = res.budget, rate = Math.round(100 * b.overflow_count / b.sample_count);
+    const p = document.createElement('p'); p.className = 'hint'; p.style.marginTop = '10px';
+    p.textContent = 'assembly budget: ' + rate + '% overflow over ' + b.sample_count + ' samples';
+    host.appendChild(p);
+  }
+  const cap = document.createElement('p'); cap.className = 'hint'; cap.style.marginTop = '10px';
+  cap.textContent = 'Disposable, never-syncing evidence (§8). Grains absent here are candidates the cold-grains analyzer flags; recurring empty questions feed coverage-gap.';
+  host.appendChild(cap);
+}
+/* Setup: the effective configuration (read-only for now). */
+async function loadSetup() {
+  const host = $('waiserTable');
+  host.textContent = '';
+  const [an, tel] = await Promise.all([api('/api/waiser/analyzers'), api('/api/waiser/telemetry')]);
+  host.appendChild(wSection('Telemetry'));
+  const tp = document.createElement('p'); tp.className = 'hint';
+  tp.textContent = (tel && tel.enabled) ? ('recall telemetry is on (' + tel.mode + ')') : 'recall telemetry is off';
+  host.appendChild(tp);
+
+  const list = (an && an.analyzers) || [];
+  host.appendChild(wSection('Analyzers (' + list.filter(a => a.default_on).length + ' of ' + list.length + ' on)'));
+  const t = wTable();
+  for (const a of list) {
+    const tr = wRow(t);
+    td(tr).textContent = a.id.replace('waiser.', '');
+    const on = td(tr); on.textContent = a.default_on ? 'on' : 'off';
+    on.style.color = a.default_on ? '#3fb950' : 'var(--dim,#888)';
+    td(tr).textContent = a.title;
+  }
+  host.appendChild(t);
+  const note = document.createElement('p'); note.className = 'hint'; note.style.marginTop = '12px';
+  note.textContent = 'Effective defaults shown. Toggle analyzers per file with deja waiser enable/disable; grant auto-apply only via a host policy file (deja waiser --policy). Editing from the console is a planned follow-up.';
+  host.appendChild(note);
 }
 async function waiserRun() {
   $('waiserHealth').textContent = 'running…';

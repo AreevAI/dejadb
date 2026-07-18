@@ -633,6 +633,44 @@ impl UiServer {
                     .collect();
                 ok_json(json!({"ok": true, "analyzers": list}))
             }
+            ("GET", "/api/waiser/telemetry") => {
+                // Recall-telemetry rollups for the Sessions view. A read — open
+                // in read-only mode like the other waiser GETs.
+                let mode = self.facade.with_store(|m| m.telemetry_mode());
+                if mode == dejadb_store::TelemetryMode::Off {
+                    ok_json(json!({"ok": true, "enabled": false}))
+                } else {
+                    let access = self.facade.with_store(|m| m.telemetry_access_stats(None));
+                    let queries = self.facade.with_store(|m| m.telemetry_query_stats(None));
+                    let budget = self.facade.with_store(|m| m.telemetry_budget_stats());
+                    match (access, queries, budget) {
+                        (Ok(mut a), Ok(mut q), Ok(b)) => {
+                            // Most-recalled first; recurring-gap questions first.
+                            a.sort_by(|x, y| y.recall_count.cmp(&x.recall_count));
+                            a.truncate(200);
+                            q.sort_by(|x, y| y.run_count.cmp(&x.run_count));
+                            q.truncate(200);
+                            ok_json(json!({
+                                "ok": true,
+                                "enabled": true,
+                                "mode": mode.as_str(),
+                                "access": a.iter().map(|x| json!({
+                                    "hash": x.hash, "recall_count": x.recall_count, "last_ms": x.last_ms,
+                                })).collect::<Vec<_>>(),
+                                "queries": q.iter().map(|x| json!({
+                                    "sample": x.sample, "run_count": x.run_count,
+                                    "empty_count": x.empty_count,
+                                })).collect::<Vec<_>>(),
+                                "budget": {
+                                    "sample_count": b.sample_count,
+                                    "overflow_count": b.overflow_count,
+                                },
+                            }))
+                        }
+                        _ => ok_json(json!({"ok": false, "error": "telemetry read failed"})),
+                    }
+                }
+            }
             ("POST", "/api/waiser/run") => {
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 match Engine::with_builtins().run(&mut sub, &RunOptions::default(), now_ms()) {
@@ -925,6 +963,17 @@ mod waiser_route_tests {
         assert!(r.0.starts_with("200"), "read CAL allowed: {}", text(&r));
         // Waiser reads stay open token-less.
         assert!(s.route("GET", "/api/waiser/recommendations", b"", None).0.starts_with("200"));
+    }
+
+    #[test]
+    fn telemetry_endpoint_is_an_open_read() {
+        let s = server(None);
+        let r = s.route("GET", "/api/waiser/telemetry", b"", None);
+        assert!(r.0.starts_with("200"), "telemetry read open: {}", text(&r));
+        let body = text(&r);
+        assert!(body.contains("\"ok\":true"), "{body}");
+        // The test store opens bare (telemetry off) → enabled:false.
+        assert!(body.contains("\"enabled\":false"), "{body}");
     }
 
     #[test]
