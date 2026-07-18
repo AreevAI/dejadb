@@ -91,10 +91,10 @@ All deterministic (T0/T1), default-on, computing over typed grains:
 
 | Analyzer | Fires on | Proposes |
 |---|---|---|
-| `tool_failure` | ≥N Tool-grain errors clustered by (tool, normalized signature) at ≥40% of a tool's calls | a memory lesson (never auto-applies — evidence-derived text) |
+| `tool_failure` | ≥N Tool-grain errors clustered by (tool, normalized signature), at ≥40% of a tool's calls **or** a large absolute count (so high-volume, moderate-rate failures aren't hidden) | a memory lesson (never auto-applies — evidence-derived text) |
 | `duplicate_sweep` | exact-duplicate facts (NFC + case-fold) and near-duplicate observations (Jaccard) | consolidation (SUPERSEDE the extras) |
-| `contradiction_sweep` | ≥2 live values under a functional relation (seeded list: `deploy_target`, `lives_in`, `tier`, …) | resolve to the latest value |
-| `fork_surfacing` | an entity with >1 live head | a merge |
+| `contradiction_sweep` | ≥2 live values under a functional relation (seeded list: `deploy_target`, `lives_in`, `tier`, … — extendable per domain via `extra_relations`) | resolve to the latest value |
+| `fork_surfacing` | an entity with >1 live head | a merge (approval-required — a merge is lossy, never auto-applies) |
 | `staleness` | a grain past its declared `valid_to` | a single-grain `FORGET` (destructive, never auto-applies) |
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 

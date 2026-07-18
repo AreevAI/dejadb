@@ -642,11 +642,12 @@ async function loadWaiser() {
     api('/api/waiser/health'),
     api('/api/waiser/recommendations?status=pending'),
   ]);
-  if (health && health.ok) {
-    const bs = health.by_status || {};
-    $('waiserHealth').textContent =
-      (bs.pending || 0) + ' pending · ' + (bs.applied || 0) + ' applied · ' + (health.total || 0) + ' total';
-    $('waiserChip').textContent = bs.pending ? ' (' + bs.pending + ')' : '';
+  if (health && health.ok && health.health) {
+    const h = health.health;
+    let line = h.pending + ' pending · ' + h.applied + ' applied · ' + h.total + ' total';
+    if (h.stale) line += ' · ⚠ loop may be stale — Run analysis';
+    $('waiserHealth').textContent = line;
+    $('waiserChip').textContent = h.pending ? ' (' + h.pending + ')' : '';
   }
   renderWaiserQueue((recs && recs.recommendations) || []);
 }

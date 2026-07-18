@@ -46,7 +46,15 @@ impl ContradictionSweep {
                 target_classes: vec![TargetClass::Memory],
                 auto_apply: AutoApplyClass::Never,
                 trust_class: TrustClass::Builtin,
-                params: vec![],
+                params: vec![ParamSpec::Str {
+                    name: "extra_relations".into(),
+                    default: String::new(),
+                    max_len: 2000,
+                    description: "Additional functional (single-valued) relations to check, \
+                                  comma-separated — e.g. a healthcare deployment adds \
+                                  \"insurance_plan,prior_auth,next_appt\"."
+                        .into(),
+                }],
                 default_on: true,
             },
         }
@@ -65,6 +73,16 @@ impl Analyzer for ContradictionSweep {
     }
 
     fn analyze(&self, ctx: &AnalyzeCtx) -> Result<Vec<RecDraft>> {
+        // Seeded functional relations + any host-supplied domain relations.
+        let mut functional: std::collections::BTreeSet<String> =
+            SEEDED_FUNCTIONAL.iter().map(|s| s.to_string()).collect();
+        for r in ctx.params().get_str("extra_relations").split(',') {
+            let r = normalize_ident(r);
+            if !r.is_empty() {
+                functional.insert(r);
+            }
+        }
+
         let facts = ctx.facts()?;
         // (ns, subject, relation) → live facts, only for functional relations.
         let mut groups: BTreeMap<(String, String, String), Vec<GrainRecord>> = BTreeMap::new();
@@ -72,7 +90,7 @@ impl Analyzer for ContradictionSweep {
             let (Some(s), Some(r)) = (f.fact_subject(), f.fact_relation()) else {
                 continue;
             };
-            if !SEEDED_FUNCTIONAL.contains(&normalize_ident(r).as_str()) {
+            if !functional.contains(&normalize_ident(r)) {
                 continue;
             }
             let key = (
@@ -150,6 +168,22 @@ mod tests {
         let drafts = sub.analyze(&ContradictionSweep::new(), 10_000);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].action_kind, ActionKind::FlagContradiction);
+    }
+
+    #[test]
+    fn extra_relations_extend_the_functional_set() {
+        let mut sub = TestSubstrate::new();
+        sub.add_fact("bob", "insurance_plan", "aetna");
+        sub.add_fact("bob", "insurance_plan", "cigna"); // not in the seeded list
+        // Without the param, insurance_plan isn't treated as functional.
+        assert!(sub.analyze(&ContradictionSweep::new(), 10_000).is_empty());
+        // A healthcare deployment adds it.
+        let drafts = sub.analyze_with(
+            &ContradictionSweep::new(),
+            10_000,
+            &[("extra_relations", serde_json::json!("insurance_plan,prior_auth"))],
+        );
+        assert_eq!(drafts.len(), 1, "the custom functional relation is now checked");
     }
 
     #[test]

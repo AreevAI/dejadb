@@ -29,7 +29,10 @@ impl ForkSurfacing {
                 cadence: CadenceClass::Fast,
                 requires: vec![Capability::Forks],
                 target_classes: vec![TargetClass::Memory],
-                auto_apply: AutoApplyClass::StructuralCuration,
+                // Merging heads supersedes the non-primary head(s), which can
+                // drop their distinct content — a lossy choice a human must
+                // make. Never auto-apply, regardless of policy.
+                auto_apply: AutoApplyClass::Never,
                 trust_class: TrustClass::Builtin,
                 params: vec![],
                 default_on: true,

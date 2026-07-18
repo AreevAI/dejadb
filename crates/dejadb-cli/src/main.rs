@@ -1554,24 +1554,27 @@ fn run_waiser(
         }
         // Bare `deja waiser` (or an unknown subcommand) prints a health summary.
         _ => {
-            let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
-            let mut pending = 0;
-            let mut applied = 0;
-            for r in &recs {
-                match r.status {
-                    RecStatus::Pending => pending += 1,
-                    RecStatus::Applied => applied += 1,
-                    _ => {}
-                }
-            }
+            let h = engine.health(&sub, now).map_err(|e| e.to_string())?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "total": recs.len(), "pending": pending, "applied": applied })
-                );
+                println!("{}", serde_json::to_string(&h).map_err(|e| e.to_string())?);
             } else {
-                println!("waiser: {} recommendation(s) — {pending} pending, {applied} applied", recs.len());
-                if pending > 0 {
+                println!(
+                    "waiser: {} recommendation(s) — {} pending, {} applied",
+                    h.total, h.pending, h.applied
+                );
+                match h.last_run_ms {
+                    None => println!("  never run — deja waiser run"),
+                    Some(last) => {
+                        let days = (now - last) / 86_400_000;
+                        println!(
+                            "  last run {days}d ago; {} new grain(s) ({} tool error(s)) since",
+                            h.grains_since_run, h.error_events_since_run
+                        );
+                    }
+                }
+                if h.stale {
+                    eprintln!("  ⚠ the loop may be stale — run `deja waiser run` or wire the SessionEnd hook");
+                } else if h.pending > 0 {
                     println!("  review with: deja waiser list");
                 }
             }

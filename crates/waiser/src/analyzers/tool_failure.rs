@@ -1,8 +1,9 @@
 //! Tool-failure clustering (T0) — the flagship analyzer. Groups error Tool
 //! grains (captured tool calls) by (tool_name, normalized error signature) and
-//! fires when a cluster is both
-//! frequent (≥ min_count) and a meaningful share of that tool's calls
-//! (≥ min_rate). Emits a memory lesson. Because the signature is derived from
+//! fires when a cluster is frequent (≥ min_count) AND is either a meaningful
+//! share of that tool's calls (≥ min_rate) OR a large absolute count
+//! (≥ min_abs) — so high-volume, moderate-rate failures aren't hidden. Emits a
+//! memory lesson. Because the signature is derived from
 //! attacker-influenceable tool output, this analyzer never auto-applies
 //! (§6.3) — its manifest is `Never`.
 
@@ -50,6 +51,15 @@ impl ToolFailureClustering {
                         description: "Minimum share of the tool's calls.".into(),
                     },
                     ParamSpec::Int {
+                        name: "min_abs".into(),
+                        default: 50,
+                        min: 1,
+                        max: 100_000,
+                        description: "Absolute failure count that fires regardless of rate \
+                                      (so high-volume, moderate-rate failures aren't hidden)."
+                            .into(),
+                    },
+                    ParamSpec::Int {
                         name: "window_days".into(),
                         default: 30,
                         min: 1,
@@ -77,6 +87,7 @@ impl Analyzer for ToolFailureClustering {
     fn analyze(&self, ctx: &AnalyzeCtx) -> Result<Vec<RecDraft>> {
         let min_count = ctx.params().get_int("min_count").max(1) as usize;
         let min_rate = ctx.params().get_float("min_rate");
+        let min_abs = ctx.params().get_int("min_abs").max(1) as usize;
         let window_ms = ctx.params().get_int("window_days") * 86_400_000;
         let since = Some(ctx.now_ms() - window_ms);
 
@@ -104,7 +115,11 @@ impl Analyzer for ToolFailureClustering {
             let count = members.len();
             let total = tool_totals.get(&tool).copied().unwrap_or(count).max(1);
             let rate = count as f64 / total as f64;
-            if count < min_count || rate < min_rate {
+            // Fire on a meaningful cluster that is EITHER a high share of the
+            // tool's calls OR a large absolute count — so a tool called 1000×
+            // at a 30% failure rate (300 real failures) isn't hidden by the
+            // rate gate alone.
+            if count < min_count || (rate < min_rate && count < min_abs) {
                 continue;
             }
             members.sort_by(|a, b| a.0.cmp(&b.0));
@@ -224,6 +239,21 @@ mod tests {
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].action_kind, ActionKind::ClusterFailure);
         assert_eq!(drafts[0].evidence.len(), 5);
+    }
+
+    #[test]
+    fn fires_on_high_volume_moderate_rate_via_absolute_count() {
+        let mut sub = TestSubstrate::new();
+        // 10 identical failures out of 40 calls = 25% (below the 40% rate) —
+        // but 10 ≥ min_abs, so it must still fire.
+        for _ in 0..10 {
+            sub.add_tool_call("search", true, "boom 500");
+        }
+        for _ in 0..30 {
+            sub.add_tool_call("search", false, "ok");
+        }
+        let drafts = sub.analyze_with(&ToolFailureClustering::new(), 10_000, &[("min_abs", serde_json::json!(10))]);
+        assert_eq!(drafts.len(), 1, "high-volume moderate-rate cluster fires via min_abs");
     }
 
     #[test]

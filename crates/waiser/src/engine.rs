@@ -369,6 +369,18 @@ impl Engine {
         if !rec.origin.auto_apply_eligible() || rec.destructive {
             return false;
         }
+        // The analyzer must declare its curation auto-appliable. An analyzer
+        // whose manifest is `Never` (e.g. fork surfacing — a lossy merge) is
+        // never auto-applied even if the payload passes the shape check.
+        let manifest_ok = self
+            .analyzers
+            .iter()
+            .map(|a| a.manifest())
+            .find(|m| m.id == rec.analyzer)
+            .is_some_and(|m| m.auto_apply == crate::manifest::AutoApplyClass::StructuralCuration);
+        if !manifest_ok {
+            return false;
+        }
         let Ok(target) = TargetRef::parse(&rec.target_ref) else {
             return false;
         };
@@ -682,6 +694,53 @@ impl Engine {
         out.sort_by_key(|o| (o.measured_at_ms, o.horizon_ms));
         Ok(out)
     }
+
+    /// A health snapshot — when the loop last ran, how much is un-analyzed
+    /// since, and the queue counts. Lets a host surface "the loop may be stale"
+    /// so a forgotten SessionEnd hook / cron doesn't silently kill it.
+    pub fn health<S: OmsSubstrate>(&self, sub: &S, now_ms: i64) -> Result<Health> {
+        let p = WaiserPersisted::from_value(sub.load_state()?)?;
+        let (grains_since_run, error_events_since_run) = count_new(sub, p.state.watermark_ms)?;
+        let recs = self.recommendations(sub, None)?;
+        let mut pending = 0;
+        let mut applied = 0;
+        for r in &recs {
+            match r.status {
+                RecStatus::Pending => pending += 1,
+                RecStatus::Applied => applied += 1,
+                _ => {}
+            }
+        }
+        // Stale if it has never run, or it's been a while / a lot has piled up.
+        let stale = match p.state.last_run_ms {
+            None => true,
+            Some(last) => now_ms - last >= 7 * 86_400_000 || grains_since_run >= 100,
+        };
+        Ok(Health {
+            last_run_ms: p.state.last_run_ms,
+            grains_since_run,
+            error_events_since_run,
+            pending,
+            applied,
+            total: recs.len() as u64,
+            stale,
+        })
+    }
+}
+
+/// A health snapshot for the backend's self-improvement loop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Health {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_ms: Option<i64>,
+    pub grains_since_run: u64,
+    pub error_events_since_run: u64,
+    pub pending: u64,
+    pub applied: u64,
+    pub total: u64,
+    /// True when the loop looks stalled (never run, or ≥7d / ≥100 new grains
+    /// since the last run) — a nudge that a trigger may be unwired.
+    pub stale: bool,
 }
 
 /// Re-measure applied recommendations at each **checkpoint** past due, via the

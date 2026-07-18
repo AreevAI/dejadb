@@ -605,12 +605,10 @@ impl UiServer {
             }
             ("GET", "/api/waiser/health") => {
                 let sub = BorrowedSubstrate::new(&self.facade);
-                let recs = Engine::with_builtins().recommendations(&sub, None).unwrap_or_default();
-                let mut by_status = std::collections::BTreeMap::<&str, u64>::new();
-                for r in &recs {
-                    *by_status.entry(r.status.as_str()).or_default() += 1;
+                match Engine::with_builtins().health(&sub, now_ms()) {
+                    Ok(h) => ok_json(json!({"ok": true, "health": h})),
+                    Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
-                ok_json(json!({"ok": true, "total": recs.len(), "by_status": by_status}))
             }
             ("GET", "/api/waiser/outcomes") => {
                 let sub = BorrowedSubstrate::new(&self.facade);

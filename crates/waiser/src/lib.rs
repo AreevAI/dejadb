@@ -42,7 +42,8 @@ mod testkit;
 
 pub use analyzer::{builtin_analyzers, AnalyzeCtx, Analyzer, OutcomeInput};
 pub use engine::{
-    Decision, Engine, RunOptions, RunOutcome, RunResult, Scope, ScopeSet, SkipReason, WAISER_NS,
+    Decision, Engine, Health, RunOptions, RunOutcome, RunResult, Scope, ScopeSet, SkipReason,
+    WAISER_NS,
 };
 pub use error::{Error, Result};
 pub use manifest::{

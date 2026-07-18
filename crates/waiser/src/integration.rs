@@ -386,6 +386,29 @@ fn policy_grant_auto_applies_structural_consolidation() {
 }
 
 #[test]
+fn fork_merge_never_auto_applies_even_when_granted() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fork("caller/john", &["ref-a", "ref-b"]);
+    // A merge is SUPERSEDE-only (passes the shape check), but it is lossy, so
+    // its manifest is Never — even an explicit policy grant cannot auto-apply it.
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.fork_surfacing", "targets": ["memory"], "max_severity": "high"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 0, "a lossy fork merge is never auto-applied");
+    assert!(
+        e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|x| x.analyzer.starts_with("waiser.fork_surfacing")),
+        "it is proposed for human review instead"
+    );
+}
+
+#[test]
 fn auto_apply_never_touches_free_text_add() {
     // tool-failure proposes an ADD carrying an evidence-derived signature —
     // shape verification rejects it even when the policy names it.

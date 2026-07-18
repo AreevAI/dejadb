@@ -96,8 +96,9 @@ portability, and write parallelism) holding:
   assembly budgets, embedding provenance. These live as *file-truths*:
   self-describing settings stored in the file's `meta` table that any host
   honors on open.
-- **Skills** — OMS 0x0B grains with success/failure counts; improvement only
-  by supersession (OMS §28.8), so the chain *is* the learning history.
+- **Skills** — OMS 0x0B grains carrying `proficiency` (aliases
+  `common.confidence`) and `practice_count`; improvement only by supersession
+  (OMS §28.8), so the chain *is* the learning history.
 - **Event history** — captured tool calls, results, `is_error` flags,
   thread-indexed exchanges: the raw material for improvement.
 - **Improvement state** — recommendation grains, audit chains, and
@@ -723,7 +724,12 @@ this proposal:
 - Self-approval block: fail-closed; enforced against the recommendation's
   **creating actor** — it bites on MCP/CLI surfaces with distinct
   `--actor` labels. The console is one principal (§5.7) and documented as
-  such.
+  such. **Scope the claim accordingly:** separation of duties is enforced on
+  the CLI/MCP surfaces (distinct per-process actors); the console is
+  single-principal, so two people sharing its token are indistinguishable and
+  propose/approve separation is *not* enforced there. Do not claim
+  "separation of duties" for the console UI — per-user tokens / SSO is a
+  prerequisite for that, and a deferred item (§5.5 scope note).
 - Creating-actor semantics: a deterministic analyzer run's recommendations
   are created by the *engine* — the propose transition records the
   engine/run identity, not the human who happened to invoke
@@ -923,8 +929,11 @@ free). Bounded at ≤64 representative hashes, plus an optional
   dedup_key (engine-local, rebuildable).
 - Rollback: the inverse is derived **at apply time** and stored on the
   applied record as a store-op plan (not CAL — no new syntax needed):
-  SUPERSEDE → re-instate prior content; ADD → index-layer retraction
-  (`verification_status=retracted`); DEFINE QUERY → restore the prior
+  SUPERSEDE → re-instate prior content; ADD → **tombstone the added grain**
+  so it truly leaves the recall path (the implementation uses `forget`, an
+  index-layer removal; a `verification_status=retracted` marker was rejected
+  because retracted grains are only *demoted* in recall, not excluded, so it
+  would not be a behaviorally real undo); DEFINE QUERY → restore the prior
   body; doc edit → supersede back to the prior head. **FORGET has no
   inverse** → `rollbackable=false`.
 - Lifecycle fields can never be written via CAL (`SUPERSEDE … SET` on them
@@ -965,8 +974,8 @@ assumed:
 embedding space when an EmbedBackend is installed (an embedder is not an
 LLM). T2 = LLM enrichment (§9), never required. The OMS type system is the
 interpretation layer — analyzers compute over declared semantics
-(`Event.is_error`, Fact s/r/o, Skill success/failure counts, `valid_to`,
-`superseded_by`, `derived_from`), never raw text. This is why no-LLM
+(`Tool.is_error`, Fact s/r/o, Skill `proficiency`/`practice_count`,
+`valid_to`, `superseded_by`, `derived_from`), never raw text. This is why no-LLM
 analysis works here and text-blob memory products cannot do it.
 
 **The initial set (six; default-on pending precision measurement):**
@@ -1084,7 +1093,12 @@ stages can only ADD draft recommendations or polish whitelisted text fields
   never prompt/host targets**; and DISCOVER drafts enter through the
   ordinary ADD path rather than as analyzer output, so the determinism
   contract — *a waiser run's own recommendations are a pure function of
-  (store state, params)* — stays literally true even with an LLM attached.
+  (store state, params, `now`)* — stays literally true even with an LLM
+  attached. `now` is an explicit input, not the wall clock: the engine takes
+  the timestamp as a parameter (`run(store, opts, now)`) and never reads the
+  clock itself, so the tool-failure window and staleness's `valid_to`
+  comparison are reproducible, and counterfactual replay (§17) simply supplies
+  a historical `now`.
 - Pending-recommendation prompt injection (recall hook
   `--with-waiser`): only engine-templated deterministic text is
   injected; llm-origin recommendations appear as hash+count stubs until
@@ -1125,7 +1139,10 @@ stages can only ADD draft recommendations or polish whitelisted text fields
 - **Claim wording** until a second real substrate passes the kit: "built
   on the OMS interfaces — DejaDB is the first substrate; the repo ships a
   reference substrate any implementation can test against." NOT "works
-  with any OMS store" at n=1.
+  with any OMS store" at n=1. And state the one gap plainly: on a substrate
+  without the `forks` capability, **fork surfacing** is the single analyzer
+  that goes dark; the other five run on CAL + grains alone. "Portable" means
+  five-of-six, not full parity — say so.
 - **Strategy note**: our earlier OMS play was spec-first — publish the
   open spec, hope implementations follow — and it underperformed. This
   architecture retries it product-first: Waiser becomes the reason to be
@@ -1599,6 +1616,16 @@ reasons, hash-chained audit, undoable applies, measured outcomes."
 Waiser's honest sentence: *it measures which of its own advice works and
 proves it — and is built to learn from that record when the record is deep
 enough to mean something.*
+
+**Framing (v1 is memory-weighted).** Five of the six analyzers are memory
+*hygiene* (dedup, contradiction, staleness, fork, outcome); only tool-failure
+distills net-new knowledge, and none yet improve Skills. So the accurate v1
+claim is a **self-improving memory backend** — the governed loop plus clean,
+coherent memory the agent reasons from — not "makes your agent better at its
+tasks." Genuine capability improvement (skill trajectories, coverage-gap
+learning) is the growth path (§8 deferred set, §17). Lead with the memory
+framing; it is both true and defensible, and it is the discipline that keeps
+the stronger future claim credible when it lands.
 
 ## 19. Naming, reservations, open questions
 
