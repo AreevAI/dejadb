@@ -145,12 +145,16 @@ impl Analyzer for ToolFailureClustering {
                 .evidence(evidence)
                 .confidence(rate)
                 .metric(MetricSnapshot {
-                    metric: "tool_error_rate".into(),
-                    baseline: rate,
-                    unit: "ratio".into(),
+                    // After the lesson is applied, does this exact tool failure
+                    // recur? Baseline 0 = we expect zero recurrences if the
+                    // lesson worked; any recurrence is a regression → revert.
+                    metric: "tool_error_recurrence".into(),
+                    baseline: 0.0,
+                    unit: "count".into(),
                     n: total as u64,
                     window: format!("{}d", ctx.params().get_int("window_days")),
-                    query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error"),
+                    subject: Some(tool.clone()),
+                    query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error SINCE <applied_at> | COUNT"),
                     review_after_ms: 14 * 86_400_000,
                 }),
             );

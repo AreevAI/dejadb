@@ -112,6 +112,7 @@ deja waiser run     [--min-new N --min-new-errors N --if-stale 6h --format json 
 deja waiser list    [--status pending|applied|all] [--fail-on high]   (exit 2 on match → CI gate)
 deja waiser show <hash>
 deja waiser approve|reject|apply|rollback <hash> --because "…" [--actor A] [--allow-destructive]
+deja waiser outcomes     the Verify gate — did applied advice hold or regress?
 deja waiser analyzers | policy
 deja waiser              (bare: a health summary)
 ```
@@ -152,6 +153,31 @@ with different `--scopes`/`--actor` so no agent can approve its own proposals.
 rollback` (writes). The console's Waiser tab renders the queue with severity
 dots, evidence, and approve/apply/reject actions gated behind a mandatory
 reason.
+
+## Does it actually work? — the Verify gate
+
+The honest test of self-improvement is not "did it make a change" but "did the
+change help." Waiser answers that for itself. When you apply a recommendation
+that carries a metric, the engine re-measures it after the review window and
+records a **measured outcome** — `held` or `regressed`:
+
+- A tool-failure lesson's metric is **recurrence**: after you apply the lesson,
+  does that exact tool failure happen again? Baseline is zero — the fix is
+  supposed to stop it. If the failure recurs, the outcome is `regressed` and
+  outcome review proposes a **revert**; if it doesn't, the outcome is `held`.
+
+```bash
+deja waiser outcomes --db agent.db
+#   57607a4  tool_error_recurrence  baseline 0 → current 0  [held]       ← the lesson worked
+#   a6f8133  tool_error_recurrence  baseline 0 → current 3  [regressed]  ← it didn't; revert proposed
+```
+
+The re-measurement is a typed read over subsequent history (no LLM, no
+guessing), recorded as a file-truth so it syncs and accumulates. That is the
+difference between "governed memory hygiene" and self-improvement that proves
+its own advice — the record is the evidence. (Outcomes accrue over real time as
+review windows elapse; the mechanism is exercised end-to-end by the engine test
+suite, which controls the clock.)
 
 ## Triggers — no daemon, anywhere
 

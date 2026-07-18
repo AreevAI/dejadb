@@ -28,6 +28,7 @@ COMMANDS:
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
+           outcomes  the Verify gate: did applied advice hold, or regress?
            [--policy FILE] grants auto-apply (else $WAISER_POLICY); `policy` prints it
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
@@ -1513,6 +1514,29 @@ fn run_waiser(
                     "{:<28}  {:?}  on={}  {}",
                     m.id, m.tier, m.default_on, m.title
                 );
+            }
+        }
+        // The Verify gate's measured history: did applied advice hold?
+        "outcomes" => {
+            let outcomes = engine.outcomes(&sub).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string(&outcomes).map_err(|e| e.to_string())?);
+            } else if outcomes.is_empty() {
+                eprintln!(
+                    "no measured outcomes yet — outcome review runs after an applied \
+                     recommendation's review window elapses"
+                );
+            } else {
+                for o in &outcomes {
+                    println!(
+                        "{}  {:<24}  baseline {} → current {}  [{}]",
+                        short(&o.rec_hash),
+                        o.metric,
+                        o.baseline,
+                        o.current,
+                        o.verdict
+                    );
+                }
             }
         }
         // Config reporting: the effective host policy (read-only).

@@ -193,8 +193,9 @@ impl Engine {
             return Ok(RunResult::skipped(reason, new_grains, new_error_events));
         }
 
-        // Phase 0 (needs &mut): re-measure applied recommendations due for review.
-        let outcome_inputs = self.compute_outcome_inputs(sub, &persisted, now_ms)?;
+        // Phase 0: re-measure applied recommendations due for review (the
+        // Verify gate). Records a measured outcome per due recommendation.
+        let outcome_inputs = measure_outcomes(sub, &mut persisted, now_ms)?;
 
         // Existing live dedup keys (pending/approved) to suppress re-proposals.
         let existing = existing_dedup_keys(sub, &persisted)?;
@@ -673,37 +674,90 @@ impl Engine {
         Ok(out)
     }
 
-    fn compute_outcome_inputs<S: OmsSubstrate>(
-        &self,
-        sub: &mut S,
-        p: &WaiserPersisted,
-        now_ms: i64,
-    ) -> Result<Vec<OutcomeInput>> {
-        let mut out = Vec::new();
-        for (rec_hash, applied) in &p.applied {
-            if p.status_index.get(rec_hash) != Some(&RecStatus::Applied) {
-                continue;
-            }
-            let Some(metric) = &applied.metric else {
-                continue;
-            };
-            if now_ms - applied.applied_at_ms < metric.review_after_ms {
-                continue;
-            }
-            let rows = sub.execute_cal(&metric.query)?;
-            let Some(current) = extract_metric_value(&rows) else {
-                continue;
-            };
-            out.push(OutcomeInput {
+    /// The measured outcomes recorded so far (the Verify gate's history),
+    /// newest-measured last. Read from the persisted state.
+    pub fn outcomes<S: OmsSubstrate>(&self, sub: &S) -> Result<Vec<crate::recommendation::OutcomeResult>> {
+        let p = WaiserPersisted::from_value(sub.load_state()?)?;
+        let mut out: Vec<_> = p.outcomes.into_values().collect();
+        out.sort_by_key(|o| o.measured_at_ms);
+        Ok(out)
+    }
+}
+
+/// Re-measure every applied recommendation past its `review_after` (once), via
+/// the engine's typed reads — no CAL-scalar round-trip. Records an
+/// `OutcomeResult` (held / regressed) and returns the inputs the outcome
+/// analyzer judges. Unknown metric kinds are skipped, never faked.
+fn measure_outcomes<S: OmsSubstrate>(
+    sub: &S,
+    p: &mut WaiserPersisted,
+    now_ms: i64,
+) -> Result<Vec<OutcomeInput>> {
+    let mut out = Vec::new();
+    // Collect first (can't hold &p.applied while mutating p).
+    let due: Vec<(String, crate::config::AppliedRecord)> = p
+        .applied
+        .iter()
+        .filter(|(h, a)| {
+            p.status_index.get(*h) == Some(&RecStatus::Applied)
+                && a.metric.as_ref().is_some_and(|m| now_ms - a.applied_at_ms >= m.review_after_ms)
+                && !p.measured.contains(*h)
+        })
+        .map(|(h, a)| (h.clone(), a.clone()))
+        .collect();
+
+    for (rec_hash, applied) in due {
+        let metric = applied.metric.as_ref().unwrap();
+        let Some(current) = measure_metric(sub, metric, applied.applied_at_ms)? else {
+            continue; // metric kind not yet re-measurable
+        };
+        let regressed = current > metric.baseline + f64::EPSILON;
+        p.outcomes.insert(
+            rec_hash.clone(),
+            crate::recommendation::OutcomeResult {
                 rec_hash: rec_hash.clone(),
-                target_ref: applied.target_ref.clone(),
                 metric: metric.metric.clone(),
                 baseline: metric.baseline,
                 current,
-                unit: metric.unit.clone(),
-            });
+                verdict: if regressed { "regressed" } else { "held" }.into(),
+                measured_at_ms: now_ms,
+            },
+        );
+        p.measured.insert(rec_hash.clone());
+        out.push(OutcomeInput {
+            rec_hash,
+            target_ref: applied.target_ref.clone(),
+            metric: metric.metric.clone(),
+            baseline: metric.baseline,
+            current,
+            unit: metric.unit.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Typed re-measurement for the fixed set of metric kinds the engine knows.
+fn measure_metric<S: SubstrateRead>(
+    sub: &S,
+    metric: &crate::recommendation::MetricSnapshot,
+    since_ms: i64,
+) -> Result<Option<f64>> {
+    match metric.metric.as_str() {
+        // How many times did this tool fail again after the lesson was applied?
+        "tool_error_recurrence" => {
+            let Some(tool) = &metric.subject else { return Ok(None) };
+            let tools = sub.grains_of_type(
+                crate::model::grain_type::TOOL,
+                None,
+                ReadOpts { live_only: true, since_ms: Some(since_ms) },
+            )?;
+            let n = tools
+                .iter()
+                .filter(|t| t.tool_name() == Some(tool.as_str()) && t.is_error())
+                .count();
+            Ok(Some(n as f64))
         }
-        Ok(out)
+        _ => Ok(None),
     }
 }
 
@@ -869,8 +923,4 @@ fn load_rec<S: SubstrateRead>(sub: &S, rec_hash: &str) -> Result<Recommendation>
         .grain(rec_hash)?
         .ok_or_else(|| Error::NotFound(rec_hash.into()))?;
     Recommendation::from_fields(rec_hash, &g.fields)
-}
-
-fn extract_metric_value(rows: &[Value]) -> Option<f64> {
-    rows.first()?.get("value").and_then(Value::as_f64)
 }

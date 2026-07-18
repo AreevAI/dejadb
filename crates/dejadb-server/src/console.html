@@ -314,6 +314,7 @@
         <span class="seg" id="waiserNav">
           <button class="on" data-w="queue" onclick="waiserView('queue')">queue</button>
           <button data-w="analyzers" onclick="waiserView('analyzers')">analyzers</button>
+          <button data-w="outcomes" onclick="waiserView('outcomes')">outcomes</button>
         </span>
         <button onclick="waiserRun()">Run analysis</button>
         <span class="spacer"></span>
@@ -636,6 +637,7 @@ function waiserView(v) {
 }
 async function loadWaiser() {
   if (WAISER_VIEW === 'analyzers') return loadAnalyzers();
+  if (WAISER_VIEW === 'outcomes') return loadOutcomes();
   const [health, recs] = await Promise.all([
     api('/api/waiser/health'),
     api('/api/waiser/recommendations?status=pending'),
@@ -728,6 +730,37 @@ async function loadAnalyzers() {
     tbl.appendChild(tr);
   }
   host.appendChild(tbl);
+}
+async function loadOutcomes() {
+  const res = await api('/api/waiser/outcomes');
+  const host = $('waiserTable');
+  host.textContent = '';
+  const list = (res && res.outcomes) || [];
+  if (!list.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = 'no measured outcomes yet — the Verify gate re-measures an applied recommendation after its review window elapses';
+    host.appendChild(e);
+    return;
+  }
+  const tbl = document.createElement('table');
+  tbl.style.cssText = 'width:100%;border-collapse:collapse';
+  for (const o of list) {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid var(--line,#333)';
+    td(tr).textContent = o.metric;
+    td(tr).textContent = 'baseline ' + o.baseline + ' → current ' + o.current;
+    const v = td(tr);
+    v.textContent = o.verdict;
+    v.style.color = o.verdict === 'regressed' ? '#e5484d' : '#3fb950';
+    tbl.appendChild(tr);
+  }
+  const cap = document.createElement('p');
+  cap.className = 'hint';
+  cap.style.marginTop = '10px';
+  cap.textContent = 'Measured history from re-running each applied recommendation’s metric — the honest answer to “did it work?”';
+  host.appendChild(tbl);
+  host.appendChild(cap);
 }
 async function waiserRun() {
   $('waiserHealth').textContent = 'running…';

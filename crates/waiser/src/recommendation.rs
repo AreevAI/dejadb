@@ -100,15 +100,35 @@ fn interpolate(template: &str, args: &Map<String, Value>, template_id: &str) -> 
 /// A reproducible metric snapshot; powers outcome review.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricSnapshot {
+    /// Metric kind — the engine knows how to re-measure a fixed set
+    /// (e.g. `tool_error_recurrence`); unknown kinds are skipped, not faked.
     pub metric: String,
     pub baseline: f64,
     pub unit: String,
     pub n: u64,
     pub window: String,
-    /// CAL that recomputes the metric at verify time.
+    /// The subject the metric is about (e.g. the tool name), used by the
+    /// engine's typed re-measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// CAL that recomputes the metric at verify time (reproducibility /
+    /// documentation; the engine re-measures with typed reads).
     pub query: String,
     /// How long after apply to re-measure, in epoch-ms delta.
     pub review_after_ms: i64,
+}
+
+/// A measured outcome for an applied recommendation — the Verify gate's
+/// output. `held` = the metric did not regress; `regressed` = it got worse
+/// (a revert is proposed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeResult {
+    pub rec_hash: String,
+    pub metric: String,
+    pub baseline: f64,
+    pub current: f64,
+    pub verdict: String,
+    pub measured_at_ms: i64,
 }
 
 /// The proposed change. Exactly one variant per recommendation.

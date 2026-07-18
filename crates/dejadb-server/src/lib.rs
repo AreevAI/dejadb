@@ -612,6 +612,13 @@ impl UiServer {
                 }
                 ok_json(json!({"ok": true, "total": recs.len(), "by_status": by_status}))
             }
+            ("GET", "/api/waiser/outcomes") => {
+                let sub = BorrowedSubstrate::new(&self.facade);
+                match Engine::with_builtins().outcomes(&sub) {
+                    Ok(o) => ok_json(json!({"ok": true, "outcomes": o})),
+                    Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
+                }
+            }
             ("GET", "/api/waiser/analyzers") => {
                 let engine = Engine::with_builtins();
                 let list: Vec<Value> = engine

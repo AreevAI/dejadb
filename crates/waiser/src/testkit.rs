@@ -78,6 +78,24 @@ impl TestSubstrate {
         })
     }
 
+    /// Add a tool call at an explicit `created_at` (for outcome-window tests).
+    pub fn add_tool_call_at(&mut self, tool: &str, is_error: bool, content: &str, created: i64) -> String {
+        let mut fields = Map::new();
+        fields.insert("tool_name".into(), json!(tool));
+        fields.insert("is_error".into(), json!(is_error));
+        fields.insert("content".into(), json!(content));
+        fields.insert("namespace".into(), json!("test"));
+        self.inner.insert(GrainRecord {
+            hash: String::new(),
+            grain_type: "tool".into(),
+            namespace: "test".into(),
+            created_at_ms: created,
+            valid_to_ms: None,
+            superseded_by: None,
+            fields,
+        })
+    }
+
     pub fn add_tool_call(&mut self, tool: &str, is_error: bool, content: &str) -> String {
         let created = self.tick();
         let mut fields = Map::new();

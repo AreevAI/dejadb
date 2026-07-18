@@ -420,6 +420,95 @@ fn policy_deny_disables_an_analyzer() {
     );
 }
 
+/// The Verify gate, end to end: apply a tool-failure lesson, let the failure
+/// RECUR afterward, and confirm outcome review measures a regression and
+/// proposes a revert — the "how do we know it worked?" evidence.
+#[test]
+fn outcome_review_flags_regression_when_failure_recurs() {
+    const DAY: i64 = 86_400_000;
+    let mut sub = TestSubstrate::new();
+    for _ in 0..5 {
+        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 1_000);
+    }
+    sub.add_tool_call_at("stripe_refund", false, "ok", 1_100);
+    let e = Engine::with_builtins();
+    e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
+
+    let hash = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.analyzer.starts_with("waiser.tool_failure"))
+        .expect("a tool-failure lesson")
+        .hash;
+    let scopes = ScopeSet::all();
+    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", 2_000_000).unwrap();
+    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply the rule", false, 2_000_000).unwrap();
+
+    // The exact failure recurs after the fix was applied.
+    for _ in 0..2 {
+        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 3_000_000);
+    }
+
+    // Re-measure past the 14-day review window.
+    e.run(&mut sub.inner, &RunOptions::default(), 2_000_000 + 15 * DAY).unwrap();
+
+    let outcomes = e.outcomes(&sub.inner).unwrap();
+    let o = outcomes.iter().find(|o| o.rec_hash == hash).expect("a measured outcome");
+    assert_eq!(o.verdict, "regressed");
+    assert_eq!(o.current, 2.0, "two recurrences measured (baseline 0)");
+    assert!(
+        e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
+        "a revert is proposed"
+    );
+}
+
+/// The other side: no recurrence → the fix held, no revert.
+#[test]
+fn outcome_review_records_held_when_fix_works() {
+    const DAY: i64 = 86_400_000;
+    let mut sub = TestSubstrate::new();
+    for _ in 0..5 {
+        sub.add_tool_call_at("stripe_refund", true, "rate_limited 429", 1_000);
+    }
+    sub.add_tool_call_at("stripe_refund", false, "ok", 1_100);
+    let e = Engine::with_builtins();
+    e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
+    let hash = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.analyzer.starts_with("waiser.tool_failure"))
+        .unwrap()
+        .hash;
+    let scopes = ScopeSet::all();
+    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", 2_000_000).unwrap();
+    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply the rule", false, 2_000_000).unwrap();
+
+    // Only a success afterward — the failure did not recur.
+    sub.add_tool_call_at("stripe_refund", false, "ok", 3_000_000);
+    e.run(&mut sub.inner, &RunOptions::default(), 2_000_000 + 15 * DAY).unwrap();
+
+    let o = e
+        .outcomes(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.rec_hash == hash)
+        .expect("a measured outcome");
+    assert_eq!(o.verdict, "held");
+    assert_eq!(o.current, 0.0);
+    assert!(
+        !e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
+        "no revert when the fix held"
+    );
+}
+
 fn status_of(e: &Engine, sub: &TestSubstrate, hash: &str) -> RecStatus {
     e.recommendations(&sub.inner, None)
         .unwrap()
