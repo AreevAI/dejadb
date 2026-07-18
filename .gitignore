@@ -19,3 +19,6 @@ mutants.out.old/
 
 # scratch/draft lineage (kept local, not for the repo)
 docs/tmp/
+
+# macOS Finder cruft
+.DS_Store
