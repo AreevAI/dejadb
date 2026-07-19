@@ -299,11 +299,17 @@ impl Engine {
         // stamped origin=llm (never auto-apply). Identity when no backend; a
         // failed/garbled call drops the contribution, never the run.
         if self.llm.is_some() {
-            let discovered = self.discover(&*sub, &candidates, now_ms);
+            let discovered = self.discover(&*sub, &candidates, watermark, &opts.namespaces, now_ms);
             candidates.extend(discovered);
         }
 
-        // Phase 2: validate/dedup.
+        // Phase 2: validate/dedup. The dedup_key (family+target+action)
+        // collapses TRUE duplicates (e.g. the same finding across two runs) but
+        // deliberately keeps distinct-family findings on one entity — an entity
+        // can have a contradiction AND a staleness AND an llm-found semantic
+        // issue at once. Novelty of llm findings vs determinism is a semantic
+        // judgement, steered at DISCOVER ("find what determinism misses") and
+        // settled by human review — not an entity-level drop here (too coarse).
         let proposed = candidates.len() as u64;
         let mut seen = BTreeSet::new();
         let mut survivors = Vec::new();
@@ -401,6 +407,8 @@ impl Engine {
         &self,
         sub: &S,
         candidates: &[Recommendation],
+        watermark: Option<i64>,
+        namespaces: &[String],
         now_ms: i64,
     ) -> Vec<Recommendation> {
         let Some(llm) = &self.llm else {
@@ -416,27 +424,45 @@ impl Engine {
                 severity: c.severity.as_str().to_string(),
             })
             .collect();
-        // Evidence bundle: the grains the deterministic findings cite.
-        let mut evidence = Vec::new();
+        // Evidence bundle. Seeded first from the grains the deterministic
+        // findings cite, THEN — the non-parasitic step (§11) — topped up with
+        // RECENT grains (created since the last run) so the LLM gets its own
+        // lens and can find issues in grains no analyzer flagged. Without this
+        // the LLM could only elaborate near what determinism already caught.
+        let mut evidence: Vec<crate::llm::EvidenceItem> = Vec::new();
         let mut bundle: BTreeSet<String> = BTreeSet::new();
         for c in candidates {
             for h in &c.evidence {
-                if evidence.len() >= 64 {
-                    break;
-                }
-                if bundle.insert(h.clone()) {
+                if !bundle.contains(h) {
                     if let Ok(Some(g)) = sub.grain(h) {
-                        evidence.push(crate::llm::EvidenceItem {
-                            hash: h.clone(),
-                            grain_type: g.grain_type.clone(),
-                            text: crate::llm::cap(&grain_brief(&g), 400),
-                        });
+                        push_evidence(&mut evidence, &mut bundle, &g);
+                    }
+                }
+            }
+        }
+        let scan_ns: Vec<Option<&str>> = if namespaces.is_empty() {
+            vec![None]
+        } else {
+            namespaces.iter().map(|n| Some(n.as_str())).collect()
+        };
+        let opts = ReadOpts { live_only: true, since_ms: watermark };
+        'seed: for gt in [
+            crate::model::grain_type::FACT,
+            crate::model::grain_type::OBSERVATION,
+        ] {
+            for ns in &scan_ns {
+                if let Ok(recent) = sub.grains_of_type(gt, *ns, opts) {
+                    for g in recent {
+                        if evidence.len() >= 64 {
+                            break 'seed;
+                        }
+                        push_evidence(&mut evidence, &mut bundle, &g);
                     }
                 }
             }
         }
         if evidence.is_empty() {
-            return Vec::new(); // nothing to ground a discovery on
+            return Vec::new(); // nothing to reflect on
         }
         // PROPOSE (§5.1): the abstention-legitimate objective — "nothing to
         // report" is a first-class, zero-penalty answer. The operator-taste
@@ -489,7 +515,7 @@ impl Engine {
         // independent grounding entailment check *and* an adversarial
         // verification pass (each a separate call — proposer ≠ scorer) reach the
         // queue, stamped with the verifier's calibrated confidence.
-        self.verify_drafts(&**llm, &validated, &evidence, &findings, now_ms)
+        self.verify_drafts(&**llm, &validated, &evidence, now_ms)
     }
 
     /// GROUND → VERIFY → ROUTE (§5.2–5.4). Two independent model calls, batched
@@ -503,7 +529,6 @@ impl Engine {
         llm: &dyn crate::llm::LlmBackend,
         validated: &[(crate::llm::LlmDraft, String, Vec<String>)],
         evidence: &[crate::llm::EvidenceItem],
-        deterministic: &[crate::llm::FindingBrief],
         now_ms: i64,
     ) -> Vec<Recommendation> {
         use crate::llm::*;
@@ -549,8 +574,10 @@ impl Engine {
         }
 
         // VERIFY (§5.3): adversarial keep/kill over the grounded drafts, a
-        // separate call from the proposer, with the deterministic findings as
-        // novelty context.
+        // separate call from the proposer. Soundness + abstention only — NOT
+        // novelty. Novelty is steered at DISCOVER and settled by human review;
+        // asking a weak verifier to judge it just makes it hallucinate "already
+        // known" and kill genuine findings (§11).
         let items: Vec<VerifyItem> = validated
             .iter()
             .enumerate()
@@ -567,7 +594,6 @@ impl Engine {
             op: "verify",
             instructions: VERIFY_INSTRUCTIONS,
             findings: items,
-            deterministic: deterministic.to_vec(),
         };
         let verdicts: std::collections::BTreeMap<usize, f64> =
             match serde_json::to_string(&verify_req).ok().and_then(|b| llm.complete(&b).ok()) {
@@ -1208,29 +1234,57 @@ your confidence 0.0-1.0. Return JSON: {\"recommendations\":[{\"summary\":\"...\"
 \"target\":\"entity:<ns>/<subject>\",\"guidance\":\"...\",\"evidence\":[\"<hash>\"],\
 \"confidence\":0.0}]}. Propose nothing you cannot ground in the evidence.";
 
-/// The fixed GROUND instruction (§5.2): decompose-then-entail, conservatively.
-const GROUND_INSTRUCTIONS: &str = "You are a strict grounding checker. For each \
-claim, decide whether the provided evidence ENTAILS it — not merely relates to \
-it. Decompose the claim into its atomic assertions; require each load-bearing \
-assertion to be directly supported by the evidence text. If any is unsupported, \
-or the evidence is only topically related, mark supported=false. Be conservative: \
-when the evidence does not clearly entail the claim, supported=false. Return JSON: \
-{\"results\":[{\"id\":0,\"supported\":true,\"reason\":\"...\"}]}.";
+/// The fixed GROUND instruction (§5.2): verify the finding's factual PREMISES
+/// are real (anti-fabrication), while allowing an inference. A self-improvement
+/// finding may reason BEYOND the evidence (e.g. 'HQ=SF and country=Germany are
+/// inconsistent'); grounding checks the premises (HQ=SF, country=Germany) are in
+/// the evidence — the soundness of the inference is VERIFY's job, not this one.
+const GROUND_INSTRUCTIONS: &str = "You are a grounding checker guarding against \
+fabrication. A finding may draw an INFERENCE from facts — your job is to confirm \
+the facts it relies on are actually present in the cited evidence, NOT that its \
+conclusion is stated verbatim. Decompose the finding into the factual claims it \
+depends on. Mark supported=true when those facts are present in the evidence \
+(even if the finding reasons beyond them). Mark supported=false ONLY if it relies \
+on a fact that is NOT in the evidence (a fabrication) or cites evidence about a \
+different subject. Return JSON: {\"results\":[{\"id\":0,\"supported\":true,\"reason\":\"...\"}]}.";
 
 /// The fixed VERIFY instruction (§5.3): adversarial, abstention-biased.
-const VERIFY_INSTRUCTIONS: &str = "You are an adversarial reviewer trying to \
-REJECT low-value findings. For each finding, ask and answer: (1) Is it novel, or \
-does it merely restate a deterministic finding already listed? (2) Is the issue \
-real, or an artifact of temporal ordering / underspecification? (3) Does it read \
-the evidence out of context? Keep a finding ONLY if it survives all three AND is \
-materially useful to a human reviewer; otherwise reject it. Give a calibrated \
-confidence 0.0-1.0. Default to keep=false when uncertain. Return JSON: \
+const VERIFY_INSTRUCTIONS: &str = "You are an adversarial reviewer stress-testing \
+each finding for SOUNDNESS — reject unsound findings, but only for real reasons, \
+never invented ones. For each finding, ask: (1) Reality — is there a genuine, \
+SPECIFIC problem, or is it vague/speculative? Reject hedged 'potential' or \
+'possible' findings with no concrete defect, and reject any claimed \
+inconsistency or contradiction that is not backed by at least two actually \
+conflicting facts in the cited evidence. (2) Context — does the finding \
+correctly read its cited evidence, or misinterpret what the grains say? Keep a \
+finding when it names a genuine, specific problem grounded in its evidence and \
+materially useful to a human reviewer; otherwise reject it, and default to \
+keep=false when uncertain. Do NOT reject a finding for being 'already known', \
+redundant, or a 'common type of error' — duplication is handled elsewhere, and a \
+grounded cross-fact inconsistency with two conflicting facts is exactly what to \
+KEEP. Give a calibrated confidence 0.0-1.0. Return JSON: \
 {\"results\":[{\"id\":0,\"keep\":true,\"confidence\":0.0,\"reason\":\"...\"}]}.";
 
 /// The fixed ENRICH instruction.
 const ENRICH_INSTRUCTIONS: &str = "For each finding, optionally add a one-sentence \
 guidance note to help a human reviewer decide. Do not restate the finding. Return \
 JSON: {\"notes\":[{\"target\":\"<target_ref>\",\"guidance\":\"...\"}]}.";
+
+/// Add a grain to the evidence bundle — deduplicated, bounded at 64, text
+/// capped. Shared by the deterministic-citation and recent-grain seeding.
+fn push_evidence(
+    evidence: &mut Vec<crate::llm::EvidenceItem>,
+    bundle: &mut BTreeSet<String>,
+    g: &GrainRecord,
+) {
+    if evidence.len() < 64 && bundle.insert(g.hash.clone()) {
+        evidence.push(crate::llm::EvidenceItem {
+            hash: g.hash.clone(),
+            grain_type: g.grain_type.clone(),
+            text: crate::llm::cap(&grain_brief(g), 400),
+        });
+    }
+}
 
 /// A short human-readable projection of a grain for the evidence bundle.
 fn grain_brief(g: &GrainRecord) -> String {

@@ -173,8 +173,6 @@ pub struct VerifyRequest<'a> {
     pub op: &'a str, // "verify"
     pub instructions: &'a str,
     pub findings: Vec<VerifyItem>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub deterministic: Vec<FindingBrief>,
 }
 
 #[derive(Debug, Clone, Serialize)]

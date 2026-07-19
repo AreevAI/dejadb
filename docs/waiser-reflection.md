@@ -281,21 +281,45 @@ is human–human agreement), and we **never headline a single vendor benchmark
 number.** If we cite an external set, prefer **LongMemEval**'s knowledge-update
 and abstention categories over the saturated/gameable LoCoMo.
 
-**Live validation (honest finding).** Running the `waiser_reflection` corpus
-through a real model (`gpt-4o-mini` via OpenRouter,
-`WAISER_EVAL_MODEL=openrouter:openai/gpt-4o-mini`) the model **surfaced nothing —
-spurious 0.00, no over-generation.** That is the *correct* answer on this corpus:
-its planted issues are contradictions/duplicates the deterministic analyzers
-already catch, so under the abstention-legitimate objective the model rightly
-finds nothing *additional*. So the live run validates two things — the abstention
-objective holds with a real model, and the verifier isn't leaking decoys — but it
-also empirically confirms the **parasitic-bundle limitation (§11)**: a *positive*
-Effective-Reliability number needs a corpus of issues that are hidden from
-determinism yet grounded in the cited evidence, which in turn needs the
-non-parasitic evidence bundle (retrieval/telemetry-seeded, not
-deterministic-citation-seeded). That is the single highest-value next step for
-the LLM path — until then the honest claim is "verified and abstaining," not
-"finds things," and we say so.
+**Live validation (honest finding).** With the **non-parasitic evidence bundle**
+(the DISCOVER bundle is seeded from deterministic citations *and then topped up
+with recent grains since the last-run watermark*), a real model (`gpt-4o-mini`
+via OpenRouter) now discriminates correctly on hand-built corpora:
+
+- **Hidden cross-fact issue → surfaced.** Seed `acme headquarters "San Francisco"`
+  + `acme country "Germany"` — a geographic inconsistency **no deterministic
+  analyzer flags** (each fact is individually well-formed). The model proposes it,
+  it grounds and verifies, and it reaches the queue as one `waiser.llm/1` rec.
+- **Consistent corpus → abstains.** Seed `acme headquarters "San Francisco"` +
+  `country "United States"` + `industry "software"` — the model proposes a vague
+  "potential inconsistency," the verifier **rejects it** under the abstention
+  rule, and the run stores **0**.
+
+So the claim upgrades from "verified and abstaining" to **"finds grounded issues
+determinism misses, and abstains when there are none"** — validated end-to-end
+with a real model, not just the mock. Reaching that took three pipeline fixes
+found by live-tracing every model call (a logging `--llm-cmd` wrapper):
+
+1. **GROUND checks premises, not the conclusion.** A semantic-inconsistency
+   finding *infers* beyond its evidence (the grains state HQ=SF and country=DE;
+   "these conflict" is world-knowledge, not in the text). Strict decompose-then-
+   entail rejected every such finding. GROUND now verifies the finding's factual
+   *premises* are present (anti-fabrication) and lets the inference through — the
+   inference's soundness is VERIFY's job, not GROUND's.
+2. **VERIFY is soundness + abstention, never novelty.** Told to check "is this
+   novel vs the deterministic findings," a weak verifier hallucinated "merely
+   restates a deterministic finding already known" — with an *empty* deterministic
+   list — and killed the genuine finding. VERIFY now judges only reality (reject
+   vague/`potential` claims and inconsistencies without ≥2 conflicting facts) and
+   context; novelty is steered at DISCOVER and settled by human review.
+3. **Novelty is not an entity-level dedup.** An entity can carry a contradiction
+   *and* a staleness *and* an llm-found semantic issue at once, so dropping an llm
+   finding because a built-in touched the same target is too coarse. The dedup_key
+   (family+target+action) already keeps distinct-family findings apart.
+
+The parasitic-bundle limitation (§11) is thereby **closed for the single-file
+path**; the remaining open item is the corpus-scale ER number (a labeled
+non-parasitic corpus), tracked below.
 
 ---
 
