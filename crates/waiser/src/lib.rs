@@ -47,6 +47,7 @@ pub use engine::{
     Decision, Engine, Health, LlmMetrics, RunOptions, RunOutcome, RunResult, Scope, ScopeSet,
     SkipReason, WAISER_NS,
 };
+pub use config::{AnalyzerConfig, AnalyzerConfigUpdate, AnalyzerSetting};
 pub use error::{Error, Result};
 pub use external::CommandAnalyzer;
 pub use llm::{CommandLlm, LlmBackend};

@@ -1048,6 +1048,80 @@ impl Engine {
         Ok(out)
     }
 
+    /// Per-analyzer effective settings for the Setup view: the manifest facts
+    /// merged with the file-config (override or manifest default). Read-only.
+    pub fn analyzer_settings<S: OmsSubstrate>(
+        &self,
+        sub: &S,
+    ) -> Result<Vec<crate::config::AnalyzerSetting>> {
+        let p = WaiserPersisted::from_value(sub.load_state()?)?;
+        Ok(self
+            .analyzers
+            .iter()
+            .map(|a| {
+                let m = a.manifest();
+                let cfg = p.config.get(&m.id);
+                crate::config::AnalyzerSetting {
+                    id: m.id.clone(),
+                    title: m.title.clone(),
+                    tier: format!("{:?}", m.tier),
+                    trust_class: format!("{:?}", m.trust_class).to_lowercase(),
+                    default_on: m.default_on,
+                    enabled: cfg.and_then(|c| c.enabled).unwrap_or(m.default_on),
+                    severity_floor: cfg
+                        .and_then(|c| c.severity_floor)
+                        .map(|s| s.as_str().to_string()),
+                }
+            })
+            .collect())
+    }
+
+    /// Update one analyzer's file-config (enable/disable, severity floor, param
+    /// overrides, namespace scoping). Requires `Admin`. Params are validated
+    /// against the analyzer's manifest first (unknown keys rejected, fail-closed),
+    /// and the analyzer must exist. Returns the merged config as stored. This is
+    /// the only write into `persisted.config` — the config layer, never a grain.
+    pub fn set_analyzer_config<S: OmsSubstrate>(
+        &self,
+        sub: &mut S,
+        analyzer_id: &str,
+        update: crate::config::AnalyzerConfigUpdate,
+        scopes: &ScopeSet,
+    ) -> Result<crate::config::AnalyzerConfig> {
+        if !scopes.has(Scope::Admin) {
+            return Err(Error::ScopeDenied("admin".into()));
+        }
+        let manifest = self
+            .analyzers
+            .iter()
+            .map(|a| a.manifest())
+            .find(|m| m.id == analyzer_id)
+            .ok_or_else(|| Error::NotFound(format!("unknown analyzer {analyzer_id:?}")))?;
+        // Validate params against the manifest BEFORE touching state.
+        if let Some(params) = &update.params {
+            manifest.resolve_params(params)?;
+        }
+        let mut p = WaiserPersisted::from_value(sub.load_state()?)?;
+        let cfg = p.config.entry(analyzer_id.to_string()).or_default();
+        if let Some(enabled) = update.enabled {
+            cfg.enabled = Some(enabled);
+        }
+        if update.clear_floor {
+            cfg.severity_floor = None;
+        } else if let Some(floor) = update.severity_floor {
+            cfg.severity_floor = Some(floor);
+        }
+        if let Some(params) = update.params {
+            cfg.params = params;
+        }
+        if let Some(ns) = update.namespaces {
+            cfg.namespaces = ns;
+        }
+        let stored = cfg.clone();
+        sub.store_state(&p.to_value()?)?;
+        Ok(stored)
+    }
+
     /// The measured outcome time series (the Verify gate's history) across all
     /// recommendations, ordered by when each checkpoint was measured.
     pub fn outcomes<S: OmsSubstrate>(&self, sub: &S) -> Result<Vec<crate::recommendation::OutcomeResult>> {

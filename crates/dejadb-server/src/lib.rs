@@ -618,20 +618,13 @@ impl UiServer {
                 }
             }
             ("GET", "/api/waiser/analyzers") => {
-                let engine = Engine::with_builtins();
-                let list: Vec<Value> = engine
-                    .analyzers()
-                    .iter()
-                    .map(|a| {
-                        let m = a.manifest();
-                        json!({
-                            "id": m.id, "title": m.title,
-                            "tier": format!("{:?}", m.tier),
-                            "default_on": m.default_on,
-                        })
-                    })
-                    .collect();
-                ok_json(json!({"ok": true, "analyzers": list}))
+                // Effective settings (manifest merged with the file-config), so
+                // the Setup view renders accurate on/off state and floors.
+                let sub = BorrowedSubstrate::new(&self.facade);
+                match Engine::with_builtins().analyzer_settings(&sub) {
+                    Ok(list) => ok_json(json!({"ok": true, "analyzers": list})),
+                    Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
+                }
             }
             ("GET", "/api/waiser/telemetry") => {
                 // Recall-telemetry rollups for the Sessions view. A read — open
@@ -681,6 +674,7 @@ impl UiServer {
             ("POST", "/api/waiser/review") => self.waiser_review(body),
             ("POST", "/api/waiser/apply") => self.waiser_apply(body),
             ("POST", "/api/waiser/rollback") => self.waiser_rollback(body),
+            ("POST", "/api/waiser/config") => self.waiser_config(body),
             _ => (
                 "404 Not Found",
                 "application/json",
@@ -735,6 +729,25 @@ impl UiServer {
             &mut sub, hash, actor, ObserverType::Human, &ScopeSet::all(), because, now_ms(),
         ) {
             Ok(()) => ok_json(json!({"ok": true})),
+            Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
+        }
+    }
+
+    /// Edit one analyzer's file-config from the Setup view. The body is
+    /// `{analyzer_id, enabled?, severity_floor?, clear_floor?, params?,
+    /// namespaces?}`; absent fields are left unchanged. The console holds all
+    /// scopes (local root of trust), so `Admin` is satisfied; an unknown
+    /// analyzer or bad param is a structured `ok:false` (not a 500).
+    fn waiser_config(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+        let id = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("analyzer_id").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        // The update reads the same body; the extra `analyzer_id` key is ignored.
+        let update: waiser::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        match Engine::with_builtins().set_analyzer_config(&mut sub, &id, update, &ScopeSet::all()) {
+            Ok(cfg) => ok_json(json!({"ok": true, "config": cfg})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
         }
     }
@@ -1004,6 +1017,46 @@ mod waiser_route_tests {
             Some("tok"),
         );
         assert!(text(&ap).contains("\"ok\":true"), "apply: {}", text(&ap));
+    }
+
+    #[test]
+    fn config_edit_toggles_analyzer_via_console() {
+        let s = server(Some("tok"));
+        // Token-less write → 401 (guarded like every POST).
+        assert!(s.route("POST", "/api/waiser/config", b"{}", None).0.starts_with("401"));
+
+        // Read the analyzers; pick one that is on by default.
+        let list = s.route("GET", "/api/waiser/analyzers", b"", Some("tok"));
+        let v: serde_json::Value = serde_json::from_slice(&list.2).unwrap();
+        let id = v["analyzers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["enabled"] == true)
+            .expect("some analyzer is on")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Disable it via the console endpoint.
+        let post = s.route(
+            "POST",
+            "/api/waiser/config",
+            format!(r#"{{"analyzer_id":"{id}","enabled":false}}"#).as_bytes(),
+            Some("tok"),
+        );
+        assert!(text(&post).contains("\"ok\":true"), "config: {}", text(&post));
+
+        // It reads back disabled.
+        let list2 = s.route("GET", "/api/waiser/analyzers", b"", Some("tok"));
+        let v2: serde_json::Value = serde_json::from_slice(&list2.2).unwrap();
+        let now = v2["analyzers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(now["enabled"], false, "toggled off and persisted");
     }
 
     #[test]

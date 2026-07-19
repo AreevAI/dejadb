@@ -239,6 +239,63 @@ fn external_command_analyzer_surfaces_advisory_findings() {
 }
 
 #[test]
+fn config_edit_toggles_analyzer_and_is_admin_gated() {
+    use crate::config::AnalyzerConfigUpdate;
+    let mut sub = TestSubstrate::new();
+    // A contradiction under a functional relation → the contradiction sweep fires.
+    sub.add_fact("acme", "deploy_target", "us-east-1");
+    sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let e = Engine::with_builtins();
+
+    // The analyzer id, via the read-side settings (no trait import needed).
+    let cid = e
+        .analyzer_settings(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id.starts_with("waiser.contradiction"))
+        .expect("contradiction analyzer present")
+        .id;
+
+    // Non-admin scope is denied.
+    let denied = e.set_analyzer_config(
+        &mut sub.inner,
+        &cid,
+        AnalyzerConfigUpdate { enabled: Some(false), ..Default::default() },
+        &ScopeSet::of(&[Scope::Review]),
+    );
+    assert!(matches!(denied, Err(Error::ScopeDenied(_))), "config edit needs admin");
+
+    // Unknown analyzer id is rejected (fail-closed).
+    assert!(e
+        .set_analyzer_config(
+            &mut sub.inner,
+            "nope.x/1",
+            AnalyzerConfigUpdate::default(),
+            &ScopeSet::all(),
+        )
+        .is_err());
+
+    // Admin disables it; the setting flips and a run no longer surfaces it.
+    e.set_analyzer_config(
+        &mut sub.inner,
+        &cid,
+        AnalyzerConfigUpdate { enabled: Some(false), ..Default::default() },
+        &ScopeSet::all(),
+    )
+    .unwrap();
+    assert!(
+        !e.analyzer_settings(&sub.inner).unwrap().iter().find(|s| s.id == cid).unwrap().enabled,
+        "disabled in the effective settings"
+    );
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    assert!(
+        recs.iter().all(|r| !r.analyzer.starts_with("waiser.contradiction")),
+        "the disabled analyzer produced no findings"
+    );
+}
+
+#[test]
 fn no_llm_backend_is_the_identity() {
     use crate::model::Origin;
     let mut sub = TestSubstrate::new();

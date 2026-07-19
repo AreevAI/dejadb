@@ -100,6 +100,45 @@ pub struct AnalyzerConfig {
     pub namespaces: Vec<String>,
 }
 
+/// A partial update to one analyzer's [`AnalyzerConfig`] — every field absent
+/// (`None`/`false`) leaves the stored value untouched, so the console can PATCH
+/// a single toggle. Deserialized straight from the `POST /api/waiser/config`
+/// body.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnalyzerConfigUpdate {
+    /// Enable/disable the analyzer. `None` leaves it as-is.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Set the severity floor. `None` leaves it as-is; to CLEAR an existing
+    /// floor, send `clear_floor: true` instead.
+    #[serde(default)]
+    pub severity_floor: Option<Severity>,
+    #[serde(default)]
+    pub clear_floor: bool,
+    /// Replace the param overrides (validated against the manifest before store).
+    /// `None` leaves them as-is.
+    #[serde(default)]
+    pub params: Option<Map<String, Value>>,
+    /// Replace the namespace scoping. `None` leaves it as-is; `Some([])` clears.
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
+}
+
+/// One analyzer's effective settings for the Setup view: the manifest facts plus
+/// the resolved file-config (override or manifest default).
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalyzerSetting {
+    pub id: String,
+    pub title: String,
+    pub tier: String,
+    pub trust_class: String,
+    pub default_on: bool,
+    /// The effective on/off state (file override, else the manifest default).
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity_floor: Option<String>,
+}
+
 /// Run state: the watermark that makes repeat runs cheap no-ops.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WaiserState {

@@ -729,8 +729,8 @@ async function loadAnalyzers() {
     td(tr).textContent = a.id;
     td(tr).textContent = a.tier;
     const on = td(tr);
-    on.textContent = a.default_on ? 'on' : 'off';
-    on.style.color = a.default_on ? '#3fb950' : 'var(--dim,#888)';
+    on.textContent = a.enabled ? 'on' : 'off';
+    on.style.color = a.enabled ? '#3fb950' : 'var(--dim,#888)';
     td(tr).textContent = a.title;
     tbl.appendChild(tr);
   }
@@ -827,7 +827,8 @@ async function loadSessions() {
   cap.textContent = 'Disposable, never-syncing evidence (§8). Grains absent here are candidates the cold-grains analyzer flags; recurring empty questions feed coverage-gap.';
   host.appendChild(cap);
 }
-/* Setup: the effective configuration (read-only for now). */
+/* Setup: the effective configuration. Analyzers are toggleable — a click
+   persists an enable/disable to the file's waiser config (POST config). */
 async function loadSetup() {
   const host = $('waiserTable');
   host.textContent = '';
@@ -838,19 +839,38 @@ async function loadSetup() {
   host.appendChild(tp);
 
   const list = (an && an.analyzers) || [];
-  host.appendChild(wSection('Analyzers (' + list.filter(a => a.default_on).length + ' of ' + list.length + ' on)'));
+  host.appendChild(wSection('Analyzers (' + list.filter(a => a.enabled).length + ' of ' + list.length + ' on)'));
   const t = wTable();
   for (const a of list) {
     const tr = wRow(t);
     td(tr).textContent = a.id.replace('waiser.', '');
-    const on = td(tr); on.textContent = a.default_on ? 'on' : 'off';
-    on.style.color = a.default_on ? '#3fb950' : 'var(--dim,#888)';
+    // Trust badge — builtin (dim), command (amber), llm (violet).
+    const tc = td(tr); tc.textContent = a.trust_class || 'builtin';
+    tc.style.color = a.trust_class === 'command' ? '#d29922' : (a.trust_class === 'llm' ? '#a371f7' : 'var(--dim,#888)');
+    // Clickable on/off — the writable control.
+    const cell = td(tr);
+    const btn = document.createElement('button');
+    btn.style.cssText = 'background:none;border:1px solid var(--line,#333);border-radius:4px;cursor:pointer;padding:1px 9px;font:inherit;min-width:42px';
+    btn.textContent = a.enabled ? 'on' : 'off';
+    btn.style.color = a.enabled ? '#3fb950' : 'var(--dim,#888)';
+    btn.title = a.enabled ? 'click to disable for this file' : 'click to enable for this file';
+    btn.onclick = () => waiserToggleAnalyzer(a.id, !a.enabled, btn);
+    cell.appendChild(btn);
     td(tr).textContent = a.title;
   }
   host.appendChild(t);
   const note = document.createElement('p'); note.className = 'hint'; note.style.marginTop = '12px';
-  note.textContent = 'Effective defaults shown. Toggle analyzers per file with deja waiser enable/disable; grant auto-apply only via a host policy file (deja waiser --policy). Editing from the console is a planned follow-up.';
+  note.textContent = 'Click on/off to enable or disable an analyzer for this file (persisted in the file’s waiser config). Auto-apply is granted only via a host policy file (deja waiser --policy), never from the console. A read-only console (no --token-env) can view but not toggle.';
   host.appendChild(note);
+}
+async function waiserToggleAnalyzer(id, enabled, btn) {
+  if (btn) btn.disabled = true;
+  const res = await api('/api/waiser/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ analyzer_id: id, enabled: enabled }),
+  });
+  if (res && res.ok) { toast((enabled ? 'enabled ' : 'disabled ') + id.replace('waiser.', '')); loadSetup(); }
+  else { if (btn) btn.disabled = false; toast('config change failed: ' + ((res && res.error) || 'read-only? start with --token-env')); }
 }
 async function waiserRun() {
   $('waiserHealth').textContent = 'running…';
