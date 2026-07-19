@@ -507,7 +507,7 @@ impl DejaDB {
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an
     /// evaluator's first call always runs. Returns the run-outcome JSON.
-    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None))]
+    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None))]
     fn waiser_run(
         &self,
         min_new: Option<u64>,
@@ -515,6 +515,8 @@ impl DejaDB {
         if_stale: Option<String>,
         model: Option<String>,
         llm_cmd: Option<String>,
+        ground_model: Option<String>,
+        ground_cmd: Option<String>,
     ) -> PyResult<String> {
         let opts = RunOptions {
             min_new,
@@ -530,6 +532,13 @@ impl DejaDB {
             engine = engine.with_llm(Box::new(llm));
         } else if let Some(spec) = model {
             engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+        }
+        // Optional separate grounding backend (defaults to the reflection model).
+        if let Some(cmd) = ground_cmd {
+            let g = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+            engine = engine.with_ground_llm(Box::new(g));
+        } else if let Some(spec) = ground_model {
+            engine = engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
         }
         let mut sub = BorrowedSubstrate::new(&self.facade);
         let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;

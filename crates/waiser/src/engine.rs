@@ -144,6 +144,11 @@ pub struct Engine {
     /// Optional LLM backend. `None` → the DISCOVER/ENRICH stages are the
     /// identity, so the pipeline is byte-for-byte the deterministic path.
     llm: Option<Box<dyn crate::llm::LlmBackend>>,
+    /// Optional separate backend for the GROUND stage (§5.2, §11). `None` →
+    /// grounding rides `llm`. Lets a team point entailment at a cheaper or
+    /// specialized model (or take the generative model out of grounding
+    /// entirely) without changing the proposer/verifier.
+    ground_llm: Option<Box<dyn crate::llm::LlmBackend>>,
 }
 
 impl Engine {
@@ -154,6 +159,7 @@ impl Engine {
             analyzers: crate::analyzer::builtin_analyzers(),
             policy: crate::policy::Policy::default(),
             llm: None,
+            ground_llm: None,
         }
     }
 
@@ -163,6 +169,7 @@ impl Engine {
             analyzers: vec![],
             policy: crate::policy::Policy::default(),
             llm: None,
+            ground_llm: None,
         }
     }
 
@@ -178,6 +185,14 @@ impl Engine {
     /// output.
     pub fn with_llm(mut self, backend: Box<dyn crate::llm::LlmBackend>) -> Self {
         self.llm = Some(backend);
+        self
+    }
+
+    /// Attach a separate backend for the GROUND stage (§5.2). Without this,
+    /// grounding uses the `with_llm` backend. Independent of the proposer so an
+    /// operator can run entailment on a cheaper/specialized model.
+    pub fn with_ground_llm(mut self, backend: Box<dyn crate::llm::LlmBackend>) -> Self {
+        self.ground_llm = Some(backend);
         self
     }
 
@@ -515,7 +530,10 @@ impl Engine {
         // independent grounding entailment check *and* an adversarial
         // verification pass (each a separate call — proposer ≠ scorer) reach the
         // queue, stamped with the verifier's calibrated confidence.
-        self.verify_drafts(&**llm, &validated, &evidence, now_ms)
+        // GROUND may run on a separate backend (§11); VERIFY always uses the
+        // main llm (the proposer≠scorer independence is on VERIFY, not GROUND).
+        let ground = self.ground_llm.as_deref().unwrap_or(&**llm);
+        self.verify_drafts(&**llm, ground, &validated, &evidence, now_ms)
     }
 
     /// GROUND → VERIFY → ROUTE (§5.2–5.4). Two independent model calls, batched
@@ -527,6 +545,7 @@ impl Engine {
     fn verify_drafts(
         &self,
         llm: &dyn crate::llm::LlmBackend,
+        ground: &dyn crate::llm::LlmBackend,
         validated: &[(crate::llm::LlmDraft, String, Vec<String>)],
         evidence: &[crate::llm::EvidenceItem],
         now_ms: i64,
@@ -559,7 +578,7 @@ impl Engine {
         };
         let grounded: std::collections::BTreeSet<usize> = match serde_json::to_string(&ground_req)
             .ok()
-            .and_then(|b| llm.complete(&b).ok())
+            .and_then(|b| ground.complete(&b).ok())
         {
             Some(raw) => parse_ground(&raw)
                 .results

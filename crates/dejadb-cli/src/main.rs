@@ -28,6 +28,8 @@ COMMANDS:
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
                   [--model provider:name | --llm-cmd 'CMD']   optional LLM reflection
                   (--model reads the key from $ANTHROPIC_API_KEY/$OPENAI_API_KEY/etc.)
+                  [--ground-model provider:name | --ground-cmd 'CMD']  separate
+                  grounding backend (defaults to the reflection model)
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
            outcomes  the Verify gate: did applied advice hold, or regress?
@@ -1403,6 +1405,19 @@ fn run_waiser(
         let llm = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
             .map_err(|e| e.to_string())?;
         engine = engine.with_llm(llm);
+    }
+    // Optional SEPARATE grounding backend (§11): point the entailment check at a
+    // cheaper or specialized model, or take the generative model out of grounding
+    // entirely. Falls back to the main backend when absent. `--ground-cmd` wins.
+    if let Some(cmd) = flag(flags, "ground-cmd") {
+        let g = waiser::CommandLlm::new(&cmd, None).map_err(|e| e.to_string())?;
+        engine = engine.with_ground_llm(Box::new(g));
+    } else if let Some(spec) = flag(flags, "ground-model") {
+        let base = flag(flags, "llm-base-url");
+        let key_env = flag(flags, "llm-api-key-env");
+        let g = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
+            .map_err(|e| e.to_string())?;
+        engine = engine.with_ground_llm(g);
     }
     let now = now_ms();
     let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());

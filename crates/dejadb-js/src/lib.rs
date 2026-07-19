@@ -491,6 +491,8 @@ impl DejaDb {
         if_stale: Option<String>,
         model: Option<String>,
         llm_cmd: Option<String>,
+        ground_model: Option<String>,
+        ground_cmd: Option<String>,
     ) -> napi::Result<String> {
         let opts = RunOptions {
             min_new: min_new.map(|n| n as u64),
@@ -506,6 +508,13 @@ impl DejaDb {
             engine = engine.with_llm(Box::new(llm));
         } else if let Some(spec) = model {
             engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+        }
+        // Optional separate grounding backend (defaults to the reflection model).
+        if let Some(cmd) = ground_cmd {
+            let g = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+            engine = engine.with_ground_llm(Box::new(g));
+        } else if let Some(spec) = ground_model {
+            engine = engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
         }
         let mut sub = BorrowedSubstrate::new(&self.facade);
         let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;

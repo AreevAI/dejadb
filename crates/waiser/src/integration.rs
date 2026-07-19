@@ -161,6 +161,43 @@ fn verifier_drops_ungrounded_and_low_confidence_drafts() {
 }
 
 #[test]
+fn separate_ground_backend_is_consulted_for_grounding() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"grounded per the main model","target":"entity:test/acme","evidence":["{h1}"],"confidence":0.9}}
+        ]}}"#
+    );
+    // The MAIN backend would ground (supported:true) and keep the draft.
+    let main = MockLlm {
+        discover,
+        ground: r#"{"results":[{"id":0,"supported":true}]}"#.to_string(),
+        verify: r#"{"results":[{"id":0,"keep":true,"confidence":0.9}]}"#.to_string(),
+        enrich: r#"{"notes":[]}"#.to_string(),
+    };
+    // The SEPARATE ground backend REJECTS (supported:false). If it — not the main
+    // backend — is the one consulted for GROUND, the draft dies before verify.
+    let ground = MockLlm {
+        discover: String::new(),
+        ground: r#"{"results":[{"id":0,"supported":false}]}"#.to_string(),
+        verify: String::new(),
+        enrich: String::new(),
+    };
+    let e = Engine::with_builtins()
+        .with_llm(Box::new(main))
+        .with_ground_llm(Box::new(ground));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    assert!(
+        recs.iter().all(|r| !matches!(r.origin, Origin::Llm { .. })),
+        "the separate ground backend's rejection gates the draft"
+    );
+}
+
+#[test]
 fn no_llm_backend_is_the_identity() {
     use crate::model::Origin;
     let mut sub = TestSubstrate::new();
