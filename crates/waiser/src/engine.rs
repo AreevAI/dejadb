@@ -68,6 +68,13 @@ pub struct RunOptions {
     pub if_stale_ms: Option<i64>,
     /// Optional global namespace filter (empty = all).
     pub namespaces: Vec<String>,
+    /// Re-analyze the WHOLE memory this pass, not just grains since the last-run
+    /// watermark (`deja waiser reflect`). Dedup/cooldowns still suppress anything
+    /// already queued, and the watermark still advances at the end — so a sweep
+    /// is safe to run any time and later runs stay incremental. Mainly widens the
+    /// watermark-sensitive inputs (tool-failure window, the non-parasitic LLM
+    /// evidence bundle) to the full history.
+    pub full_sweep: bool,
 }
 
 /// Whether a run executed or was skipped.
@@ -219,6 +226,11 @@ impl Engine {
     ) -> Result<RunResult> {
         let mut persisted = WaiserPersisted::from_value(sub.load_state()?)?;
         let watermark = persisted.state.watermark_ms;
+        // A full sweep analyzes the whole memory (watermark ignored for the
+        // analysis inputs), while gating, `new` counts, and the end-of-run
+        // watermark advance still use the real watermark. Dedup/cooldowns keep
+        // it from re-proposing what is already queued.
+        let analysis_watermark = if opts.full_sweep { None } else { watermark };
 
         let (new_grains, new_error_events) = count_new(sub, watermark)?;
         if let Some(reason) = gate(opts, &persisted, new_grains, new_error_events, now_ms) {
@@ -286,7 +298,7 @@ impl Engine {
                 reader,
                 &params,
                 ns_slice,
-                watermark,
+                analysis_watermark,
                 now_ms,
                 &outcome_inputs,
             );
@@ -314,7 +326,8 @@ impl Engine {
         // stamped origin=llm (never auto-apply). Identity when no backend; a
         // failed/garbled call drops the contribution, never the run.
         if self.llm.is_some() {
-            let discovered = self.discover(&*sub, &candidates, watermark, &opts.namespaces, now_ms);
+            let discovered =
+                self.discover(&*sub, &candidates, analysis_watermark, &opts.namespaces, now_ms);
             candidates.extend(discovered);
         }
 

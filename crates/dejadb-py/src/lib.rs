@@ -507,6 +507,7 @@ impl DejaDB {
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an
     /// evaluator's first call always runs. Returns the run-outcome JSON.
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
     #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None, analyzer_cmd = None))]
     fn waiser_run(
         &self,
@@ -524,6 +525,7 @@ impl DejaDB {
             min_new_errors,
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
+            full_sweep: false,
         };
         // Optional verified LLM reflection: `model="claude-sonnet"` (key from the
         // env) attaches a built-in HTTP backend; `llm_cmd="..."` a subprocess.

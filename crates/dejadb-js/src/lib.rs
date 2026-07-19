@@ -484,6 +484,7 @@ impl DejaDb {
 
     /// Run one analysis pass. Bare it never gates. Returns run-outcome JSON.
     #[napi]
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
     pub fn waiser_run(
         &self,
         min_new: Option<u32>,
@@ -500,6 +501,7 @@ impl DejaDb {
             min_new_errors: min_new_errors.map(|n| n as u64),
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
+            full_sweep: false,
         };
         // Optional verified LLM reflection: `model` ("claude-sonnet", key from
         // the env) attaches a built-in HTTP backend; `llmCmd` a subprocess.

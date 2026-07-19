@@ -296,6 +296,51 @@ fn config_edit_toggles_analyzer_and_is_admin_gated() {
 }
 
 #[test]
+fn full_sweep_reconsiders_grains_before_the_watermark() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "country", "germany"); // created_at 1000
+
+    // A plain run (no llm) advances the watermark to 10_000 — past the fact.
+    Engine::with_builtins()
+        .run(&mut sub.inner, &RunOptions::default(), 10_000)
+        .unwrap();
+
+    // Attach an llm that WOULD discover on that (now pre-watermark) fact.
+    let discover = format!(
+        r#"{{"recommendations":[{{"summary":"semantic issue on acme","target":"entity:test/acme","evidence":["{h1}"],"confidence":0.9}}]}}"#
+    );
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm {
+        discover,
+        ground: r#"{"results":[{"id":0,"supported":true}]}"#.to_string(),
+        verify: r#"{"results":[{"id":0,"keep":true,"confidence":0.9}]}"#.to_string(),
+        enrich: r#"{"notes":[]}"#.to_string(),
+    }));
+
+    // Incremental: discover seeds only grains since the watermark, so the old
+    // fact is not in the bundle → no llm finding.
+    e.run(&mut sub.inner, &RunOptions::default(), 20_000).unwrap();
+    let incremental = e
+        .recommendations(&sub.inner, None)
+        .unwrap()
+        .into_iter()
+        .filter(|r| matches!(r.origin, Origin::Llm { .. }))
+        .count();
+    assert_eq!(incremental, 0, "an incremental run skips pre-watermark grains");
+
+    // Full sweep: re-seeds the whole memory → the old fact is reconsidered.
+    let sweep = RunOptions { full_sweep: true, ..Default::default() };
+    e.run(&mut sub.inner, &sweep, 30_000).unwrap();
+    let swept = e
+        .recommendations(&sub.inner, None)
+        .unwrap()
+        .into_iter()
+        .filter(|r| matches!(r.origin, Origin::Llm { .. }))
+        .count();
+    assert_eq!(swept, 1, "a full sweep reconsiders pre-watermark grains");
+}
+
+#[test]
 fn no_llm_backend_is_the_identity() {
     use crate::model::Origin;
     let mut sub = TestSubstrate::new();

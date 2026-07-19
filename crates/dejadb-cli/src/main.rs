@@ -23,8 +23,8 @@ USAGE:
 COMMANDS:
   init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
            print the Claude Code hook snippet (never writes your settings)
-  waiser   <run|list|show|approve|reject|apply|rollback|analyzers|policy>  the
-           governed self-improvement loop (deterministic core; optional verified LLM):
+  waiser   <run|reflect|list|show|approve|reject|apply|rollback|analyzers|policy>
+           the governed self-improvement loop (deterministic core; optional verified LLM):
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
                   [--model provider:name | --llm-cmd 'CMD']   optional LLM reflection
                   (--model reads the key from $ANTHROPIC_API_KEY/$OPENAI_API_KEY/etc.)
@@ -32,6 +32,8 @@ COMMANDS:
                   grounding backend (defaults to the reflection model)
                   [--analyzer-cmd 'CMD']   register an external analyzer
                   (advisory only — never auto-applies)
+           reflect  like run, but re-analyzes the whole memory (ignores the
+                  incremental watermark) — a full sweep; same flags as run
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
            outcomes  the Verify gate: did applied advice hold, or regress?
@@ -1435,12 +1437,15 @@ fn run_waiser(
     let json = flag(flags, "format").as_deref() == Some("json");
 
     match sub_cmd {
-        "run" => {
+        // `reflect` = a run that re-analyzes the whole memory (full sweep),
+        // ignoring the incremental watermark; otherwise identical to `run`.
+        "run" | "reflect" => {
             let opts = RunOptions {
                 min_new: flag(flags, "min-new").and_then(|v| v.parse().ok()),
                 min_new_errors: flag(flags, "min-new-errors").and_then(|v| v.parse().ok()),
                 if_stale_ms: flag(flags, "if-stale").and_then(|v| parse_duration(&v)),
                 namespaces: Vec::new(),
+                full_sweep: sub_cmd == "reflect",
             };
             let res = engine.run(&mut sub, &opts, now).map_err(|e| e.to_string())?;
             if json {

@@ -298,6 +298,7 @@ impl McpServer {
                     min_new_errors: args.get("min_new_errors").and_then(Value::as_u64),
                     if_stale_ms: None,
                     namespaces: Vec::new(),
+                    full_sweep: args.get("full_sweep").and_then(Value::as_bool).unwrap_or(false),
                 };
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 let engine = Engine::with_builtins();
