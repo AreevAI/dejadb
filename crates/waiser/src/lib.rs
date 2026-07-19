@@ -28,6 +28,7 @@ pub mod cal;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod external;
 pub mod llm;
 pub mod manifest;
 pub mod model;
@@ -47,6 +48,7 @@ pub use engine::{
     SkipReason, WAISER_NS,
 };
 pub use error::{Error, Result};
+pub use external::CommandAnalyzer;
 pub use llm::{CommandLlm, LlmBackend};
 pub use manifest::{
     analyzer_family, AnalyzerManifest, AutoApplyClass, CadenceClass, Capability, ParamSpec, Params,

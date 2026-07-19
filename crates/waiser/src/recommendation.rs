@@ -76,6 +76,9 @@ fn builtin_template(id: &str) -> Option<&'static str> {
         // origin=llm drafts carry free text (clearly marked llm) rather than a
         // deterministic template — the model's proposed summary rides in {text}.
         "llm.discover" => "{text}",
+        // External command analyzers (trust class Command): free text from the
+        // subprocess, rendered as-is (the trust badge, not the prose, marks it).
+        "command.finding" => "{text}",
         _ => return None,
     })
 }

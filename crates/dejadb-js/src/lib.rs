@@ -493,6 +493,7 @@ impl DejaDb {
         llm_cmd: Option<String>,
         ground_model: Option<String>,
         ground_cmd: Option<String>,
+        analyzer_cmd: Option<String>,
     ) -> napi::Result<String> {
         let opts = RunOptions {
             min_new: min_new.map(|n| n as u64),
@@ -515,6 +516,10 @@ impl DejaDb {
             engine = engine.with_ground_llm(Box::new(g));
         } else if let Some(spec) = ground_model {
             engine = engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+        }
+        // Optional external analyzer (advisory only — never auto-applies).
+        if let Some(cmd) = analyzer_cmd {
+            engine.register(Box::new(waiser::CommandAnalyzer::new(&cmd).map_err(err)?));
         }
         let mut sub = BorrowedSubstrate::new(&self.facade);
         let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;

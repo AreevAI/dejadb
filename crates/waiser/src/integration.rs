@@ -197,6 +197,47 @@ fn separate_ground_backend_is_consulted_for_grounding() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn external_command_analyzer_surfaces_advisory_findings() {
+    use crate::analyzer::Analyzer; // for .manifest()
+    use std::os::unix::fs::PermissionsExt;
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "country", "germany");
+
+    // A tiny analyzer: consume stdin, always emit one finding. One fixed body
+    // serves both the probe (reads `id`) and analyze (reads `findings`), since
+    // each reply type ignores the other's fields. Written to a space-free temp
+    // path (argv is whitespace-split, like --llm-cmd).
+    let script = std::env::temp_dir().join(format!("waiser_ext_{}.sh", std::process::id()));
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"id\":\"acme.ext/1\",\"title\":\"ext\",\
+         \"findings\":[{\"target\":\"entity:test/acme\",\"summary\":\"external flags acme\",\
+         \"severity\":\"medium\",\"evidence\":[\"deadbeef\"]}]}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let analyzer = crate::external::CommandAnalyzer::new(script.to_str().unwrap()).unwrap();
+    assert_eq!(analyzer.manifest().id, "acme.ext/1");
+    assert_eq!(analyzer.manifest().trust_class, crate::manifest::TrustClass::Command);
+    assert_eq!(analyzer.manifest().auto_apply, crate::manifest::AutoApplyClass::Never);
+
+    let mut e = Engine::with_builtins();
+    e.register(Box::new(analyzer));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+
+    let ext: Vec<_> = recs.iter().filter(|r| r.analyzer == "acme.ext/1").collect();
+    assert_eq!(ext.len(), 1, "the external finding is surfaced");
+    assert_eq!(ext[0].summary.render(), "external flags acme");
+    assert_eq!(ext[0].severity, crate::model::Severity::Medium);
+    assert!(!ext[0].destructive, "advisory flag, not a mutation");
+
+    std::fs::remove_file(&script).ok();
+}
+
 #[test]
 fn no_llm_backend_is_the_identity() {
     use crate::model::Origin;

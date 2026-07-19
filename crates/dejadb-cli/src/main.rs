@@ -30,6 +30,8 @@ COMMANDS:
                   (--model reads the key from $ANTHROPIC_API_KEY/$OPENAI_API_KEY/etc.)
                   [--ground-model provider:name | --ground-cmd 'CMD']  separate
                   grounding backend (defaults to the reflection model)
+                  [--analyzer-cmd 'CMD']   register an external analyzer
+                  (advisory only — never auto-applies)
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
            outcomes  the Verify gate: did applied advice hold, or regress?
@@ -1418,6 +1420,13 @@ fn run_waiser(
         let g = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
             .map_err(|e| e.to_string())?;
         engine = engine.with_ground_llm(g);
+    }
+    // Optional external analyzer: a subprocess that flags domain-specific issues
+    // (trust class Command → advisory only, never auto-applies). Registered up
+    // front so it participates in the pass like a built-in.
+    if let Some(cmd) = flag(flags, "analyzer-cmd") {
+        let a = waiser::CommandAnalyzer::new(&cmd).map_err(|e| e.to_string())?;
+        engine.register(Box::new(a));
     }
     let now = now_ms();
     let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());

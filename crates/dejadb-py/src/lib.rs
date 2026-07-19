@@ -507,7 +507,7 @@ impl DejaDB {
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an
     /// evaluator's first call always runs. Returns the run-outcome JSON.
-    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None))]
+    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None, analyzer_cmd = None))]
     fn waiser_run(
         &self,
         min_new: Option<u64>,
@@ -517,6 +517,7 @@ impl DejaDB {
         llm_cmd: Option<String>,
         ground_model: Option<String>,
         ground_cmd: Option<String>,
+        analyzer_cmd: Option<String>,
     ) -> PyResult<String> {
         let opts = RunOptions {
             min_new,
@@ -539,6 +540,10 @@ impl DejaDB {
             engine = engine.with_ground_llm(Box::new(g));
         } else if let Some(spec) = ground_model {
             engine = engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+        }
+        // Optional external analyzer (advisory only — never auto-applies).
+        if let Some(cmd) = analyzer_cmd {
+            engine.register(Box::new(waiser::CommandAnalyzer::new(&cmd).map_err(err)?));
         }
         let mut sub = BorrowedSubstrate::new(&self.facade);
         let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;
