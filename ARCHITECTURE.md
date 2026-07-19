@@ -17,8 +17,69 @@ Related references:
 
 - [CAL query language reference](docs/cal-reference.md)
 - [MCP server reference](docs/mcp-reference.md)
+- [Waiser: governed self-improvement](docs/waiser.md)
 - [Security model & threat model](docs/security-model.md)
 - [Vulnerability reporting](SECURITY.md)
+
+---
+
+## System at a glance
+
+DejaDB is one loop: memory is **assembled** into a prompt on the read path,
+and every action feeds back into memory on the write path — which **Waiser**
+then governs, verifies, and improves.
+
+```
+        D E J A D B   —   in-process recall · governed, verified self-improvement
+
+   recall path (no server, no network) ─────────▶   the assembled context   ──▶
+                                                     (one budgeted token block)
+   ┌──────────────────┐     ╔══════════════╗                            ╔═══════════╗
+   │  S T O R A G E   │read▶║ CAL·ASSEMBLE ║ ───────────────────────────▶║    LLM    ║
+   │  per-file Turso  │     ╚══════════════╝                            ╚═════╤═════╝
+   ├──────────────────┤      hybrid recall  structural · BM25 · vector · RRF   │ tool
+   │ FACTS   EVENTS   │      per-source  BUDGET + PRIORITY · dedup             ▼ calls
+   │ SKILLS  TOOLS    │      FORMAT sml│toon│markdown│json                ╔═══════════╗
+   │ WORKFLOWS STATE  │◀── results · events · facts captured (ADD) ────────╢  ACTIONS  ║
+   │ GOALS   …   (11) │    immutable · content-addressed grains            ║ host runs ║
+   └──┬────────────▲──┘                                                    ╚═══════════╝
+      │            │
+   op-log +   governed writes back — SUPERSEDE · ADD · FORGET
+  telemetry        ▲   (only through the four gates)
+      │            │
+      ▼            │
+   ╔═════════════════════════════════════════════════════════════════════════════╗
+   ║  W A I S E R  —  governed · verified · measured self-improvement     [built] ║
+   ║   ANALYZE    11 deterministic analyzers over typed grains — 0 LLM calls      ║
+   ║   DISCOVER   optional LLM: propose → GROUND → VERIFY  (proposer ≠ scorer)    ║
+   ║   RECOMMEND  recommendation grain + cited evidence + severity                ║
+   ║   GOVERN     four gates — propose · review (BECAUSE) · apply · verify        ║
+   ║   MEASURE    re-run the metric at 1d / 7d / 30d · revert on regression       ║
+   ╚═════════════════════════════════════════════════════════════════════════════╝
+
+   recall — in-process, p50 ~33µs · no server in the recall path
+   write  — append-only · immutable history · full provenance · forks surface contradictions
+   waiser — deterministic core needs no model · the LLM only proposes, never gates or applies ·
+            every change is evidence-cited, reviewed, undoable, and re-measured · no daemon
+```
+
+**Reading the diagram — one clockwise cycle with an inner governed loop:**
+
+1. **Storage (left).** The memory itself — immutable, content-addressed grains
+   in per-file Turso DBs (§2–§3). The labeled streams are the grain types that
+   actually reach a model; `(11)` marks the rest.
+2. **Recall (`CAL · ASSEMBLE`, §5–§7).** Reads storage and joins the streams
+   under per-source token budgets and priorities, in-process — no server, no
+   network. What travels the arrow is not "a prompt string" but one
+   token-accounted budgeted block; that block *is* the prompt.
+3. **Actions (write path).** The model calls tools; execution is always the
+   **host's** job (DejaDB stores tool grains, never runs them). Results and new
+   events are **captured back** as fresh grains.
+4. **Waiser (inner loop, §8).** Tails the op-log and recall telemetry, runs
+   deterministic analyzers (optionally an *independently verified* LLM), and
+   writes vetted improvements back — but only through four governance gates.
+   Unlike an autonomous consolidation daemon, it has no scheduler: a run is a
+   cheap, idempotent command a host triggers on a hook, cron, CI, or MCP call.
 
 ---
 
@@ -367,19 +428,160 @@ agent.
 
 ---
 
-## 8. Crate layout
+## 8. Waiser: governed self-improvement
 
-DejaDB is a Rust workspace of 9 crates. The dependency order (foundation
-first):
+Recall (§5–§7) makes memory *useful* on the read path. **Waiser** is the layer
+that makes memory *get better* on the write path — an agent learning from its
+own history — without the failure mode that keeps most teams from shipping it:
+an agent that edits its own memory and prompt is an unreviewed production deploy
+that runs continuously. Waiser's stance is that **self-improvement is a
+governance problem before it is an intelligence problem**. Every change to the
+backend is a first-class object — evidence-cited, reviewable, undoable, measured.
+
+Two properties shape everything below:
+
+- **Deterministic core; LLM optional.** Because memories are typed grains, not
+  text blobs, analyzers compute over declared semantics (`Event.is_error`, a
+  Fact's subject/relation/object, supersession chains, `valid_to`) and produce
+  useful recommendations with **zero model calls**. An LLM is strictly additive
+  enrichment — it can never gate, approve, or apply anything.
+- **Governance is native.** Every change passes four gates and lands as
+  hash-chained audit grains. There is no daemon and no scheduler anywhere; a
+  waiser run is a cheap, idempotent command a host triggers however it already
+  triggers things (a hook, cron, CI, an MCP call).
+
+### 8.1 The loop and the four gates
 
 ```
-dejadb-core ──┬── dejadb-store ──┬── dejadb-cal ──┬── dejadb-context
-              │                  │                │
-              └──────────────────┴────────────────┴──> dejadb-mcp
-                                                        dejadb-server
-                                                        dejadb-py
-                                                        dejadb (binary)
-                                                        dejadb-bench (harness)
+capture  (tool calls, facts, events)   — record_tool_call / add / import
+  → ANALYZE   deterministic, typed       — 11 analyzers over grain semantics
+  → RECOMMEND recommendation + evidence  — dedup'd, template-rendered, cited
+  → GOVERN    review / policy auto-apply — the four gates, audit grains
+  → APPLY     undoable supersession      — scope-checked at execution
+  → MEASURE   outcome review             — re-run the metric, revert on regression
+```
+
+1. **Propose** — only recommendation objects enter the queue, each carrying a
+   versioned analyzer id + params, a deterministic template-rendered summary
+   (analyzers cannot emit free prose), bounded evidence hashes, a severity, and
+   a reproducible metric snapshot.
+2. **Review** — separation of duties (`write` grants neither `review` nor
+   `apply`), a mandatory `BECAUSE` reason on every decision, and self-approval
+   blocked against the recommendation's creating actor.
+3. **Apply** — requires the `apply` scope plus every scope the payload itself
+   needs, evaluated at execution time (no privilege amplification); every apply
+   records its inverse, or is marked non-rollbackable up front.
+4. **Verify** — after a review window the stored metric re-runs and the outcome
+   is recorded; regressions propose a revert (§8.4).
+
+Auto-apply is **off by default** and, where a host policy file grants it, is
+restricted to structural, engine-verified, non-destructive curation on
+memory/query targets only — never prompts, never destruction, never LLM-drafted
+text. The rule is one sentence: **the file selects and restricts; only the host
+grants** — so a synced or hostile memory file can never arrive pre-armed. Waiser
+inherits DejaDB's standing invariant that the only destructive verb is
+single-grain `FORGET` (§5.2), so a staleness sweep proposes tombstones a human
+must approve under `admin` + `allow_destructive_ops`. The audit trail is grains:
+one immutable Observation per transition, hash-chained per recommendation,
+carrying the actor label and the reason — it syncs with the file and is
+queryable in CAL.
+
+### 8.2 Deterministic analyzers and recall telemetry
+
+Eleven built-in analyzers (nine default-on) read typed grains, never prose:
+tool-failure clustering, duplicate/near-duplicate consolidation, contradiction
+resolution under functional relations, fork surfacing, staleness, skill-stall,
+goal-stagnation, and three **telemetry-fed** analyzers — cold grains, coverage
+gaps, and budget pressure — that move Waiser from *hygiene* (is memory
+internally correct?) to *utility* (is memory used, and does it help?). Precision
+is measured, not asserted: the `waiser_precision` bench scores each analyzer
+against a labeled fixture and gates CI.
+
+The utility signal comes from a disposable `<file>.telemetry.db` **sidecar**
+that records what recall actually surfaced — which grains were retrieved, which
+questions came back empty. It is host-only (a bare library `open()` records
+nothing), encrypted under the main file's key (crypto-erasure covers it), never
+syncs, and is rebuildable. Capture on the recall path is buffered and
+non-blocking, so it never touches the microsecond recall / 50 ms voice budgets
+(voice-loop recall p50 stays ~82µs with telemetry on).
+
+### 8.3 The optional, verified LLM path
+
+Attach a model (`deja waiser run --model claude-sonnet`, or `--llm-cmd` for a
+subprocess backend) and the pipeline gains strictly additive stages that are the
+identity when no backend is set:
+
+```
+ANALYZE → DISCOVER → GROUND → VERIFY → ENRICH → VALIDATE+DEDUP → STORE
+```
+
+The design follows the one result the self-improvement literature agrees on:
+**improvement is reliable when an external verifier grades the change, and
+degrades when a model judges its own correctness.** Deterministic analyzers do
+the error-*finding* LLMs provably can't; the LLM only proposes fixes localized
+to a finding, under an **abstention-legitimate objective** ("nothing to report"
+is a zero-penalty answer, so it isn't pushed to over-generate). Every draft is
+then **grounded** (does the cited evidence entail the claim?) and
+**independently verified** (a separate call — the proposer never grades itself)
+before it can reach the queue, stamped with a calibrated confidence and
+`origin = llm` so it can **never auto-apply**. A bad or slow backend drops its
+contribution, never the run. Quality is measured (§8.4), not asserted.
+
+Providers ship out of the box in the `dejadb-llm` crate (OpenAI-compatible,
+Anthropic, Ollama over a small blocking HTTP client, keys read from the
+environment), isolated there so the core crates stay dependency-light.
+
+### 8.4 Measurement: the Verify gate
+
+The honest test of self-improvement is not "did it make a change" but "did the
+change help." When an applied recommendation carries a metric, the engine
+re-measures it on a **schedule of checkpoints** (1d / 7d / 30d) — a typed read
+over subsequent history, no LLM — and records each outcome as a file-truth
+(`held` / `regressed`); a late regression proposes a revert. The LLM path is
+measured too: the `waiser_reflection` bench scores **Effective Reliability** (it
+subtracts for confident-wrong, unlike raw precision), and `deja waiser` reports
+the live approval-rate of LLM drafts.
+
+The boundary is deliberate. This works for **internal, bounded, attributable**
+outcomes — did this tool fail again, does this duplicate still exist — the facts
+Waiser owns. It does **not** claim open-ended, world-facing outcomes (was a
+generated post good, is a patient happier); those surface as a monitored trend a
+human judges, never a machine verdict. Waiser improves the agent's *memory*, not
+its *outputs*.
+
+### 8.5 Where it lives
+
+Waiser is three crates (§9). The **`waiser`** engine is substrate-agnostic — it
+depends on no DejaDB crate and runs against any OMS-shaped store through the
+`OmsSubstrate` trait — so the governance model is not DejaDB-specific.
+**`dejadb-waiser`** implements that trait over `DejaDbFacade`; **`dejadb-llm`**
+implements the `LlmBackend` trait with out-of-box providers. The whole user
+surface — the `deja waiser` verb family and `deja init`, two MCP tools, the
+`/api/waiser/*` routes, the Waiser console tab, and the Python/Node bindings —
+reduces to that engine. Recommendation and audit grains are modeled as a
+forthcoming OMS `0x0C` type; until it is realized in `dejadb-core` they ride as
+content-addressed Fact grains in a `waiser` namespace (an additive, address-safe
+interim, per OMS §4.5). Full design: [`waiser.md`](docs/waiser.md) and
+[`waiser-reflection.md`](docs/waiser-reflection.md).
+
+---
+
+## 9. Crate layout
+
+DejaDB is a Rust workspace of 12 crates (plus `dejadb-js`, a standalone napi
+package built outside the workspace). Two foundations converge on the leaf
+crates — the memory stack, and the Waiser self-improvement engine:
+
+```
+  the memory stack
+    dejadb-core ─▶ dejadb-store ─▶ dejadb-cal ─▶ dejadb-context
+
+  the self-improvement engine
+    waiser ─▶ dejadb-waiser   (waiser::OmsSubstrate over DejaDbFacade)
+         └──▶ dejadb-llm      (waiser::LlmBackend — OpenAI / Anthropic / Ollama)
+
+  both feed the leaf crates
+    dejadb-mcp · dejadb-server · dejadb-py · dejadb (binary) · dejadb-bench (harness)
 ```
 
 | Crate | Depends on | What it does |
@@ -388,15 +590,18 @@ dejadb-core ──┬── dejadb-store ──┬── dejadb-cal ──┬─
 | **dejadb-store** | core | The Turso store: dictionary-encoded triple indexes, `entity_latest` heads/forks, hybrid recall + RRF, bounded graph ops, the op-log + HLC + tombstones, the CAS blob sidecar, bundles/streaming, and the memory-tool adapter. |
 | **dejadb-cal** | core, store | CAL lexer, parser, AST, executor, multi-source ASSEMBLE, templates, saved queries, and the `DejaDbFacade` (with read-only mounts) that binds CAL to the store. |
 | **dejadb-context** | cal, core | Budget-aware rendering (SML/TOON/Markdown/JSON), progressive disclosure, provider presets, and tool-schema formats. |
-| **dejadb-mcp** | cal, core, store | The stdio MCP server — six memory-semantic tools over newline-delimited JSON-RPC 2.0. See the [MCP reference](docs/mcp-reference.md). |
-| **dejadb-server** | cal, context, core, store | A dependency-light HTTP/1.1 web console (loopback, no auth by default) plus an optional sync-hub mode with bearer-token auth. |
-| **dejadb** | all of the above | The `deja` binary: ~27 verbs (`add`, `recall`, `cal`, `history`, `log`, `bundle`, `import`, `migrate`, `reindex`, `verify`, `serve --mcp`, `ui`, `repl`, `remember`, …). |
-| **dejadb-py** | cal, context, core, store | Python bindings (`import dejadb`); scalars in, JSON strings out. |
-| **dejadb-bench** | most of the stack | Reproducible accuracy and latency benchmark harnesses. |
+| **waiser** | — (substrate-agnostic) | The Waiser self-improvement engine: the `OmsSubstrate` / `LlmBackend` / `Analyzer` traits, the 11 deterministic analyzers, the recommendation lifecycle + four gates, the LLM DISCOVER → GROUND → VERIFY verifier, and outcome measurement. Depends on no DejaDB crate — it runs against any OMS-shaped store. |
+| **dejadb-waiser** | waiser, cal, store, core | The DejaDB substrate adapter: implements `waiser::OmsSubstrate` over `DejaDbFacade` so `deja waiser` runs against real `.mg`/Turso files, plus the recall-telemetry sidecar. |
+| **dejadb-llm** | waiser | Out-of-box LLM provider backends (OpenAI-compatible, Anthropic, Ollama) implementing `waiser::LlmBackend` over a small blocking HTTP client — isolates the HTTP surface so the core crates stay dependency-light. |
+| **dejadb-mcp** | cal, core, store, waiser, dejadb-waiser | The stdio MCP server — eight memory- and improvement-semantic tools (six memory + `dejadb_waiser` / `dejadb_recommendations`) over newline-delimited JSON-RPC 2.0. See the [MCP reference](docs/mcp-reference.md). |
+| **dejadb-server** | cal, context, core, store, waiser, dejadb-waiser | A dependency-light HTTP/1.1 web console (loopback, read-only without a token) plus the `/api/waiser/*` routes and Waiser console tab, and an optional sync-hub mode with bearer-token auth. |
+| **dejadb** | all of the above | The `deja` binary: ~27 verbs (`add`, `recall`, `cal`, `history`, `log`, `bundle`, `import`, `migrate`, `reindex`, `verify`, `serve --mcp`, `ui`, `repl`, `remember`, `init`, `waiser`, …). |
+| **dejadb-py** | cal, context, core, store, waiser, dejadb-waiser | Python bindings (`import dejadb`); scalars in, JSON strings out. |
+| **dejadb-bench** | most of the stack | Reproducible accuracy and latency benchmark harnesses (latency, honesty, LoCoMo accuracy, `waiser_precision`, `waiser_reflection`). |
 
 ---
 
-## 9. Key design decisions and trade-offs
+## 10. Key design decisions and trade-offs
 
 These are the decisions that most shape the system, and what they buy.
 
@@ -440,6 +645,18 @@ verb is a single-grain `FORGET` — with no bulk-erasure primitive to reach for,
 and a one-flag switch to make a session fully read-only for untrusted input — is
 a safety property you can rely on.
 
+### Self-improvement is governed, not autonomous
+
+Most agent-memory products treat self-improvement as an intelligence problem —
+let an LLM rewrite memory and hope. [Waiser](#8-waiser-governed-self-improvement)
+treats it as a governance problem first: a deterministic core that needs no
+model, an LLM that can only *propose* under an independent verifier, four gates
+on every change, an undo for every apply, and a re-measured outcome for every
+metric. Just as deliberately, there is **no daemon and no scheduler** — a waiser
+run is a command a host triggers, so improvement never runs unattended. That is
+the difference between "an LLM edits your memory" and self-improvement you can
+put in production.
+
 ### Portability and provenance over lock-in
 
 Grains are content-addressed, immutable, and hash-linked; the format reserves
@@ -454,7 +671,7 @@ immutable objects.
 
 ---
 
-## 10. Deployment topology
+## 11. Deployment topology
 
 DejaDB has no platform dependency. Three tiers cover a multi-channel fleet:
 

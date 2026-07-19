@@ -1,7 +1,7 @@
 # DejaDB
 
 Embedded memory engine for AI agents — reference implementation of OMS (Open
-Memory Spec). Rust workspace of 9 crates (plus `dejadb-js`, a standalone napi
+Memory Spec). Rust workspace of 12 crates (plus `dejadb-js`, a standalone napi
 package built outside the workspace). Memories are immutable
 content-addressed grains in per-file Turso databases, queried with CAL, and
 rendered into model-ready context in-process (no server in the recall path).
@@ -39,9 +39,10 @@ cargo run -p dejadb -- recall --db demo.db --ns caller --subject john
 ## Workspace (dependency order)
 
 ```
-dejadb-core ← dejadb-store ← dejadb-cal ← dejadb-context
-                                  ↑              ↑
-                    dejadb-mcp, dejadb-server, dejadb-py, dejadb (binary)
+memory stack:  dejadb-core ← dejadb-store ← dejadb-cal ← dejadb-context ┐
+waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
+                              both feed the leaf crates ↓                 ↓
+             dejadb-mcp, dejadb-server, dejadb-py, dejadb (binary), dejadb-bench
 ```
 
 | Crate | What | CLAUDE.md |
@@ -50,6 +51,9 @@ dejadb-core ← dejadb-store ← dejadb-cal ← dejadb-context
 | `dejadb-store` | Turso store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs, memory-tool adapter, migration importers | yes |
 | `dejadb-cal` | CAL lexer/parser/executor, ASSEMBLE, `DejaDbFacade` + mounts | yes |
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |
+| `waiser` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/waiser.md` | — |
+| `dejadb-waiser` | DejaDB substrate adapter for Waiser (`waiser::OmsSubstrate` over `DejaDbFacade`) + recall-telemetry sidecar | — |
+| `dejadb-llm` | Out-of-box LLM backends for Waiser (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) | — |
 | `dejadb-mcp` | Stdio MCP server (see below) | — |
 | `dejadb-server` | Web console + dejad hub (see below) | — |
 | `dejadb` | The `deja` binary (see below) | — |
