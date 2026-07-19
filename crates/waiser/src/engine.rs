@@ -438,12 +438,14 @@ impl Engine {
         if evidence.is_empty() {
             return Vec::new(); // nothing to ground a discovery on
         }
+        // PROPOSE (§5.1): the abstention-legitimate objective — "nothing to
+        // report" is a first-class, zero-penalty answer.
         let request = crate::llm::LlmRequest {
             waiser: 1,
             op: "discover",
             instructions: DISCOVER_INSTRUCTIONS,
-            findings,
-            evidence,
+            findings: findings.clone(),
+            evidence: evidence.clone(),
             rejected: Vec::new(),
             approved: Vec::new(),
         };
@@ -454,27 +456,144 @@ impl Engine {
             Ok(r) => r,
             Err(_) => return Vec::new(), // fail-soft
         };
-        let mut out = Vec::new();
+        // Cheap structural validation (cite-check + target class); collect the
+        // survivors for the verifier. Storing the normalized target string
+        // avoids a TargetRef clone through the pipeline.
+        let mut validated: Vec<(crate::llm::LlmDraft, String, Vec<String>)> = Vec::new();
         for d in crate::llm::parse_discover(&raw)
             .recommendations
             .into_iter()
             .take(crate::llm::MAX_LLM_DRAFTS)
         {
-            // Cite-check: keep only evidence present in the bundle; drop uncited.
             let cited: Vec<String> =
                 d.evidence.iter().filter(|h| bundle.contains(*h)).cloned().collect();
             if cited.is_empty() {
-                continue;
+                continue; // uncited → drop (no fabrication)
             }
-            // Target must be a memory/query surface (never prompt/host).
             let Ok(target) = TargetRef::parse(&d.target) else {
                 continue;
             };
             let tc = target.target_class();
             if tc != "memory" && tc != "query" {
-                continue;
+                continue; // never prompt/host
             }
-            out.push(stamp_llm(llm.model(), &d, target, cited, now_ms));
+            validated.push((d, target.as_string(), cited));
+        }
+        if validated.is_empty() {
+            return Vec::new();
+        }
+        // GROUND → VERIFY → ROUTE (§5.2–5.4): only drafts that survive an
+        // independent grounding entailment check *and* an adversarial
+        // verification pass (each a separate call — proposer ≠ scorer) reach the
+        // queue, stamped with the verifier's calibrated confidence.
+        self.verify_drafts(&**llm, &validated, &evidence, &findings, now_ms)
+    }
+
+    /// GROUND → VERIFY → ROUTE (§5.2–5.4). Two independent model calls, batched
+    /// over the drafts: a grounding-entailment gate ("does the cited evidence
+    /// support the claim?"), then an adversarial keep/kill with a calibrated
+    /// confidence. A draft reaches the queue only if it is grounded **and** kept
+    /// **and** clears the confidence floor. Any failed call drops the whole LLM
+    /// contribution for the run (safe default), never the run.
+    fn verify_drafts(
+        &self,
+        llm: &dyn crate::llm::LlmBackend,
+        validated: &[(crate::llm::LlmDraft, String, Vec<String>)],
+        evidence: &[crate::llm::EvidenceItem],
+        deterministic: &[crate::llm::FindingBrief],
+        now_ms: i64,
+    ) -> Vec<Recommendation> {
+        use crate::llm::*;
+        let ev_by_hash: std::collections::BTreeMap<&str, &EvidenceItem> =
+            evidence.iter().map(|e| (e.hash.as_str(), e)).collect();
+        let ev_for = |cited: &[String]| -> Vec<EvidenceItem> {
+            cited
+                .iter()
+                .filter_map(|h| ev_by_hash.get(h.as_str()).map(|e| (*e).clone()))
+                .collect()
+        };
+
+        // GROUND (§5.2): decompose-then-entail per draft, batched into one call.
+        let claims: Vec<GroundItem> = validated
+            .iter()
+            .enumerate()
+            .map(|(i, (d, _t, cited))| GroundItem {
+                id: i,
+                claim: cap(&d.summary, MAX_SUMMARY_LEN),
+                evidence: ev_for(cited),
+            })
+            .collect();
+        let ground_req = GroundRequest {
+            waiser: 1,
+            op: "ground",
+            instructions: GROUND_INSTRUCTIONS,
+            claims,
+        };
+        let grounded: std::collections::BTreeSet<usize> = match serde_json::to_string(&ground_req)
+            .ok()
+            .and_then(|b| llm.complete(&b).ok())
+        {
+            Some(raw) => parse_ground(&raw)
+                .results
+                .into_iter()
+                .filter(|r| r.supported)
+                .map(|r| r.id)
+                .collect(),
+            None => return Vec::new(),
+        };
+        if grounded.is_empty() {
+            return Vec::new();
+        }
+
+        // VERIFY (§5.3): adversarial keep/kill over the grounded drafts, a
+        // separate call from the proposer, with the deterministic findings as
+        // novelty context.
+        let items: Vec<VerifyItem> = validated
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| grounded.contains(i))
+            .map(|(i, (d, t, cited))| VerifyItem {
+                id: i,
+                summary: cap(&d.summary, MAX_SUMMARY_LEN),
+                target: t.clone(),
+                evidence: ev_for(cited),
+            })
+            .collect();
+        let verify_req = VerifyRequest {
+            waiser: 1,
+            op: "verify",
+            instructions: VERIFY_INSTRUCTIONS,
+            findings: items,
+            deterministic: deterministic.to_vec(),
+        };
+        let verdicts: std::collections::BTreeMap<usize, f64> =
+            match serde_json::to_string(&verify_req).ok().and_then(|b| llm.complete(&b).ok()) {
+                Some(raw) => parse_verify(&raw)
+                    .results
+                    .into_iter()
+                    .filter(|r| r.keep)
+                    .map(|r| (r.id, r.confidence.clamp(0.0, 1.0)))
+                    .collect(),
+                None => return Vec::new(),
+            };
+
+        // ROUTE (§5.4): grounded ∧ kept ∧ verifier-confidence ≥ floor. The
+        // verifier's confidence (the independent signal) is what we trust and
+        // stamp — not the proposer's self-report.
+        let mut out = Vec::new();
+        for (i, (d, target_str, cited)) in validated.iter().enumerate() {
+            if let Some(&conf) = verdicts.get(&i) {
+                if conf >= MIN_LLM_CONFIDENCE {
+                    out.push(stamp_llm(
+                        llm.model(),
+                        d,
+                        target_str.clone(),
+                        cited.clone(),
+                        conf,
+                        now_ms,
+                    ));
+                }
+            }
         }
         out
     }
@@ -894,6 +1013,30 @@ impl Engine {
             stale,
         })
     }
+
+    /// Approval-rate metric for `origin = llm` recommendations (reflection
+    /// design §6b) — the live field-quality signal that accrues off the audit
+    /// chain: what fraction of the model's *surfaced* proposals a reviewer
+    /// accepts. Complements the offline Effective-Reliability eval.
+    pub fn llm_metrics<S: OmsSubstrate>(&self, sub: &S) -> Result<LlmMetrics> {
+        let recs = self.recommendations(sub, None)?;
+        let mut m = LlmMetrics::default();
+        for r in &recs {
+            if !matches!(r.origin, Origin::Llm { .. }) {
+                continue;
+            }
+            m.proposed += 1;
+            match r.status {
+                RecStatus::Pending => m.pending += 1,
+                RecStatus::Approved | RecStatus::Applied | RecStatus::RolledBack => m.approved += 1,
+                RecStatus::Rejected => m.rejected += 1,
+                RecStatus::Expired => {}
+            }
+        }
+        let decided = m.approved + m.rejected;
+        m.approval_rate = (decided > 0).then(|| m.approved as f64 / decided as f64);
+        Ok(m)
+    }
 }
 
 /// A health snapshot for the backend's self-improvement loop.
@@ -909,6 +1052,21 @@ pub struct Health {
     /// True when the loop looks stalled (never run, or ≥7d / ≥100 new grains
     /// since the last run) — a nudge that a trigger may be unwired.
     pub stale: bool,
+}
+
+/// Approval-rate metric for `origin = llm` recommendations (reflection §6b).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmMetrics {
+    /// Total llm-origin recommendations ever stored (those that survived the
+    /// verifier and reached the queue).
+    pub proposed: u64,
+    pub pending: u64,
+    /// Approved + Applied + RolledBack (a reviewer said yes at least once).
+    pub approved: u64,
+    pub rejected: u64,
+    /// approved / (approved + rejected); `None` until at least one is decided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_rate: Option<f64>,
 }
 
 /// Re-measure applied recommendations at each **checkpoint** past due, via the
@@ -997,15 +1155,45 @@ fn measure_metric<S: SubstrateRead>(
 
 // --- free helpers ---
 
-/// The fixed DISCOVER instruction. Kept in its own request field so it never
-/// interleaves with (attacker-influenced) evidence text.
+/// The confidence floor (§5.4): a verified draft below this is dropped. The
+/// verifier's calibrated confidence is the gate, not the proposer's self-report.
+const MIN_LLM_CONFIDENCE: f64 = 0.75;
+
+/// The fixed DISCOVER instruction (§5.1). The scoring rule makes "nothing to
+/// report" a first-class, zero-penalty answer — the structural antidote to
+/// over-generation. Kept in its own request field so it never interleaves with
+/// (attacker-influenced) evidence text.
 const DISCOVER_INSTRUCTIONS: &str = "You review an agent's memory for quality. \
-Given deterministic findings and the evidence they cite, propose at most a few \
-ADDITIONAL findings the deterministic checks would miss (e.g. a semantic \
-contradiction, a stale assumption, a duplicated meaning). Every proposal MUST \
-cite one or more evidence hashes from the bundle and target a memory entity. \
-Return JSON: {\"recommendations\":[{\"summary\":\"...\",\"target\":\"entity:<ns>/<subject>\",\
-\"guidance\":\"...\",\"evidence\":[\"<hash>\"]}]}. Propose nothing you cannot ground in the evidence.";
+Given deterministic findings and the evidence they cite, propose ADDITIONAL \
+findings the deterministic checks would miss (e.g. a semantic contradiction, a \
+stale assumption, a duplicated meaning). SCORING: propose a finding ONLY if you \
+are more than 0.75 confident it is BOTH correct AND materially useful. A correct, \
+useful finding earns 1; a wrong or trivial one is penalized 2; returning nothing \
+earns 0. When in doubt, propose nothing — an empty list is the correct answer \
+when there is nothing worth flagging. Every proposal MUST cite one or more \
+evidence hashes from the bundle, target a memory entity, and include your \
+confidence 0.0-1.0. Return JSON: {\"recommendations\":[{\"summary\":\"...\",\
+\"target\":\"entity:<ns>/<subject>\",\"guidance\":\"...\",\"evidence\":[\"<hash>\"],\
+\"confidence\":0.0}]}. Propose nothing you cannot ground in the evidence.";
+
+/// The fixed GROUND instruction (§5.2): decompose-then-entail, conservatively.
+const GROUND_INSTRUCTIONS: &str = "You are a strict grounding checker. For each \
+claim, decide whether the provided evidence ENTAILS it — not merely relates to \
+it. Decompose the claim into its atomic assertions; require each load-bearing \
+assertion to be directly supported by the evidence text. If any is unsupported, \
+or the evidence is only topically related, mark supported=false. Be conservative: \
+when the evidence does not clearly entail the claim, supported=false. Return JSON: \
+{\"results\":[{\"id\":0,\"supported\":true,\"reason\":\"...\"}]}.";
+
+/// The fixed VERIFY instruction (§5.3): adversarial, abstention-biased.
+const VERIFY_INSTRUCTIONS: &str = "You are an adversarial reviewer trying to \
+REJECT low-value findings. For each finding, ask and answer: (1) Is it novel, or \
+does it merely restate a deterministic finding already listed? (2) Is the issue \
+real, or an artifact of temporal ordering / underspecification? (3) Does it read \
+the evidence out of context? Keep a finding ONLY if it survives all three AND is \
+materially useful to a human reviewer; otherwise reject it. Give a calibrated \
+confidence 0.0-1.0. Default to keep=false when uncertain. Return JSON: \
+{\"results\":[{\"id\":0,\"keep\":true,\"confidence\":0.0,\"reason\":\"...\"}]}.";
 
 /// The fixed ENRICH instruction.
 const ENRICH_INSTRUCTIONS: &str = "For each finding, optionally add a one-sentence \
@@ -1034,8 +1222,9 @@ fn grain_brief(g: &GrainRecord) -> String {
 fn stamp_llm(
     model: &str,
     d: &crate::llm::LlmDraft,
-    target: TargetRef,
+    target_ref: String,
     cited: Vec<String>,
+    confidence: f64,
     now_ms: i64,
 ) -> Recommendation {
     let summary_text = crate::llm::cap(&d.summary, crate::llm::MAX_SUMMARY_LEN);
@@ -1046,7 +1235,6 @@ fn stamp_llm(
     } else {
         Some(crate::llm::cap(&d.guidance, crate::llm::MAX_GUIDANCE_LEN))
     };
-    let target_str = target.as_string();
     let action = ActionKind::Flag;
     let mut data = serde_json::Map::new();
     data.insert("source".into(), Value::from("llm"));
@@ -1055,9 +1243,9 @@ fn stamp_llm(
         analyzer: "waiser.llm/1".to_string(),
         params_snapshot: serde_json::Map::new(),
         origin: Origin::Llm { model: model.to_string() },
-        target_ref: target_str.clone(),
+        target_ref: target_ref.clone(),
         action_kind: action,
-        dedup_key: dedup_key("llm", &target_str, action),
+        dedup_key: dedup_key("llm", &target_ref, action),
         summary: Summary::new("llm.discover", args),
         severity: Severity::Low,
         proposal: Proposal::Data { data },
@@ -1066,7 +1254,8 @@ fn stamp_llm(
         evidence: cited,
         evidence_query: None,
         metric: None,
-        confidence: 0.5,
+        // The verifier's calibrated confidence — not a hardcoded default.
+        confidence: confidence.clamp(0.0, 1.0),
         importance: 0.3,
         created_at_ms: now_ms,
         guidance,

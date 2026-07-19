@@ -90,7 +90,8 @@ pub struct LlmRequest<'a> {
 // ---- wire schema (response) ------------------------------------------------
 
 /// One DISCOVER draft as returned by the model. Unknown fields are dropped by
-/// serde; the engine further validates (cite-check, caps, target class).
+/// serde; the engine further validates (cite-check, caps, target class,
+/// grounding, and independent verification before it is ever stored).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct LlmDraft {
@@ -98,6 +99,10 @@ pub struct LlmDraft {
     pub target: String,
     pub guidance: String,
     pub evidence: Vec<String>,
+    /// The model's self-reported confidence 0.0–1.0 that this finding is both
+    /// correct and materially useful (§5.1). Missing/garbled → 0.0 (rejected by
+    /// the confidence floor), a safe default.
+    pub confidence: f64,
 }
 
 /// The DISCOVER response.
@@ -120,6 +125,79 @@ pub struct EnrichResponse {
 pub struct EnrichNote {
     pub target: String,
     pub guidance: String,
+}
+
+// ---- verifier stages (§5.2 GROUND, §5.3 VERIFY) ----------------------------
+
+/// GROUND request: for each candidate draft, does its cited evidence actually
+/// *entail* the claim? Decompose-then-entail is asked of the model here; a
+/// stronger deployment can swap a dedicated entailment checker behind the same
+/// shape. Kept a separate op/call from DISCOVER (proposer ≠ grounder).
+#[derive(Debug, Clone, Serialize)]
+pub struct GroundRequest<'a> {
+    pub waiser: u8,
+    pub op: &'a str, // "ground"
+    pub instructions: &'a str,
+    pub claims: Vec<GroundItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroundItem {
+    pub id: usize,
+    pub claim: String,
+    pub evidence: Vec<EvidenceItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct GroundResponse {
+    pub results: Vec<GroundResult>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct GroundResult {
+    pub id: usize,
+    pub supported: bool,
+    pub reason: String,
+}
+
+/// VERIFY request: an **independent** adversarial pass (a separate call from the
+/// proposer — the anti-Goodhart rule) that tries to refute each grounded draft
+/// on novelty / reality / out-of-context grounds and returns keep/kill + a
+/// calibrated confidence. Deterministic findings are passed as context so the
+/// verifier can reject drafts that merely restate them.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifyRequest<'a> {
+    pub waiser: u8,
+    pub op: &'a str, // "verify"
+    pub instructions: &'a str,
+    pub findings: Vec<VerifyItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deterministic: Vec<FindingBrief>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifyItem {
+    pub id: usize,
+    pub summary: String,
+    pub target: String,
+    pub evidence: Vec<EvidenceItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct VerifyResponse {
+    pub results: Vec<VerifyResult>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct VerifyResult {
+    pub id: usize,
+    pub keep: bool,
+    pub confidence: f64,
+    pub reason: String,
 }
 
 /// The probe response.
@@ -208,6 +286,17 @@ pub fn parse_discover(raw: &str) -> DiscoverResponse {
 
 /// Parse an ENRICH response, dropping anything malformed.
 pub fn parse_enrich(raw: &str) -> EnrichResponse {
+    serde_json::from_str(raw.trim()).unwrap_or_default()
+}
+
+/// Parse a GROUND response; garbage → no results (⇒ every draft is treated as
+/// ungrounded and dropped, the safe default).
+pub fn parse_ground(raw: &str) -> GroundResponse {
+    serde_json::from_str(raw.trim()).unwrap_or_default()
+}
+
+/// Parse a VERIFY response; garbage → no results (⇒ every draft is dropped).
+pub fn parse_verify(raw: &str) -> VerifyResponse {
     serde_json::from_str(raw.trim()).unwrap_or_default()
 }
 

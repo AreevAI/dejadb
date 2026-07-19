@@ -30,6 +30,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `WSR-E050`.
 - **Console Sessions + Setup views** and `GET /api/waiser/telemetry`: visualize
   recall activity, coverage gaps, and the effective configuration.
+- **Waiser reflection verifier + measurement** (design:
+  `docs/waiser-reflection.md`). The LLM path is no longer "cite a real hash and
+  hope": DISCOVER runs under an abstention-legitimate objective, then every
+  draft passes an independent **GROUND** (evidence-entailment) and **VERIFY**
+  (adversarial keep/kill) gate — each a separate call (proposer ≠ scorer) —
+  before it can reach the review queue, stamped with the verifier's calibrated
+  confidence. Measured, not asserted: a `waiser_reflection` Effective-Reliability
+  bench (the verifier lifts ER from +0.00 to +1.00 on the reference corpus by
+  filtering decoys) and a live approval-rate metric on `deja waiser`.
 
 ## [1.0.1] - 2026-07-15
 

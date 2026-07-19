@@ -28,10 +28,11 @@ never fails the run.
 ```json
 {
   "waiser": 1,
-  "op": "probe" | "discover" | "enrich",
+  "op": "probe" | "discover" | "ground" | "verify" | "enrich",
   "instructions": "<fixed engine instruction — treat as the system prompt>",
   "findings":  [{"analyzer": "...", "summary": "...", "target": "...", "severity": "..."}],
   "evidence":  [{"hash": "...", "grain_type": "...", "text": "..."}],
+  "claims":    [{"id": 0, "claim": "...", "evidence": [{"hash","text"}]}],
   "rejected":  ["<recent operator rejections>"],
   "approved":  ["<recent operator approvals>"]
 }
@@ -45,11 +46,25 @@ attacker-influenced) `evidence` text — keep it that way in your prompt.
 | op         | response                                                                 |
 |------------|--------------------------------------------------------------------------|
 | `probe`    | `{"model": "<name>"}`                                                     |
-| `discover` | `{"recommendations": [{"summary","target","guidance","evidence":[hash]}]}`|
+| `discover` | `{"recommendations": [{"summary","target","guidance","evidence":[hash],"confidence":0.0}]}`|
+| `ground`   | `{"results": [{"id":0,"supported":true,"reason":"..."}]}`                 |
+| `verify`   | `{"results": [{"id":0,"keep":true,"confidence":0.0,"reason":"..."}]}`     |
 | `enrich`   | `{"notes": [{"target","guidance"}]}`                                      |
 
+The pipeline is `DISCOVER → GROUND → VERIFY → ENRICH`, each a **separate call**
+(the proposer never grades itself — the anti-Goodhart rule):
+
+- **`ground`** — for each `claims[]` entry, decide whether its cited evidence
+  *entails* the claim (decompose-then-entail; be conservative). A draft that
+  isn't `supported` is dropped before verification.
+- **`verify`** — for each grounded finding, adversarially try to reject it
+  (novel? real? in-context?), return `keep` + a calibrated `confidence`; default
+  to `keep:false` when uncertain. Only drafts kept above the confidence floor
+  reach the review queue.
+
 Return **only** JSON. Unknown fields are dropped; strings are capped; a response
-that doesn't parse yields no drafts (safe default).
+that doesn't parse drops that stage's contribution (safe default). See
+`docs/waiser-reflection.md` for the full design.
 
 ## Backends here
 

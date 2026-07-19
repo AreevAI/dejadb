@@ -1,9 +1,14 @@
 # Waiser Reflection Engine — governed, verified, measured self-improvement
 
-**Status**: design proposal. Supersedes the "optional LLM enrichment" framing in
-`waiser.md` / proposal §9 with a verifier-and-measurement architecture. This
-pass scopes the build to the **verifier + measurement** (§7–§8); the out-of-box
-multi-provider layer (§9) is designed here but deferred.
+**Status**: the **verifier (§5) and measurement (§6) are implemented** on
+`feat/waiser` — the `DISCOVER → GROUND → VERIFY → ROUTE` pipeline (proposer ≠
+scorer), the abstention-legitimate objective, the confidence floor, the
+Effective-Reliability eval (`waiser_reflection` bench: the verifier lifts ER
+from +0.00 to +1.00 on the reference corpus by filtering decoys), and the live
+approval-rate metric (`deja waiser`). The out-of-box multi-provider layer (§9)
+is designed here but deferred to a later pass (the verifier rides the existing
+`--llm-cmd` path). This proposal supersedes the "optional LLM enrichment"
+framing in `waiser.md` / proposal §9.
 
 ---
 

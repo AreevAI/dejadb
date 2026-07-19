@@ -142,15 +142,25 @@ The console **Sessions** view visualizes it; `GET /api/waiser/telemetry` serves 
 ## LLM enrichment (optional)
 
 The deterministic loop closes with no model. Attach one with `deja waiser run
---llm-cmd 'CMD'` and the pipeline gains two **strictly additive** stages —
-`ANALYZE → DISCOVER → ENRICH → VALIDATE+DEDUP → STORE` — that are the identity
-when no backend is set:
+--llm-cmd 'CMD'` and the pipeline gains **strictly additive** stages —
+`ANALYZE → DISCOVER → GROUND → VERIFY → ENRICH → VALIDATE+DEDUP → STORE` — that
+are the identity when no backend is set:
 
 - **DISCOVER** — the model proposes *additional* findings determinism can't see
-  (a semantic contradiction, a stale assumption). Every draft must **cite
-  evidence** from the request bundle (uncited → dropped) and target a memory
-  entity; it is stamped `origin = llm`, so it can **never auto-apply**, and it
-  is advisory. The deterministic findings are unchanged — the LLM only adds.
+  (a semantic contradiction, a stale assumption), under an **abstention-legitimate
+  objective**: "nothing to report" is a first-class, zero-penalty answer, so it
+  isn't pushed to over-generate. Every draft must **cite evidence** (uncited →
+  dropped) and target a memory entity; `origin = llm` so it can **never
+  auto-apply**.
+- **GROUND → VERIFY** — before a draft is ever queued it must pass an
+  independent grounding-entailment check (does the cited evidence *support* the
+  claim?) and an adversarial verification pass — **each a separate call, so the
+  proposer never grades itself**. Only findings that survive, above a confidence
+  floor, reach review. This is what turns "generates something" into "generates
+  something that survived a skeptic." Quality is measured, not asserted: the
+  `waiser_reflection` bench scores **Effective Reliability**, and `deja waiser`
+  reports the live approval-rate of LLM findings. Full design +
+  evidence: [`waiser-reflection.md`](waiser-reflection.md).
 - **ENRICH** — a whitelisted one-line `guidance` note on a deterministic
   finding; the engine-templated summary is always kept.
 - **Fail-soft**: a failed/garbled/slow backend drops the contribution, never

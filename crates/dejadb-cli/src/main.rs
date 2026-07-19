@@ -1594,6 +1594,18 @@ fn run_waiser(
                         );
                     }
                 }
+                // Reflection §6b: the live approval-rate for LLM-surfaced
+                // findings (only shown once the LLM path has produced any).
+                let lm = engine.llm_metrics(&sub).map_err(|e| e.to_string())?;
+                if lm.proposed > 0 {
+                    match lm.approval_rate {
+                        Some(rate) => println!(
+                            "  LLM findings: {} surfaced, {:.0}% approved ({} approved / {} rejected, {} pending)",
+                            lm.proposed, rate * 100.0, lm.approved, lm.rejected, lm.pending
+                        ),
+                        None => println!("  LLM findings: {} surfaced, none decided yet", lm.proposed),
+                    }
+                }
                 if h.stale {
                     eprintln!("  ⚠ the loop may be stale — run `deja waiser run` or wire the SessionEnd hook");
                 } else if h.pending > 0 {

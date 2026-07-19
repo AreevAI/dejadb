@@ -22,6 +22,16 @@ elif op == "discover":
         }]}))
     else:
         print(json.dumps({"recommendations": []}))
+elif op == "ground":
+    # Permissive stub: mark every claim supported (a real backend entails each
+    # claim against its cited evidence — see the README).
+    claims = req.get("claims", [])
+    print(json.dumps({"results": [{"id": c["id"], "supported": True} for c in claims]}))
+elif op == "verify":
+    # Permissive stub: keep every finding with a fixed confidence (a real
+    # backend adversarially refutes each and calibrates confidence).
+    findings = req.get("findings", [])
+    print(json.dumps({"results": [{"id": f["id"], "keep": True, "confidence": 0.85} for f in findings]}))
 elif op == "enrich":
     # Add a guidance note to the first finding, if any.
     f = req.get("findings", [])

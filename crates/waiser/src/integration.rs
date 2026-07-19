@@ -49,9 +49,12 @@ fn run_proposes_across_analyzers_and_is_idempotent() {
     assert_eq!(r2.stored, 0, "no re-proposals");
 }
 
-/// A canned LLM backend: returns a fixed DISCOVER or ENRICH body by op.
+/// A canned LLM backend keyed by op (discover / ground / verify / enrich) so a
+/// test can drive the whole PROPOSE → GROUND → VERIFY → ENRICH pipeline.
 struct MockLlm {
     discover: String,
+    ground: String,
+    verify: String,
     enrich: String,
 }
 impl crate::llm::LlmBackend for MockLlm {
@@ -61,6 +64,10 @@ impl crate::llm::LlmBackend for MockLlm {
     fn complete(&self, request: &str) -> crate::error::Result<String> {
         Ok(if request.contains("\"op\":\"discover\"") {
             self.discover.clone()
+        } else if request.contains("\"op\":\"ground\"") {
+            self.ground.clone()
+        } else if request.contains("\"op\":\"verify\"") {
+            self.verify.clone()
         } else {
             self.enrich.clone()
         })
@@ -68,7 +75,7 @@ impl crate::llm::LlmBackend for MockLlm {
 }
 
 #[test]
-fn llm_discover_adds_only_cited_rec_and_enrich_adds_guidance() {
+fn llm_discover_verified_rec_is_stamped_with_confidence_and_enrich_adds_guidance() {
     use crate::model::Origin;
     let mut sub = TestSubstrate::new();
     // A contradiction gives a deterministic finding whose cited evidence seeds
@@ -77,29 +84,34 @@ fn llm_discover_adds_only_cited_rec_and_enrich_adds_guidance() {
     let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
 
     // One draft cites a real evidence hash (kept); one cites a bogus hash
-    // (dropped as uncited — the trust floor).
+    // (dropped as uncited before the verifier even runs).
     let discover = format!(
         r#"{{"recommendations":[
-          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"]}},
-          {{"summary":"uncited nonsense","target":"entity:test/acme","evidence":["deadbeef"]}}
+          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"],"confidence":0.9}},
+          {{"summary":"uncited nonsense","target":"entity:test/acme","evidence":["deadbeef"],"confidence":0.9}}
         ]}}"#
     );
+    // After validation only the cited draft remains → verifier id 0.
+    let ground = r#"{"results":[{"id":0,"supported":true,"reason":"entailed"}]}"#.to_string();
+    let verify =
+        r#"{"results":[{"id":0,"keep":true,"confidence":0.88,"reason":"novel and real"}]}"#.to_string();
     let enrich =
         r#"{"notes":[{"target":"entity:test/acme","guidance":"resolve to latest"}]}"#.to_string();
 
-    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, enrich }));
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, ground, verify, enrich }));
     e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
     let recs = e.recommendations(&sub.inner, None).unwrap();
 
-    // Exactly one llm-origin rec — the cited one; the uncited draft was dropped.
+    // Exactly one llm-origin rec — cited, grounded, verified.
     let llm: Vec<_> = recs
         .iter()
         .filter(|r| matches!(r.origin, Origin::Llm { .. }))
         .collect();
-    assert_eq!(llm.len(), 1, "only the cited LLM draft survives");
+    assert_eq!(llm.len(), 1, "only the cited+grounded+verified draft survives");
     assert!(llm[0].summary.render().contains("ambiguous"));
     assert_eq!(llm[0].evidence, vec![h1.clone()]);
-    // An llm-origin rec is never auto-applied and never destructive.
+    // The verifier's calibrated confidence is stamped (not a hardcoded default).
+    assert!((llm[0].confidence - 0.88).abs() < 1e-9, "conf {}", llm[0].confidence);
     assert!(!llm[0].destructive);
     assert_eq!(llm[0].status, RecStatus::Pending);
 
@@ -111,6 +123,41 @@ fn llm_discover_adds_only_cited_rec_and_enrich_adds_guidance() {
         .expect("a contradiction recommendation");
     assert_eq!(det.guidance.as_deref(), Some("resolve to latest"));
     assert!(det.summary.render().contains("deploy_target"));
+
+    // §6b approval-rate metric: one surfaced llm proposal, still undecided.
+    let m = e.llm_metrics(&sub.inner).unwrap();
+    assert_eq!(m.proposed, 1);
+    assert_eq!(m.pending, 1);
+    assert_eq!(m.approval_rate, None);
+}
+
+#[test]
+fn verifier_drops_ungrounded_and_low_confidence_drafts() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+    // Two cited drafts pass validation → verifier ids 0 and 1.
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"grounded but the verifier is unsure","target":"entity:test/acme","evidence":["{h1}"],"confidence":0.9}},
+          {{"summary":"an ungrounded claim","target":"entity:test/acme","evidence":["{h1}"],"confidence":0.9}}
+        ]}}"#
+    );
+    // Grounding: id 0 supported, id 1 NOT — id 1 never reaches verify.
+    let ground =
+        r#"{"results":[{"id":0,"supported":true},{"id":1,"supported":false}]}"#.to_string();
+    // Verify (only id 0): kept, but confidence 0.5 is below the 0.75 floor → dropped.
+    let verify = r#"{"results":[{"id":0,"keep":true,"confidence":0.5}]}"#.to_string();
+    let enrich = r#"{"notes":[]}"#.to_string();
+
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, ground, verify, enrich }));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    assert!(
+        recs.iter().all(|r| !matches!(r.origin, Origin::Llm { .. })),
+        "ungrounded (id 1) and below-floor (id 0) drafts never reach the queue"
+    );
 }
 
 #[test]
