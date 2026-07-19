@@ -159,14 +159,18 @@ are the identity when no backend is set:
   dropped) and target a memory entity; `origin = llm` so it can **never
   auto-apply**.
 - **GROUND → VERIFY** — before a draft is ever queued it must pass an
-  independent grounding-entailment check (does the cited evidence *support* the
-  claim?) and an adversarial verification pass — **each a separate call, so the
-  proposer never grades itself**. Only findings that survive, above a confidence
-  floor, reach review. This is what turns "generates something" into "generates
-  something that survived a skeptic." Quality is measured, not asserted: the
-  `waiser_reflection` bench scores **Effective Reliability**, and `deja waiser`
-  reports the live approval-rate of LLM findings. Full design +
-  evidence: [`waiser-reflection.md`](waiser-reflection.md).
+  independent **grounding** check (are the finding's factual *premises* present
+  in the cited evidence? — this guards against fabrication while still allowing a
+  genuine *inference*, e.g. "HQ=San Francisco and country=Germany conflict") and
+  an adversarial **verification** pass (is the finding sound and specific, not
+  vague or spurious — abstention is legitimate). **Each is a separate call, so
+  the proposer never grades itself**; grounding can even run on a different model
+  (`--ground-model` / `--ground-cmd`) to take the generator out of the loop. Only
+  findings that survive, above a confidence floor, reach review. This is what
+  turns "generates something" into "generates something that survived a skeptic."
+  Quality is measured, not asserted: the `waiser_reflection` bench scores
+  **Effective Reliability**, and `deja waiser` reports the live approval-rate of
+  LLM findings. Full design + evidence: [`waiser-reflection.md`](waiser-reflection.md).
 - **ENRICH** — a whitelisted one-line `guidance` note on a deterministic
   finding; the engine-templated summary is always kept.
 - **Fail-soft**: a failed/garbled/slow backend drops the contribution, never
@@ -177,13 +181,30 @@ stdout, one process per call, probed at construction. CLI-only, never persisted.
 Ready-to-run backends live in `examples/llm/` (`claude -p`, OpenAI, ollama, and
 a dependency-free mock) with the protocol documented.
 
+## External analyzers (optional)
+
+Determinism you can extend without recompiling: `deja waiser run --analyzer-cmd
+'CMD'` registers a subprocess analyzer. It receives a live-grain snapshot on
+stdin and returns advisory findings on stdout (`{op:analyze,grains:[…]}` →
+`{findings:[{target,summary,severity,evidence}]}`, self-describing via a probe).
+It runs at **trust class `command`, auto-apply `never`** — a domain-specific
+check (PII, a house style rule, a compliance sweep) can *surface* an issue a
+human then reviews, but can never mutate memory. A failure skips that analyzer
+for the run, never the pass. This is also the only custom-analyzer path from
+Python/Node (which can't implement the Rust `Analyzer` trait): `waiser_run(…,
+analyzer_cmd="…")`.
+
 ## Surfaces
 
 ### CLI — `deja waiser`
 
 ```
 deja init   [--template blank|demo|coding-agent] [--ns NS]   seed a backend + print hooks
-deja waiser run     [--min-new N --min-new-errors N --if-stale 6h --llm-cmd 'CMD' --format json --quiet]
+deja waiser run     [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
+                    [--model P:N | --llm-cmd 'CMD'] [--ground-model P:N | --ground-cmd 'CMD']
+                    [--analyzer-cmd 'CMD']
+deja waiser reflect  like run, but re-analyzes the WHOLE memory (ignores the incremental
+                    watermark) — a full sweep; same flags as run
 deja waiser list    [--status pending|applied|all] [--fail-on high]   (exit 2 on match → CI gate)
 deja waiser show <hash>
 deja waiser approve|reject|apply|rollback <hash> --because "…" [--actor A] [--allow-destructive]
@@ -225,9 +246,11 @@ with different `--scopes`/`--actor` so no agent can approve its own proposals.
 ### HTTP — `/api/waiser/*`
 
 `GET recommendations|health|analyzers` (reads) and `POST run|review|apply|
-rollback` (writes). The console's Waiser tab renders the queue with severity
-dots, evidence, and approve/apply/reject actions gated behind a mandatory
-reason.
+rollback|config` (writes). The console's Waiser tab renders the queue with
+severity dots, evidence, and approve/apply/reject actions gated behind a
+mandatory reason; the **Setup** tab is writable — click an analyzer on/off to
+persist an enable/disable to the file's config (`POST /api/waiser/config`).
+Auto-apply is never grantable from the console — only via a host policy file.
 
 ## Does it actually work? — the Verify gate
 
@@ -346,8 +369,17 @@ the tool-log importer, the policy file, the `/api/waiser/*` API (incl.
 analyzers / **sessions** / outcomes / **setup**), the `examples/llm/` backends,
 and the precision bench.
 
-Remaining follow-ups (documented, not blockers): wiring the ASSEMBLE
-overflow signal into `budget_pressure` (opt-in until then); console config
-*editing* (the Setup view is read-only today); the LLM operator-taste history
-(20 recent approvals/rejections, currently passed empty); and `--llm-cmd` on
-the bindings. See `waiser-proposal.md` for the full plan.
+Also shipped since: `budget_pressure` reads the live ASSEMBLE overflow signal
+(default-on); the LLM operator-taste history (recent approvals/rejections) is
+passed to DISCOVER so the model learns this reviewer's taste; the bindings carry
+`model`/`llm_cmd`/`ground_*`/`analyzer_cmd`; a **pluggable grounding backend**
+(`--ground-cmd`), **external command analyzers** (`--analyzer-cmd`), a
+**full-memory sweep** (`deja waiser reflect`), and a **writable console Setup**.
+
+Remaining follow-ups (documented, not blockers): the **native OMS `0x0C`
+Recommendation grain** in `dejadb-core` — deliberately deferred, because it
+changes the frozen canonical serialization / grain-type registry and is an
+OMS-spec-level decision; until then recommendations ride as Facts with a
+distinguishing relation (`waiser_recommendation`). And a labeled non-parasitic
+corpus for a published Effective-Reliability number. See `waiser-proposal.md`
+for the full plan.

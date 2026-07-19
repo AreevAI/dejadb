@@ -19,9 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   records nothing.
 - **Three telemetry-fed analyzers** (11 built-ins total): `cold_grains` (facts
   never recalled), `coverage_gap` (recurring questions the memory can't answer),
-  and `budget_pressure` (assembly overflow, opt-in until its ASSEMBLE datasource
-  is wired). `cold_grains`/`coverage_gap` are default-on at 1.00 fixture
-  precision.
+  and `budget_pressure` (assembly overflow). All default-on (`budget_pressure`
+  once its ASSEMBLE overflow datasource was wired — see below);
+  `cold_grains`/`coverage_gap` at 1.00 fixture precision.
 - **Optional LLM enrichment (§9).** `deja waiser run --llm-cmd 'CMD'` attaches a
   subprocess backend (`CommandLlm`, mirroring `--embed-cmd`) that only *adds* —
   DISCOVER proposes cited `origin=llm` drafts (never auto-applied), ENRICH adds
@@ -57,6 +57,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Reflection quality**: the DISCOVER stage now receives the operator's recent
   approve/reject decisions (taste history) so the model learns what this reviewer
   accepts.
+- **Non-parasitic evidence bundle** — DISCOVER seeds its bundle from deterministic
+  citations *and* recent grains (since the last-run watermark), so the LLM gets
+  its own lens and finds issues no analyzer flagged. Validated end-to-end with a
+  real model: a hidden cross-fact inconsistency (each fact individually
+  well-formed) is proposed, grounded, verified, and queued; a consistent corpus
+  abstains. Three pipeline fixes made it discriminate: **GROUND** now checks a
+  finding's factual *premises* (anti-fabrication) while allowing an inference (so
+  semantic findings aren't rejected for not stating their conclusion verbatim);
+  **VERIFY** judges soundness + abstention only, never novelty (a weak verifier
+  hallucinated "already known" and killed genuine findings); novelty stays a
+  DISCOVER concern settled by human review, not an over-coarse entity dedup.
+- **Pluggable grounding backend** (`--ground-model` / `--ground-cmd`, and
+  `ground_*` on the bindings): run the GROUND entailment check on a cheaper or
+  specialized model — or take the generative model out of grounding entirely.
+  Falls back to the reflection backend; VERIFY always stays on the main model.
+- **External command analyzers** (`--analyzer-cmd`, `analyzer_cmd` on the
+  bindings): a subprocess receives a live-grain snapshot and returns advisory
+  findings — trust class `command`, auto-apply `never` (surfaces, never mutates).
+  The only custom-analyzer path for Python/Node. A failure skips the analyzer,
+  never the run.
+- **Full-memory reflection sweep** (`deja waiser reflect`): re-analyze the whole
+  memory in one pass, ignoring the incremental watermark, for a first look at an
+  imported memory or a periodic deep pass. Dedup/cooldowns still suppress what is
+  already queued and the watermark still advances, so later runs stay incremental.
+- **Writable console Setup**: toggle analyzers on/off from the console, persisted
+  to the file's waiser config (`POST /api/waiser/config`, Admin-gated like every
+  write). `GET /api/waiser/analyzers` now returns effective settings + trust
+  class. Auto-apply is still only grantable via a host policy file, never the UI.
 
 ## [1.0.1] - 2026-07-15
 

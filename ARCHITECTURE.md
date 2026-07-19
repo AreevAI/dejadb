@@ -488,14 +488,19 @@ queryable in CAL.
 
 ### 8.2 Deterministic analyzers and recall telemetry
 
-Eleven built-in analyzers (nine default-on) read typed grains, never prose:
+Eleven built-in analyzers (ten default-on) read typed grains, never prose:
 tool-failure clustering, duplicate/near-duplicate consolidation, contradiction
 resolution under functional relations, fork surfacing, staleness, skill-stall,
 goal-stagnation, and three **telemetry-fed** analyzers — cold grains, coverage
 gaps, and budget pressure — that move Waiser from *hygiene* (is memory
 internally correct?) to *utility* (is memory used, and does it help?). Precision
 is measured, not asserted: the `waiser_precision` bench scores each analyzer
-against a labeled fixture and gates CI.
+against a labeled fixture and gates CI. Teams extend the set without recompiling
+via `--analyzer-cmd`: a subprocess that reads a live-grain snapshot and returns
+advisory findings, at trust class `command` (auto-apply `never`) — it surfaces,
+never mutates. `deja waiser reflect` re-runs every analyzer over the whole
+memory (ignoring the incremental watermark) for a first pass or a periodic deep
+sweep; dedup keeps it from re-proposing what is already queued.
 
 The utility signal comes from a disposable `<file>.telemetry.db` **sidecar**
 that records what recall actually surfaced — which grains were retrieved, which
@@ -521,11 +526,15 @@ degrades when a model judges its own correctness.** Deterministic analyzers do
 the error-*finding* LLMs provably can't; the LLM only proposes fixes localized
 to a finding, under an **abstention-legitimate objective** ("nothing to report"
 is a zero-penalty answer, so it isn't pushed to over-generate). Every draft is
-then **grounded** (does the cited evidence entail the claim?) and
-**independently verified** (a separate call — the proposer never grades itself)
-before it can reach the queue, stamped with a calibrated confidence and
-`origin = llm` so it can **never auto-apply**. A bad or slow backend drops its
-contribution, never the run. Quality is measured (§8.4), not asserted.
+then **grounded** (are the finding's factual *premises* present in the cited
+evidence? — a fabrication guard that still allows a genuine inference) and
+**independently verified** (a separate call — the proposer never grades itself —
+judging soundness and abstention, not novelty) before it can reach the queue,
+stamped with a calibrated confidence and `origin = llm` so it can **never
+auto-apply**. Grounding can run on a separate backend (`--ground-model` /
+`--ground-cmd`) to take the generative model out of the entailment check. A bad
+or slow backend drops its contribution, never the run. Quality is measured
+(§8.4), not asserted.
 
 Providers ship out of the box in the `dejadb-llm` crate (OpenAI-compatible,
 Anthropic, Ollama over a small blocking HTTP client, keys read from the

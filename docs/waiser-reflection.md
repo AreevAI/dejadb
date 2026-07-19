@@ -430,8 +430,11 @@ Then, as a separate pass: the out-of-box provider layer (§9).
   async/batchy (the explicit constraint), and batch + caching keep a full pass
   in the ~$1 range — but we should measure calls-per-surfaced-finding and cap it.
 - **Grounding-checker choice.** LLM-entailer (no dep, but the LLM is in the loop)
-  vs. a small local model (MiniCheck-class, a dep behind a feature). Start with
-  the LLM-entailer; add the local option if teams want the model out of grounding.
+  vs. a small local model (MiniCheck-class, a dep behind a feature). We ship the
+  LLM-entailer and now expose `--ground-model` / `--ground-cmd` so a team can
+  point GROUND at a *different* backend — a cheaper model, or a local
+  NLI/entailment command that takes the generative model out of grounding
+  entirely — without changing the proposer or verifier.
 - **Eval labeling cost.** ER needs human labels. Start with a small planted
   fixture (like `waiser_precision`), grow it from real approve/reject decisions
   (the approval-rate data doubles as label seed).

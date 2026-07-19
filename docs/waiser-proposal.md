@@ -1027,8 +1027,8 @@ legitimate long-running work is genuinely ambiguous). Both are advisory
 (`Flag`) and never auto-apply. The earlier cut evaluated only the weaker
 event-based forms ("failure counts trend upward" / "no progress events");
 the field-based forms are cleaner. With the three telemetry-fed analyzers this
-makes **eleven built-in analyzers (nine default-on**; goal-stagnation and
-budget-pressure opt-in); `skill_stall` is the first that distills a *capability*
+makes **eleven built-in analyzers (ten default-on**; goal-stagnation opt-in);
+`skill_stall` is the first that distills a *capability*
 signal, and `cold_grains`/`coverage_gap` are the first that measure *utility*
 rather than pure memory hygiene.
 
