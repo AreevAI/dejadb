@@ -5,10 +5,11 @@
 scorer), the abstention-legitimate objective, the confidence floor, the
 Effective-Reliability eval (`waiser_reflection` bench: the verifier lifts ER
 from +0.00 to +1.00 on the reference corpus by filtering decoys), and the live
-approval-rate metric (`deja waiser`). The out-of-box multi-provider layer (§9)
-is designed here but deferred to a later pass (the verifier rides the existing
-`--llm-cmd` path). This proposal supersedes the "optional LLM enrichment"
-framing in `waiser.md` / proposal §9.
+approval-rate metric (`deja waiser`). The **out-of-box multi-provider layer (§9)
+is now built too**: the `dejadb-llm` crate (OpenAI-compatible + Anthropic +
+Ollama adapters over `ureq`) + `deja waiser run --model provider:name`, key from
+the environment — `--llm-cmd` remains the escape hatch. This proposal supersedes
+the "optional LLM enrichment" framing in `waiser.md` / proposal §9.
 
 ---
 

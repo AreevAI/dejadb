@@ -24,8 +24,10 @@ COMMANDS:
   init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
            print the Claude Code hook snippet (never writes your settings)
   waiser   <run|list|show|approve|reject|apply|rollback|analyzers|policy>  the
-           governed self-improvement loop (deterministic, no LLM):
+           governed self-improvement loop (deterministic core; optional verified LLM):
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
+                  [--model provider:name | --llm-cmd 'CMD']   optional LLM reflection
+                  (--model reads the key from $ANTHROPIC_API_KEY/$OPENAI_API_KEY/etc.)
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
            outcomes  the Verify gate: did applied advice hold, or regress?
@@ -1383,14 +1385,24 @@ fn run_waiser(
         Some(p) => Engine::with_builtins().with_policy(p),
         None => Engine::with_builtins(),
     };
-    // Optional LLM enrichment (§9): `--llm-cmd 'CMD'` installs a subprocess
-    // backend (probed at construction, fail-loud). It can only ADD cited drafts
-    // (origin=llm, never auto-applied) and whitelisted guidance — never gate or
-    // rewrite the deterministic output. Never persisted; CLI-only by design.
+    // Optional LLM reflection: the model proposes findings that are grounded +
+    // adversarially verified before they can reach the queue (origin=llm, never
+    // auto-applied). Two ways to attach one, both CLI-only, never persisted:
+    //   --model provider:name   → a built-in HTTP backend (key from the env)
+    //   --llm-cmd 'CMD'         → a subprocess backend (the zero-dep escape hatch)
+    // `--llm-cmd` wins if both are given.
     if let Some(cmd) = flag(flags, "llm-cmd") {
         let model = flag(flags, "llm-model");
         let llm = waiser::CommandLlm::new(&cmd, model.as_deref()).map_err(|e| e.to_string())?;
         engine = engine.with_llm(Box::new(llm));
+    } else if let Some(spec) = flag(flags, "model") {
+        // Key is read from the environment (ANTHROPIC_API_KEY / OPENAI_API_KEY /
+        // OLLAMA_HOST, or --llm-api-key-env), never taken on the command line.
+        let base = flag(flags, "llm-base-url");
+        let key_env = flag(flags, "llm-api-key-env");
+        let llm = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
+            .map_err(|e| e.to_string())?;
+        engine = engine.with_llm(llm);
     }
     let now = now_ms();
     let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());

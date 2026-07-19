@@ -39,6 +39,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   confidence. Measured, not asserted: a `waiser_reflection` Effective-Reliability
   bench (the verifier lifts ER from +0.00 to +1.00 on the reference corpus by
   filtering decoys) and a live approval-rate metric on `deja waiser`.
+- **Out-of-box LLM providers** (`dejadb-llm` crate): `deja waiser run --model
+  claude-sonnet` (or `openai:gpt-5`, `ollama:llama3.1`) attaches a built-in
+  backend — OpenAI-compatible (covers ~90% of providers incl. Gemini's compat
+  endpoint, Groq, OpenRouter, vLLM, LM Studio, llama.cpp), Anthropic, or Ollama
+  — over a small blocking HTTP client, key read from the environment. `--llm-cmd`
+  remains the zero-dependency escape hatch. Core crates stay serde-only; the HTTP
+  surface is isolated to this opt-in crate.
 
 ## [1.0.1] - 2026-07-15
 

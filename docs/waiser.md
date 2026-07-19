@@ -141,8 +141,14 @@ The console **Sessions** view visualizes it; `GET /api/waiser/telemetry` serves 
 
 ## LLM enrichment (optional)
 
-The deterministic loop closes with no model. Attach one with `deja waiser run
---llm-cmd 'CMD'` and the pipeline gains **strictly additive** stages —
+The deterministic loop closes with no model. Attach one out of the box with
+`deja waiser run --model claude-sonnet` (the key comes from
+`$ANTHROPIC_API_KEY`/`$OPENAI_API_KEY`/`$OLLAMA_HOST`; `--model openai:gpt-5`,
+`--model ollama:llama3.1`, `--llm-base-url` for any gateway) — or
+`--llm-cmd 'CMD'` for a subprocess backend. The built-in adapters
+(OpenAI-compatible, Anthropic, Ollama) live in `dejadb-llm` over a small
+blocking HTTP client, so the core crates stay dependency-light. Either way the
+pipeline gains **strictly additive** stages —
 `ANALYZE → DISCOVER → GROUND → VERIFY → ENRICH → VALIDATE+DEDUP → STORE` — that
 are the identity when no backend is set:
 
