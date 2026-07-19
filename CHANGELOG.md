@@ -45,7 +45,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint, Groq, OpenRouter, vLLM, LM Studio, llama.cpp), Anthropic, or Ollama
   — over a small blocking HTTP client, key read from the environment. `--llm-cmd`
   remains the zero-dependency escape hatch. Core crates stay serde-only; the HTTP
-  surface is isolated to this opt-in crate.
+  surface is isolated to this opt-in crate. Structured output is
+  **schema-constrained** per stage (OpenAI/compat `json_schema` strict, Ollama
+  native `format`) with a `json_object` fallback; prompt caching is transparent
+  on OpenAI/OpenRouter and explicit (`cache_control`) on Anthropic; an
+  `openrouter:` shortcut reaches many models with one key. `--model` / `--llm-cmd`
+  are also exposed on the Python and Node `waiser_run`.
+- **budget_pressure is now default-on**: the ASSEMBLE budget allocator records
+  overflow (grains dropped to fit the token budget) via
+  `CalStoreFacade::note_assembly_budget`, feeding the analyzer's telemetry.
+- **Reflection quality**: the DISCOVER stage now receives the operator's recent
+  approve/reject decisions (taste history) so the model learns what this reviewer
+  accepts.
 
 ## [1.0.1] - 2026-07-15
 

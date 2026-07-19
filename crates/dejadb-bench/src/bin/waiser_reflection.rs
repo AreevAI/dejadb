@@ -183,7 +183,18 @@ fn main() {
         mk(&mut sub, &format!("neg_dup_{i}"), "tier", "gold");
     }
 
-    let engine = Engine::with_builtins().with_llm(Box::new(RefReviewer));
+    // Default: the deterministic reference reviewer (a machinery reference).
+    // `WAISER_EVAL_MODEL=openrouter:openai/gpt-4o-mini` runs the corpus through
+    // a real model for the field number.
+    let real = std::env::var("WAISER_EVAL_MODEL").ok().filter(|s| !s.is_empty());
+    let engine = match &real {
+        Some(spec) => {
+            eprintln!("# reviewer: real model `{spec}` (via dejadb-llm)");
+            Engine::with_builtins()
+                .with_llm(dejadb_llm::resolve(spec, None, None).expect("resolve WAISER_EVAL_MODEL"))
+        }
+        None => Engine::with_builtins().with_llm(Box::new(RefReviewer)),
+    };
     engine.run(&mut sub, &RunOptions::default(), NOW).expect("run");
     let recs = engine.recommendations(&sub, None).expect("list");
 
@@ -225,9 +236,9 @@ fn main() {
         raw.er, rep.er
     );
 
-    // CI guard: the pipeline must filter the decoys (no spurious findings) and
-    // surface the planted issues.
-    if rep.spurious_rate > 0.0 || rep.recall < 0.9 {
+    // CI guard applies only to the deterministic reference reviewer; a real
+    // model produces an exploratory number, not a gate.
+    if real.is_none() && (rep.spurious_rate > 0.0 || rep.recall < 0.9) {
         eprintln!(
             "\nREGRESSION: spurious_rate {:.2} (want 0), recall {:.2} (want ≥0.9)",
             rep.spurious_rate, rep.recall

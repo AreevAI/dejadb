@@ -489,6 +489,8 @@ impl DejaDb {
         min_new: Option<u32>,
         min_new_errors: Option<u32>,
         if_stale: Option<String>,
+        model: Option<String>,
+        llm_cmd: Option<String>,
     ) -> napi::Result<String> {
         let opts = RunOptions {
             min_new: min_new.map(|n| n as u64),
@@ -496,8 +498,17 @@ impl DejaDb {
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
         };
+        // Optional verified LLM reflection: `model` ("claude-sonnet", key from
+        // the env) attaches a built-in HTTP backend; `llmCmd` a subprocess.
+        let mut engine = Engine::with_builtins();
+        if let Some(cmd) = llm_cmd {
+            let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+            engine = engine.with_llm(Box::new(llm));
+        } else if let Some(spec) = model {
+            engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+        }
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        let res = Engine::with_builtins().run(&mut sub, &opts, now_ms()).map_err(err)?;
+        let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;
         serde_json::to_string(&res).map_err(err)
     }
 

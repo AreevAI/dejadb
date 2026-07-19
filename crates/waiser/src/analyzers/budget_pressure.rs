@@ -5,12 +5,11 @@
 //! global (one finding, not per-entity): the remedy — raise the budget, tighten
 //! selection, or curate — is a human/host decision, so it never auto-applies.
 //!
-//! **Opt-in (default-off)** until the ASSEMBLE path feeds it: the store-side
-//! writer (`DejaDB::telemetry_note_budget`) exists, but the call site inside
-//! the ASSEMBLE budget allocator (a different subsystem, `dejadb-cal`) is a
-//! follow-up. Until then `budget_stat` stays empty and this analyzer degrades
-//! to nothing, so shipping it default-on would advertise a signal it can't yet
-//! see. Enable it (`deja waiser enable waiser.budget_pressure`) once wired.
+//! **Default-on.** The datasource is wired: the ASSEMBLE budget allocator
+//! (`dejadb-cal`) records one sample per assembly via
+//! `CalStoreFacade::note_assembly_budget` → `DejaDB::telemetry_note_budget`
+//! (overflow = the token budget forced grains to be dropped). With no telemetry
+//! sidecar the `requires: [telemetry]` gate degrades it cleanly to nothing.
 
 use crate::analyzer::{AnalyzeCtx, Analyzer};
 use crate::error::Result;
@@ -37,8 +36,6 @@ impl BudgetPressure {
                 target_classes: vec![TargetClass::Memory],
                 auto_apply: AutoApplyClass::Never, // raising a budget is a host decision
                 trust_class: TrustClass::Builtin,
-                // default-off placement is below (see the module doc): opt-in
-                // until the ASSEMBLE overflow signal is wired.
                 params: vec![
                     ParamSpec::Int {
                         name: "min_samples".into(),
@@ -57,7 +54,7 @@ impl BudgetPressure {
                             .into(),
                     },
                 ],
-                default_on: false, // opt-in until ASSEMBLE feeds budget_stat
+                default_on: true,
             },
         }
     }

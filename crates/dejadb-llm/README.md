@@ -18,10 +18,19 @@ serde-only.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
-deja waiser run --db agent.db --model claude-sonnet     # key from the env
+deja waiser run --db agent.db --model claude-sonnet         # key from the env
 deja waiser run --db agent.db --model openai:gpt-5
-deja waiser run --db agent.db --model ollama:llama3.1   # local, no key
+deja waiser run --db agent.db --model ollama:llama3.1       # local, no key
+deja waiser run --db agent.db --model openrouter:openai/gpt-4o-mini   # one key → many models
 ```
+
+Structured output is **schema-constrained** where the provider supports it
+(OpenAI/compat `json_schema` strict, Ollama native `format`), with a
+`json_object` fallback. Prompt caching is transparent on OpenAI/OpenRouter
+(auto-cached prefixes) and explicit on Anthropic (`cache_control` on the
+instruction prefix). The reflection loop is async/batchy, so a slow call is
+fine; a dedicated 24h Batch-API job is a possible future add for a full-memory
+sweep (not the interactive `deja waiser run` path).
 
 Keys are read from the environment (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` /
 `OLLAMA_HOST`, or `--llm-api-key-env VAR`), never taken on the command line.

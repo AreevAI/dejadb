@@ -27,6 +27,7 @@ dejadb-cal = { path = "../dejadb-cal", version = "1.0.0" }
 dejadb-context = { path = "../dejadb-context", version = "1.0.0" }
 waiser = { path = "../waiser" }
 dejadb-waiser = { path = "../dejadb-waiser" }
+dejadb-llm = { path = "../dejadb-llm" }
 serde_json = "1"
 napi = { version = "3", features = ["napi9"] }
 napi-derive = "3"

@@ -281,6 +281,22 @@ is human–human agreement), and we **never headline a single vendor benchmark
 number.** If we cite an external set, prefer **LongMemEval**'s knowledge-update
 and abstention categories over the saturated/gameable LoCoMo.
 
+**Live validation (honest finding).** Running the `waiser_reflection` corpus
+through a real model (`gpt-4o-mini` via OpenRouter,
+`WAISER_EVAL_MODEL=openrouter:openai/gpt-4o-mini`) the model **surfaced nothing —
+spurious 0.00, no over-generation.** That is the *correct* answer on this corpus:
+its planted issues are contradictions/duplicates the deterministic analyzers
+already catch, so under the abstention-legitimate objective the model rightly
+finds nothing *additional*. So the live run validates two things — the abstention
+objective holds with a real model, and the verifier isn't leaking decoys — but it
+also empirically confirms the **parasitic-bundle limitation (§11)**: a *positive*
+Effective-Reliability number needs a corpus of issues that are hidden from
+determinism yet grounded in the cited evidence, which in turn needs the
+non-parasitic evidence bundle (retrieval/telemetry-seeded, not
+deterministic-citation-seeded). That is the single highest-value next step for
+the LLM path — until then the honest claim is "verified and abstaining," not
+"finds things," and we say so.
+
 ---
 
 ## 7. How it maps onto DejaDB / Waiser primitives

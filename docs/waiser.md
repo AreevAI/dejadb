@@ -88,8 +88,8 @@ syncs with the file and is queryable.
 ## The analyzers
 
 Eleven built-in analyzers, all deterministic (T0/T1), computing over typed
-grains — never raw prose. Nine are default-on; goal stagnation and budget
-pressure are opt-in (see the table). The last three are **telemetry-fed** —
+grains — never raw prose. Ten are default-on; goal stagnation is opt-in (see
+the table). The last three are **telemetry-fed** —
 they read the recall-telemetry sidecar (below) and move Waiser from *hygiene*
 (is memory internally correct?) to *utility* (is memory used, and does it
 help?):
@@ -105,7 +105,7 @@ help?):
 | `goal_stagnation` | an active Goal with little progress that's gone stale (**opt-in** — "stalled" is ambiguous; enable per file) | an advisory flag |
 | `cold_grains` *(telemetry)* | a live fact never recalled past a grace window — memory not earning its place | a retire-candidate flag (advisory; cold ≠ wrong) |
 | `coverage_gap` *(telemetry)* | a recurring recall question that keeps returning nothing — knowledge the memory should hold | a gap flag (advisory; the fix is to *add* memory) |
-| `budget_pressure` *(telemetry)* | context assembly repeatedly overflowing its token budget (**opt-in** — until the ASSEMBLE overflow signal is wired) | a flag: raise the budget or curate |
+| `budget_pressure` *(telemetry)* | context assembly repeatedly overflowing its token budget (fed by the ASSEMBLE allocator) | a flag: raise the budget or curate |
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin

@@ -439,15 +439,18 @@ impl Engine {
             return Vec::new(); // nothing to ground a discovery on
         }
         // PROPOSE (§5.1): the abstention-legitimate objective — "nothing to
-        // report" is a first-class, zero-penalty answer.
+        // report" is a first-class, zero-penalty answer. The operator-taste
+        // history (recent approve/reject decisions on llm findings) is passed so
+        // the model learns what this reviewer accepts.
+        let (approved, rejected) = self.llm_history(sub);
         let request = crate::llm::LlmRequest {
             waiser: 1,
             op: "discover",
             instructions: DISCOVER_INSTRUCTIONS,
             findings: findings.clone(),
             evidence: evidence.clone(),
-            rejected: Vec::new(),
-            approved: Vec::new(),
+            rejected,
+            approved,
         };
         let Ok(body) = serde_json::to_string(&request) else {
             return Vec::new();
@@ -596,6 +599,33 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// Recent operator decisions on `origin = llm` findings — approved (incl.
+    /// applied) and rejected summaries, most-recent first and bounded — so
+    /// DISCOVER can learn what this reviewer accepts (§9). Best-effort: a read
+    /// failure yields empty history, never an error.
+    fn llm_history<S: OmsSubstrate>(&self, sub: &S) -> (Vec<String>, Vec<String>) {
+        const MAX: usize = 20;
+        let Ok(mut recs) = self.recommendations(sub, None) else {
+            return (Vec::new(), Vec::new());
+        };
+        recs.retain(|r| matches!(r.origin, Origin::Llm { .. }));
+        recs.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
+        let mut approved = Vec::new();
+        let mut rejected = Vec::new();
+        for r in &recs {
+            match r.status {
+                RecStatus::Approved | RecStatus::Applied | RecStatus::RolledBack
+                    if approved.len() < MAX =>
+                {
+                    approved.push(r.summary.render());
+                }
+                RecStatus::Rejected if rejected.len() < MAX => rejected.push(r.summary.render()),
+                _ => {}
+            }
+        }
+        (approved, rejected)
     }
 
     /// ENRICH (§9): ask the LLM to add a short guidance note to the surviving
@@ -1170,9 +1200,11 @@ stale assumption, a duplicated meaning). SCORING: propose a finding ONLY if you 
 are more than 0.75 confident it is BOTH correct AND materially useful. A correct, \
 useful finding earns 1; a wrong or trivial one is penalized 2; returning nothing \
 earns 0. When in doubt, propose nothing — an empty list is the correct answer \
-when there is nothing worth flagging. Every proposal MUST cite one or more \
-evidence hashes from the bundle, target a memory entity, and include your \
-confidence 0.0-1.0. Return JSON: {\"recommendations\":[{\"summary\":\"...\",\
+when there is nothing worth flagging. The 'approved' and 'rejected' lists, when \
+present, show findings this reviewer recently accepted or rejected — prefer the \
+kind they accept and avoid the kind they reject. Every proposal MUST cite one \
+or more evidence hashes from the bundle, target a memory entity, and include \
+your confidence 0.0-1.0. Return JSON: {\"recommendations\":[{\"summary\":\"...\",\
 \"target\":\"entity:<ns>/<subject>\",\"guidance\":\"...\",\"evidence\":[\"<hash>\"],\
 \"confidence\":0.0}]}. Propose nothing you cannot ground in the evidence.";
 

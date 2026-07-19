@@ -154,6 +154,11 @@ pub trait CalStoreFacade: Send + Sync {
         Vec::new()
     }
 
+    /// Record one assembly-budget sample for the `budget_pressure` analyzer
+    /// (telemetry §8): did this ASSEMBLE have to drop grains to fit its token
+    /// budget? Default no-op — only a telemetry-backed store overrides it.
+    fn note_assembly_budget(&self, _overflow: bool) {}
+
     // ── Template management (FR-003) ─────────────────────────────────────
 
     /// Register a custom template (persists to store).

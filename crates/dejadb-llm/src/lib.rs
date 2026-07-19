@@ -80,6 +80,56 @@ fn probe_reply(request: &str, model: &str) -> Option<String> {
         .then(|| json!({ "model": model }).to_string())
 }
 
+/// The `op` of a request (`discover`/`ground`/`verify`/`enrich`).
+fn request_op(request: &str) -> String {
+    serde_json::from_str::<Value>(request)
+        .ok()
+        .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The exact JSON schema for a stage's response (§9 structured output). Authored
+/// to the cross-provider intersection: flat, every field `required`,
+/// `additionalProperties:false`, no numeric/string constraints — so one schema
+/// is portable across OpenAI strict mode and local grammar decoders. `None` for
+/// ops (like probe) that have no schema.
+fn op_schema(op: &str) -> Option<Value> {
+    let obj = |req: Value, props: Value| {
+        json!({"type":"object","additionalProperties":false,"required":req,"properties":props})
+    };
+    let arr = |items: Value| json!({"type":"array","items":items});
+    let s = json!({"type":"string"});
+    let num = json!({"type":"number"});
+    match op {
+        "discover" => Some(obj(
+            json!(["recommendations"]),
+            json!({"recommendations": arr(obj(
+                json!(["summary","target","guidance","evidence","confidence"]),
+                json!({"summary":s,"target":s,"guidance":s,"evidence":arr(s.clone()),"confidence":num}),
+            ))}),
+        )),
+        "ground" => Some(obj(
+            json!(["results"]),
+            json!({"results": arr(obj(
+                json!(["id","supported","reason"]),
+                json!({"id":{"type":"integer"},"supported":{"type":"boolean"},"reason":s}),
+            ))}),
+        )),
+        "verify" => Some(obj(
+            json!(["results"]),
+            json!({"results": arr(obj(
+                json!(["id","keep","confidence","reason"]),
+                json!({"id":{"type":"integer"},"keep":{"type":"boolean"},"confidence":num,"reason":s}),
+            ))}),
+        )),
+        "enrich" => Some(obj(
+            json!(["notes"]),
+            json!({"notes": arr(obj(json!(["target","guidance"]), json!({"target":s,"guidance":s})))}),
+        )),
+        _ => None,
+    }
+}
+
 // ---- OpenAI-compatible (the workhorse / universal fallback) -----------------
 
 pub struct OpenAiCompat {
@@ -93,16 +143,24 @@ impl OpenAiCompat {
         OpenAiCompat { base_url: base_url.into(), api_key: api_key.into(), model: model.into() }
     }
 
-    fn build_body(&self, system: &str, user: &str) -> Value {
+    fn build_body(&self, system: &str, user: &str, op: &str, use_schema: bool) -> Value {
+        // Schema-constrained decoding (guaranteed-valid JSON) when the op has a
+        // schema; otherwise plain json_object. The instruction still carries the
+        // shape, and Waiser's parsers tolerate deviation.
+        let response_format = match (use_schema, op_schema(op)) {
+            (true, Some(schema)) => json!({
+                "type": "json_schema",
+                "json_schema": {"name": "waiser", "strict": true, "schema": schema}
+            }),
+            _ => json!({"type": "json_object"}),
+        };
         json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ],
-            // Guaranteed syntactic JSON; the instruction carries the shape and
-            // Waiser tolerates deviation. (A per-op json_schema is a refinement.)
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
             "temperature": 0
         })
     }
@@ -123,11 +181,20 @@ impl LlmBackend for OpenAiCompat {
         if let Some(p) = probe_reply(request, &self.model) {
             return Ok(p);
         }
+        let op = request_op(request);
         let (system, user) = split_request(request);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let auth = format!("Bearer {}", self.api_key);
-        let resp = post_json(&url, &[("Authorization", &auth)], &self.build_body(&system, &user))?;
-        Ok(Self::extract(&resp))
+        // Prefer schema-constrained decoding; fall back to plain json_object if
+        // the endpoint/model rejects json_schema (gateways/local models vary).
+        match post_json(&url, &[("Authorization", &auth)], &self.build_body(&system, &user, &op, true)) {
+            Ok(resp) => Ok(Self::extract(&resp)),
+            Err(_) if op_schema(&op).is_some() => {
+                let body = self.build_body(&system, &user, &op, false);
+                Ok(Self::extract(&post_json(&url, &[("Authorization", &auth)], &body)?))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -147,7 +214,10 @@ impl Anthropic {
         json!({
             "model": self.model,
             "max_tokens": 4096,
-            "system": system,
+            // Cache the (stable, per-op) instruction prefix — a cross-run cost
+            // win on Anthropic's GA prompt caching. OpenAI/OpenRouter auto-cache
+            // long prefixes with no code; Ollama is local.
+            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": user}]
         })
     }
@@ -194,7 +264,7 @@ impl Ollama {
         Ollama { host: host.into(), model: model.into() }
     }
 
-    fn build_body(&self, system: &str, user: &str) -> Value {
+    fn build_body(&self, system: &str, user: &str, op: &str) -> Value {
         json!({
             "model": self.model,
             "messages": [
@@ -202,7 +272,10 @@ impl Ollama {
                 {"role": "user", "content": user}
             ],
             "stream": false,
-            "format": "json"
+            // The schema (converted to a GBNF grammar locally) when the op has
+            // one; else plain "json". Ollama's native `format` is reliable where
+            // its OpenAI-compat `/v1` ignores `response_format`.
+            "format": op_schema(op).unwrap_or_else(|| json!("json"))
         })
     }
 
@@ -222,10 +295,10 @@ impl LlmBackend for Ollama {
         if let Some(p) = probe_reply(request, &self.model) {
             return Ok(p);
         }
+        let op = request_op(request);
         let (system, user) = split_request(request);
         let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
-        let resp = post_json(&url, &[], &self.build_body(&system, &user))?;
-        Ok(Self::extract(&resp))
+        Ok(Self::extract(&post_json(&url, &[], &self.build_body(&system, &user, &op))?))
     }
 }
 
@@ -299,6 +372,16 @@ pub fn resolve(spec: &str, base_url: Option<&str>, key_env: Option<&str>) -> Res
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
             Ok(Box::new(Ollama::new(host, model)))
         }
+        // OpenRouter is OpenAI-compatible (one key → hundreds of models,
+        // named `vendor/model`, e.g. `openrouter:openai/gpt-4o-mini`).
+        "openrouter" => {
+            let base = base_url
+                .map(str::to_string)
+                .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+            let key = read_key(key_env.or(Some("OPENROUTER_API_KEY")), "openai")?;
+            Ok(Box::new(OpenAiCompat::new(base, key, model)))
+        }
         other => Err(Error::LlmBackend(format!(
             "unknown provider {other:?} (use anthropic|openai|ollama, or provider:model, or --llm-cmd)"
         ))),
@@ -330,14 +413,28 @@ mod tests {
     }
 
     #[test]
-    fn openai_body_and_extract() {
+    fn openai_body_uses_schema_with_json_object_fallback() {
         let a = OpenAiCompat::new("https://x/v1", "k", "gpt-x");
-        let b = a.build_body("sys", "usr");
+        let b = a.build_body("sys", "usr", "discover", true);
         assert_eq!(b["model"], "gpt-x");
-        assert_eq!(b["response_format"]["type"], "json_object");
+        assert_eq!(b["response_format"]["type"], "json_schema");
+        assert_eq!(b["response_format"]["json_schema"]["strict"], true);
         assert_eq!(b["messages"][0]["content"], "sys");
+        // Fallback (use_schema=false) and a schemaless op both use json_object.
+        assert_eq!(a.build_body("s", "u", "discover", false)["response_format"]["type"], "json_object");
+        assert_eq!(a.build_body("s", "u", "probe", true)["response_format"]["type"], "json_object");
         let r = json!({"choices":[{"message":{"content":"{\"ok\":1}"}}]});
         assert_eq!(OpenAiCompat::extract(&r), "{\"ok\":1}");
+    }
+
+    #[test]
+    fn op_schemas_are_strict_and_flat() {
+        for op in ["discover", "ground", "verify", "enrich"] {
+            let s = op_schema(op).unwrap_or_else(|| panic!("{op} has a schema"));
+            assert_eq!(s["additionalProperties"], false, "{op}");
+            assert!(!s["required"].as_array().unwrap().is_empty(), "{op}");
+        }
+        assert!(op_schema("probe").is_none());
     }
 
     #[test]
@@ -347,9 +444,10 @@ mod tests {
     }
 
     #[test]
-    fn ollama_body_sets_json_format() {
+    fn ollama_body_uses_schema_or_json() {
         let a = Ollama::new("http://localhost:11434", "llama3.1");
-        assert_eq!(a.build_body("s", "u")["format"], "json");
+        assert_eq!(a.build_body("s", "u", "discover")["format"]["type"], "object");
+        assert_eq!(a.build_body("s", "u", "probe")["format"], "json");
         let r = json!({"message":{"content":"{}"}});
         assert_eq!(Ollama::extract(&r), "{}");
     }

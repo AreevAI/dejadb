@@ -112,6 +112,20 @@ fn structural_recall_feeds_telemetry() {
 }
 
 #[test]
+fn note_budget_accumulates() {
+    let dir = TempDir::new().unwrap();
+    let mut m = open(&dir, TelemetryMode::Aggregate);
+    // Feeds the budget_pressure analyzer: overflow=true when ASSEMBLE dropped
+    // grains to fit its token budget.
+    m.telemetry_note_budget(true).unwrap();
+    m.telemetry_note_budget(false).unwrap();
+    m.telemetry_note_budget(true).unwrap();
+    let b = m.telemetry_budget_stats().unwrap();
+    assert_eq!(b.sample_count, 3);
+    assert_eq!(b.overflow_count, 2);
+}
+
+#[test]
 fn full_mode_keeps_a_recall_log() {
     let dir = TempDir::new().unwrap();
     let mut m = open(&dir, TelemetryMode::Full);
