@@ -32,6 +32,11 @@ pub struct McpServer {
     /// arguments are ignored and `dejadb_cal` queries are namespace-overridden,
     /// so an agent cannot read or write outside its partition.
     locked_ns: Option<String>,
+    /// Host waiser policy (§6.2) for the `dejadb_waiser` engine — the same
+    /// `waiser-policy.json` the CLI takes (`deja serve --mcp --policy`).
+    /// Absent → the closed default (nothing auto-applies). Host config, set at
+    /// process start, never controllable by the MCP client.
+    waiser_policy: Option<waiser::Policy>,
 }
 
 impl McpServer {
@@ -47,6 +52,23 @@ impl McpServer {
             default_ns,
             allow_destructive_ops: true,
             locked_ns: None,
+            waiser_policy: None,
+        }
+    }
+
+    /// Attach a host waiser policy so an MCP-triggered `dejadb_waiser` run
+    /// honors the same auto-apply grants, denies, and severity floors as
+    /// `deja waiser run --policy`.
+    pub fn with_waiser_policy(mut self, policy: waiser::Policy) -> Self {
+        self.waiser_policy = Some(policy);
+        self
+    }
+
+    /// The waiser engine for a call: builtins + the host policy when set.
+    fn engine(&self) -> Engine {
+        match &self.waiser_policy {
+            Some(p) => Engine::with_builtins().with_policy(p.clone()),
+            None => Engine::with_builtins(),
         }
     }
 
@@ -301,7 +323,7 @@ impl McpServer {
                     full_sweep: args.get("full_sweep").and_then(Value::as_bool).unwrap_or(false),
                 };
                 let mut sub = BorrowedSubstrate::new(&self.facade);
-                let engine = Engine::with_builtins();
+                let engine = self.engine();
                 let res = engine.run(&mut sub, &opts, now_ms()).map_err(|e| e.to_string())?;
                 let pending = engine
                     .recommendations(&sub, Some(RecStatus::Pending))
@@ -310,7 +332,7 @@ impl McpServer {
                 Ok(json!({ "run": res, "pending": list }).to_string())
             }
             "dejadb_recommendations" => {
-                let engine = Engine::with_builtins();
+                let engine = self.engine();
                 let action = args.get("action").and_then(Value::as_str);
                 if let Some(action) = action {
                     let hash = args
@@ -443,7 +465,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dejadb_waiser",
-            "description": "Run one governed self-improvement pass (deterministic, no LLM) and return the run outcome plus the pending recommendation queue. Call at session start; review pending recommendations before acting.",
+            "description": "Run one governed self-improvement pass (deterministic analyzers; auto-apply only under the host policy the server was started with; LLM reflection attaches on the CLI, not here) and return the run outcome plus the pending recommendation queue. Call at session start; review pending recommendations before acting.",
             "inputSchema": {"type": "object", "properties": {
                 "min_new": {"type": "integer", "description": "only run if at least this many new grains since the last run (optional)"},
                 "min_new_errors": {"type": "integer", "description": "or this many new tool failures (optional)"}

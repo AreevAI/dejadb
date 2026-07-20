@@ -48,6 +48,11 @@ pub struct UiServer {
     /// Set true only when the operator intentionally serves to other hosts
     /// (CLI `--allow-remote`), where a non-loopback `Host` is expected.
     allow_remote: bool,
+    /// Host waiser policy (§6.2) applied to the `/api/waiser/*` engine — the
+    /// same `waiser-policy.json` the CLI takes (`deja ui --policy`). Absent →
+    /// the closed default: nothing auto-applies, nothing is denied. Host
+    /// config, never persisted in the memory file.
+    waiser_policy: Option<waiser::Policy>,
 }
 
 impl UiServer {
@@ -60,6 +65,24 @@ impl UiServer {
             auth_all: false,
             segment_dir: None,
             allow_remote: false,
+            waiser_policy: None,
+        }
+    }
+
+    /// Attach a host waiser policy to the console's waiser routes, so a
+    /// console-triggered run honors the same auto-apply grants, denies, and
+    /// severity floors as `deja waiser run --policy`.
+    pub fn with_waiser_policy(mut self, policy: waiser::Policy) -> Self {
+        self.waiser_policy = Some(policy);
+        self
+    }
+
+    /// The waiser engine for a request: builtins + the host policy when one
+    /// was attached.
+    fn engine(&self) -> Engine {
+        match &self.waiser_policy {
+            Some(p) => Engine::with_builtins().with_policy(p.clone()),
+            None => Engine::with_builtins(),
         }
     }
 
@@ -595,7 +618,7 @@ impl UiServer {
             ("GET", "/api/waiser/recommendations") => {
                 let status = q("status").and_then(|s| status_from_str(&s));
                 let sub = BorrowedSubstrate::new(&self.facade);
-                match Engine::with_builtins().recommendations(&sub, status) {
+                match self.engine().recommendations(&sub, status) {
                     Ok(recs) => ok_json(json!({
                         "ok": true,
                         "recommendations": recs.iter().map(rec_json).collect::<Vec<_>>(),
@@ -605,14 +628,14 @@ impl UiServer {
             }
             ("GET", "/api/waiser/health") => {
                 let sub = BorrowedSubstrate::new(&self.facade);
-                match Engine::with_builtins().health(&sub, now_ms()) {
+                match self.engine().health(&sub, now_ms()) {
                     Ok(h) => ok_json(json!({"ok": true, "health": h})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
             ("GET", "/api/waiser/outcomes") => {
                 let sub = BorrowedSubstrate::new(&self.facade);
-                match Engine::with_builtins().outcomes(&sub) {
+                match self.engine().outcomes(&sub) {
                     Ok(o) => ok_json(json!({"ok": true, "outcomes": o})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
@@ -621,7 +644,7 @@ impl UiServer {
                 // Effective settings (manifest merged with the file-config), so
                 // the Setup view renders accurate on/off state and floors.
                 let sub = BorrowedSubstrate::new(&self.facade);
-                match Engine::with_builtins().analyzer_settings(&sub) {
+                match self.engine().analyzer_settings(&sub) {
                     Ok(list) => ok_json(json!({"ok": true, "analyzers": list})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
@@ -666,7 +689,7 @@ impl UiServer {
             }
             ("POST", "/api/waiser/run") => {
                 let mut sub = BorrowedSubstrate::new(&self.facade);
-                match Engine::with_builtins().run(&mut sub, &RunOptions::default(), now_ms()) {
+                match self.engine().run(&mut sub, &RunOptions::default(), now_ms()) {
                     Ok(res) => ok_json(json!({"ok": true, "run": res})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
@@ -696,7 +719,7 @@ impl UiServer {
             Decision::Approve
         };
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match Engine::with_builtins().review(
+        match self.engine().review(
             &mut sub, hash, decision, actor, ObserverType::Human, &ScopeSet::all(), because, now_ms(),
         ) {
             Ok(()) => ok_json(json!({"ok": true})),
@@ -711,7 +734,7 @@ impl UiServer {
         let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
         let allow_destructive = req.get("allow_destructive").and_then(Value::as_bool).unwrap_or(false);
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match Engine::with_builtins().apply(
+        match self.engine().apply(
             &mut sub, hash, actor, ObserverType::Human, &ScopeSet::all(), because, allow_destructive, now_ms(),
         ) {
             Ok(applied) => ok_json(json!({"ok": true, "rollbackable": applied.rollbackable})),
@@ -725,7 +748,7 @@ impl UiServer {
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
         let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match Engine::with_builtins().rollback(
+        match self.engine().rollback(
             &mut sub, hash, actor, ObserverType::Human, &ScopeSet::all(), because, now_ms(),
         ) {
             Ok(()) => ok_json(json!({"ok": true})),
@@ -746,7 +769,7 @@ impl UiServer {
         // The update reads the same body; the extra `analyzer_id` key is ignored.
         let update: waiser::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match Engine::with_builtins().set_analyzer_config(&mut sub, &id, update, &ScopeSet::all()) {
+        match self.engine().set_analyzer_config(&mut sub, &id, update, &ScopeSet::all()) {
             Ok(cfg) => ok_json(json!({"ok": true, "config": cfg})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
         }

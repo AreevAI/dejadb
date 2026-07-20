@@ -192,4 +192,13 @@ test('waiser: record tool calls, run, review, apply', () => {
 
   // A second bare run is idempotent (dedup).
   assert.equal(JSON.parse(m.waiserRun()).stored, 0)
+
+  // The Verify gate's record parses (empty until checkpoints elapse) and an
+  // applied recommendation rolls back with a mandatory reason.
+  assert.ok(Array.isArray(JSON.parse(m.waiserOutcomes())))
+  const rb = JSON.parse(m.rollbackRecommendation(tf.hash, 'the lesson did not help'))
+  assert.equal(rb.status, 'rolled_back')
+
+  // A full-memory sweep (reflect semantics) still runs after the rollback.
+  assert.equal(JSON.parse(m.waiserRun(null, null, null, null, null, null, null, null, true)).outcome, 'ran')
 })

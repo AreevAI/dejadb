@@ -482,7 +482,10 @@ impl DejaDb {
         Ok(h.to_hex())
     }
 
-    /// Run one analysis pass. Bare it never gates. Returns run-outcome JSON.
+    /// Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
+    /// the whole memory (`deja waiser reflect` semantics); `policy` is a path
+    /// to a host `waiser-policy.json` — the only way auto-apply is granted
+    /// from the bindings. Returns run-outcome JSON.
     #[napi]
     #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
     pub fn waiser_run(
@@ -495,17 +498,26 @@ impl DejaDb {
         ground_model: Option<String>,
         ground_cmd: Option<String>,
         analyzer_cmd: Option<String>,
+        full_sweep: Option<bool>,
+        policy: Option<String>,
     ) -> napi::Result<String> {
         let opts = RunOptions {
             min_new: min_new.map(|n| n as u64),
             min_new_errors: min_new_errors.map(|n| n as u64),
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
-            full_sweep: false,
+            full_sweep: full_sweep.unwrap_or(false),
         };
         // Optional verified LLM reflection: `model` ("claude-sonnet", key from
         // the env) attaches a built-in HTTP backend; `llmCmd` a subprocess.
         let mut engine = Engine::with_builtins();
+        // Host policy file (§6.2) — mirrors the CLI's --policy. Host config,
+        // read per call, never persisted in the memory file.
+        if let Some(path) = policy {
+            let s = std::fs::read_to_string(&path)
+                .map_err(|e| err(format!("policy {path}: {e}")))?;
+            engine = engine.with_policy(waiser::Policy::from_json(&s).map_err(err)?);
+        }
         if let Some(cmd) = llm_cmd {
             let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
             engine = engine.with_llm(Box::new(llm));
@@ -587,5 +599,27 @@ impl DejaDb {
             .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
             .map_err(err)?;
         Ok(json!({"hash": hash, "status": "rejected"}).to_string())
+    }
+
+    /// Roll back an applied recommendation (retracts the grains it created).
+    /// Mandatory reason; fails for non-rollbackable applies (FORGET has no
+    /// inverse). Parity with `deja waiser rollback`.
+    #[napi]
+    pub fn rollback_recommendation(&self, hash: String, because: String) -> napi::Result<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        Engine::with_builtins()
+            .rollback(&mut sub, &hash, &self.actor, ObserverType::Human, &ScopeSet::all(), &because, now_ms())
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "status": "rolled_back"}).to_string())
+    }
+
+    /// Measured outcomes of applied recommendations — the Verify gate's
+    /// record (`held` / `regressed` per checkpoint). JSON list, parity with
+    /// `deja waiser outcomes`.
+    #[napi]
+    pub fn waiser_outcomes(&self) -> napi::Result<String> {
+        let sub = BorrowedSubstrate::new(&self.facade);
+        let outs = Engine::with_builtins().outcomes(&sub).map_err(err)?;
+        serde_json::to_string(&outs).map_err(err)
     }
 }
