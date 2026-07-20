@@ -9,6 +9,12 @@ use dejadb_store::DejaDB;
 use tempfile::TempDir;
 
 fn req(addr: &str, raw: &str) -> String {
+    // The server runs with_auth (§5.7: token-less is read-only), so inject the
+    // console token after the request line on every call.
+    let raw = match raw.find("\r\n") {
+        Some(pos) => format!("{}\r\nAuthorization: Bearer t{}", &raw[..pos], &raw[pos..]),
+        None => raw.to_string(),
+    };
     let mut s = TcpStream::connect(addr).unwrap();
     s.write_all(raw.as_bytes()).unwrap();
     let mut out = String::new();
@@ -22,7 +28,7 @@ fn console_api_round_trip() {
     let db = dir.path().join("ui.db");
     let m = DejaDB::open(db.to_str().unwrap()).unwrap();
     let facade = DejaDbFacade::with_session(m, Some("caller".into()), None);
-    let server = UiServer::new(facade, "ui.db".into());
+    let server = UiServer::new(facade, "ui.db".into()).with_auth("t".to_string());
     let listener = UiServer::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || server.serve(listener));

@@ -1,0 +1,22 @@
+[package]
+name = "waiser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Waiser: the governed self-improvement engine for AI-agent memory. Standalone engine over an OmsSubstrate (CAL + grains) — zero DejaDB dependencies."
+readme = "README.md"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["ai-agents", "memory", "governance", "self-improvement", "oms"]
+categories = ["algorithms"]
+# Developed as a workspace member during the churn phase; lifted to its own
+# repo when semantics freeze (proposal §10). Not published from this workspace.
+publish = false
+
+# The engine crate must never depend on a dejadb-* sibling (proposal §10);
+# CI greps this Cargo.toml to enforce it. serde only — dependency-light.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

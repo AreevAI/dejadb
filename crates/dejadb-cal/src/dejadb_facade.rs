@@ -142,6 +142,12 @@ impl GrainSink for SupersedeSink<'_> {
 }
 
 impl CalStoreFacade for DejaDbFacade {
+    /// Record one assembly-budget sample into the telemetry sidecar (feeds the
+    /// `budget_pressure` analyzer). Best-effort: telemetry never fails a query.
+    fn note_assembly_budget(&self, overflow: bool) {
+        let _ = self.with_store(|m| m.telemetry_note_budget(overflow));
+    }
+
     fn recall(&self, params: &RecallParams) -> Result<Vec<SearchHit>> {
         // mount routing: "alias.inner" namespaces hit mounted replicas
         let requested = params.namespace.as_deref().or(self.namespace.as_deref());

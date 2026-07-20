@@ -40,7 +40,8 @@ fn mcp_round_trip() {
             "query": "RECALL facts WHERE subject = \"alice\" | COUNT"}})),
         rpc(7, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
             "query": "DELETE sha256:abc"}})),
-        rpc(8, "ping", serde_json::json!({})),
+        rpc(8, "tools/call", serde_json::json!({"name": "dejadb_waiser", "arguments": {}})),
+        rpc(9, "ping", serde_json::json!({})),
     ];
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -55,14 +56,14 @@ fn mcp_round_trip() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 8 requests (the notification gets no response)
-    assert_eq!(lines.len(), 8, "one response per request");
+    // 9 requests (the notification gets no response)
+    assert_eq!(lines.len(), 9, "one response per request");
 
     let by_id = |id: u64| lines.iter().find(|v| v["id"] == id).unwrap();
 
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "dejadb");
     let tools = by_id(2)["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 8);
 
     // add returned a hash
     let add_text = by_id(3)["result"]["content"][0]["text"].as_str().unwrap();
@@ -87,7 +88,14 @@ fn mcp_round_trip() {
     // destructive CAL is a tool error, not a crash
     assert_eq!(by_id(7)["result"]["isError"], true);
 
-    assert!(by_id(8)["result"].is_object());
+    // dejadb_waiser runs a pass and returns the run outcome + pending queue
+    assert_eq!(by_id(8)["result"]["isError"], false);
+    let waiser_text = by_id(8)["result"]["content"][0]["text"].as_str().unwrap();
+    let waiser: serde_json::Value = serde_json::from_str(waiser_text).unwrap();
+    assert_eq!(waiser["run"]["outcome"], "ran");
+    assert!(waiser["pending"].is_array());
+
+    assert!(by_id(9)["result"].is_object());
 }
 
 /// `--lock-ns` pins the session: a caller-supplied `namespace` in tool

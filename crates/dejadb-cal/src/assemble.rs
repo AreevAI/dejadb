@@ -227,6 +227,7 @@ impl<'a> AssembleEngine<'a> {
         let mut final_grains: Vec<CalGrainResult> = Vec::new();
         let mut meta: Vec<SourceMeta> = Vec::new();
         let mut remaining_budget = budget_tokens;
+        let mut dropped = 0usize; // grains the budget forced us to omit
 
         for (label, grains) in &source_results {
             let allocated = allocations
@@ -238,6 +239,7 @@ impl<'a> AssembleEngine<'a> {
             let effective_allocation = allocated.min(remaining_budget);
 
             let (trimmed, tokens_used) = self.trim_to_budget(grains, effective_allocation);
+            dropped += grains.len().saturating_sub(trimmed.len());
             remaining_budget = remaining_budget.saturating_sub(tokens_used);
 
             meta.push(SourceMeta {
@@ -251,6 +253,10 @@ impl<'a> AssembleEngine<'a> {
         }
 
         let total_tokens = meta.iter().map(|m| m.tokens_used).sum();
+
+        // Record one budget sample for the `budget_pressure` analyzer (telemetry
+        // §8): overflow = the token budget forced grains to be dropped.
+        store.note_assembly_budget(dropped > 0);
 
         // 6. Build result.
         let count = final_grains.len();

@@ -415,6 +415,12 @@ pub struct DejaDbOptions {
     /// memory database (grains, indexes, op-log, WAL); the `.blobs` CAS
     /// sidecar is not yet encrypted.
     pub encryption_key: Option<[u8; 32]>,
+    /// Recall-telemetry retention for the `<file>.telemetry.db` sidecar.
+    /// Host-only capability (never persisted in the file, like the embedder):
+    /// a bare `open()` leaves it `Off`, so the library default records nothing;
+    /// agent-facing hosts opt into `Aggregate`. The sidecar is encrypted under
+    /// this same key when `encryption_key` is set. See [`telemetry`].
+    pub telemetry: TelemetryMode,
 }
 
 impl Default for DejaDbOptions {
@@ -435,6 +441,7 @@ impl Default for DejaDbOptions {
             entity_relations: ents.iter().map(|s| s.to_string()).collect(),
             index_text: true,
             encryption_key: None,
+            telemetry: TelemetryMode::Off,
         }
     }
 }
@@ -592,6 +599,25 @@ impl DejaDB {
         Self::open_with(
             path,
             DejaDbOptions { encryption_key: Some(*key), ..DejaDbOptions::default() },
+        )
+    }
+
+    /// [`open_with_passphrase`](Self::open_with_passphrase) with a
+    /// recall-telemetry sidecar (encrypted under the same passphrase-derived
+    /// key). The agent-host binding path.
+    pub fn open_with_passphrase_telemetry(
+        path: &str,
+        passphrase: &str,
+        telemetry: TelemetryMode,
+    ) -> Result<Self> {
+        let key = Self::derive_key_for(path, passphrase)?;
+        Self::open_with(
+            path,
+            DejaDbOptions {
+                encryption_key: Some(*key),
+                telemetry,
+                ..DejaDbOptions::default()
+            },
         )
     }
 }
@@ -755,6 +781,9 @@ pub struct DejaDB {
     /// what this session supplied). Never fatal; surfaced by hosts.
     warnings: Vec<String>,
     blob_dir: std::path::PathBuf,
+    /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
+    /// left telemetry `Off` — the recall path then does nothing extra.
+    telemetry: Option<Telemetry>,
     // cached hot-path statements (lazily prepared)
     st_probe_sp: Option<turso::Statement>,
     st_probe_s: Option<turso::Statement>,
@@ -779,14 +808,26 @@ impl DejaDB {
     /// file-truth path: settings like `text_index` travel with the file,
     /// so the same memory behaves identically on any host.
     pub fn open(path: &str) -> Result<Self> {
-        Self::open_internal(path, None)
+        Self::open_internal(path, None, TelemetryMode::Off)
     }
 
     /// Open with explicit options. Explicit options are deliberate: they
     /// re-stamp the file's declarations, and a change to an existing
     /// declaration is recorded in `open_warnings()`.
     pub fn open_with(path: &str, opts: DejaDbOptions) -> Result<Self> {
-        Self::open_internal(path, Some(opts))
+        let telemetry = opts.telemetry;
+        Self::open_internal(path, Some(opts), telemetry)
+    }
+
+    /// Open honoring the file's own declarations (like [`open`](Self::open))
+    /// but with a recall-telemetry sidecar enabled. Telemetry is host config,
+    /// **not** a file-truth, so this deliberately does *not* re-stamp the file's
+    /// `index_text`/`entity_relations` declarations — it just attaches the
+    /// sidecar (encrypted under the file's key when the file is encrypted; for
+    /// an encrypted file, open with [`open_with`](Self::open_with) instead so
+    /// the key is supplied).
+    pub fn open_with_telemetry(path: &str, telemetry: TelemetryMode) -> Result<Self> {
+        Self::open_internal(path, None, telemetry)
     }
 
     /// Open (or create) an encrypted memory: AES-256-GCM at rest with a
@@ -801,7 +842,11 @@ impl DejaDB {
         )
     }
 
-    fn open_internal(path: &str, explicit: Option<DejaDbOptions>) -> Result<Self> {
+    fn open_internal(
+        path: &str,
+        explicit: Option<DejaDbOptions>,
+        telemetry_mode: TelemetryMode,
+    ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -901,6 +946,9 @@ impl DejaDB {
                 entity_relations: declared_rels
                     .unwrap_or_else(|| DejaDbOptions::default().entity_relations),
                 encryption_key: None,
+                // Telemetry is host config, not a file-truth: a bare `open()`
+                // never turns it on.
+                telemetry: TelemetryMode::Off,
             },
         };
         // The plaintext key now lives only inside the storage engine (turso keeps
@@ -971,6 +1019,18 @@ impl DejaDB {
         let blob_dir = std::path::PathBuf::from(format!("{}.blobs", path));
         std::fs::create_dir_all(&blob_dir).map_err(db_err)?;
 
+        // Telemetry sidecar (`<file>.telemetry.db`): opened under the SAME AEAD
+        // key as the main file (still live in `enc_key` here, before it is
+        // dropped/zeroized) so crypto-erasure covers it. Only when the host
+        // asked for it — `Off` opens no sidecar and costs the recall path
+        // nothing. The mode is a separate argument, not read from `opts`, so
+        // telemetry can be enabled on a declaration-honoring open without
+        // re-stamping file-truths.
+        let telemetry = match telemetry_mode {
+            TelemetryMode::Off => None,
+            mode => Some(Telemetry::open(&rt, path, enc_key.as_deref(), mode)?),
+        };
+
         Ok(DejaDB {
             rt,
             _db: db,
@@ -988,6 +1048,7 @@ impl DejaDB {
             meta_embed,
             warnings,
             blob_dir,
+            telemetry,
             st_probe_sp: None,
             st_probe_s: None,
             st_fetch_seq: None,
@@ -1594,6 +1655,7 @@ impl DejaDB {
         relation: Option<&str>,
         k: usize,
     ) -> Result<Vec<DeserializedGrain>> {
+        let start = std::time::Instant::now();
         let (ns_id, s_id) = match (self.term_lookup(ns), self.term_lookup(subject)) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
@@ -1660,7 +1722,14 @@ impl DejaDB {
             }
             Ok::<_, DejaDbError>(out)
         })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        let out = blobs
+            .iter()
+            .map(|b| deserialize_blob(b))
+            .collect::<Result<Vec<_>>>()?;
+        // Structural recall feeds telemetry too, so `cold_grains` doesn't
+        // false-positive on grains that are recalled by subject (not query).
+        self.record_recall_event(ns, Some(subject), relation, None, &out, start);
+        Ok(out)
     }
 
     /// Current value head for (subject, relation) — the µs point read.
@@ -1919,7 +1988,77 @@ impl DejaDB {
                     Err(e)
                 }
             }
-        })
+        })?;
+
+        // Scrub the telemetry sidecar so a forgotten grain never lingers there.
+        // Best-effort: the main erasure already committed, and the sidecar is
+        // encrypted under the same key (crypto-erasure covers any residue) and
+        // is rebuildable — a scrub hiccup must not fail an accomplished forget.
+        let rt = &self.rt;
+        if let Some(tel) = self.telemetry.as_mut() {
+            let _ = tel.scrub(rt, hash);
+        }
+        Ok(())
+    }
+
+    // ----- telemetry sidecar (host capability; off the recall path) -----
+
+    /// The active telemetry mode — `Off` when no sidecar is attached.
+    pub fn telemetry_mode(&self) -> TelemetryMode {
+        self.telemetry
+            .as_ref()
+            .map(|t| t.mode())
+            .unwrap_or(TelemetryMode::Off)
+    }
+
+    /// Drain buffered recall telemetry into the sidecar. A no-op when the
+    /// buffer is empty; called from write ops and on close — never from recall.
+    pub fn telemetry_flush(&mut self) -> Result<()> {
+        let rt = &self.rt;
+        if let Some(tel) = self.telemetry.as_mut() {
+            tel.flush(rt)?;
+        }
+        Ok(())
+    }
+
+    /// Record one assembly-budget sample (feeds the `budget_pressure` analyzer).
+    pub fn telemetry_note_budget(&mut self, overflow: bool) -> Result<()> {
+        let rt = &self.rt;
+        if let Some(tel) = self.telemetry.as_mut() {
+            tel.note_budget(rt, overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Grain-access rollups (feeds `cold_grains`). Flushes first so buffered
+    /// recalls are counted; empty when telemetry is off.
+    pub fn telemetry_access_stats(&mut self, ns: Option<&str>) -> Result<Vec<AccessStat>> {
+        self.telemetry_flush()?;
+        let rt = &self.rt;
+        match self.telemetry.as_ref() {
+            Some(tel) => tel.access_stats(rt, ns),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Query rollups (feeds `coverage_gap`). Flushes first; empty when off.
+    pub fn telemetry_query_stats(&mut self, ns: Option<&str>) -> Result<Vec<QueryStat>> {
+        self.telemetry_flush()?;
+        let rt = &self.rt;
+        match self.telemetry.as_ref() {
+            Some(tel) => tel.query_stats(rt, ns),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The assembly-budget rollup (feeds `budget_pressure`). Empty when off.
+    pub fn telemetry_budget_stats(&mut self) -> Result<BudgetStat> {
+        self.telemetry_flush()?;
+        let rt = &self.rt;
+        match self.telemetry.as_ref() {
+            Some(tel) => tel.budget_stats(rt),
+            None => Ok(BudgetStat::default()),
+        }
     }
 
     // ----- graph ops (bounded, indexed, capped) -----
@@ -2420,6 +2559,9 @@ impl DejaDB {
             _ => Vec::new(),
         };
         if structural.is_empty() && fts_legs.iter().all(|l| l.is_empty()) && vecs.is_empty() {
+            // Record the miss too: an empty-result query is the coverage-gap
+            // signal, not a no-op.
+            self.record_recall_event(ns, subject, relation, query, &[], start);
             return Ok(Vec::new());
         }
 
@@ -2463,7 +2605,43 @@ impl DejaDB {
                 out.push(deserialize_blob(&b)?);
             }
         }
+
+        // Telemetry: capture the recall (buffered, non-blocking). See
+        // `record_recall_event` — the only recall-path work is an in-memory
+        // push, and `Off` telemetry makes it a single branch.
+        self.record_recall_event(ns, subject, relation, query, &out, start);
         Ok(out)
+    }
+
+    /// Buffer one recall into the telemetry sidecar. **Non-blocking**: no
+    /// SQLite I/O runs here, so this stays inside the recall latency budget;
+    /// the buffer drains off-path (writes / close / explicit flush). When the
+    /// host left telemetry `Off`, `self.telemetry` is `None` and this is a
+    /// single branch that allocates nothing. Called on BOTH recall exit paths
+    /// (including the empty-result early return — an empty query is the
+    /// coverage-gap signal, so it must be recorded, not dropped).
+    #[inline]
+    fn record_recall_event(
+        &mut self,
+        ns: &str,
+        subject: Option<&str>,
+        relation: Option<&str>,
+        query: Option<&str>,
+        out: &[DeserializedGrain],
+        start: std::time::Instant,
+    ) {
+        if let Some(tel) = self.telemetry.as_mut() {
+            tel.record(RecallEvent {
+                ts_ms: now_ms(),
+                ns: ns.to_string(),
+                subject: subject.map(str::to_string),
+                relation: relation.map(str::to_string),
+                query: query.map(str::to_string),
+                n_results: out.len(),
+                latency_us: start.elapsed().as_micros() as i64,
+                hashes: out.iter().map(|g| g.hash).collect(),
+            });
+        }
     }
 
     /// Query variants for Tier-1 expansion: the installed [`QueryExpander`],
@@ -3606,11 +3784,22 @@ impl DejaDB {
     }
 }
 
+impl Drop for DejaDB {
+    fn drop(&mut self) {
+        // Persist any buffered recall telemetry on close. Best-effort: the
+        // sidecar is disposable and rebuildable, so a failed final flush costs
+        // evidence detail, never state — never let it surface from a destructor.
+        let _ = self.telemetry_flush();
+    }
+}
+
 pub mod asyncdb;
 pub mod memory_tool;
 pub mod migrate;
+pub mod telemetry;
 
 pub use asyncdb::AsyncDejaDB;
+pub use telemetry::{AccessStat, BudgetStat, QueryStat, RecallEvent, Telemetry, TelemetryMode};
 
 /// Object-safe serialization adapter so `add_batch` can take mixed grain types.
 pub trait AddableDyn {

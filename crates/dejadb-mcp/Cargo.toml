@@ -16,6 +16,8 @@ categories = ["api-bindings"]
 dejadb-core = { path = "../dejadb-core", version = "1.0.0" }
 dejadb-store = { path = "../dejadb-store", version = "1.0.0" }
 dejadb-cal = { path = "../dejadb-cal", version = "1.0.0" }
+waiser = { path = "../waiser" }
+dejadb-waiser = { path = "../dejadb-waiser" }
 serde_json = "1"
 
 [dev-dependencies]

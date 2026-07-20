@@ -7,8 +7,10 @@ use std::process::ExitCode;
 
 use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
-use dejadb_core::types::{Fact, Grain};
+use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::DejaDB;
+use dejadb_waiser::{now_ms, DejaDbSubstrate};
+use waiser::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
 
 const USAGE: &str = "\
 deja — embedded memory engine for AI agents (OMS + CAL on Turso)
@@ -19,6 +21,23 @@ USAGE:
   deja help | --help | -h             show this help
 
 COMMANDS:
+  init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
+           print the Claude Code hook snippet (never writes your settings)
+  waiser   <run|reflect|list|show|approve|reject|apply|rollback|analyzers|policy>
+           the governed self-improvement loop (deterministic core; optional verified LLM):
+           run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
+                  [--model provider:name | --llm-cmd 'CMD']   optional LLM reflection
+                  (--model reads the key from $ANTHROPIC_API_KEY/$OPENAI_API_KEY/etc.)
+                  [--ground-model provider:name | --ground-cmd 'CMD']  separate
+                  grounding backend (defaults to the reflection model)
+                  [--analyzer-cmd 'CMD']   register an external analyzer
+                  (advisory only — never auto-applies)
+           reflect  like run, but re-analyzes the whole memory (ignores the
+                  incremental watermark) — a full sweep; same flags as run
+           list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
+           show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
+           outcomes  the Verify gate: did applied advice hold, or regress?
+           [--policy FILE] grants auto-apply (else $WAISER_POLICY); `policy` prints it
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
            [--idempotent]   no-op if this exact value is already the head
@@ -38,8 +57,9 @@ COMMANDS:
   migrate  --from SRC --file PATH [--history PATH]   import another system's
            export: mem0 | mem0-history | langgraph | letta | letta-archival |
            zep | basic-memory (PATH = vault dir) | jsonl (generic
-           {subject,relation,object}|{content} lines). Re-runs skip what is
-           already imported. See docs/migrate.md for per-source dump commands.
+           {subject,relation,object}|{content} lines) | tool-log (OpenAI-style
+           tool-call JSONL → Tool grains, feeds tool-failure clustering).
+           Re-runs skip what is already imported; see docs/migrate.md.
   reindex                             backfill + rebuild the BM25 text index
                                       (e.g. after --index-text true on a file
                                       written with indexing off)
@@ -279,6 +299,30 @@ fn run_migrate(
             mig::migrate_zep(m, ns, &v)
         }
         "jsonl" => mig::migrate_jsonl(m, ns, &read(file)?),
+        // Generic tool-call log (OpenAI-style JSONL) → Tool grains, so the
+        // flagship analyzer can cluster failures from history that predates
+        // DejaDB. One line per record; assistant `tool_calls` arrays expand.
+        "tool-log" | "openai-tools" => {
+            let mut rep = mig::MigrateReport::default();
+            for (i, line) in read(file)?.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|e| format!("{file}:{}: bad JSON: {e}", i + 1))?;
+                for (name, content, is_err) in extract_tool_records(&v) {
+                    let mut t = Tool::new(&name).is_error(is_err);
+                    if !content.is_empty() {
+                        t = t.content(&content);
+                    }
+                    let t = t.namespace(ns);
+                    m.add(&t).map_err(|e| e.to_string())?;
+                    rep.added += 1;
+                }
+            }
+            Ok(rep)
+        }
         "basic-memory" => {
             let root = std::path::PathBuf::from(file);
             if !root.is_dir() {
@@ -322,11 +366,62 @@ fn run_migrate(
         other => {
             return Err(format!(
                 "unknown --from '{other}' — sources: mem0, mem0-history, langgraph, letta, \
-                 letta-archival, zep, basic-memory, jsonl"
+                 letta-archival, zep, basic-memory, jsonl, tool-log"
             ))
         }
     };
     rep.map_err(|e| e.to_string())
+}
+
+/// Extract `(tool_name, content, is_error)` records from one tool-log JSONL
+/// line: a direct `{tool_name, content, is_error}` record, an OpenAI
+/// `role:"tool"` result, or an assistant message carrying a `tool_calls` array.
+fn extract_tool_records(v: &serde_json::Value) -> Vec<(String, String, bool)> {
+    let stringify = |x: &serde_json::Value| match x {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    // Assistant message with a tool_calls array: one record per call.
+    if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+        return calls
+            .iter()
+            .filter_map(|c| {
+                let name = c
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .or_else(|| c.get("name").and_then(|n| n.as_str()))?;
+                let args = c
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .map(&stringify)
+                    .unwrap_or_default();
+                Some((name.to_string(), args, false))
+            })
+            .collect();
+    }
+    // A single tool record / tool-result message.
+    let name = v
+        .get("tool_name")
+        .and_then(|n| n.as_str())
+        .or_else(|| v.get("name").and_then(|n| n.as_str()))
+        .or_else(|| v.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()));
+    match name {
+        Some(name) => {
+            let content = v
+                .get("content")
+                .or_else(|| v.get("output"))
+                .or_else(|| v.get("result"))
+                .map(&stringify)
+                .unwrap_or_default();
+            let is_error = v
+                .get("is_error")
+                .and_then(|e| e.as_bool())
+                .unwrap_or_else(|| v.get("error").is_some());
+            vec![(name.to_string(), content, is_error)]
+        }
+        None => Vec::new(),
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -408,6 +503,15 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         None => None,
     };
 
+    // Recall-telemetry sidecar (host capability, §8): the agent-host default is
+    // `aggregate`; `--telemetry off|aggregate|full` overrides. It is NOT a
+    // file-truth, so it never re-stamps the file's declarations.
+    let tel_mode = match flag(&flags, "telemetry") {
+        Some(v) => dejadb_store::TelemetryMode::parse(&v)
+            .ok_or_else(|| format!("--telemetry: unknown mode '{v}' (off|aggregate|full)"))?,
+        None => dejadb_store::TelemetryMode::Aggregate,
+    };
+
     // Files carry their own declarations (meta table); a bare open honors
     // them. --index-text is an explicit, deliberate re-stamp; encryption is a
     // host-supplied capability that also requires open_with.
@@ -420,7 +524,11 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         if let Some(key) = &enc_key {
             o.encryption_key = Some(**key);
         }
+        o.telemetry = tel_mode;
         DejaDB::open_with(&db, o)
+    } else if tel_mode != dejadb_store::TelemetryMode::Off {
+        // Honor the file's declarations AND attach the telemetry sidecar.
+        DejaDB::open_with_telemetry(&db, tel_mode)
     } else {
         DejaDB::open(&db)
     }
@@ -1188,9 +1296,420 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 );
             }
         }
+        "init" => {
+            run_init(m, &ns, &flags, &positional)?;
+        }
+        "waiser" => {
+            run_waiser(m, &ns, &flags, &positional)?;
+        }
         other => return Err(format!("unknown command '{other}' — try `deja help`")),
     }
     Ok(())
+}
+
+/// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: i64 = s[..split].parse().ok()?;
+    let mult = match &s[split..] {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+fn parse_severity(s: &str) -> Severity {
+    match s.to_ascii_lowercase().as_str() {
+        "high" => Severity::High,
+        "medium" => Severity::Medium,
+        "low" => Severity::Low,
+        _ => Severity::Info,
+    }
+}
+
+/// `--status` filter; default is `pending`, `all` clears the filter.
+fn status_filter(flags: &HashMap<String, String>) -> Option<RecStatus> {
+    match flag(flags, "status").as_deref() {
+        Some("approved") => Some(RecStatus::Approved),
+        Some("rejected") => Some(RecStatus::Rejected),
+        Some("applied") => Some(RecStatus::Applied),
+        Some("rolled_back") => Some(RecStatus::RolledBack),
+        Some("expired") => Some(RecStatus::Expired),
+        Some("all") => None,
+        _ => Some(RecStatus::Pending),
+    }
+}
+
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+/// Resolve a git-style unique hash prefix to a full recommendation hash.
+fn resolve_hash(engine: &Engine, sub: &DejaDbSubstrate, prefix: &str) -> Result<String, String> {
+    let recs = engine.recommendations(sub, None).map_err(|e| e.to_string())?;
+    let matches: Vec<&str> = recs
+        .iter()
+        .map(|r| r.hash.as_str())
+        .filter(|h| h.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no recommendation matches '{prefix}'")),
+        1 => Ok(matches[0].to_string()),
+        n => Err(format!("'{prefix}' is ambiguous ({n} matches) — use more characters")),
+    }
+}
+
+/// Load the host policy from `--policy FILE` or `$WAISER_POLICY` (§6.2).
+fn load_policy(flags: &HashMap<String, String>) -> Result<Option<Policy>, String> {
+    let path = flag(flags, "policy").or_else(|| std::env::var("WAISER_POLICY").ok());
+    match path {
+        Some(p) => {
+            let s = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
+            Ok(Some(Policy::from_json(&s).map_err(|e| e.to_string())?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `deja waiser <run|list|show|approve|reject|apply|rollback|analyzers|policy|status>`.
+fn run_waiser(
+    m: DejaDB,
+    ns: &str,
+    flags: &HashMap<String, String>,
+    positional: &[String],
+) -> Result<(), String> {
+    let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("status");
+    let mut sub = DejaDbSubstrate::new(m, Some(ns.to_string()));
+    // Host policy (--policy FILE or $WAISER_POLICY) — the only place
+    // auto-apply is granted. Absent → a closed default (nothing auto-applies).
+    let policy = load_policy(flags)?;
+    let mut engine = match policy {
+        Some(p) => Engine::with_builtins().with_policy(p),
+        None => Engine::with_builtins(),
+    };
+    // Optional LLM reflection: the model proposes findings that are grounded +
+    // adversarially verified before they can reach the queue (origin=llm, never
+    // auto-applied). Two ways to attach one, both CLI-only, never persisted:
+    //   --model provider:name   → a built-in HTTP backend (key from the env)
+    //   --llm-cmd 'CMD'         → a subprocess backend (the zero-dep escape hatch)
+    // `--llm-cmd` wins if both are given.
+    if let Some(cmd) = flag(flags, "llm-cmd") {
+        let model = flag(flags, "llm-model");
+        let llm = waiser::CommandLlm::new(&cmd, model.as_deref()).map_err(|e| e.to_string())?;
+        engine = engine.with_llm(Box::new(llm));
+    } else if let Some(spec) = flag(flags, "model") {
+        // Key is read from the environment (ANTHROPIC_API_KEY / OPENAI_API_KEY /
+        // OLLAMA_HOST, or --llm-api-key-env), never taken on the command line.
+        let base = flag(flags, "llm-base-url");
+        let key_env = flag(flags, "llm-api-key-env");
+        let llm = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
+            .map_err(|e| e.to_string())?;
+        engine = engine.with_llm(llm);
+    }
+    // Optional SEPARATE grounding backend (§11): point the entailment check at a
+    // cheaper or specialized model, or take the generative model out of grounding
+    // entirely. Falls back to the main backend when absent. `--ground-cmd` wins.
+    if let Some(cmd) = flag(flags, "ground-cmd") {
+        let g = waiser::CommandLlm::new(&cmd, None).map_err(|e| e.to_string())?;
+        engine = engine.with_ground_llm(Box::new(g));
+    } else if let Some(spec) = flag(flags, "ground-model") {
+        let base = flag(flags, "llm-base-url");
+        let key_env = flag(flags, "llm-api-key-env");
+        let g = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
+            .map_err(|e| e.to_string())?;
+        engine = engine.with_ground_llm(g);
+    }
+    // Optional external analyzer: a subprocess that flags domain-specific issues
+    // (trust class Command → advisory only, never auto-applies). Registered up
+    // front so it participates in the pass like a built-in.
+    if let Some(cmd) = flag(flags, "analyzer-cmd") {
+        let a = waiser::CommandAnalyzer::new(&cmd).map_err(|e| e.to_string())?;
+        engine.register(Box::new(a));
+    }
+    let now = now_ms();
+    let actor = flag(flags, "actor").unwrap_or_else(|| "user:local".to_string());
+    let observer = ObserverType::Human;
+    let scopes = ScopeSet::all(); // the CLI is the local root of trust
+    let json = flag(flags, "format").as_deref() == Some("json");
+
+    match sub_cmd {
+        // `reflect` = a run that re-analyzes the whole memory (full sweep),
+        // ignoring the incremental watermark; otherwise identical to `run`.
+        "run" | "reflect" => {
+            let opts = RunOptions {
+                min_new: flag(flags, "min-new").and_then(|v| v.parse().ok()),
+                min_new_errors: flag(flags, "min-new-errors").and_then(|v| v.parse().ok()),
+                if_stale_ms: flag(flags, "if-stale").and_then(|v| parse_duration(&v)),
+                namespaces: Vec::new(),
+                full_sweep: sub_cmd == "reflect",
+            };
+            let res = engine.run(&mut sub, &opts, now).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string(&res).map_err(|e| e.to_string())?);
+            } else if res.ran() {
+                if !flags.contains_key("quiet") {
+                    eprintln!(
+                        "waiser: ran — proposed {} ({} deduped, {} auto-applied) across {} analyzer(s)",
+                        res.stored,
+                        res.deduped,
+                        res.auto_applied,
+                        res.analyzers_run.len()
+                    );
+                }
+                if res.stored > 0 {
+                    eprintln!("waiser: {} new — deja waiser list", res.stored);
+                }
+            } else if !flags.contains_key("quiet") {
+                eprintln!("waiser: skipped ({:?})", res.skip_reason);
+            }
+        }
+        "list" => {
+            let filter = status_filter(flags);
+            let recs = engine.recommendations(&sub, filter).map_err(|e| e.to_string())?;
+            if json {
+                let rows: Vec<_> = recs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "hash": r.hash,
+                            "status": r.status.as_str(),
+                            "severity": r.severity.as_str(),
+                            "analyzer": r.analyzer,
+                            "destructive": r.destructive,
+                            "summary": r.summary.render(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string(&rows).map_err(|e| e.to_string())?);
+            } else if recs.is_empty() {
+                eprintln!("no recommendations — run `deja waiser run` first");
+            } else {
+                for r in &recs {
+                    println!(
+                        "{}  {:<6}  {:<28}  {}",
+                        short(&r.hash),
+                        r.severity.as_str(),
+                        r.analyzer,
+                        r.summary.render()
+                    );
+                }
+            }
+            // CI gate: exit 2 if any pending recommendation meets --fail-on.
+            if let Some(sev) = flag(flags, "fail-on") {
+                let threshold = parse_severity(&sev);
+                let hit = recs
+                    .iter()
+                    .any(|r| r.status == RecStatus::Pending && r.severity >= threshold);
+                if hit {
+                    eprintln!("waiser: pending recommendation(s) at or above severity '{sev}'");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "show" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser show <hash>".to_string())?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
+            let r = recs.iter().find(|r| r.hash == hash).unwrap();
+            let out = serde_json::json!({
+                "hash": r.hash,
+                "status": r.status.as_str(),
+                "severity": r.severity.as_str(),
+                "analyzer": r.analyzer,
+                "target_ref": r.target_ref,
+                "summary": r.summary.render(),
+                "destructive": r.destructive,
+                "rollbackable": r.rollbackable,
+                "evidence": r.evidence,
+                "dedup_key": r.dedup_key,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+        }
+        "approve" | "reject" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| format!("usage: deja waiser {sub_cmd} <hash> --because \"...\""))?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let decision = if sub_cmd == "approve" { Decision::Approve } else { Decision::Reject };
+            engine
+                .review(&mut sub, &hash, decision, &actor, observer, &scopes, &because, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!("{sub_cmd}d {}", short(&hash));
+        }
+        "apply" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser apply <hash> --because \"...\"".to_string())?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            let allow_destructive = flags.contains_key("allow-destructive");
+            let applied = engine
+                .apply(&mut sub, &hash, &actor, observer, &scopes, &because, allow_destructive, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "applied {} ({})",
+                short(&hash),
+                if applied.rollbackable { "rollbackable" } else { "non-rollbackable" }
+            );
+        }
+        "rollback" => {
+            let prefix = positional
+                .get(1)
+                .ok_or_else(|| "usage: deja waiser rollback <hash> --because \"...\"".to_string())?;
+            let because = need(flags, "because")?;
+            let hash = resolve_hash(&engine, &sub, prefix)?;
+            engine
+                .rollback(&mut sub, &hash, &actor, observer, &scopes, &because, now)
+                .map_err(|e| e.to_string())?;
+            eprintln!("rolled back {}", short(&hash));
+        }
+        "analyzers" => {
+            for a in engine.analyzers() {
+                let m = a.manifest();
+                println!(
+                    "{:<28}  {:?}  on={}  {}",
+                    m.id, m.tier, m.default_on, m.title
+                );
+            }
+        }
+        // The Verify gate's measured history: did applied advice hold?
+        "outcomes" => {
+            let outcomes = engine.outcomes(&sub).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string(&outcomes).map_err(|e| e.to_string())?);
+            } else if outcomes.is_empty() {
+                eprintln!(
+                    "no measured outcomes yet — outcome review runs after an applied \
+                     recommendation's review window elapses"
+                );
+            } else {
+                for o in &outcomes {
+                    let horizon = if o.horizon_ms % 86_400_000 == 0 {
+                        format!("{}d", o.horizon_ms / 86_400_000)
+                    } else {
+                        format!("{}h", o.horizon_ms / 3_600_000)
+                    };
+                    println!(
+                        "{}  {:<22}  @{:<4}  baseline {} → current {}  [{}]",
+                        short(&o.rec_hash),
+                        o.metric,
+                        horizon,
+                        o.baseline,
+                        o.current,
+                        o.verdict
+                    );
+                }
+            }
+        }
+        // Config reporting: the effective host policy (read-only).
+        "policy" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(engine.policy()).map_err(|e| e.to_string())?
+            );
+        }
+        // Bare `deja waiser` (or an unknown subcommand) prints a health summary.
+        _ => {
+            let h = engine.health(&sub, now).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string(&h).map_err(|e| e.to_string())?);
+            } else {
+                println!(
+                    "waiser: {} recommendation(s) — {} pending, {} applied",
+                    h.total, h.pending, h.applied
+                );
+                match h.last_run_ms {
+                    None => println!("  never run — deja waiser run"),
+                    Some(last) => {
+                        let days = (now - last) / 86_400_000;
+                        println!(
+                            "  last run {days}d ago; {} new grain(s) ({} tool error(s)) since",
+                            h.grains_since_run, h.error_events_since_run
+                        );
+                    }
+                }
+                // Reflection §6b: the live approval-rate for LLM-surfaced
+                // findings (only shown once the LLM path has produced any).
+                let lm = engine.llm_metrics(&sub).map_err(|e| e.to_string())?;
+                if lm.proposed > 0 {
+                    match lm.approval_rate {
+                        Some(rate) => println!(
+                            "  LLM findings: {} surfaced, {:.0}% approved ({} approved / {} rejected, {} pending)",
+                            lm.proposed, rate * 100.0, lm.approved, lm.rejected, lm.pending
+                        ),
+                        None => println!("  LLM findings: {} surfaced, none decided yet", lm.proposed),
+                    }
+                }
+                if h.stale {
+                    eprintln!("  ⚠ the loop may be stale — run `deja waiser run` or wire the SessionEnd hook");
+                } else if h.pending > 0 {
+                    println!("  review with: deja waiser list");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `deja init --db <file> [--template blank|demo|coding-agent] [--ns N]` —
+/// seed a working backend and print the wiring snippet (never writes settings).
+fn run_init(
+    m: DejaDB,
+    ns: &str,
+    flags: &HashMap<String, String>,
+    _positional: &[String],
+) -> Result<(), String> {
+    let template = flag(flags, "template").unwrap_or_else(|| "blank".to_string());
+    let mut m = m;
+    let seeded = match template.as_str() {
+        "blank" => 0,
+        "demo" => seed_demo(&mut m, ns)?,
+        "coding-agent" | "support-agent" => {
+            m.add(&Fact::new("agent", "instruction", "review pending recommendations before acting").namespace(ns))
+                .map_err(|e| e.to_string())?;
+            1
+        }
+        other => return Err(format!("unknown --template '{other}' (blank|demo|coding-agent|support-agent)")),
+    };
+
+    println!("initialized backend (template: {template}, seeded {seeded} grain(s))");
+    if template == "demo" {
+        println!("next: deja waiser run --db <file>   # ~4 recommendations across analyzers");
+    }
+    // Print the Claude Code hook snippet — deja never edits your settings.
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "deja".to_string());
+    eprintln!("\nClaude Code hooks (paste into settings.json — absolute path baked in):");
+    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns}");
+    eprintln!("  Stop             → {exe} capture-stop --ns {ns}");
+    eprintln!("  SessionEnd       → {exe} waiser run --min-new 20 --min-new-errors 3 --quiet --ns {ns}");
+    Ok(())
+}
+
+/// Seed the demo corpus: planted duplicates, a contradiction, and a stale
+/// grain, so the first `deja waiser run` fires several analyzers at once.
+fn seed_demo(m: &mut DejaDB, ns: &str) -> Result<usize, String> {
+    let past = 1_000_000_000_000; // year 2001 — safely elapsed
+    let grains = [
+        Fact::new("acme", "tier", "Enterprise").namespace(ns),
+        Fact::new("acme", "tier", "Enterprise").namespace(ns),
+        Fact::new("acme", "deploy_target", "us-east-1").namespace(ns),
+        Fact::new("acme", "deploy_target", "eu-west-1").namespace(ns),
+        Fact::new("promo", "active", "true").namespace(ns).valid_to(past),
+    ];
+    for g in &grains {
+        m.add(g).map_err(|e| e.to_string())?;
+    }
+    Ok(grains.len())
 }
 
 fn main() -> ExitCode {

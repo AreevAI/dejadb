@@ -51,7 +51,7 @@ per line to stdout. It handles these methods:
 |---|---|
 | `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
 | `ping` | Returns an empty result |
-| `tools/list` | Returns the six tool definitions (with input schemas) |
+| `tools/list` | Returns the eight tool definitions (with input schemas) |
 | `tools/call` | Invokes a tool by `name` with `arguments` |
 
 Conventions:
@@ -98,7 +98,7 @@ multi-tenant host gives an agent a session it must not escape.
 
 ---
 
-## The six tools
+## The eight tools
 
 ### `dejadb_recall`
 
@@ -200,6 +200,37 @@ to gate it off for both this tool and `dejadb_forget`.
 { "name": "dejadb_cal",
   "arguments": { "query": "RECALL facts WHERE subject = \"john\" | COUNT" } }
 ```
+
+---
+
+### `dejadb_waiser`
+
+Runs one governed self-improvement pass (deterministic, no LLM) and returns
+the run outcome plus the pending recommendation queue. Call it at session
+start; review pending recommendations before acting. See
+[waiser.md](waiser.md).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `min_new` | integer | no | only run if at least this many new grains since the last run |
+| `min_new_errors` | integer | no | …or this many new tool failures |
+
+Result: `{ "run": <run-outcome>, "pending": [ <recommendation>, … ] }`.
+
+### `dejadb_recommendations`
+
+Lists recommendations, or acts on one. Without `action`, lists by status
+(default `pending`). With `action` + a `hash` + a mandatory `because` reason,
+performs the audited transition. An agent approving **its own** proposal is
+blocked (self-approval, `WSR-E021`) — run a reviewer process with distinct
+`--scopes`/`--actor` for separation of duties.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `status` | string | no | filter: `pending` \| `approved` \| `applied` \| `all` (default `pending`) |
+| `action` | string | no | `apply` \| `approve` \| `reject` (omit to list) |
+| `hash` | string | for an action | recommendation hash |
+| `because` | string | for an action | mandatory written reason |
 
 ---
 

@@ -1,15 +1,25 @@
 //! Voice-loop simulation: 50ms-cadence recall on the "audio
 //! loop" with batched write-back interleaved — the M4 CI gate shape.
 //! Run: cargo run --release -p dejadb-store --example voice_loop
+//!
+//! Telemetry is **on** (`aggregate`) here on purpose: a voice receptionist
+//! using Waiser runs with recall telemetry enabled, so this gate proves the
+//! buffered, non-blocking capture stays inside the 50ms voice budget. The
+//! off path is a strict subset (a single `None` branch), so protecting the
+//! on path protects both.
 
 use dejadb_core::types::{Event, Fact};
-use dejadb_store::{AddableDyn, DejaDB};
+use dejadb_store::{AddableDyn, DejaDB, TelemetryMode};
 use std::time::{Duration, Instant};
 
 fn main() {
     let dir = tempfile::TempDir::new().unwrap();
-    // §6 edge profile: FTS off on the voice hot path
-    let opts = dejadb_store::DejaDbOptions { index_text: false, ..Default::default() };
+    // §6 edge profile: FTS off on the voice hot path; telemetry on (aggregate).
+    let opts = dejadb_store::DejaDbOptions {
+        index_text: false,
+        telemetry: TelemetryMode::Aggregate,
+        ..Default::default()
+    };
     let mut m = DejaDB::open_with(dir.path().join("call.db").to_str().unwrap(), opts).unwrap();
 
     // seed a realistic caller profile
@@ -63,8 +73,8 @@ fn main() {
         v[((v.len() as f64 * q) as usize).min(v.len() - 1)] as f64 / 1000.0
     };
     let (mut r, mut w) = (reads, writes);
-    println!("voice loop: {frames} frames @50ms, {} write-backs, wall {:.1}s", w.len(), call_start.elapsed().as_secs_f64());
-    println!("frame recall  p50 {:.1}µs  p95 {:.1}µs  p99 {:.1}µs  (target <200µs)", pct(&mut r, 0.5), pct(&mut r, 0.95), pct(&mut r, 0.99));
+    println!("voice loop: {frames} frames @50ms, {} write-backs, wall {:.1}s  (telemetry: aggregate)", w.len(), call_start.elapsed().as_secs_f64());
+    println!("frame recall  p50 {:.1}µs  p95 {:.1}µs  p99 {:.1}µs  (target <200µs, telemetry on)", pct(&mut r, 0.5), pct(&mut r, 0.95), pct(&mut r, 0.99));
     println!("write-back    p50 {:.1}µs  p95 {:.1}µs  (off audio thread in prod)", pct(&mut w, 0.5), pct(&mut w, 0.95));
     let ok = pct(&mut r, 0.5) < 200.0;
     println!("verdict: {}", if ok { "PASS" } else { "FAIL" });

@@ -132,6 +132,40 @@ top of that.
 - Forged grain provenance when syncing with an untrusted peer (integrity is
   guaranteed; authenticity is not, until signing lands).
 
+## Waiser (self-improvement) trust boundary
+
+Waiser lets an agent change its own memory, so its governance *is* a security
+boundary. See [`waiser.md`](waiser.md) for the surfaces; the invariants:
+
+- **Read-only token-less console (breaking change).** Token-less `deja ui` is
+  read-only. Every write — any waiser mutation, or an `ADD`/`SUPERSEDE`/
+  `FORGET` CAL batch — returns 401 without `--token-env VAR`. This closes the
+  bypass where a local process could execute a proposal's CAL directly and
+  skip the review queue, which would void the whole governance story. The
+  server classifies a POST `/api/cal` by its leading keyword and fails closed.
+- **The trust floor is not configurable.** These fields do not exist in any
+  file or policy schema (unknown keys are rejected at load), so a hostile or
+  synced file can never arrive pre-armed: auto-apply never touches free text,
+  destruction, prompts, or LLM-drafted content; analyzers execute read-only;
+  no payload amplifies scopes; no file raises a host-set cap.
+- **The laundering threat.** The deterministic path can carry attacker text:
+  tool-failure clustering derives a signature from attacker-controlled tool
+  output. So auto-apply is restricted to SUPERSEDE-only structural curation
+  with **zero** attacker-influenced free text (an `ADD` disqualifies), and any
+  recommendation introducing evidence-derived text is always approval-required
+  with the untrusted prose shown as a literal, escaped diff.
+- **Auto-apply is default-off and host-granted only.** It requires host opt-in
+  plus a matching grant in the optional `waiser-policy.json`, a built-in
+  analyzer, a memory/query target, non-destructive payload, and an engine-side
+  per-draft shape check. The policy file is host config, never persisted in a
+  memory file, and rejects unknown keys — a stolen or committed policy file is
+  inert (it cannot register an executable).
+- **Separation of duties + accountable audit.** `write` grants neither
+  `review` nor `apply`; self-approval is blocked against the creating actor;
+  every transition writes an immutable, hash-chained audit Observation with a
+  mandatory reason. Audit grains live and die with the file they govern —
+  erasing a subject's file erases its audit (correct GDPR-shaped behavior).
+
 ## Roadmap
 
 - Blob (`.blobs`) encryption at rest.

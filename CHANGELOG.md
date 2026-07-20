@@ -6,6 +6,86 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Waiser recall-telemetry sidecar (§8).** A disposable, never-syncing
+  `<file>.telemetry.db` records what recall actually surfaced — grain access,
+  query outcomes, assembly-budget pressure — so Waiser can see memory *utility*,
+  not just internal consistency. Encrypted under the main file's key,
+  `FORGET`-scrubbed, rebuildable. Capture on the recall path is buffered and
+  non-blocking (voice-loop recall p50 stays ~82µs with telemetry on). Host-only
+  mode `off | aggregate | full`: `deja --telemetry`, `telemetry=` on the
+  Python/Node constructors (default `aggregate`); a bare library `open()`
+  records nothing.
+- **Three telemetry-fed analyzers** (11 built-ins total): `cold_grains` (facts
+  never recalled), `coverage_gap` (recurring questions the memory can't answer),
+  and `budget_pressure` (assembly overflow). All default-on (`budget_pressure`
+  once its ASSEMBLE overflow datasource was wired — see below);
+  `cold_grains`/`coverage_gap` at 1.00 fixture precision.
+- **Optional LLM enrichment (§9).** `deja waiser run --llm-cmd 'CMD'` attaches a
+  subprocess backend (`CommandLlm`, mirroring `--embed-cmd`) that only *adds* —
+  DISCOVER proposes cited `origin=llm` drafts (never auto-applied), ENRICH adds
+  a whitelisted guidance note; with no backend the stages are the identity, so
+  the deterministic output is unchanged. Backends in `examples/llm/`. New error
+  `WSR-E050`.
+- **Console Sessions + Setup views** and `GET /api/waiser/telemetry`: visualize
+  recall activity, coverage gaps, and the effective configuration.
+- **Waiser reflection verifier + measurement** (design:
+  `docs/waiser-reflection.md`). The LLM path is no longer "cite a real hash and
+  hope": DISCOVER runs under an abstention-legitimate objective, then every
+  draft passes an independent **GROUND** (evidence-entailment) and **VERIFY**
+  (adversarial keep/kill) gate — each a separate call (proposer ≠ scorer) —
+  before it can reach the review queue, stamped with the verifier's calibrated
+  confidence. Measured, not asserted: a `waiser_reflection` Effective-Reliability
+  bench (the verifier lifts ER from +0.00 to +1.00 on the reference corpus by
+  filtering decoys) and a live approval-rate metric on `deja waiser`.
+- **Out-of-box LLM providers** (`dejadb-llm` crate): `deja waiser run --model
+  claude-sonnet` (or `openai:gpt-5`, `ollama:llama3.1`) attaches a built-in
+  backend — OpenAI-compatible (covers ~90% of providers incl. Gemini's compat
+  endpoint, Groq, OpenRouter, vLLM, LM Studio, llama.cpp), Anthropic, or Ollama
+  — over a small blocking HTTP client, key read from the environment. `--llm-cmd`
+  remains the zero-dependency escape hatch. Core crates stay serde-only; the HTTP
+  surface is isolated to this opt-in crate. Structured output is
+  **schema-constrained** per stage (OpenAI/compat `json_schema` strict, Ollama
+  native `format`) with a `json_object` fallback; prompt caching is transparent
+  on OpenAI/OpenRouter and explicit (`cache_control`) on Anthropic; an
+  `openrouter:` shortcut reaches many models with one key. `--model` / `--llm-cmd`
+  are also exposed on the Python and Node `waiser_run`.
+- **budget_pressure is now default-on**: the ASSEMBLE budget allocator records
+  overflow (grains dropped to fit the token budget) via
+  `CalStoreFacade::note_assembly_budget`, feeding the analyzer's telemetry.
+- **Reflection quality**: the DISCOVER stage now receives the operator's recent
+  approve/reject decisions (taste history) so the model learns what this reviewer
+  accepts.
+- **Non-parasitic evidence bundle** — DISCOVER seeds its bundle from deterministic
+  citations *and* recent grains (since the last-run watermark), so the LLM gets
+  its own lens and finds issues no analyzer flagged. Validated end-to-end with a
+  real model: a hidden cross-fact inconsistency (each fact individually
+  well-formed) is proposed, grounded, verified, and queued; a consistent corpus
+  abstains. Three pipeline fixes made it discriminate: **GROUND** now checks a
+  finding's factual *premises* (anti-fabrication) while allowing an inference (so
+  semantic findings aren't rejected for not stating their conclusion verbatim);
+  **VERIFY** judges soundness + abstention only, never novelty (a weak verifier
+  hallucinated "already known" and killed genuine findings); novelty stays a
+  DISCOVER concern settled by human review, not an over-coarse entity dedup.
+- **Pluggable grounding backend** (`--ground-model` / `--ground-cmd`, and
+  `ground_*` on the bindings): run the GROUND entailment check on a cheaper or
+  specialized model — or take the generative model out of grounding entirely.
+  Falls back to the reflection backend; VERIFY always stays on the main model.
+- **External command analyzers** (`--analyzer-cmd`, `analyzer_cmd` on the
+  bindings): a subprocess receives a live-grain snapshot and returns advisory
+  findings — trust class `command`, auto-apply `never` (surfaces, never mutates).
+  The only custom-analyzer path for Python/Node. A failure skips the analyzer,
+  never the run.
+- **Full-memory reflection sweep** (`deja waiser reflect`): re-analyze the whole
+  memory in one pass, ignoring the incremental watermark, for a first look at an
+  imported memory or a periodic deep pass. Dedup/cooldowns still suppress what is
+  already queued and the watermark still advances, so later runs stay incremental.
+- **Writable console Setup**: toggle analyzers on/off from the console, persisted
+  to the file's waiser config (`POST /api/waiser/config`, Admin-gated like every
+  write). `GET /api/waiser/analyzers` now returns effective settings + trust
+  class. Auto-apply is still only grantable via a host policy file, never the UI.
+
 ## [1.0.1] - 2026-07-15
 
 ### Added

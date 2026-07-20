@@ -1,0 +1,22 @@
+[package]
+name = "dejadb-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Out-of-box LLM provider backends for Waiser: OpenAI-compatible, Anthropic, and Ollama adapters over a small blocking HTTP client, implementing waiser::LlmBackend. Keeps the core crates dependency-light — the HTTP surface lives here."
+readme = "README.md"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["ai-agents", "llm", "waiser", "self-improvement", "dejadb"]
+categories = ["api-bindings"]
+publish = false
+
+[dependencies]
+waiser = { path = "../waiser" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# A small BLOCKING HTTP client — matches the sync-over-private-runtime / std
+# TcpListener posture of the rest of the tree; no tokio/reqwest enters here.
+ureq = "2"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dejadb-core", "crates/dejadb-store", "crates/dejadb-cal", "crates/dejadb-cli", "crates/dejadb-mcp", "crates/dejadb-context", "crates/dejadb-server", "crates/dejadb-py", "crates/dejadb-bench"]
+members = ["crates/dejadb-core", "crates/dejadb-store", "crates/dejadb-cal", "crates/dejadb-cli", "crates/dejadb-mcp", "crates/dejadb-context", "crates/dejadb-server", "crates/dejadb-py", "crates/dejadb-bench", "crates/waiser", "crates/dejadb-waiser", "crates/dejadb-llm"]
 
 [workspace.package]
 version = "1.0.1"

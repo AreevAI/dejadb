@@ -284,10 +284,31 @@ contradiction — that's a semantic, host-side, judgment).
 
 ### Can I inspect or edit memories in a UI?
 
-Yes. `deja ui --db <file>` serves a local web console (memories, graph, and
-query tabs, light + dark themes) at `http://127.0.0.1:7437`. It binds loopback
-with **no authentication** by design — do not expose it to a network without a
-TLS-terminating reverse proxy and auth in front. See [`SECURITY.md`](SECURITY.md).
+Yes. `deja ui --db <file>` serves a local web console (memories, graph, query,
+and Waiser tabs, light + dark themes) at `http://127.0.0.1:7437`. It binds
+loopback. **Token-less, the console is read-only** — it browses everything but
+cannot write; pass `--token-env VAR` to unlock writes (review/apply and CAL
+writes). Do not expose it to a network without a TLS-terminating reverse proxy.
+See [`SECURITY.md`](SECURITY.md).
+
+### Can my agent improve its own memory safely?
+
+Yes — that is [Waiser](docs/waiser.md), built into DejaDB. It turns your
+agent's history into **recommendations** (deduplicate these facts, resolve this
+contradiction, this tool keeps failing, this lesson is stale) with **no model
+calls** — the analyzers are deterministic. Every recommendation cites its
+evidence, every decision needs a written reason, every apply is audited and
+(unless it's a `FORGET`) undoable. Run it with `deja waiser run`,
+`db.waiser_run()`, or the `dejadb_waiser` MCP tool.
+
+### Does Waiser edit my agent's memory or prompt on its own?
+
+No, not by default. Everything lands in a review queue you approve. Auto-apply
+is off unless you opt in with a host `waiser-policy.json`, and even then it is
+restricted to structural memory curation (deduplication, fork merges) — it can
+**never** auto-apply anything carrying model-derived or tool-derived free text,
+touch a prompt/instruction file, or run a destructive `FORGET`. Those always
+require a human. See [`docs/security-model.md`](docs/security-model.md).
 
 ### What are the latency characteristics?
 
