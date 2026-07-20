@@ -110,6 +110,13 @@ impl DuplicateSweep {
                 "object".into(),
                 json!(canonical.fact_object().unwrap_or("")),
             );
+            // The replacement must carry the original's namespace — a
+            // supersession builds a NEW grain from exactly these fields, so an
+            // absent namespace would silently move the fact to the store
+            // default namespace and out of every ns-scoped recall.
+            if !canonical.namespace.is_empty() {
+                canonical_fields.insert("namespace".into(), json!(canonical.namespace));
+            }
 
             let mut statements = Vec::new();
             for extra in &members[1..] {
@@ -122,6 +129,13 @@ impl DuplicateSweep {
             args.insert("count".into(), json!(members.len()));
             args.insert("subject".into(), json!(subject));
 
+            // No recurrence metric here (unlike contradiction_sweep): a
+            // supersession creates a NEW replacement grain, so post-apply the
+            // canonical + its copy both stay live and a live-grain count
+            // never drops — a grain-count metric would read "regressed" the
+            // moment it was applied. Head-based recall (`latest`) already
+            // returns one value; measuring duplicate recurrence honestly
+            // needs a supersede-by-existing substrate primitive first.
             drafts.push(
                 RecDraft::new(
                     format!(
@@ -183,6 +197,11 @@ impl DuplicateSweep {
             let canonical = &tokenized[cluster[0]].0;
             let mut canonical_fields = Map::new();
             canonical_fields.insert("body".into(), json!(obs_text(canonical).unwrap_or("")));
+            // Keep the cluster's namespace on the replacement (clusters never
+            // cross namespaces — see the filter above).
+            if !canonical.namespace.is_empty() {
+                canonical_fields.insert("namespace".into(), json!(canonical.namespace));
+            }
 
             let mut statements = Vec::new();
             for &k in &cluster[1..] {

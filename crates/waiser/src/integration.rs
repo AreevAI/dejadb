@@ -732,6 +732,105 @@ fn auto_apply_never_touches_free_text_add() {
     assert_eq!(r.auto_applied, 0, "an ADD-with-text proposal never auto-applies");
 }
 
+/// The exact-equality half of the shape check (§6.3): a near-duplicate
+/// consolidation rewrites an observation body, so it must stay pending even
+/// under a policy grant — while an exact (value-identical) consolidation in
+/// the same run auto-applies. This is the module-doc promise of
+/// `duplicate_sweep`, enforced engine-side.
+#[test]
+fn near_duplicate_consolidation_never_auto_applies() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "enterprise"); // exact (case variant)
+    sub.add_observation("caller", "user asked about pricing tiers refunds billing invoices today");
+    sub.add_observation(
+        "caller",
+        "user asked about pricing tiers refunds billing invoices today please", // near, not exact
+    );
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 1, "only the value-identical consolidation auto-applies");
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    let near = recs
+        .iter()
+        .find(|x| x.summary.template_id == "duplicate.near")
+        .expect("the near-dup consolidation is proposed");
+    assert_eq!(
+        near.status,
+        RecStatus::Pending,
+        "a body-rewriting consolidation waits for a human"
+    );
+}
+
+/// An auto-applied consolidation must keep the fact in its namespace — the
+/// replacement grain carries `namespace`, so ns-scoped recall still finds the
+/// value afterwards.
+#[test]
+fn auto_applied_consolidation_preserves_namespace() {
+    use crate::substrate::{ReadOpts, SubstrateRead};
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "Enterprise");
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 1);
+    let live = sub
+        .inner
+        .grains_of_type("fact", None, ReadOpts { live_only: true, since_ms: None })
+        .unwrap();
+    let acme: Vec<_> = live
+        .iter()
+        .filter(|g| g.fact_subject() == Some("acme"))
+        .collect();
+    assert!(!acme.is_empty());
+    assert!(
+        acme.iter().all(|g| g.namespace == "test"),
+        "no replacement grain escaped to the store default namespace"
+    );
+}
+
+/// An applied tool-failure lesson lands in the namespace of its evidence, so
+/// the ns-scoped recall the agent actually runs can surface it.
+#[test]
+fn applied_lesson_lands_in_evidence_namespace() {
+    let mut sub = TestSubstrate::new();
+    for _ in 0..5 {
+        sub.add_tool_call("stripe_refund", true, "rate_limited 429");
+    }
+    sub.add_tool_call("stripe_refund", false, "ok");
+    let e = Engine::with_builtins();
+    e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
+    let hash = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.analyzer.starts_with("waiser.tool_failure"))
+        .expect("a tool-failure lesson")
+        .hash;
+    let scopes = ScopeSet::all();
+    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "codify", 1_000_100).unwrap();
+    let applied = e
+        .apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "apply", false, 1_000_200)
+        .unwrap();
+    let created = applied.created_hashes.first().expect("the lesson grain");
+    use crate::substrate::SubstrateRead;
+    let grain = sub.inner.grain(created).unwrap().expect("stored");
+    assert_eq!(
+        grain.namespace, "test",
+        "the lesson inherits the evidence tool calls' namespace"
+    );
+}
+
 #[test]
 fn policy_deny_disables_an_analyzer() {
     let mut sub = TestSubstrate::new();
@@ -835,6 +934,77 @@ fn outcome_time_series_holds_when_fix_works() {
             .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
         "no revert when the fix held"
     );
+}
+
+/// Apply a contradiction resolution; return (engine, sub, rec_hash).
+fn apply_resolution(now: i64) -> (Engine, TestSubstrate, String) {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "deploy_target", "us-east-1");
+    sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let e = Engine::with_builtins();
+    e.run(&mut sub.inner, &RunOptions::default(), 1_000_000).unwrap();
+    let hash = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.analyzer.starts_with("waiser.contradiction_sweep"))
+        .expect("a contradiction resolution")
+        .hash;
+    let scopes = ScopeSet::all();
+    e.review(&mut sub.inner, &hash, Decision::Approve, "user:a", ObserverType::Human, &scopes, "latest wins", now).unwrap();
+    e.apply(&mut sub.inner, &hash, "user:a", ObserverType::Human, &scopes, "resolve", false, now).unwrap();
+    (e, sub, hash)
+}
+
+/// The contradiction-recurrence metric: held while the subject keeps one live
+/// value; a NEW conflicting value after apply regresses a later checkpoint and
+/// a revert is proposed — the Verify gate now covers resolutions, not just
+/// tool lessons.
+#[test]
+fn contradiction_outcome_regresses_when_conflict_returns() {
+    let t = 2_000_000;
+    let (e, mut sub, hash) = apply_resolution(t);
+
+    // 1d checkpoint: resolved — one live value → held.
+    e.run(&mut sub.inner, &RunOptions::default(), t + 2 * DAY).unwrap();
+
+    // A new conflicting value arrives after the early checkpoint.
+    sub.add_fact("acme", "deploy_target", "ap-south-1");
+
+    // 7d checkpoint: two live values again → regressed.
+    e.run(&mut sub.inner, &RunOptions::default(), t + 8 * DAY).unwrap();
+
+    let series: Vec<_> = e
+        .outcomes(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.rec_hash == hash)
+        .collect();
+    let verdict_at = |h: i64| series.iter().find(|o| o.horizon_ms == h).map(|o| o.verdict.as_str());
+    assert_eq!(verdict_at(DAY), Some("held"), "one live value at day 1");
+    assert_eq!(verdict_at(7 * DAY), Some("regressed"), "the returned conflict is caught at day 7");
+    assert!(
+        e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
+        "a revert is proposed for the regressed resolution"
+    );
+}
+
+#[test]
+fn contradiction_outcome_holds_when_resolution_sticks() {
+    let t = 2_000_000;
+    let (e, mut sub, hash) = apply_resolution(t);
+    e.run(&mut sub.inner, &RunOptions::default(), t + 31 * DAY).unwrap();
+    let series: Vec<_> = e
+        .outcomes(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.rec_hash == hash)
+        .collect();
+    assert_eq!(series.len(), 3, "all three checkpoints measured");
+    assert!(series.iter().all(|o| o.verdict == "held"), "held throughout");
 }
 
 fn status_of(e: &Engine, sub: &TestSubstrate, hash: &str) -> RecStatus {

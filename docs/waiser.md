@@ -192,7 +192,8 @@ check (PII, a house style rule, a compliance sweep) can *surface* an issue a
 human then reviews, but can never mutate memory. A failure skips that analyzer
 for the run, never the pass. This is also the only custom-analyzer path from
 Python/Node (which can't implement the Rust `Analyzer` trait): `waiser_run(…,
-analyzer_cmd="…")`.
+analyzer_cmd="…")`. A ready-to-run sample (a PII scan, protocol documented
+inline) lives in `examples/analyzers/`.
 
 ## Surfaces
 
@@ -227,13 +228,18 @@ Same methods in both (scalars in, JSON strings out):
 db = dejadb.DejaDB("agent.db", actor="user:alice")
 db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42")
 db.waiser_run(min_new=20, min_new_errors=3, if_stale="6h")   # gated; bare call never gates
+db.waiser_run(full_sweep=True)                 # the `reflect` semantics: whole memory
+db.waiser_run(policy="waiser-policy.json")     # host policy file — the only auto-apply path
 db.recommendations('{"status":"pending"}')
 db.apply_recommendation(hash, because="…")     # audited approve+apply
 db.dismiss_recommendation(hash, "…")           # audited reject
+db.rollback_recommendation(hash, because="…")  # retract what an apply created
+db.waiser_outcomes()                           # the Verify gate's held/regressed record
 ```
 
-Node mirrors these as `recordToolCall`, `waiserRun`, `recommendations`,
-`applyRecommendation`, `dismissRecommendation`, plus the `actor` constructor
+Node mirrors these as `recordToolCall`, `waiserRun` (incl. `fullSweep` /
+`policy`), `recommendations`, `applyRecommendation`, `dismissRecommendation`,
+`rollbackRecommendation`, and `waiserOutcomes`, plus the `actor` constructor
 argument.
 
 ### MCP — two tools
@@ -263,6 +269,13 @@ records a **measured outcome** — `held` or `regressed`:
   does that exact tool failure happen again? Baseline is zero — the fix is
   supposed to stop it. If the failure recurs, the outcome is `regressed` and
   outcome review proposes a **revert**; if it doesn't, the outcome is `held`.
+- A contradiction resolution's metric is **recurrence** too: after resolving
+  to the latest value, does the subject again hold two live values under that
+  functional relation? A returned conflict regresses the checkpoint and
+  proposes a revert for human judgment. (Duplicate consolidation carries no
+  metric yet: a supersession creates a replacement grain, so a live-grain
+  count can't honestly measure it — that needs a supersede-by-existing
+  substrate primitive first.)
 
 Crucially, it re-measures on a **schedule of checkpoints** (1d / 7d / 30d), not
 once — so an outcome that looked fine early can be caught regressing later. A
@@ -305,6 +318,13 @@ The SessionEnd Claude Code hook runs `deja waiser run --min-new 20
 --min-new-errors 3 --quiet`, so most session ends are a watermark check that
 exits immediately. There is no scheduler in the product.
 
+The loop also closes **into** the agent's context: the UserPromptSubmit hook
+`deja recall-hook --with-waiser` appends a compact block of pending
+recommendations (severity + summary, capped at 3, `origin=llm` entries
+labeled) to the memory it injects — so the agent sees its own pending queue
+instead of waiting to be asked. `deja init` and `deja hook claude-code` print
+the flag in their snippets.
+
 ## Auto-apply & the policy file
 
 Auto-apply is **off by default** and is granted **only** by an optional
@@ -326,11 +346,20 @@ host policy file — `deja waiser --policy waiser-policy.json` (or
 A recommendation auto-applies **only if all** hold (proposal §6.3): host
 opt-in + a matching grant, a built-in analyzer (never command/LLM), a
 `memory`/`query` target (never prompt/host), non-destructive, and
-engine-side shape verification (SUPERSEDE-only structural curation — an ADD
-that introduces evidence-derived text, or a FORGET, disqualifies). Anything
-failing stays pending. The policy file rejects unknown keys, so it can never
-arrive pre-armed; it is host config and is never persisted in a memory file.
+engine-side shape verification — the batch must be SUPERSEDE-only **and
+value-identical**: every replacement field is checked against the grain it
+supersedes (case-fold/trim; `namespace` against the grain's own), so only
+consolidation that provably changes no value qualifies. An ADD that
+introduces evidence-derived text, a FORGET, or a near-duplicate consolidation
+that rewrites an observation body all stay pending. Anything failing stays
+pending. The policy file rejects unknown keys, so it can never arrive
+pre-armed; it is host config and is never persisted in a memory file.
 `deja waiser policy` prints the effective policy.
+
+The same policy file attaches to the other run surfaces — `deja ui --policy`
+(console-triggered runs) and `deja serve --mcp --policy` (the `dejadb_waiser`
+tool) — so every surface honors one set of grants, set at process start and
+never controllable by a client.
 
 ## Read-only console (breaking change)
 
@@ -375,6 +404,17 @@ passed to DISCOVER so the model learns this reviewer's taste; the bindings carry
 `model`/`llm_cmd`/`ground_*`/`analyzer_cmd`; a **pluggable grounding backend**
 (`--ground-cmd`), **external command analyzers** (`--analyzer-cmd`), a
 **full-memory sweep** (`deja waiser reflect`), and a **writable console Setup**.
+
+And in the post-merge follow-up pass: the auto-apply **value-identity check**
+(near-duplicate consolidations stay pending, as §6.3 always intended);
+analyzer writes now **carry their namespace** (a consolidation or lesson can
+no longer drift to the store default namespace — the tool-failure lesson lands
+in the dominant namespace of its evidence); a **contradiction-recurrence
+metric** (the Verify gate now measures resolutions, not just tool lessons);
+**`recall-hook --with-waiser`** (pending recommendations ride into the
+injected context); bindings parity (`rollback_recommendation`,
+`waiser_outcomes`, `full_sweep`, `policy`); the **host policy attaches to
+`deja ui` and `deja serve --mcp`**; and an `examples/analyzers/` sample.
 
 Remaining follow-ups (documented, not blockers): the **native OMS `0x0C`
 Recommendation grain** in `dejadb-core` — deliberately deferred, because it

@@ -111,6 +111,36 @@ fn console_api_round_trip() {
     );
 }
 
+/// A host waiser policy attached at server start (`deja ui --policy`) governs
+/// console-triggered runs: the granted structural consolidation auto-applies,
+/// exactly as it would under `deja waiser run --policy`.
+#[test]
+fn console_run_honors_attached_waiser_policy() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("pol.db");
+    let mut m = DejaDB::open(db.to_str().unwrap()).unwrap();
+    // A case-variant exact duplicate (distinct bytes, same normalized value).
+    use dejadb_core::types::{Fact, Grain};
+    m.add(&Fact::new("acme", "tier", "Enterprise").namespace("caller")).unwrap();
+    m.add(&Fact::new("acme", "tier", "enterprise").namespace("caller")).unwrap();
+    let facade = DejaDbFacade::with_session(m, Some("caller".into()), None);
+    let policy = waiser::Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let server = UiServer::new(facade, "pol.db".into())
+        .with_auth("t".to_string())
+        .with_waiser_policy(policy);
+    let listener = UiServer::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || server.serve(listener));
+
+    let post = "POST /api/waiser/run HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    let resp = req(&addr, post);
+    assert!(resp.contains("\"auto_applied\":1"), "{resp}");
+}
+
 /// With `with_auth`, every request needs the token. Browsers authenticate via
 /// the native HTTP Basic prompt (any username, password = token); scripts via
 /// `Authorization: Bearer`. Missing/wrong credentials get a 401 that carries a

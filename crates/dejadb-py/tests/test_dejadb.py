@@ -309,3 +309,69 @@ def test_passphrase_roundtrip_and_wrong_key(tmp_path):
 def test_open_warnings_is_json_list(tmp_path):
     m = make_db(tmp_path)
     assert isinstance(json.loads(m.open_warnings()), list)
+
+
+# --------------------------------------------------------------------------
+# waiser — the governed self-improvement loop
+# --------------------------------------------------------------------------
+
+def test_waiser_loop_rollback_and_outcomes(tmp_path):
+    m = make_db(tmp_path)
+    for _ in range(4):
+        m.record_tool_call("stripe_refund", "rate_limited 429", True)
+    m.record_tool_call("stripe_refund", "ok", False)
+
+    run = json.loads(m.waiser_run())
+    assert run["outcome"] == "ran"
+    assert run["stored"] >= 1
+
+    pending = json.loads(m.recommendations())
+    tf = next(r for r in pending if r["analyzer"].startswith("waiser.tool_failure"))
+    assert "rate_limited" in tf["summary"]
+
+    applied = json.loads(m.apply_recommendation(tf["hash"], "codify the lesson"))
+    assert applied["rollbackable"] is True
+
+    # The Verify gate's record is a JSON list (empty until checkpoints elapse).
+    assert isinstance(json.loads(m.waiser_outcomes()), list)
+
+    rb = json.loads(m.rollback_recommendation(tf["hash"], "the lesson did not help"))
+    assert rb["status"] == "rolled_back"
+
+    # A full-memory sweep (the `deja waiser reflect` semantics) still runs.
+    sweep = json.loads(m.waiser_run(full_sweep=True))
+    assert sweep["outcome"] == "ran"
+
+
+def test_waiser_policy_file_grants_auto_apply(tmp_path):
+    """The bindings honor a host waiser-policy.json (path in, same file the
+    CLI takes) — and only value-identical structural curation auto-applies."""
+    m = make_db(tmp_path)
+    # A case-variant exact duplicate (distinct bytes, same normalized value).
+    m.add_fact("acme", "tier", "Enterprise")
+    m.add_fact("acme", "tier", "enterprise")
+
+    policy = tmp_path / "waiser-policy.json"
+    policy.write_text(json.dumps({
+        "auto_apply_enabled": True,
+        "auto_apply": [
+            {"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}
+        ],
+    }))
+
+    # Without the policy nothing auto-applies.
+    run = json.loads(m.waiser_run())
+    assert run["auto_applied"] == 0
+
+    # The pending consolidation is not re-proposed on a re-run (dedup), so
+    # seed a fresh file to see the grant auto-apply end-to-end.
+    fresh = dejadb.DejaDB(str(tmp_path / "granted.db"), ns="caller")
+    fresh.add_fact("acme", "tier", "Enterprise")
+    fresh.add_fact("acme", "tier", "enterprise")
+    granted = json.loads(fresh.waiser_run(policy=str(policy)))
+    assert granted["auto_applied"] == 1
+
+    bad = tmp_path / "bad-policy.json"
+    bad.write_text('{"auto_apply_enabled": true, "surprise": 1}')
+    with pytest.raises(ValueError):
+        fresh.waiser_run(policy=str(bad))  # unknown keys are rejected

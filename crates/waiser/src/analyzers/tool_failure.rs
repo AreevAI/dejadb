@@ -93,9 +93,11 @@ impl Analyzer for ToolFailureClustering {
 
         let tools = ctx.tools_since(since)?;
 
-        // Per-tool total calls, and per (tool, signature) error clusters.
+        // Per-tool total calls, and per (tool, signature) error clusters —
+        // each member carries its namespace so the lesson can land where the
+        // evidence lives.
         let mut tool_totals: BTreeMap<String, usize> = BTreeMap::new();
-        let mut clusters: BTreeMap<(String, String), Vec<(String, i64)>> = BTreeMap::new();
+        let mut clusters: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
         for e in &tools {
             let Some(tool) = e.tool_name() else {
                 continue;
@@ -106,7 +108,7 @@ impl Analyzer for ToolFailureClustering {
                 clusters
                     .entry((tool.to_string(), sig))
                     .or_default()
-                    .push((e.hash.clone(), e.created_at_ms));
+                    .push((e.hash.clone(), e.namespace.clone()));
             }
         }
 
@@ -132,12 +134,32 @@ impl Analyzer for ToolFailureClustering {
             args.insert("rate".into(), json!(rate_pct));
             args.insert("signature".into(), json!(signature));
 
-            // Proposed lesson: a fact recording the recurring failure.
+            // Proposed lesson: a fact recording the recurring failure. It
+            // lands in the DOMINANT namespace of the evidence tool calls (an
+            // ADD without a namespace would fall to the store default and be
+            // invisible to the ns-scoped recall the agent actually runs);
+            // the `entity:lessons/…` target_ref stays a stable grouping
+            // label, deliberately independent of where the grain lives.
+            let mut ns_counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for (_, ns) in &members {
+                if !ns.is_empty() {
+                    *ns_counts.entry(ns.as_str()).or_default() += 1;
+                }
+            }
+            // Max count; ties break to the lexicographically smallest
+            // namespace — deterministic on any host.
+            let lesson_ns = ns_counts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(ns, _)| ns.to_string());
             let mut lesson = Map::new();
             lesson.insert("subject".into(), json!(tool));
             lesson.insert("relation".into(), json!("fails_with"));
             lesson.insert("object".into(), json!(signature));
             lesson.insert("confidence".into(), json!(rate));
+            if let Some(ns) = &lesson_ns {
+                lesson.insert("namespace".into(), json!(ns));
+            }
 
             let severity = if rate >= 0.7 && count >= 5 {
                 Severity::High
@@ -169,6 +191,8 @@ impl Analyzer for ToolFailureClustering {
                     n: total as u64,
                     window: format!("{}d", ctx.params().get_int("window_days")),
                     subject: Some(tool.clone()),
+                    namespace: None,
+                    relation: None,
                     query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error SINCE <applied_at> | COUNT"),
                     review_after_ms: 86_400_000,
                     // Re-measure at 1 day, 1 week, 1 month — a late recurrence

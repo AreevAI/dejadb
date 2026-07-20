@@ -506,9 +506,13 @@ impl DejaDB {
     }
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an
-    /// evaluator's first call always runs. Returns the run-outcome JSON.
+    /// evaluator's first call always runs. `full_sweep=True` re-analyzes the
+    /// whole memory (the `deja waiser reflect` semantics); `policy` is a path
+    /// to a host `waiser-policy.json` — the only way auto-apply is granted
+    /// from the bindings, same file the CLI takes. Returns the run-outcome
+    /// JSON.
     #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
-    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None, analyzer_cmd = None))]
+    #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None, analyzer_cmd = None, full_sweep = false, policy = None))]
     fn waiser_run(
         &self,
         min_new: Option<u64>,
@@ -519,17 +523,26 @@ impl DejaDB {
         ground_model: Option<String>,
         ground_cmd: Option<String>,
         analyzer_cmd: Option<String>,
+        full_sweep: bool,
+        policy: Option<String>,
     ) -> PyResult<String> {
         let opts = RunOptions {
             min_new,
             min_new_errors,
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
-            full_sweep: false,
+            full_sweep,
         };
         // Optional verified LLM reflection: `model="claude-sonnet"` (key from the
         // env) attaches a built-in HTTP backend; `llm_cmd="..."` a subprocess.
         let mut engine = Engine::with_builtins();
+        // Host policy file (§6.2) — mirrors the CLI's --policy. Host config,
+        // read per call, never persisted in the memory file.
+        if let Some(path) = policy {
+            let s = std::fs::read_to_string(&path)
+                .map_err(|e| err(format!("policy {path}: {e}")))?;
+            engine = engine.with_policy(waiser::Policy::from_json(&s).map_err(err)?);
+        }
         if let Some(cmd) = llm_cmd {
             let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
             engine = engine.with_llm(Box::new(llm));
@@ -608,6 +621,26 @@ impl DejaDB {
             .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
             .map_err(err)?;
         Ok(json!({"hash": hash, "status": "rejected"}).to_string())
+    }
+
+    /// Roll back an applied recommendation (retracts the grains it created).
+    /// Mandatory reason; fails for non-rollbackable applies (FORGET has no
+    /// inverse). Parity with `deja waiser rollback`.
+    fn rollback_recommendation(&self, hash: String, because: String) -> PyResult<String> {
+        let mut sub = BorrowedSubstrate::new(&self.facade);
+        Engine::with_builtins()
+            .rollback(&mut sub, &hash, &self.actor, ObserverType::Human, &ScopeSet::all(), &because, now_ms())
+            .map_err(err)?;
+        Ok(json!({"hash": hash, "status": "rolled_back"}).to_string())
+    }
+
+    /// Measured outcomes of applied recommendations — the Verify gate's
+    /// record (`held` / `regressed` per checkpoint). JSON list, parity with
+    /// `deja waiser outcomes`.
+    fn waiser_outcomes(&self) -> PyResult<String> {
+        let sub = BorrowedSubstrate::new(&self.facade);
+        let outs = Engine::with_builtins().outcomes(&sub).map_err(err)?;
+        serde_json::to_string(&outs).map_err(err)
     }
 }
 

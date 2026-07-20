@@ -10,10 +10,8 @@ installs). See [`docs/waiser.md`](../docs/waiser.md) for the full guide.
 | [`import/`](import/) | A tool-call JSONL sample + walkthrough → Tool grains → tool-failure clustering |
 | [`ci/`](ci/) | A GitHub Actions job that fails the build on pending high-severity recommendations |
 | [`mcp/`](mcp/) | The multi-agent supervisor pattern (separation of duties over MCP) |
-
-Coming with later layers (not yet implemented): `analyzers/` (bring-your-own
-command analyzers, with the `--analyzer-cmd` extension surface) and `llm/`
-(the optional `--llm-cmd` enrichment scripts).
+| [`llm/`](llm/) | Ready-to-run `--llm-cmd` backends (`claude -p`, OpenAI, Ollama, a dependency-free mock) + the stdin/stdout protocol |
+| [`analyzers/`](analyzers/) | A bring-your-own command analyzer (`--analyzer-cmd`, advisory-only) with the probe/analyze protocol |
 
 Every example models **judgment** — approve one recommendation, dismiss one
 with a reason. Never a rubber-stamp loop.

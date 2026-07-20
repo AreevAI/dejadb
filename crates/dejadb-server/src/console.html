@@ -318,13 +318,13 @@
           <button data-w="outcomes" onclick="waiserView('outcomes')">outcomes</button>
           <button data-w="setup" onclick="waiserView('setup')">setup</button>
         </span>
-        <button onclick="waiserRun()">Run analysis</button>
+        <button onclick="waiserRun()" title="deterministic analyzers; auto-apply only per the host policy the server was started with (deja ui --policy); LLM reflection attaches on the CLI">Run analysis</button>
         <span class="spacer"></span>
         <span id="waiserHealth" class="hint"></span>
         <button class="ghost" onclick="loadWaiser()" title="reload">&#8635;</button>
       </div>
       <div class="tablewrap" id="waiserTable"><div class="empty">loading&hellip;</div></div>
-      <p class="hint" style="margin-top:12px">Every recommendation cites its evidence; every apply is audited and (unless it's a <code>FORGET</code>) undoable; the analyzers are deterministic &mdash; no model runs here. A read-only console (no <code>--token-env</code>) can browse the queue but not act.</p>
+      <p class="hint" style="margin-top:12px">Every recommendation cites its evidence; every apply is audited and (unless it's a <code>FORGET</code>) undoable; the analyzers are deterministic &mdash; no model runs here (LLM reflection attaches on the CLI: <code>deja waiser run --model &hellip;</code>). Auto-apply follows the host policy the server was started with (<code>deja ui --policy</code>) and is never grantable from this page. A read-only console (no <code>--token-env</code>) can browse the queue but not act.</p>
     </div>
   </section>
 

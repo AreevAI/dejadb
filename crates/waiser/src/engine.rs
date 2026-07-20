@@ -12,7 +12,7 @@ use crate::cal;
 use crate::config::{AppliedRecord, WaiserPersisted};
 use crate::error::{Error, Result};
 use crate::manifest::{AnalyzerManifest, Capability};
-use crate::model::{ActionKind, GrainRecord, Origin, Severity, TargetRef};
+use crate::model::{normalize_ident, ActionKind, GrainRecord, Origin, Severity, TargetRef};
 use crate::recommendation::{
     dedup_key, AuditRecord, ObserverType, Proposal, RecStatus, Recommendation, Summary,
     MAX_BECAUSE, MAX_EVIDENCE,
@@ -401,7 +401,7 @@ impl Engine {
             persisted.audit_heads.insert(hash.clone(), audit_hash);
             stored += 1;
 
-            if self.can_auto_apply(&rec) {
+            if self.can_auto_apply(&*sub, &rec) {
                 self.auto_apply(sub, &mut persisted, &rec, now_ms)?;
                 auto_applied += 1;
             }
@@ -737,10 +737,13 @@ impl Engine {
 
     /// Evaluate the auto-apply gate (§6.3) — ALL preconditions must hold:
     /// host opt-in + policy grant, builtin origin, memory/query target,
-    /// non-destructive, and engine-side shape verification (SUPERSEDE-only
-    /// structural curation — never an ADD that introduces evidence-derived
-    /// text). A default (closed) policy never grants, so nothing auto-applies.
-    fn can_auto_apply(&self, rec: &Recommendation) -> bool {
+    /// non-destructive, and engine-side shape verification: SUPERSEDE-only
+    /// structural curation (never an ADD that introduces evidence-derived
+    /// text) whose every replacement is **value-identical** to the grain it
+    /// supersedes (the exact-equality check — a near-duplicate consolidation
+    /// stays pending). A default (closed) policy never grants, so nothing
+    /// auto-applies.
+    fn can_auto_apply<S: OmsSubstrate>(&self, sub: &S, rec: &Recommendation) -> bool {
         if !rec.origin.auto_apply_eligible() || rec.destructive {
             return false;
         }
@@ -763,15 +766,16 @@ impl Engine {
         if !self.policy.grants_auto_apply(family, target.target_class(), rec.severity) {
             return false;
         }
-        // Shape verification: only a CAL batch of pure SUPERSEDE statements is
-        // structural curation. An ADD (introducing content) or FORGET
-        // (destructive) disqualifies.
+        // Shape verification: only a CAL batch of pure SUPERSEDE statements
+        // whose replacements change no value is structural curation. An ADD
+        // (introducing content), a FORGET (destructive), or a supersession
+        // that alters any field disqualifies.
         match &rec.proposal {
             Proposal::Cal { cal } => cal
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
-                .all(|l| l.len() >= 9 && l[..9].eq_ignore_ascii_case("SUPERSEDE")),
+                .all(|l| supersede_is_value_identical(sub, l)),
             _ => false,
         }
     }
@@ -1311,11 +1315,86 @@ fn measure_metric<S: SubstrateRead>(
                 .count();
             Ok(Some(n as f64))
         }
+        // After a resolve-to-latest, does the subject again hold more than one
+        // live value under the functional relation? Live-state read (no since
+        // filter): the excess beyond one distinct object is the regression.
+        "contradiction_recurrence" => {
+            let (Some(subject), Some(relation)) = (&metric.subject, &metric.relation) else {
+                return Ok(None);
+            };
+            let facts = scoped_live_facts(sub, metric.namespace.as_deref(), subject)?;
+            let distinct: BTreeSet<String> = facts
+                .iter()
+                .filter(|f| {
+                    f.fact_relation()
+                        .is_some_and(|r| normalize_ident(r) == *relation)
+                })
+                .filter_map(|f| f.fact_object().map(normalize_ident))
+                .collect();
+            Ok(Some(distinct.len().saturating_sub(1) as f64))
+        }
         _ => Ok(None),
     }
 }
 
+/// Live facts for one normalized (namespace?, subject) — the shared scope of
+/// the fact-shaped recurrence metrics. `namespace: None` spans all namespaces.
+fn scoped_live_facts<S: SubstrateRead>(
+    sub: &S,
+    namespace: Option<&str>,
+    subject: &str,
+) -> Result<Vec<GrainRecord>> {
+    let facts = sub.grains_of_type(
+        crate::model::grain_type::FACT,
+        None,
+        ReadOpts { live_only: true, since_ms: None },
+    )?;
+    Ok(facts
+        .into_iter()
+        .filter(|f| namespace.is_none_or(|ns| normalize_ident(&f.namespace) == ns))
+        .filter(|f| {
+            f.fact_subject()
+                .is_some_and(|s| normalize_ident(s) == subject)
+        })
+        .collect())
+}
+
 // --- free helpers ---
+
+/// The §6.3 exact-equality check: a SUPERSEDE is *value-identical* when every
+/// replacement field equals the superseded grain's value — strings after
+/// case-fold/trim (upstream NFC is an OMS invariant), `namespace` against the
+/// grain's own namespace, everything else exactly. This is what makes an
+/// auto-applied consolidation provably information-preserving; a
+/// near-duplicate (an observation body off by one token) fails it and stays
+/// pending for human review. Fails closed: an unrecognized line shape, an
+/// empty replacement, a missing grain, or a field the original never had all
+/// disqualify.
+fn supersede_is_value_identical<S: SubstrateRead>(sub: &S, line: &str) -> bool {
+    let Some((target, _gtype, fields)) = crate::cal::parse_own_supersede(line) else {
+        return false;
+    };
+    if fields.is_empty() {
+        return false;
+    }
+    let Ok(Some(grain)) = sub.grain(&target) else {
+        return false;
+    };
+    fields.iter().all(|(k, v)| {
+        if k == "namespace" {
+            return v
+                .as_str()
+                .is_some_and(|s| normalize_ident(s) == normalize_ident(&grain.namespace));
+        }
+        match (v, grain.fields.get(k)) {
+            (Value::String(a), Some(Value::String(b))) => {
+                normalize_ident(a) == normalize_ident(b)
+            }
+            (a, Some(b)) => a == b,
+            (_, None) => false,
+        }
+    })
+}
 
 /// The confidence floor (§5.4): a verified draft below this is dropped. The
 /// verifier's calibrated confidence is the gate, not the proposer's self-report.

@@ -29,6 +29,25 @@ pub fn batch(statements: &[String]) -> String {
     statements.join("\n")
 }
 
+/// Round-trip a line this module's own [`supersede`] emitted back into
+/// `(target_hash, grain_type, fields)`. This is a strict inverse of the
+/// writer's own output — **not** a CAL parser (any other shape returns
+/// `None`; the substrate's grammar stays authoritative). The auto-apply gate
+/// uses it to value-verify a replacement against the grain it supersedes.
+pub fn parse_own_supersede(
+    line: &str,
+) -> Option<(String, String, Map<String, Value>)> {
+    let rest = line.trim().strip_prefix("SUPERSEDE ")?;
+    let (target, after) = rest.split_once(" WITH ")?;
+    let (grain_type, json) = after.trim().split_once(' ')?;
+    match serde_json::from_str(json.trim()).ok()? {
+        Value::Object(fields) => {
+            Some((target.trim().to_string(), grain_type.to_string(), fields))
+        }
+        _ => None,
+    }
+}
+
 /// Cheap engine-side destructive check (defense in depth; the substrate's
 /// `validate_cal` is authoritative). True if any statement is a FORGET.
 pub fn contains_forget(cal: &str) -> bool {
@@ -56,5 +75,25 @@ mod tests {
         f.insert("subject".into(), json!("acme"));
         assert!(add("fact", &f).starts_with("ADD fact {"));
         assert!(supersede("sha256:x", "fact", &f).starts_with("SUPERSEDE sha256:x WITH fact {"));
+    }
+
+    #[test]
+    fn parse_own_supersede_round_trips_the_writer() {
+        let mut f = Map::new();
+        f.insert("subject".into(), json!("acme"));
+        f.insert("object".into(), json!("Enterprise"));
+        let line = supersede("sha256:abc", "fact", &f);
+        let (target, gtype, fields) = parse_own_supersede(&line).expect("round-trip");
+        assert_eq!(target, "sha256:abc");
+        assert_eq!(gtype, "fact");
+        assert_eq!(fields, f);
+    }
+
+    #[test]
+    fn parse_own_supersede_rejects_other_shapes() {
+        assert!(parse_own_supersede("ADD fact {}").is_none());
+        assert!(parse_own_supersede("SUPERSEDE x WITH fact").is_none(), "no json");
+        assert!(parse_own_supersede("SUPERSEDE x WITH fact []").is_none(), "non-object json");
+        assert!(parse_own_supersede("FORGET x").is_none());
     }
 }

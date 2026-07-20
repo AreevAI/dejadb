@@ -2,7 +2,7 @@
 /* eslint-disable */
 /** One memory = one file. Open with `new DejaDb("caller.db", "caller")`. */
 export declare class DejaDb {
-  constructor(path: string, ns?: string | undefined | null, passphrase?: string | undefined | null, actor?: string | undefined | null)
+  constructor(path: string, ns?: string | undefined | null, passphrase?: string | undefined | null, actor?: string | undefined | null, telemetry?: string | undefined | null)
   /**
    * Reconciliation warnings from open (file-vs-host declaration changes,
    * embedding-model mismatches). JSON list string.
@@ -85,8 +85,13 @@ export declare class DejaDb {
   verify(): string
   /** Record a tool call as a Tool grain — the flagship analyzer's food. */
   recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null): string
-  /** Run one analysis pass. Bare it never gates. Returns run-outcome JSON. */
-  waiserRun(minNew?: number | undefined | null, minNewErrors?: number | undefined | null, ifStale?: string | undefined | null): string
+  /**
+   * Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
+   * the whole memory (`deja waiser reflect` semantics); `policy` is a path
+   * to a host `waiser-policy.json` — the only way auto-apply is granted
+   * from the bindings. Returns run-outcome JSON.
+   */
+  waiserRun(minNew?: number | undefined | null, minNewErrors?: number | undefined | null, ifStale?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, analyzerCmd?: string | undefined | null, fullSweep?: boolean | undefined | null, policy?: string | undefined | null): string
   /**
    * List recommendations. `filter` is optional JSON, e.g. `{"status":
    * "pending"}`; `{"status":"all"}` clears the filter. JSON list.
@@ -99,4 +104,16 @@ export declare class DejaDb {
   applyRecommendation(hash: string, because: string, allowDestructive?: boolean | undefined | null): string
   /** Reject a recommendation with a reason (library-friendly `reject`). */
   dismissRecommendation(hash: string, why: string): string
+  /**
+   * Roll back an applied recommendation (retracts the grains it created).
+   * Mandatory reason; fails for non-rollbackable applies (FORGET has no
+   * inverse). Parity with `deja waiser rollback`.
+   */
+  rollbackRecommendation(hash: string, because: string): string
+  /**
+   * Measured outcomes of applied recommendations — the Verify gate's
+   * record (`held` / `regressed` per checkpoint). JSON list, parity with
+   * `deja waiser outcomes`.
+   */
+  waiserOutcomes(): string
 }

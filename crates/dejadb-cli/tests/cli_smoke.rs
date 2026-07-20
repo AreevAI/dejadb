@@ -155,6 +155,48 @@ fn capture_stop_keeps_tool_outcomes() {
     assert!(text.contains("shared tempdir race"), "tool output body missing: {text}");
 }
 
+/// `recall-hook --with-waiser` closes the loop: pending recommendations ride
+/// into the injected context (compact, capped) instead of waiting to be
+/// polled; without the flag the hook stays memory-only.
+#[test]
+fn recall_hook_with_waiser_injects_pending_queue() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("w.db");
+    let db = db.to_str().unwrap();
+
+    let (ok, _, err) = deja(&["init", "--db", db, "--ns", "caller", "--template", "demo"]);
+    assert!(ok, "init demo failed: {err}");
+    let (ok, _, err) = deja(&["waiser", "run", "--db", db, "--ns", "caller"]);
+    assert!(ok, "waiser run failed: {err}");
+
+    let hook = serde_json::json!({ "prompt": "what do we know about acme" }).to_string();
+    let run_hook = |extra: &[&str]| {
+        let mut args = vec!["recall-hook", "--db", db, "--ns", "caller"];
+        args.extend_from_slice(extra);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn recall-hook");
+        child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "recall-hook failed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let with = run_hook(&["--with-waiser"]);
+    assert!(with.contains("pending recommendation"), "waiser block missing: {with}");
+    assert!(with.contains("deja waiser list"), "review pointer missing: {with}");
+
+    let without = run_hook(&[]);
+    assert!(
+        !without.contains("pending recommendation"),
+        "flagless hook must stay memory-only: {without}"
+    );
+}
+
 #[test]
 fn cli_positional_and_env_db() {
     let dir = TempDir::new().unwrap();

@@ -465,7 +465,7 @@ each exchange (with tool outcomes) when a turn ends:
   "hooks": {{
     "UserPromptSubmit": [{{ "hooks": [{{
       "type": "command",
-      "command": "{exe} recall-hook --db {db} --ns {ns}"
+      "command": "{exe} recall-hook --db {db} --ns {ns} --with-waiser"
     }}] }}],
     "Stop": [{{ "hooks": [{{
       "type": "command",
@@ -917,6 +917,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 server = server.lock_namespace(lock.clone());
                 eprintln!("deja: namespace locked to '{lock}' (per-call namespace ignored)");
             }
+            // Host waiser policy (--policy FILE or $WAISER_POLICY): the
+            // dejadb_waiser tool honors the same grants as the CLI run. Host
+            // config set at process start — never controllable by the client.
+            if let Some(p) = load_policy(&flags)? {
+                server = server.with_waiser_policy(p);
+                eprintln!("deja: waiser host policy attached to dejadb_waiser");
+            }
             server.serve_stdio().map_err(|e| e.to_string())?;
         }
         "capture-stop" => {
@@ -979,39 +986,75 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 return Ok(());
             }
             let k: usize = flag(&flags, "k").and_then(|v| v.parse().ok()).unwrap_or(5);
+            // --with-waiser additionally injects the pending recommendation
+            // queue (a compact, capped block) so the loop closes into the
+            // agent's context instead of waiting to be polled.
+            let with_waiser = flag(&flags, "with-waiser").is_some();
             let grains = m
                 .recall_hybrid(&ns, None, None, Some(&query), k, None)
                 .map_err(|e| e.to_string())?;
-            if grains.is_empty() {
+            if grains.is_empty() && !with_waiser {
                 return Ok(());
             }
-            use dejadb_context::{ContextAssembler, FormatPolicy};
-            let mut policy = FormatPolicy::claude();
-            policy.token_budget =
-                Some(flag(&flags, "budget").and_then(|v| v.parse().ok()).unwrap_or(400));
-            let hits: Vec<dejadb_cal::store_types::SearchHit> = grains
-                .into_iter()
-                .map(|grain| {
-                    let hash = grain.hash;
-                    dejadb_cal::store_types::SearchHit {
-                        grain,
-                        score: 1.0,
-                        hash,
-                        score_breakdown: None,
-                        explanation: None,
-                        scope_depth: None,
-                        source_namespace: None,
-                        relative_time: None,
-                        conflict_status: None,
-                        supersession_status: None,
-                        superseded_by_hash: None,
-                        recall_source: None,
+            if !grains.is_empty() {
+                use dejadb_context::{ContextAssembler, FormatPolicy};
+                let mut policy = FormatPolicy::claude();
+                policy.token_budget =
+                    Some(flag(&flags, "budget").and_then(|v| v.parse().ok()).unwrap_or(400));
+                let hits: Vec<dejadb_cal::store_types::SearchHit> = grains
+                    .into_iter()
+                    .map(|grain| {
+                        let hash = grain.hash;
+                        dejadb_cal::store_types::SearchHit {
+                            grain,
+                            score: 1.0,
+                            hash,
+                            score_breakdown: None,
+                            explanation: None,
+                            scope_depth: None,
+                            source_namespace: None,
+                            relative_time: None,
+                            conflict_status: None,
+                            supersession_status: None,
+                            superseded_by_hash: None,
+                            recall_source: None,
+                        }
+                    })
+                    .collect();
+                let ctx = ContextAssembler::new().format(&hits, &policy);
+                if !ctx.text.trim().is_empty() {
+                    println!("Relevant memory from DejaDB:\n{}", ctx.text);
+                }
+            }
+            if with_waiser {
+                // Read-only listing over the same store handle (single writer
+                // per file — never a second open). Engine-templated summaries;
+                // origin=llm entries are labeled. Capped so a long queue can't
+                // flood the prompt; the console/CLI remain the review surface.
+                let sub = DejaDbSubstrate::new(m, Some(ns.to_string()));
+                let engine = Engine::with_builtins();
+                let mut pending = engine
+                    .recommendations(&sub, Some(RecStatus::Pending))
+                    .map_err(|e| e.to_string())?;
+                if !pending.is_empty() {
+                    pending.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.hash.cmp(&b.hash)));
+                    const CAP: usize = 3;
+                    println!(
+                        "\nWaiser: {} pending recommendation(s) for this memory (review with `deja waiser list`, act with approve/apply/reject --because):",
+                        pending.len()
+                    );
+                    for r in pending.iter().take(CAP) {
+                        let origin = match r.origin {
+                            waiser::Origin::Llm { .. } => " [llm]",
+                            waiser::Origin::Command { .. } => " [external]",
+                            _ => "",
+                        };
+                        println!("  [{}] {}{}  {}", r.severity.as_str(), short(&r.hash), origin, r.summary.render());
                     }
-                })
-                .collect();
-            let ctx = ContextAssembler::new().format(&hits, &policy);
-            if !ctx.text.trim().is_empty() {
-                println!("Relevant memory from DejaDB:\n{}", ctx.text);
+                    if pending.len() > CAP {
+                        println!("  … and {} more", pending.len() - CAP);
+                    }
+                }
             }
         }
         "remember" => {
@@ -1174,6 +1217,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 );
             } else {
                 eprintln!("deja: console is UNAUTHENTICATED (enable with --token-env <VAR>)");
+            }
+            // Host waiser policy (--policy FILE or $WAISER_POLICY): a
+            // console-triggered waiser run honors the same grants as the CLI
+            // run. Never grantable from the console itself.
+            if let Some(p) = load_policy(&flags)? {
+                server = server.with_waiser_policy(p);
+                eprintln!("deja: waiser host policy attached to the console's waiser routes");
             }
             let listener = dejadb_server::UiServer::bind(&addr).map_err(|e| e.to_string())?;
             if !addr_is_loopback(&addr) {
@@ -1689,7 +1739,7 @@ fn run_init(
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "deja".to_string());
     eprintln!("\nClaude Code hooks (paste into settings.json — absolute path baked in):");
-    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns}");
+    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns} --with-waiser");
     eprintln!("  Stop             → {exe} capture-stop --ns {ns}");
     eprintln!("  SessionEnd       → {exe} waiser run --min-new 20 --min-new-errors 3 --quiet --ns {ns}");
     Ok(())
