@@ -10,7 +10,7 @@ use crate::cal;
 use crate::error::Result;
 use crate::manifest::*;
 use crate::model::{normalize_ident, ActionKind, GrainRecord, Severity};
-use crate::recommendation::{Proposal, RecDraft, Summary};
+use crate::recommendation::{MetricSnapshot, Proposal, RecDraft, Summary};
 use serde_json::{json, Map};
 use std::collections::BTreeMap;
 
@@ -125,6 +125,12 @@ impl Analyzer for ContradictionSweep {
                 json!(latest.fact_relation().unwrap_or("")),
             );
             latest_fields.insert("object".into(), json!(latest.fact_object().unwrap_or("")));
+            // The resolution supersedes older values with a NEW grain built
+            // from these fields — carry the namespace or the winning value
+            // would migrate to the store default namespace.
+            if !latest.namespace.is_empty() {
+                latest_fields.insert("namespace".into(), json!(latest.namespace));
+            }
 
             let mut statements = Vec::new();
             for older in &members[..members.len() - 1] {
@@ -147,7 +153,27 @@ impl Analyzer for ContradictionSweep {
                     },
                 )
                 .severity(Severity::Medium)
-                .evidence(evidence),
+                .evidence(evidence)
+                .metric(MetricSnapshot {
+                    // After resolving to the latest value, does the subject
+                    // again hold ≥2 live values under this functional
+                    // relation? Baseline 0 = one live value; any excess at a
+                    // checkpoint is a regression → outcome review proposes a
+                    // revert for human judgment.
+                    metric: "contradiction_recurrence".into(),
+                    baseline: 0.0,
+                    unit: "count".into(),
+                    n: members.len() as u64,
+                    window: "live".into(),
+                    subject: Some(subject.clone()),
+                    namespace: (!ns.is_empty()).then(|| ns.clone()),
+                    relation: Some(relation.clone()),
+                    query: format!(
+                        "RECALL facts WHERE subject = \"{subject}\" AND relation = \"{relation}\" | COUNT DISTINCT object > 1"
+                    ),
+                    review_after_ms: 86_400_000,
+                    horizons_ms: vec![86_400_000, 7 * 86_400_000, 30 * 86_400_000],
+                }),
             );
         }
         drafts.sort_by(|a, b| a.target_ref.cmp(&b.target_ref));

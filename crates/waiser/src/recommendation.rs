@@ -130,6 +130,16 @@ pub struct MetricSnapshot {
     /// engine's typed re-measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Namespace scope for the re-measurement, normalized (case-fold/trim).
+    /// `None` = all namespaces. Additive: older snapshots deserialize to
+    /// `None` and existing metric kinds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Relation scope for fact-shaped metrics (e.g. which functional relation
+    /// a contradiction was resolved under), normalized. Additive like
+    /// `namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
     /// CAL that recomputes the metric at verify time (reproducibility /
     /// documentation; the engine re-measures with typed reads).
     pub query: String,
