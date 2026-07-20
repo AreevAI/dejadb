@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`deja recall-hook --with-waiser`** — the UserPromptSubmit hook now closes
+  the loop *into* the agent's context: after the memory block it appends a
+  compact pending-recommendation queue (severity + summary, capped at 3,
+  `origin=llm`/external entries labeled). `deja init` and `deja hook
+  claude-code` print the flag in their snippets. Flagless behavior unchanged.
+- **Contradiction-recurrence metric** — an applied contradiction resolution is
+  now re-measured at the 1d/7d/30d checkpoints (does the subject again hold
+  two live values under the functional relation?); a returned conflict
+  regresses and proposes a revert. `MetricSnapshot` gains optional
+  `namespace`/`relation` fields (additive; older snapshots unaffected).
+  Duplicate consolidation deliberately carries no metric yet: a supersession
+  creates a replacement grain, so a live-grain count can't honestly measure it
+  (needs a supersede-by-existing primitive).
+- **Waiser bindings parity** — Python/Node gain `rollback_recommendation`,
+  `waiser_outcomes`, and `waiser_run(full_sweep=…, policy=…)`: the full-memory
+  `reflect` semantics and the host policy file (the only auto-apply path) are
+  now reachable from the bindings.
+- **Host policy on every run surface** — `deja ui --policy` and
+  `deja serve --mcp --policy` (or `$WAISER_POLICY`) attach the same
+  `waiser-policy.json` the CLI takes, so console- and MCP-triggered runs honor
+  one set of grants; never controllable by a client. The console's Waiser tab
+  states it; the `dejadb_waiser` tool description no longer implies the CLI
+  and MCP engines are identical (LLM reflection remains CLI-only).
+- **`examples/analyzers/`** — a ready-to-run external command analyzer (a PII
+  scan in dependency-free Python) with the probe/analyze protocol documented
+  inline; validated live against the demo corpus.
+- **`waiser_reflection` results table in RESULTS.md** — the Effective-
+  Reliability machinery numbers (verifier lifts ER +0.00 → +1.00 on the
+  reference corpus) are now recorded alongside the analyzer-precision table.
+
 - **Waiser recall-telemetry sidecar (§8).** A disposable, never-syncing
   `<file>.telemetry.db` records what recall actually surfaced — grain access,
   query outcomes, assembly-budget pressure — so Waiser can see memory *utility*,
@@ -85,6 +115,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to the file's waiser config (`POST /api/waiser/config`, Admin-gated like every
   write). `GET /api/waiser/analyzers` now returns effective settings + trust
   class. Auto-apply is still only grantable via a host policy file, never the UI.
+
+### Fixed
+
+- **Auto-apply now enforces the exact-equality shape check** duplicate_sweep's
+  docs promised: a granted consolidation auto-applies only when every
+  SUPERSEDE replacement is value-identical (case-fold; `namespace` against the
+  grain's own) to the grain it supersedes. Previously a near-duplicate
+  *observation* consolidation (Jaccard ≥ 0.9 — a body rewrite) could
+  auto-apply under a `duplicate_sweep` grant; it now always stays pending for
+  human review.
+- **Analyzer writes carry their namespace.** The consolidation/resolution
+  replacement grains and the tool-failure lesson previously omitted
+  `namespace`, so applying them moved the surviving value to the store default
+  namespace — invisible to the ns-scoped recall the agent actually runs. The
+  duplicate/contradiction replacements now inherit the original grain's
+  namespace, and the lesson lands in the dominant namespace of its evidence
+  tool calls.
+- `crates/dejadb-bench/RESULTS.md` no longer claims `budget_pressure` is
+  default-off (it has been default-on since its ASSEMBLE datasource was
+  wired), and `examples/README.md` no longer lists the shipped `llm/`
+  directory as unimplemented.
 
 ## [1.0.1] - 2026-07-15
 

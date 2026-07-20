@@ -3,7 +3,8 @@
 > English · [中文](README.zh-CN.md)
 
 **The embedded memory engine for AI agents** — memory that doesn't rot, stays
-current, and proves where every fact came from.
+current, and proves where every fact came from — plus **Waiser**, the built-in
+loop that improves it: governed, evidence-cited, undoable, measured.
 
 [![CI](https://github.com/AreevAI/dejadb/actions/workflows/ci.yml/badge.svg)](https://github.com/AreevAI/dejadb/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -55,7 +56,15 @@ embed**, built so memory *can't* rot silently.
   to the experience that taught them, replay-idempotent sync, and
   point-in-time rollback of the memory file make the loop auditable and
   reversible:
-  [build an agent that learns](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn).
+  [build an agent that learns](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn--by-hand).
+- **Self-improvement with governance — [Waiser](#waiser--governed-self-improvement-built-in),
+  built in**: eleven deterministic analyzers turn the agent's own history into
+  recommendations — *"this tool failed 71% of its calls"*, *"these two facts
+  contradict"* — each citing the grains it was computed from, gated
+  propose → review → apply → verify, undoable, and re-measured after apply.
+  Zero model calls required; attach an LLM and its findings are grounded
+  against the evidence and independently verified before a human ever sees
+  them.
 - **CAL-native**: `RECALL` / `ASSEMBLE` / `EXISTS` / `HISTORY` / `ADD` /
   `SUPERSEDE` — a query language with no bulk destruction: `DELETE` and `DROP`
   are not tokens in the grammar, and the one destructive statement —
@@ -182,14 +191,14 @@ point-in-time restore (checkpoint first — the recipe shows the flow). Even a
 *paraphrased* re-learning is caught: `deja novelty` reports the nearest existing
 lesson so the harness supersedes it instead of adding a near-duplicate
 (advise-only — it never drops a write itself). Full loop:
-[cookbook §10](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn).
+[cookbook §10](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn--by-hand).
 
-### Waiser — governed self-improvement (deterministic, no LLM)
+### Waiser — governed self-improvement, built in
 
 The section above is the loop *by hand*. **Waiser** governs it: it turns your
 agent's history into recommendations — evidence-cited, reviewable, undoable,
-measured — with **zero model calls**. The fastest way to see it needs no
-agent and no waiting:
+measured — starting with **zero model calls**. The fastest way to see it needs
+no agent and no waiting:
 
 ```python
 import dejadb, json
@@ -202,13 +211,48 @@ for r in json.loads(db.recommendations('{"status":"pending"}')): print(r["severi
 db.apply_recommendation(<hash>, because="retries belong in the client")   # audited, undoable
 ```
 
-Or from a fresh install: `deja init --db demo.db --template demo` seeds a
-corpus, `deja waiser run` proposes across analyzers, and `deja ui` shows the
-governed queue. Six deterministic analyzers (tool-failure clustering,
-duplicate/contradiction/staleness sweeps, fork surfacing, outcome review),
-four gates (propose → review → apply → verify), a mandatory reason on every
-decision, and an undo for every apply. Auto-apply is off unless a host policy
-file grants it. Full guide: [docs/waiser.md](docs/waiser.md).
+What that buys you:
+
+- **Your agent stops repeating what fails.** Eleven deterministic analyzers
+  (ten default-on) cluster recurring tool failures into lessons, catch
+  duplicate and contradictory facts, flag stale grains, and surface forks —
+  computed over typed grains, never raw prose. With the recall-telemetry
+  sidecar on, three of them see memory *utility*, not just hygiene: facts
+  never recalled (`cold_grains`), questions that keep coming back empty
+  (`coverage_gap`), context budgets overflowing (`budget_pressure`).
+  Precision is measured, not asserted: 1.00 on the labeled fixture,
+  CI-gated at 0.90 (`cargo run -p dejadb-bench --bin waiser_precision`).
+- **Nothing changes behind your back.** Four gates — propose → review →
+  apply → verify — with separation of duties, a **mandatory reason** on every
+  decision, a hash-chained audit grain per transition, and a stored inverse
+  for every apply. Auto-apply is off unless a host policy file explicitly
+  grants it, and never for destructive or LLM-originated changes.
+- **It proves whether its own advice worked.** A recommendation that carries
+  a metric is re-measured after you apply it — at 1d / 7d / 30d checkpoints,
+  against what actually happened (did that tool failure recur?); a late
+  regression proposes a revert. `deja waiser outcomes` is the receipt.
+- **Add an LLM for what determinism can't see — verified, never trusted.**
+  `deja waiser run --model claude-sonnet` (or `openai:gpt-5`,
+  `ollama:llama3.1`, any OpenAI-compatible endpoint, or `--llm-cmd 'CMD'`)
+  lets a model discover cross-fact issues like a semantic contradiction — but
+  every draft must ground against the cited grains and survive an
+  **independent verifier** (the proposer never grades itself) before it
+  reaches the queue, and `origin = llm` can never auto-apply. "Nothing to
+  report" is a first-class answer, so it doesn't invent findings to look busy.
+- **It runs where you already run things — no daemon.** A cheap, idempotent
+  command with watermark gates (`--min-new`, `--if-stale`): a Claude Code
+  `SessionEnd` hook, cron, CI (`deja waiser list --fail-on high` exits 2 —
+  a build gate), or the `dejadb_waiser` MCP tool. And the loop closes *into*
+  the agent: `deja recall-hook --with-waiser` rides the pending queue into
+  the context Claude Code injects, so the agent sees its own recommendations
+  without polling. The console (`deja ui`) shows the queue, recall sessions,
+  and measured outcomes.
+
+From a fresh install: `deja init --db demo.db --template demo` seeds a demo
+corpus, `deja waiser run` proposes across analyzers (`deja waiser reflect`
+sweeps the whole memory), and the Waiser tab in `deja ui` is the governed
+review queue. Full guide: [docs/waiser.md](docs/waiser.md) · why the LLM layer
+is verified, never trusted: [docs/waiser-reflection.md](docs/waiser-reflection.md).
 
 ### Rust
 
@@ -344,6 +388,7 @@ embedding it.
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | How DejaDB works: grains, `.mg` format, CAL, recall, sync |
 | [`docs/waiser.md`](docs/waiser.md) | Waiser — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
+| [`docs/waiser-reflection.md`](docs/waiser-reflection.md) | The reflection engine — how LLM proposals are grounded, verified, and measured |
 | [`docs/cal-reference.md`](docs/cal-reference.md) | The CAL query language reference |
 | [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 8 tools |
 | [`docs/migrate.md`](docs/migrate.md) | Importing from mem0, Zep, Letta, LangMem, Basic Memory, JSONL |
@@ -374,8 +419,11 @@ local machine, and report vulnerabilities per our [security policy](SECURITY.md)
 | `dejadb-store` | Turso-backed store: dictionary-encoded triples, hybrid recall, heads/forks, blobs (CAS), bundles/streaming, memory-tool adapter |
 | `dejadb-cal` | CAL lexer/parser/executor, multi-source ASSEMBLE, saved queries, `DejaDbFacade` (+ read-only mounts) |
 | `dejadb-context` | Budget-aware provider-optimal rendering (SML/TOON/Markdown/JSON) |
-| `dejadb-mcp` | Stdio MCP server (`dejadb_recall/add/supersede/forget/remember/cal`) |
-| `dejadb-server` | Local web console (memories / graph / query, light + dark, read-only `/api/config`) + dejad hub mode (segment push/pull, bearer auth) |
+| `waiser` | The self-improvement engine — substrate-agnostic: analyzers, four gates, recommendation lifecycle, LLM verifier (no DejaDB deps) |
+| `dejadb-waiser` | DejaDB substrate adapter for Waiser + the recall-telemetry sidecar |
+| `dejadb-llm` | Out-of-box LLM backends for Waiser reflection (OpenAI-compatible / Anthropic / Ollama) |
+| `dejadb-mcp` | Stdio MCP server (`dejadb_recall/add/supersede/forget/remember/cal` + `dejadb_waiser/recommendations`) |
+| `dejadb-server` | Local web console (memories / graph / query / Waiser queue / sessions, light + dark) + dejad hub mode (segment push/pull, bearer auth) |
 | `dejadb` | The `deja` binary |
 | `dejadb-py` | Python bindings (`import dejadb`) |
 | `dejadb-js` | Node bindings (napi-rs native addon, `require('dejadb')`) |

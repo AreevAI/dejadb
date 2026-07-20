@@ -256,11 +256,12 @@ regressions in CI.
 | waiser.staleness | 6 | 6 | 0 | 1.00 | 1.00 |
 | waiser.tool_failure | 6 | 6 | 0 | 1.00 | 1.00 |
 
-(`waiser.goal_stagnation` and `waiser.budget_pressure` are default-**off** —
-"stalled" is ambiguous, and budget pressure awaits its ASSEMBLE datasource — so
-they don't appear in the default-on bench; both are unit-tested separately. The
-two telemetry-fed fixtures, `cold_grains` and `coverage_gap`, run over an
-injected telemetry snapshot in the same harness.)
+(`waiser.goal_stagnation` is default-**off** — "stalled" is ambiguous — and
+`waiser.budget_pressure`, default-on since its ASSEMBLE overflow datasource was
+wired, is a single global signal; neither appears in this per-finding fixture,
+and both are unit-tested separately. The two telemetry-fed fixtures,
+`cold_grains` and `coverage_gap`, run over an injected telemetry snapshot in
+the same harness.)
 
 This is a **synthetic floor**, not a field number: it proves the analyzers
 don't fire on obvious look-alikes and catch obvious positives. Real-world
@@ -268,3 +269,28 @@ precision needs a real telemetry + labels corpus (fork_surfacing and
 outcome_review need concurrent heads / applied history and are exercised by
 the crate tests, not this fixture). All seven fixture analyzers clear the
 0.90 default-on bar.
+
+## Waiser reflection — Effective Reliability (verifier machinery)
+
+`cargo run --release -p dejadb-bench --bin waiser_reflection`
+
+Scores the LLM reflection pipeline on a reference corpus of planted positives
+(real hidden issues DISCOVER should surface) and decoys (superficially similar
+but legitimate), with a deterministic mock backend so the run is reproducible
+in CI. **Effective Reliability = (useful-correct − wrong) / positives** —
+it subtracts for confident-wrong, so over-generation lowers it, unlike raw
+precision.
+
+| pipeline | surfaced | useful | wrong | ER | precision | recall | spurious |
+|---|---|---|---|---|---|---|---|
+| no verifier (accept grounded) | 6 | 3 | 3 | +0.00 | 0.50 | 1.00 | 0.50 |
+| with verifier (GROUND → VERIFY → ROUTE) | 3 | 3 | 0 | **+1.00** | 1.00 | 1.00 | 0.00 |
+
+The verifier lifts ER from +0.00 to +1.00 on this corpus by filtering the
+decoys; CI guards spurious = 0 and recall ≥ 0.9. This is the **machinery
+number** (mock backend, reference corpus) — it proves the pre-queue filter
+discriminates, not what a given model scores in the field. A live model can be
+scored with `WAISER_EVAL_MODEL` (see `waiser_reflection.rs`); the live
+approval-rate of `origin=llm` findings accrues per file and prints on
+`deja waiser`. A corpus-scale ER number on a labeled non-parasitic corpus is
+tracked as an open follow-up in `docs/waiser-reflection.md` §6.
