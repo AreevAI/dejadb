@@ -88,7 +88,7 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
       - run: npm install
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: crates/dejadb-js/artifacts
       - name: Create platform package dirs
