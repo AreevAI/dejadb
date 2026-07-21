@@ -25,7 +25,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Wall-clock now in epoch milliseconds — the `now_ms` the engine's `run`,
 /// `review`, `apply`, and `rollback` take. Kept out of `waiser` itself so the
 /// engine stays deterministic (the caller supplies the clock).
+///
+/// `WAISER_NOW_MS` (epoch ms) overrides the wall clock — the simulation seam
+/// that makes a run through the real binary a pure function of (file, policy,
+/// time). The golden E2E suite uses it to pin analyzer output and to step time
+/// across outcome-review horizons and rejection cooldowns without sleeping.
+/// A set-but-unparseable value panics: the caller asked for simulated time,
+/// and silently running at wall time instead would defeat the point.
 pub fn now_ms() -> i64 {
+    if let Ok(v) = std::env::var("WAISER_NOW_MS") {
+        return v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("WAISER_NOW_MS is set but not epoch milliseconds: {v:?}"));
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

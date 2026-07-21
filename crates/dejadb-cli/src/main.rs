@@ -1567,18 +1567,35 @@ fn run_waiser(
             let hash = resolve_hash(&engine, &sub, prefix)?;
             let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
             let r = recs.iter().find(|r| r.hash == hash).unwrap();
-            let out = serde_json::json!({
+            let mut out = serde_json::json!({
                 "hash": r.hash,
                 "status": r.status.as_str(),
                 "severity": r.severity.as_str(),
                 "analyzer": r.analyzer,
+                "origin": r.origin,
                 "target_ref": r.target_ref,
                 "summary": r.summary.render(),
                 "destructive": r.destructive,
                 "rollbackable": r.rollbackable,
                 "evidence": r.evidence,
                 "dedup_key": r.dedup_key,
+                "confidence": r.confidence,
             });
+            // The reviewable change itself — `show` is the review surface, so
+            // the proposal must be visible before approve/apply. Flattened
+            // (`proposal` kind tag + its fields, e.g. `cal`) exactly like the
+            // stored grain body; the outcome metric and any LLM guidance ride
+            // along when present.
+            let o = out.as_object_mut().unwrap();
+            if let Ok(serde_json::Value::Object(p)) = serde_json::to_value(&r.proposal) {
+                o.extend(p);
+            }
+            if let Some(m) = &r.metric {
+                o.insert("metric".into(), serde_json::to_value(m).map_err(|e| e.to_string())?);
+            }
+            if let Some(gd) = &r.guidance {
+                o.insert("guidance".into(), serde_json::Value::from(gd.clone()));
+            }
             println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
         }
         "approve" | "reject" => {
@@ -1621,11 +1638,18 @@ fn run_waiser(
             eprintln!("rolled back {}", short(&hash));
         }
         "analyzers" => {
+            // One row per registered analyzer: id, tier, trust class
+            // (builtin vs an external command — advisory only), default state,
+            // title. Same lowercase trust strings as the console's Setup view.
             for a in engine.analyzers() {
                 let m = a.manifest();
                 println!(
-                    "{:<28}  {:?}  on={}  {}",
-                    m.id, m.tier, m.default_on, m.title
+                    "{:<28}  {:?}  {:<7}  on={}  {}",
+                    m.id,
+                    m.tier,
+                    format!("{:?}", m.trust_class).to_lowercase(),
+                    m.default_on,
+                    m.title
                 );
             }
         }

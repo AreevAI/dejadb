@@ -416,6 +416,20 @@ injected context); bindings parity (`rollback_recommendation`,
 `waiser_outcomes`, `full_sweep`, `policy`); the **host policy attaches to
 `deja ui` and `deja serve --mcp`**; and an `examples/analyzers/` sample.
 
+The whole loop is now pinned end to end by a **golden E2E suite**
+(`crates/dejadb-cli/tests/golden_waiser_tests.rs`): a committed dataset in
+which every deterministic analyzer has a seeded target, driven through the
+real `deja` binary with the engine clock pinned via **`WAISER_NOW_MS`** (a
+simulation seam honored by the CLI, MCP serve, and the console — with it, and
+with recommendation/audit grains stamped from engine time, a run is a pure
+function of (file, policy, now), so queue listings are byte-pinned including
+content addresses, and outcome horizons / rejection cooldowns are tested by
+stepping time instead of sleeping). The same pass made `waiser show` carry
+the reviewable proposal (the CAL that will execute), the outcome metric, and
+guidance; stamped external-analyzer findings `origin = command` (they were
+mislabeled `builtin` — the `[external]` badge could never render); and added
+the trust class to `waiser analyzers`.
+
 Remaining follow-ups (documented, not blockers): the **native OMS `0x0C`
 Recommendation grain** in `dejadb-core` — deliberately deferred, because it
 changes the frozen canonical serialization / grain-type registry and is an
