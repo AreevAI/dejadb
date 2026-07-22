@@ -340,13 +340,14 @@ fn heads(f: &DejaDbFacade, namespace: Option<&str>) -> WResult<Vec<HeadGroup>> {
 fn put_grain(f: &DejaDbFacade, spec: &GrainSpec) -> WResult<String> {
     let payload = serde_json::to_string(&spec.fields)
         .map_err(|e| WErr::Substrate(format!("encode grain: {e}")))?;
-    let fact = Fact::new(
+    let mut fact = Fact::new(
         &unique_subject(&payload),
         waiser_relation(&spec.grain_type),
         &payload,
     )
     .namespace(WAISER_NS)
     .confidence(1.0);
+    fact.common.created_at = spec_created_ms(spec);
     f.with_store(|m| m.add(&fact))
         .map(|h| h.to_hex())
         .map_err(we)
@@ -362,9 +363,23 @@ fn supersede_op(f: &DejaDbFacade, target_hash: &str, spec: &GrainSpec) -> WResul
         &payload,
     )
     .namespace(WAISER_NS);
+    fact.common.created_at = spec_created_ms(spec);
     f.with_store(|m| m.supersede(&old, &mut fact))
         .map(|h| h.to_hex())
         .map_err(we)
+}
+
+/// The engine-logical creation time already carried in the spec's fields —
+/// `created_at_ms` on recommendations, `at_ms` on audit observations. Stamping
+/// it onto the stored Fact keeps the grain's own `created_at` aligned with the
+/// engine's injected `now` instead of leaking the wall clock, so a waiser
+/// write is content-addressed purely from (spec, now). `None` (a spec without
+/// a time field) falls through to the store's own stamp.
+fn spec_created_ms(spec: &GrainSpec) -> Option<i64> {
+    spec.fields
+        .get("created_at_ms")
+        .or_else(|| spec.fields.get("at_ms"))
+        .and_then(Value::as_i64)
 }
 
 fn retract_op(f: &DejaDbFacade, hash: &str) -> WResult<()> {

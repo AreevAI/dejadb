@@ -1,0 +1,11 @@
+2142e8f572f4  medium  waiser.staleness/1            Expire "promo-black-friday": past its declared valid_to (100d ago)
+22c68e2dca3a  info    waiser.duplicate_sweep/1      Consolidate 2 near-duplicate observations (similarity ≥ 0.9)
+31873caffc7c  low     waiser.duplicate_sweep/1      Consolidate 3 exact-duplicate grains for "acme"
+38993e67cb62  medium  waiser.fork_surfacing/1       Entity "deploy/region" has 2 competing heads
+42497ba019b9  medium  waiser.contradiction_sweep/1  "deploy" holds 2 live values for functional relation "region"
+71e28de8bd63  medium  waiser.fork_surfacing/1       Entity "sam/lives_in" has 2 competing heads
+80c76d6f2e00  low     waiser.staleness/1            Expire "promo-spring": past its declared valid_to (10d ago)
+c1777b571177  medium  waiser.fork_surfacing/1       Entity "acme/tier" has 3 competing heads
+d7b0b0d3836c  medium  waiser.contradiction_sweep/1  "sam" holds 2 live values for functional relation "lives_in"
+df809b8fb0c6  medium  waiser.skill_stall/1          Skill "parse_invoices" isn't improving: practiced 12× but proficiency is still 0.25
+e0255b6b438f  high    waiser.tool_failure/1         Tool "stripe_refund" failed 5 times (83% of calls): rate limited # retry later

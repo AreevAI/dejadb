@@ -1553,11 +1553,19 @@ fn stamp(
     };
     let mut evidence = d.evidence;
     evidence.truncate(MAX_EVIDENCE);
+    // Provenance follows the analyzer's trust class: a subprocess
+    // (`--analyzer-cmd`) finding is stamped `Command` — structurally
+    // auto-apply-ineligible and badged [external] on the recall surface —
+    // not `Builtin`.
+    let origin = match m.trust_class {
+        crate::manifest::TrustClass::Command => Origin::Command { id: m.id.clone() },
+        _ => Origin::Builtin,
+    };
     Ok(Recommendation {
         hash: String::new(),
         analyzer: m.id.clone(),
         params_snapshot: params.snapshot(),
-        origin: Origin::Builtin,
+        origin,
         target_ref: target.as_string(),
         action_kind: d.action_kind,
         dedup_key: dedup,

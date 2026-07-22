@@ -1,0 +1,5 @@
+Waiser: 11 pending recommendation(s) for this memory (review with `deja waiser list`, act with approve/apply/reject --because):
+  [high] e0255b6b438f  Tool "stripe_refund" failed 5 times (83% of calls): rate limited # retry later
+  [medium] 2142e8f572f4  Expire "promo-black-friday": past its declared valid_to (100d ago)
+  [medium] 38993e67cb62  Entity "deploy/region" has 2 competing heads
+  … and 8 more
