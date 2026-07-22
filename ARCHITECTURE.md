@@ -319,8 +319,9 @@ CAL's destructive surface is deliberately tiny and defense-in-depth gated. The
 (`DejaDB::forget`). Everything larger is kept out, and even FORGET is gated:
 
 1. **Lexer.** A destructive-keyword blocklist (`DELETE`, `ERASE`, `TRUNCATE`,
-   `INSERT`, `CREATE`, `GRANT`, …) is rejected before tokenization. `DELETE`
-   has no token in the grammar at all — the deletion verb is `FORGET`.
+   `INSERT`, `CREATE`, `GRANT`, …) has no statement tokens in the grammar —
+   the words only ever lex as inert identifiers, hard-rejected by the parser
+   before any dispatch. The deletion verb is `FORGET`.
 2. **Parser.** Those identifiers are fast-rejected with a dedicated error.
    `FORGET <hash>` parses; the bulk/scope forms (`FORGET USER/SCOPE`, `PURGE`)
    exist in the AST but the text parser still refuses them, and `DROP` accepts

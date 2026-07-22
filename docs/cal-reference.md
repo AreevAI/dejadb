@@ -416,9 +416,10 @@ CAL has exactly one destructive statement — `FORGET <hash>`, a single-grain
 tombstone — and it is gated. There is no way to delete in bulk, drop a table,
 truncate, or erase a namespace from a query. Defense in depth:
 
-1. **Lexer blocklist.** A set of destructive keywords is rejected *before
-   tokenization*. `DELETE` has no token in the grammar at all — the deletion
-   verb is `FORGET`. The blocked set includes:
+1. **Lexer blocklist.** A set of destructive keywords has no statement token
+   in the grammar — they only ever lex as inert identifiers, which the parser
+   hard-rejects (`is_destructive_keyword`) before any dispatch. `DELETE` has
+   no token at all — the deletion verb is `FORGET`. The blocked set includes:
 
    ```
    DELETE  ERASE   DESTROY  TRUNCATE  INSERT   CREATE   WRITE   STORE

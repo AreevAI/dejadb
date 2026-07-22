@@ -532,7 +532,17 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     } else {
         DejaDB::open(&db)
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        let mut msg = e.to_string();
+        // A .kdf sidecar means the file was created encrypted; opening it
+        // without a key fails with an unhelpful "not a database" — say why.
+        if enc_key.is_none() && std::path::Path::new(&format!("{db}.kdf")).exists() {
+            msg.push_str(&format!(
+                " — {db}.kdf exists, so this memory is encrypted; pass --passphrase-env <VAR>"
+            ));
+        }
+        msg
+    })?;
     for w in m.open_warnings() {
         eprintln!("deja: warning: {w}");
     }

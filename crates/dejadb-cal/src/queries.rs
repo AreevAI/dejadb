@@ -566,7 +566,7 @@ impl QueryRegistry {
              \x20 user_facts: (RECALL facts   ABOUT $query RECENT 8)\n\
              BUDGET 4000 tokens\n\
              FORMAT sml\n\
-             WITH dedup, conflict_resolution, rerank, provenance, session_affinity, recency_weight(0.7), min_score(0.55)",
+             WITH dedup, conflict_resolution, rerank, provenance, session_affinity(0.9), recency_weight(0.7), min_score(0.55)",
             "Default harness runtime context: harness definition (goal/workflow/tools), recent conversation Events, and rerank-filtered user facts scoped to the active query.",
             &[
                 QueryParam { name: "user".to_string(), default: None },

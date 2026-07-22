@@ -223,3 +223,27 @@ fn cli_positional_and_env_db() {
         "{stdout}"
     );
 }
+
+/// Regression: a boolean flag (`--once`, `--mcp`, `--allow-remote`) must not
+/// swallow a following `-d`. `deja serve --mcp -d mem.db` used to lose the
+/// path to `--mcp` and silently fall back to the default memory file.
+#[test]
+fn boolean_flag_does_not_swallow_short_db_flag() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("m.db");
+    let db = db.to_str().unwrap();
+    let seg = dir.path().join("seg");
+    let seg = seg.to_str().unwrap();
+
+    let (ok, _, err) = deja(&["add", "bob", "likes", "chess", "-d", db]);
+    assert!(ok, "add failed: {err}");
+
+    // --once is boolean; the -d after it must still name the memory file.
+    let (ok, _out, err) = deja(&["stream", "--once", "-d", db, "--to", seg]);
+    assert!(ok, "stream failed: {err}");
+    assert!(
+        !err.contains("using default memory"),
+        "-d was swallowed by --once; deja fell back to the default file: {err}"
+    );
+    assert!(err.contains("shipped"), "expected ops shipped from {db}: {err}");
+}
