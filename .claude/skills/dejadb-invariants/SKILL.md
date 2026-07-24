@@ -46,6 +46,12 @@ cargo test --workspace                              # full suite must be green
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 ```
 
+For the full test taxonomy (unit / integration / golden+bless / property /
+fuzz / perf-gate / cross-surface), the determinism rules that keep the suite
+non-flaky, and a **combination-coverage checklist** for finding bugs at feature
+interactions, see [[dejadb-testing]] — and add a regression test for every bug
+you fix.
+
 - **Do NOT run blanket `cargo fmt`** — the tree is not uniformly rustfmt-clean by
   design. Format only the lines you touch; match the surrounding style.
 - If you changed anything under `dejadb-core/src/format/`, also confirm the OMS

@@ -39,11 +39,20 @@ reconstruct, with tests catching only some of it.
 
 ## Canonical-serialization rules the new fields must obey
 
-- **NFC-normalize** every string before hashing (`serialize.rs` `nfc_string`).
+- **NFC-normalize** every string before hashing (`serialize.rs` `nfc_string`) —
+  **keys as well as values** (a map key stored un-normalized gives composition
+  variants distinct content addresses).
 - **Sorted map keys** — build as `BTreeMap`, emit sorted.
 - **Omit-when-default** — `None`/empty omitted; default enum variants omitted so
   legacy blobs stay byte-identical.
 - Timestamps: epoch **ms** in the payload, epoch **sec** in the header.
+- **Anything you write must read back** (the serialize ⇒ deserialize symmetry
+  invariant). If a new field holds a float, reject non-finite values on write
+  (the reader refuses NaN/±Inf); if it holds nested user JSON, store keys
+  verbatim and do **not** run them through `expand_field` on read (that rewrites
+  a user key colliding with an OMS short code, e.g. `"o"`→`"object"`); integers
+  above `i64::MAX` stay integers, not lossy floats. See the "serialize ⇒
+  deserialize symmetry" axis in [[dejadb-testing]] and add a round-trip test.
 
 ## Verify
 
