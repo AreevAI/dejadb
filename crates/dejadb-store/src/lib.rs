@@ -1875,6 +1875,48 @@ impl DejaDB {
                 conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(old_seq),))
                     .await
                     .map_err(db_err)?;
+                // Reconcile the OLD key's head/entity_latest indexes. Normally
+                // add(new) handles this because new shares (ns,s,p) with old; but
+                // when the new grain carries a DIFFERENT (subject,relation) — or
+                // no triple — add reconciles the new key and leaves the old key
+                // pointing at the now-superseded grain. Mirror forget so
+                // latest()/heads() for the old key don't surface it. Harmless
+                // no-op in the common same-key case (old is already out of heads).
+                if let (Some(ns), Some(s), Some(p)) = (_ns, old_s, old_p) {
+                    conn.execute(
+                        "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                        (pi(ns), pi(s), pi(p), pi(old_seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    conn.execute(
+                        "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                        (pi(ns), pi(s), pi(p), pi(old_seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT t.o, h.seq, h.hash, h.created_at
+                             FROM heads h JOIN triples t ON t.seq=h.seq
+                             WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
+                             ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
+                            (pi(ns), pi(s), pi(p)),
+                        )
+                        .await
+                        .map_err(db_err)?;
+                    if let Some(row) = rows.next().await.map_err(db_err)? {
+                        let o = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
+                        let sq = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
+                        let h = v_blob(&row.get_value(2).map_err(db_err)?).unwrap_or_default();
+                        conn.execute(
+                            "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                            (pi(ns), pi(s), pi(p), pi(o), pi(sq), pb(h)),
+                        )
+                        .await
+                        .map_err(db_err)?;
+                    }
+                }
                 conn.execute(
                     "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
                     (pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(new_hash.as_bytes().to_vec())),
@@ -1892,7 +1934,6 @@ impl DejaDB {
                 }
             }
         })?;
-        let _ = (old_s, old_p);
         Ok(new_hash)
     }
 
@@ -1944,18 +1985,34 @@ impl DejaDB {
                 conn.execute("DELETE FROM grains WHERE seq=?1", (pi(seq),))
                     .await
                     .map_err(db_err)?;
-                // entity_latest fallback: newest remaining current triple, if any.
+                // Reconcile the head/entity_latest indexes for the cell.
                 if let (Some(ns), Some(s), Some(p)) = (ns, s, p) {
+                    // Forget must drop the grain's fork-tip row too — every other
+                    // index is reconciled here, but `heads` was left dangling, so
+                    // heads()/open_forks() kept surfacing a hash whose get() fails
+                    // (and merge_heads could merge a forgotten tip).
+                    conn.execute(
+                        "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                        (pi(ns), pi(s), pi(p), pi(seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
                     conn.execute(
                         "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
                         (pi(ns), pi(s), pi(p), pi(seq)),
                     )
                     .await
                     .map_err(db_err)?;
+                    // Re-elect the provisional head from the surviving tips using
+                    // the SAME (created_at, hash) rule as heads()/insert_blob —
+                    // was `ORDER BY seq DESC`, which can disagree with the
+                    // provisional-head rule in a 3+-way fork after a forget.
                     let mut rows = conn
                         .query(
-                            "SELECT t.o, t.seq, g.hash FROM triples t JOIN grains g ON g.seq=t.seq
-                             WHERE t.ns=?1 AND t.s=?2 AND t.p=?3 AND t.cur=1 ORDER BY t.seq DESC LIMIT 1",
+                            "SELECT t.o, h.seq, h.hash, h.created_at
+                             FROM heads h JOIN triples t ON t.seq=h.seq
+                             WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
+                             ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
                             (pi(ns), pi(s), pi(p)),
                         )
                         .await
@@ -1999,6 +2056,27 @@ impl DejaDB {
             let _ = tel.scrub(rt, hash);
         }
         Ok(())
+    }
+
+    /// Append one op-log record (fresh local `op_seq`, caller-supplied `hlc`).
+    /// The change-feed / sync primitive for state transitions that happen
+    /// outside `add`/`supersede`/`forget` — a `merge_heads` fork-closure and an
+    /// imported supersession whose grain already existed locally. Without it
+    /// those transitions never replicate and downstream replicas diverge.
+    fn log_op(&mut self, op: i64, hash: &Hash, hlc: i64) -> Result<()> {
+        let op_seq = self.next_op;
+        self.next_op += 1;
+        let conn = &self.conn;
+        let h = hash.as_bytes().to_vec();
+        self.rt.block_on(async {
+            conn.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                (pi(op_seq), pi(hlc), pi(op), pb(h)),
+            )
+            .await
+            .map_err(db_err)?;
+            Ok::<(), DejaDbError>(())
+        })
     }
 
     // ----- telemetry sidecar (host capability; off the recall path) -----
@@ -2536,13 +2614,18 @@ impl DejaDB {
         let mut fts_legs: Vec<Vec<i64>> = Vec::new();
         if let Some(q) = query {
             if !over(&start) {
-                fts_legs.push(self.search_text(ns, q, leg_k)?);
+                // Fail-open: a BM25 leg that errors (e.g. the raw user query
+                // trips the FTS query-grammar on `:` / quotes / parens — common
+                // in DIDs, namespaces, timestamps) degrades to an empty leg,
+                // exactly like a deadline-skipped one. recall_hybrid must never
+                // error — the structural/vector legs still answer.
+                fts_legs.push(self.search_text(ns, q, leg_k).unwrap_or_default());
                 if tuning.query_expansion && self.index_text {
                     for variant in self.expand_query(q) {
                         if over(&start) {
                             break;
                         }
-                        let hits = self.search_text(ns, &variant, leg_k)?;
+                        let hits = self.search_text(ns, &variant, leg_k).unwrap_or_default();
                         if !hits.is_empty() {
                             fts_legs.push(hits);
                         }
@@ -2554,7 +2637,11 @@ impl DejaDB {
         // tokenization can't serve rides this leg)
         let vecs: Vec<i64> = match query {
             Some(q) if self.embedder.is_some() && !over(&start) => {
-                self.search_vector(ns, q, leg_k)?
+                // Fail-open: e.g. a query embedded at a different dim than the
+                // file's stored vectors errors inside vector_distance_cos (the
+                // store permits a mismatched embedder with only a warning) —
+                // degrade the vector leg rather than failing the whole recall.
+                self.search_vector(ns, q, leg_k).unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -3108,6 +3195,13 @@ impl DejaDB {
                 })?;
             }
         }
+        // Record the fork-closure in the op-log so it replicates. A merge that
+        // ships only its OP_ADD leaves every downstream replica with the parent
+        // tips still open (a phantom fork). One OP_SUPERSEDE(merge_hash) carries
+        // it; the merge grain's context.merge_parents lets import close all tips
+        // (see superseded_parents + the import OP_SUPERSEDE branch).
+        let hlc = self.next_hlc();
+        self.log_op(OP_SUPERSEDE, &merge_hash, hlc)?;
         Ok(merge_hash)
     }
 
@@ -3302,6 +3396,12 @@ impl DejaDB {
         let hex = uri
             .strip_prefix("cas://sha256:")
             .ok_or_else(|| DejaDbError::Validation(format!("not a cas uri: {uri}")))?;
+        // Validate before blob_path byte-slices `hex[..2]` — an untrusted or
+        // truncated URI (e.g. from an imported content_ref) must return Err,
+        // never panic on a short or non-char-boundary slice.
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(DejaDbError::Validation(format!("malformed cas uri: {uri}")));
+        }
         let bytes = std::fs::read(self.blob_path(hex))
             .map_err(|_| DejaDbError::Storage(format!("blob missing: {uri}")))?;
         if hex::encode(Sha256::digest(&bytes)) != hex {
@@ -3759,16 +3859,29 @@ impl DejaDB {
                         None => stats.skipped += 1,
                         Some(bb) => {
                             let mut changed = false;
+                            let inserted = !exists;
                             if !exists {
+                                // insert_blob logs its own OP_SUPERSEDE row.
                                 self.insert_blob(bb.clone(), hash, op, hlc)?;
                                 changed = true;
                             }
                             if let Ok(view) = deserialize_blob(&bb) {
-                                if let Some(df) = view.get_str("derived_from") {
-                                    if let Ok(old) = Hash::from_hex(df) {
-                                        changed |= self.apply_supersede_flip(&old, &hash)?;
-                                    }
+                                // Close EVERY tip this grain supersedes: the
+                                // linear derived_from parent and, for a merge
+                                // commit, all merge_parents — else the other
+                                // parents stay open and the replica forks.
+                                for old in superseded_parents(&view) {
+                                    changed |= self.apply_supersede_flip(&old, &hash)?;
                                 }
+                            }
+                            // If the grain already existed (its OP_ADD twin was
+                            // imported first) insert_blob didn't run, so the flip
+                            // is missing from our op-log — record it here so a
+                            // re-export (the B->C hop) carries the supersession
+                            // instead of shipping two bare adds that fork.
+                            // Idempotent replays return changed=false above.
+                            if changed && !inserted {
+                                self.log_op(OP_SUPERSEDE, &hash, hlc)?;
                             }
                             if changed {
                                 stats.applied += 1;
@@ -3806,6 +3919,33 @@ pub mod telemetry;
 
 pub use asyncdb::AsyncDejaDB;
 pub use telemetry::{AccessStat, BudgetStat, QueryStat, RecallEvent, Telemetry, TelemetryMode};
+
+/// Every parent hash a grain supersedes: the linear `derived_from`, plus any
+/// `context.merge_parents` recorded by a merge commit. Used by bundle import to
+/// close all tips a replicated supersession/merge closes at the source.
+fn superseded_parents(view: &DeserializedGrain) -> Vec<Hash> {
+    let mut out = Vec::new();
+    if let Some(df) = view.get_str("derived_from") {
+        if let Ok(h) = Hash::from_hex(df) {
+            out.push(h);
+        }
+    }
+    if let Some(arr) = view
+        .fields
+        .get("context")
+        .and_then(|c| c.get("merge_parents"))
+        .and_then(|v| v.as_array())
+    {
+        for p in arr {
+            if let Some(h) = p.as_str().and_then(|s| Hash::from_hex(s).ok()) {
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Object-safe serialization adapter so `add_batch` can take mixed grain types.
 pub trait AddableDyn {

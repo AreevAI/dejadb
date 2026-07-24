@@ -20,6 +20,26 @@ fn encode_value_to_vec(value: &Value) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Reject non-finite floats (NaN / ±Inf) anywhere in the payload before it is
+/// written. The deserializer refuses them (`serde_json::Number::from_f64`
+/// returns None), so persisting one yields a grain that serializes but can
+/// never be read back — and grains are immutable, so the store would be stuck
+/// with it forever. Enforcing it on the write side keeps the serialize ⇒
+/// deserialize symmetry invariant (a grain that can be written can be read).
+fn reject_non_finite(value: &Value) -> Result<()> {
+    match value {
+        Value::F32(f) if !f.is_finite() => Err(DejaDbError::Format(
+            "non-finite float (NaN/Inf) cannot be serialized".into(),
+        )),
+        Value::F64(f) if !f.is_finite() => Err(DejaDbError::Format(
+            "non-finite float (NaN/Inf) cannot be serialized".into(),
+        )),
+        Value::Array(arr) => arr.iter().try_for_each(reject_non_finite),
+        Value::Map(pairs) => pairs.iter().try_for_each(|(_, v)| reject_non_finite(v)),
+        _ => Ok(()),
+    }
+}
+
 /// Serialize a grain to .mg blob bytes and compute its content address.
 /// Returns (blob_bytes, content_address_hash).
 pub fn serialize_grain<G: Grain + 'static>(grain: &G) -> Result<(Vec<u8>, Hash)> {
@@ -44,6 +64,7 @@ pub fn serialize_grain<G: Grain + 'static>(grain: &G) -> Result<(Vec<u8>, Hash)>
 
     // Encode to msgpack
     let msgpack_value = btree_to_msgpack_map(map);
+    reject_non_finite(&msgpack_value)?;
     let payload = encode_value_to_vec(&msgpack_value)?;
 
     // Build header
@@ -155,6 +176,10 @@ fn json_to_msgpack(json: &serde_json::Value) -> Value {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::Integer(i.into())
+            } else if let Some(u) = n.as_u64() {
+                // u64 above i64::MAX: keep it an integer (the deserializer reads
+                // u64) rather than lossily coercing it to f64.
+                Value::Integer(u.into())
             } else if let Some(f) = n.as_f64() {
                 Value::F64(f)
             } else {
@@ -166,7 +191,10 @@ fn json_to_msgpack(json: &serde_json::Value) -> Value {
         serde_json::Value::Object(obj) => {
             let mut sorted: BTreeMap<String, Value> = BTreeMap::new();
             for (k, v) in obj {
-                sorted.insert(k.clone(), json_to_msgpack(v));
+                // NFC-normalize keys, not only values — otherwise two Unicode
+                // composition variants of one key hash to different content
+                // addresses, defeating the dedup NFC exists to provide.
+                sorted.insert(k.nfc().collect::<String>(), json_to_msgpack(v));
             }
             btree_to_msgpack_map(sorted)
         }
@@ -182,7 +210,10 @@ fn json_to_msgpack_with_key_compaction(json: &serde_json::Value) -> Value {
         serde_json::Value::Object(obj) => {
             let mut sorted: BTreeMap<String, Value> = BTreeMap::new();
             for (k, v) in obj {
-                let compacted_key = compact_field(k).to_string();
+                // NFC-normalize before compacting so composition variants of a
+                // context key collapse (int:* keys are ASCII, so unaffected).
+                let nfc_k = k.nfc().collect::<String>();
+                let compacted_key = compact_field(&nfc_k).to_string();
                 sorted.insert(compacted_key, json_to_msgpack(v));
             }
             btree_to_msgpack_map(sorted)
@@ -998,11 +1029,14 @@ fn add_common_fields(common: &GrainCommon, created_at: i64, map: &mut BTreeMap<S
     // Extra fields — custom fields not in the grain type's whitelist.
     // Stored as-is (no compaction) since they're not in FIELD_MAP.
     for (key, value) in &common.extra_fields {
+        // NFC-normalize the key for content-address stability (composition
+        // variants must collapse), same as every other stored string.
+        let key = key.nfc().collect::<String>();
         // Skip if a known field somehow ended up here (defensive).
-        if map.contains_key(key) || map.contains_key(&compact_field(key).to_string()) {
+        if map.contains_key(&key) || map.contains_key(compact_field(&key)) {
             continue;
         }
-        map.insert(key.clone(), json_to_msgpack(value));
+        map.insert(key, json_to_msgpack(value));
     }
 }
 

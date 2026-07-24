@@ -385,11 +385,19 @@ impl ContextAssembler {
         let mut omitted_count = primary_ctx.omitted_count;
 
         if let Some(ref census) = census_ctx {
-            let sep = section_separator(&policy.format);
-            if !text.is_empty() {
-                text.push_str(sep);
+            if policy.format == OutputFormat::Json {
+                // JSON is a single structured document: primary and census
+                // grains form ONE array (census grains already carry
+                // recall_source). Concatenating two top-level arrays with a
+                // comma produced invalid JSON — see merge_json_census.
+                text = merge_json_census(&text, &census.text);
+            } else {
+                let sep = section_separator(&policy.format);
+                if !text.is_empty() {
+                    text.push_str(sep);
+                }
+                text.push_str(&census.text);
             }
-            text.push_str(&census.text);
             included_count += census.included_count;
             omitted_count += census.omitted_count;
         }
@@ -1088,6 +1096,12 @@ impl ContextAssembler {
                     rendered
                 }
             }
+            // TOON is a tabular format whose header declares fixed columns
+            // (e.g. facts[N]{subject,content,confidence}); a text status prefix
+            // would land inside the first column value ("[CURRENT] john") and
+            // corrupt the declared schema. Emit the row unprefixed — status is
+            // not part of the TOON column set (JSON carries it structurally).
+            OutputFormat::Toon => rendered,
             _ => format!("{status_prefix}{rendered}"),
         }
     }
@@ -1720,7 +1734,30 @@ fn section_separator(format: &OutputFormat) -> &'static str {
         OutputFormat::Toon => "\n\n",
         OutputFormat::Markdown => "\n\n",
         OutputFormat::PlainText => "\n\n",
+        // JSON census merges structurally (merge_json_census); this separator
+        // is only reached for the non-census JSON paths that never concatenate.
         OutputFormat::Json => ",\n",
+    }
+}
+
+/// Merge the primary and census JSON documents into ONE valid JSON value.
+/// Both sides are normally arrays → concatenate their elements (census grains
+/// keep their injected `recall_source`). If the primary is a grouped object,
+/// attach the census grains under a `"census"` key. Falls back to the primary
+/// alone if either side is unparseable, so the result is always valid JSON.
+fn merge_json_census(primary: &str, census: &str) -> String {
+    let p = serde_json::from_str::<serde_json::Value>(primary);
+    let c = serde_json::from_str::<serde_json::Value>(census);
+    match (p, c) {
+        (Ok(serde_json::Value::Array(mut pa)), Ok(serde_json::Value::Array(ca))) => {
+            pa.extend(ca);
+            serde_json::to_string(&serde_json::Value::Array(pa)).unwrap_or_else(|_| primary.to_string())
+        }
+        (Ok(serde_json::Value::Object(mut po)), Ok(ca)) => {
+            po.insert("census".to_string(), ca);
+            serde_json::to_string(&serde_json::Value::Object(po)).unwrap_or_else(|_| primary.to_string())
+        }
+        _ => primary.to_string(),
     }
 }
 
@@ -3450,5 +3487,56 @@ mod tests {
         assert_eq!(format_timestamp(1681516800), Some("2023-04-15".to_string()));
         // Zero returns None
         assert_eq!(format_timestamp(0), None);
+    }
+
+    // Regression (2026-07-22 combination-hunt).
+
+    /// #7 — census + JSON must be ONE valid JSON array, with the census grains'
+    /// recall_source preserved (was two top-level arrays joined by a comma).
+    #[test]
+    fn census_json_is_valid_and_keeps_recall_source() {
+        let assembler = ContextAssembler::new();
+        let policy = FormatPolicy::new(OutputFormat::Json).metadata(MetadataLevel::None);
+        let mut census = make_hit(
+            GrainType::Fact,
+            vec![("subject", "bob"), ("relation", "likes"), ("object", "tea")],
+            0.4,
+        );
+        census.recall_source = Some(RecallSource::Census);
+        let hits = vec![
+            make_hit(
+                GrainType::Fact,
+                vec![("subject", "john"), ("relation", "likes"), ("object", "coffee")],
+                0.9,
+            ),
+            census,
+        ];
+        let ctx = assembler.format(&hits, &policy);
+        let v: serde_json::Value = serde_json::from_str(&ctx.text)
+            .unwrap_or_else(|e| panic!("census+JSON must be valid JSON: {e}\n{}", ctx.text));
+        let arr = v.as_array().expect("one top-level array");
+        assert_eq!(arr.len(), 2, "primary + census grains in one array");
+        assert!(ctx.text.contains("\"recall_source\":\"census\""), "census marker preserved");
+    }
+
+    /// #11 — TOON rows must not carry a `[CURRENT]`/`[OUTDATED]` text prefix
+    /// that corrupts the declared subject column.
+    #[test]
+    fn toon_row_has_no_status_prefix() {
+        for status in [SupersessionStatus::Current, SupersessionStatus::Superseded] {
+            let mut hit = make_hit(
+                GrainType::Fact,
+                vec![("subject", "john"), ("relation", "likes"), ("object", "coffee")],
+                0.9,
+            );
+            hit.supersession_status = Some(status);
+            let ctx = ContextAssembler::new().format(
+                &[hit],
+                &FormatPolicy::new(OutputFormat::Toon).metadata(MetadataLevel::Minimal),
+            );
+            assert!(!ctx.text.contains("[CURRENT]"), "no marker in TOON column:\n{}", ctx.text);
+            assert!(!ctx.text.contains("[OUTDATED]"), "no marker in TOON column:\n{}", ctx.text);
+            assert!(ctx.text.contains("john"), "subject column intact:\n{}", ctx.text);
+        }
     }
 }

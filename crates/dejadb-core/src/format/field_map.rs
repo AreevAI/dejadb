@@ -331,6 +331,20 @@ pub fn expand_field(short: &str) -> &str {
     REVERSE_FIELD_MAP.get(short).copied().unwrap_or(short)
 }
 
+/// Expand a compacted `context`-map key. Only the OMS `int:*` Integration
+/// Domain Profile keys are deliberately compacted inside a context map; every
+/// other context key is user-controlled and MUST survive verbatim. Reversing
+/// such a key through the general [`expand_field`] corrupts any user key that
+/// happens to equal an OMS short code (e.g. `"o"` → `"object"`), so the general
+/// expansion must never be applied to nested user JSON — only this restricted
+/// `int:*` reversal is safe there.
+pub fn expand_context_field(short: &str) -> &str {
+    match REVERSE_FIELD_MAP.get(short) {
+        Some(&long) if long.starts_with("int:") => long,
+        _ => short,
+    }
+}
+
 /// Compact content_ref nested fields.
 pub fn compact_content_ref_field(name: &str) -> &str {
     CONTENT_REF_FIELD_MAP.get(name).copied().unwrap_or(name)

@@ -1444,6 +1444,13 @@ impl CalExecutor {
             span: run.span,
         })?;
 
+        // 3a. Re-validate read-only at execution. The DEFINE-time scan is
+        // skipped for $-parameterized bodies, so this is the precise gate: a
+        // saved-query body that resolves to ADD/SUPERSEDE/FORGET/DROP/DEFINE/RUN
+        // is refused here regardless of the destructive-ops gate.
+        let span = run.span.unwrap_or_else(Span::zero);
+        super::parser::check_read_only_statement(&parsed.statement, &span)?;
+
         // 4. Merge WITH options: saved query's with + outer query's with (outer wins).
         let mut merged_query = parsed;
 

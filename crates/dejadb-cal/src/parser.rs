@@ -129,6 +129,52 @@ pub fn parse_with_params(input: &str, _params: &HashMap<String, Value>) -> CalRe
     parser.parse_query()
 }
 
+/// Recursively check that a statement is read-only (no writes, no RUN) — the
+/// enforcement behind the "saved-query bodies stay read-only" invariant. A free
+/// function so the executor can re-check a parsed RUN body at execution time,
+/// not only the parser at DEFINE time (defense in depth: the DEFINE-time scan
+/// is skipped for `$`-parameterized bodies, so RUN is the precise gate).
+pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> CalResult<()> {
+    let write = |s: &str| {
+        Err(CalError::WriteInQueryBody {
+            stmt: s.into(),
+            span: Some(*span),
+        })
+    };
+    match stmt {
+        CalStatement::Recall(_)
+        | CalStatement::SetOp(_)
+        | CalStatement::Exists(_)
+        | CalStatement::Assemble(_)
+        | CalStatement::History(_)
+        | CalStatement::Explain(_)
+        | CalStatement::Describe(_)
+        | CalStatement::Coalesce(_) => Ok(()),
+        CalStatement::Batch(batch) => {
+            for entry in &batch.statements {
+                check_read_only_statement(&entry.statement, span)?;
+            }
+            if let Some(labeled) = &batch.labeled {
+                for (_, entry) in labeled {
+                    check_read_only_statement(&entry.statement, span)?;
+                }
+            }
+            Ok(())
+        }
+        CalStatement::Add(_) | CalStatement::AddWorkflow(_) => write("ADD"),
+        CalStatement::Supersede(_) | CalStatement::SupersedeWorkflow(_) => write("SUPERSEDE"),
+        CalStatement::Accumulate(_) => write("ACCUMULATE"),
+        CalStatement::Revert(_) => write("REVERT"),
+        CalStatement::Forget(_) => write("FORGET"),
+        CalStatement::Purge(_) => write("PURGE"),
+        CalStatement::DefineTemplate(_) => write("DEFINE TEMPLATE"),
+        CalStatement::DropTemplate(_) => write("DROP TEMPLATE"),
+        CalStatement::DefineQuery(_) => write("DEFINE QUERY"),
+        CalStatement::DropQuery(_) => write("DROP QUERY"),
+        CalStatement::RunQuery(_) => Err(CalError::RecursiveQuery { span: Some(*span) }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -5295,25 +5341,30 @@ impl Parser {
         // may not parse correctly until then (e.g., RECENT $limit is not a
         // valid number literal). The body will be validated when RUN executes.
         if body.contains('$') {
-            // Quick lexical scan: check for obvious write-tier keywords.
+            // Word-level lexical scan (a `$`-body can't fully parse until RUN
+            // substitutes params, so this guard must not be evadable). Split on
+            // anything that isn't an identifier char so ANY whitespace or
+            // punctuation between a keyword and its operand counts as a boundary
+            // — `SUPERSEDE\n` no longer slips past a `"SUPERSEDE "` substring
+            // test. Covers DROP/DEFINE (and the lexer-blocked destructive words)
+            // that the old list missed. RUN is re-checked precisely at execution
+            // via check_read_only_statement; this is only the DEFINE-time guard.
             let upper = body.to_ascii_uppercase();
-            for keyword in &[
-                "ADD ",
-                "SUPERSEDE ",
-                "ACCUMULATE ",
-                "REVERT ",
-                "FORGET ",
-                "PURGE ",
-            ] {
-                if upper.contains(keyword) {
+            for word in upper.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                if word == "RUN" {
+                    return Err(CalError::RecursiveQuery { span: Some(*span) });
+                }
+                if matches!(
+                    word,
+                    "ADD" | "SUPERSEDE" | "ACCUMULATE" | "REVERT" | "FORGET" | "PURGE" | "DROP"
+                        | "DEFINE" | "DELETE" | "ERASE" | "TRUNCATE" | "INSERT" | "UPDATE"
+                        | "CREATE" | "GRANT"
+                ) {
                     return Err(CalError::WriteInQueryBody {
-                        stmt: keyword.trim().to_string(),
+                        stmt: word.to_string(),
                         span: Some(*span),
                     });
                 }
-            }
-            if upper.contains("RUN ") || upper.starts_with("RUN") {
-                return Err(CalError::RecursiveQuery { span: Some(*span) });
             }
             return Ok(());
         }
@@ -5335,80 +5386,10 @@ impl Parser {
     }
 
     /// Recursively check that a statement is read-only (no writes, no RUN).
+    /// Delegates to the free [`check_read_only_statement`] so the executor can
+    /// apply the identical gate to a parsed RUN body at execution time.
     fn check_statement_read_only(&self, stmt: &CalStatement, span: &Span) -> CalResult<()> {
-        match stmt {
-            // Read-tier: allowed
-            CalStatement::Recall(_)
-            | CalStatement::SetOp(_)
-            | CalStatement::Exists(_)
-            | CalStatement::Assemble(_)
-            | CalStatement::History(_)
-            | CalStatement::Explain(_)
-            | CalStatement::Describe(_)
-            | CalStatement::Coalesce(_) => Ok(()),
-
-            // Batch: check each entry
-            CalStatement::Batch(batch) => {
-                for entry in &batch.statements {
-                    self.check_statement_read_only(&entry.statement, span)?;
-                }
-                if let Some(labeled) = &batch.labeled {
-                    for (_, entry) in labeled {
-                        self.check_statement_read_only(&entry.statement, span)?;
-                    }
-                }
-                Ok(())
-            }
-
-            // Write-tier: rejected
-            CalStatement::Add(_) | CalStatement::AddWorkflow(_) => {
-                Err(CalError::WriteInQueryBody {
-                    stmt: "ADD".into(),
-                    span: Some(*span),
-                })
-            }
-            CalStatement::Supersede(_) | CalStatement::SupersedeWorkflow(_) => {
-                Err(CalError::WriteInQueryBody {
-                    stmt: "SUPERSEDE".into(),
-                    span: Some(*span),
-                })
-            }
-            CalStatement::Accumulate(_) => Err(CalError::WriteInQueryBody {
-                stmt: "ACCUMULATE".into(),
-                span: Some(*span),
-            }),
-            CalStatement::Revert(_) => Err(CalError::WriteInQueryBody {
-                stmt: "REVERT".into(),
-                span: Some(*span),
-            }),
-            CalStatement::Forget(_) => Err(CalError::WriteInQueryBody {
-                stmt: "FORGET".into(),
-                span: Some(*span),
-            }),
-            CalStatement::Purge(_) => Err(CalError::WriteInQueryBody {
-                stmt: "PURGE".into(),
-                span: Some(*span),
-            }),
-            CalStatement::DefineTemplate(_) => Err(CalError::WriteInQueryBody {
-                stmt: "DEFINE TEMPLATE".into(),
-                span: Some(*span),
-            }),
-            CalStatement::DropTemplate(_) => Err(CalError::WriteInQueryBody {
-                stmt: "DROP TEMPLATE".into(),
-                span: Some(*span),
-            }),
-            CalStatement::DefineQuery(_) => Err(CalError::WriteInQueryBody {
-                stmt: "DEFINE QUERY".into(),
-                span: Some(*span),
-            }),
-            CalStatement::DropQuery(_) => Err(CalError::WriteInQueryBody {
-                stmt: "DROP QUERY".into(),
-                span: Some(*span),
-            }),
-
-            // RUN: recursive — rejected
-            CalStatement::RunQuery(_) => Err(CalError::RecursiveQuery { span: Some(*span) }),
-        }
+        check_read_only_statement(stmt, span)
     }
 
     // -- RUN ---------------------------------------------------------------

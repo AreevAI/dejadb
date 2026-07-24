@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rmpv::Value;
 
 use crate::error::{DejaDbError, Hash, Result};
-use crate::format::field_map::expand_field;
+use crate::format::field_map::{expand_context_field, expand_field};
 use crate::format::header::MgHeader;
 #[allow(clippy::wildcard_imports)]
 use crate::types::*;
@@ -84,8 +84,19 @@ pub fn deserialize_blob(blob: &[u8]) -> Result<DeserializedGrain> {
     // a huge container/string length) before `read_value` ever touches them.
     let payload = &inner[9..];
     guard_msgpack_shape(payload)?;
-    let value: Value = rmpv::decode::read_value(&mut &payload[..])
+    let mut cursor: &[u8] = payload;
+    let value: Value = rmpv::decode::read_value(&mut cursor)
         .map_err(|e| DejaDbError::Serialization(format!("msgpack decode error: {}", e)))?;
+    // Canonical blobs are exactly one msgpack value — no trailing bytes. Reject
+    // padding: otherwise the same logical grain has unlimited distinct content
+    // addresses (a content-address malleability / dedup bypass), since the hash
+    // is taken over the whole padded blob.
+    if !cursor.is_empty() {
+        return Err(DejaDbError::Format(format!(
+            "non-canonical blob: {} trailing byte(s) after the grain payload",
+            cursor.len()
+        )));
+    }
 
     // Convert to expanded field names
     let fields = msgpack_to_json_expanded(&value)?;
@@ -338,8 +349,30 @@ mod msgpack_guard_tests {
     }
 }
 
-/// Convert a msgpack Value to JSON, expanding field names.
+/// Which key table (if any) applies to the map currently being decoded.
+#[derive(Clone, Copy)]
+enum KeyMode {
+    /// The grain's top-level map — keys are OMS field names, expand via FIELD_MAP.
+    OmsTop,
+    /// The immediate keys of a `context` map — only the OMS int:* profile keys
+    /// were compacted there; reverse just those, keep user keys verbatim.
+    ContextTop,
+    /// A user-controlled / already-verbatim nested map — never rewrite keys.
+    Verbatim,
+}
+
+/// Convert a msgpack Value to JSON, expanding field names ONLY where the
+/// serializer compacted them: the grain's top-level OMS fields and (restricted
+/// to int:* profile keys) the immediate keys of a `context` map. Every deeper,
+/// user-controlled map is converted verbatim — applying the general FIELD_MAP
+/// to nested user JSON rewrites keys that collide with an OMS short code (e.g.
+/// a State `context` key `"o"` → `"object"`), corrupting the data and
+/// destabilizing the content address on re-serialize.
 fn msgpack_to_json_expanded(value: &Value) -> Result<serde_json::Value> {
+    msgpack_to_json(value, KeyMode::OmsTop)
+}
+
+fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
     match value {
         Value::Nil => Ok(serde_json::Value::Null),
         Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
@@ -366,22 +399,34 @@ fn msgpack_to_json_expanded(value: &Value) -> Result<serde_json::Value> {
         }
         Value::Binary(b) => Ok(serde_json::Value::String(hex::encode(b))),
         Value::Array(arr) => {
+            // Array elements are values, not OMS field names — verbatim keys.
             let items: Result<Vec<serde_json::Value>> =
-                arr.iter().map(msgpack_to_json_expanded).collect();
+                arr.iter().map(|x| msgpack_to_json(x, KeyMode::Verbatim)).collect();
             Ok(serde_json::Value::Array(items?))
         }
         Value::Map(pairs) => {
             let mut map = serde_json::Map::new();
             for (k, v) in pairs {
-                let key = match k {
-                    Value::String(s) => {
-                        let short = s.as_str().unwrap_or("");
-                        expand_field(short).to_string()
-                    }
+                let raw = match k {
+                    Value::String(s) => s.as_str().unwrap_or(""),
                     _ => return Err(DejaDbError::Format("map key must be string".into())),
                 };
-                let val = msgpack_to_json_expanded(v)?;
-                map.insert(key, val);
+                let (key, child) = match mode {
+                    KeyMode::OmsTop => {
+                        let expanded = expand_field(raw).to_string();
+                        // Only the `context` field's immediate keys carry the
+                        // restricted int:* reversal; everything else is verbatim.
+                        let child = if expanded == "context" {
+                            KeyMode::ContextTop
+                        } else {
+                            KeyMode::Verbatim
+                        };
+                        (expanded, child)
+                    }
+                    KeyMode::ContextTop => (expand_context_field(raw).to_string(), KeyMode::Verbatim),
+                    KeyMode::Verbatim => (raw.to_string(), KeyMode::Verbatim),
+                };
+                map.insert(key, msgpack_to_json(v, child)?);
             }
             Ok(serde_json::Value::Object(map))
         }
