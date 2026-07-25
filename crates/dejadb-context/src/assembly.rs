@@ -692,11 +692,18 @@ impl ContextAssembler {
             return inner;
         }
 
+        // Honor the census sub-budget: render only the hits `inner` actually
+        // included (its default allocator is priority-prefix). Otherwise the
+        // section renders EVERY census hit regardless of budget, and the
+        // included/omitted counts returned below (taken from `inner`) disagree
+        // with the text a caller sees.
+        let shown = &census_hits[..inner.included_count.min(census_hits.len())];
+
         // Wrap in a census section header.
         let text = match policy.format {
             OutputFormat::Sml => {
                 let mut rendered_grains = Vec::new();
-                for hit in census_hits {
+                for hit in shown {
                     let session = hit.source_namespace.as_deref().unwrap_or("unknown");
                     let gt = hit.grain.grain_type;
                     let renderer = self.registry.get(gt);
@@ -722,7 +729,7 @@ impl ContextAssembler {
             }
             OutputFormat::Markdown => {
                 let mut lines = vec!["## Additional Sessions (census)".to_string()];
-                for hit in census_hits {
+                for hit in shown {
                     let session = hit.source_namespace.as_deref().unwrap_or("unknown");
                     let gt = hit.grain.grain_type;
                     let renderer = self.registry.get(gt);
@@ -736,7 +743,7 @@ impl ContextAssembler {
             }
             OutputFormat::PlainText => {
                 let mut lines = vec!["=== Additional Sessions (census) ===".to_string()];
-                for hit in census_hits {
+                for hit in shown {
                     let session = hit.source_namespace.as_deref().unwrap_or("unknown");
                     let gt = hit.grain.grain_type;
                     let renderer = self.registry.get(gt);
@@ -752,7 +759,7 @@ impl ContextAssembler {
                 // JSON: census grains are in the main array but with recall_source.
                 // Re-render each grain as JSON with the recall_source field injected.
                 let mut parts = Vec::new();
-                for hit in census_hits {
+                for hit in shown {
                     let gt = hit.grain.grain_type;
                     let renderer = self.registry.get(gt);
                     let rendered = match renderer {
@@ -788,7 +795,7 @@ impl ContextAssembler {
                 let mut sections = Vec::new();
                 let mut groups: HashMap<GrainType, Vec<&SearchHit>> = HashMap::new();
                 let mut type_order: Vec<GrainType> = Vec::new();
-                for hit in census_hits {
+                for hit in shown {
                     let gt = hit.grain.grain_type;
                     if !groups.contains_key(&gt) {
                         type_order.push(gt);
@@ -3538,5 +3545,33 @@ mod tests {
             assert!(!ctx.text.contains("[OUTDATED]"), "no marker in TOON column:\n{}", ctx.text);
             assert!(ctx.text.contains("john"), "subject column intact:\n{}", ctx.text);
         }
+    }
+
+    /// #A5F4 — the census section renders only its budgeted hits, not all of
+    /// them, and stays consistent with the reported included_count.
+    #[test]
+    fn census_section_honors_budget() {
+        let assembler = ContextAssembler::new();
+        let policy = FormatPolicy::new(OutputFormat::PlainText)
+            .metadata(MetadataLevel::None)
+            .token_budget(40); // census gets ~1/5 → not enough for all six
+        let mut hits = Vec::new();
+        for i in 0..6 {
+            let mut h = make_hit(
+                GrainType::Fact,
+                vec![("subject", "s"), ("relation", "notes"), ("object", "x")],
+                0.5,
+            );
+            h.grain
+                .fields
+                .insert("object".into(), serde_json::Value::String(format!("censusobject{i}")));
+            h.recall_source = Some(RecallSource::Census);
+            hits.push(h);
+        }
+        let ctx = assembler.format(&hits, &policy);
+        let rendered = (0..6).filter(|i| ctx.text.contains(&format!("censusobject{i}"))).count();
+        assert!(rendered < 6, "census must honor its budget (rendered {rendered}/6):\n{}", ctx.text);
+        assert!(rendered > 0, "but some census hits still render");
+        assert!(rendered <= ctx.included_count, "text renders no more grains than included_count reports");
     }
 }

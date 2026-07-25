@@ -40,6 +40,46 @@
   "target_ref": "grain:78f3e5d1c401a5472840a3ef702021439c941c1ba86d59d2a3fe685cbffc4adf"
 }
 {
+  "analyzer": "waiser.tool_failure/1",
+  "cal": "ADD fact {\"confidence\":0.8333333333333334,\"namespace\":\"agent\",\"object\":\"rate limited # retry later\",\"relation\":\"fails_with\",\"subject\":\"stripe_refund\"}",
+  "confidence": 0.8333333333333334,
+  "dedup_key": "waiser.tool_failure\u001fentity:lessons/stripe_refund\u001fcluster_failure",
+  "destructive": false,
+  "evidence": [
+    "12b5f2c680f4d2c389267a91b03137097aeefdbb429521f3843b112e7bb1cfe8",
+    "49680fe34a403f600b09516d9edb7d2b29214d4425cd2e631ad161c3c80593d0",
+    "9ee0f66fc7cfb9a7845daad0ba18c25a0eeabbdf78b9b902017bd73343f4bbc5",
+    "a8849ae77cdb1fac0d172a86a3f813e7e1d59e39bd27cd44e5dcbe8abf0b4282",
+    "b5a548354c4c292926eef57d9e373360a38d5e2686445535d3b7ea4f602762fd"
+  ],
+  "hash": "2a00639b4c4637ab53a70321b1bac2c4a9e14aa0ce1942f9ee528f62a75222f2",
+  "metric": {
+    "baseline": 0.0,
+    "horizons_ms": [
+      86400000,
+      604800000,
+      2592000000
+    ],
+    "metric": "tool_error_recurrence",
+    "n": 6,
+    "query": "RECALL tools WHERE tool_name = \"stripe_refund\" AND is_error AND signature = \"rate limited # retry later\" SINCE <applied_at> | COUNT",
+    "relation": "rate limited # retry later",
+    "review_after_ms": 86400000,
+    "subject": "stripe_refund",
+    "unit": "count",
+    "window": "30d"
+  },
+  "origin": {
+    "kind": "builtin"
+  },
+  "proposal": "cal",
+  "rollbackable": true,
+  "severity": "high",
+  "status": "pending",
+  "summary": "Tool \"stripe_refund\" failed 5 times (83% of calls): rate limited # retry later",
+  "target_ref": "entity:lessons/stripe_refund"
+}
+{
   "analyzer": "waiser.duplicate_sweep/1",
   "cal": "SUPERSEDE 75f48e1cbc437967e2f9222faed59bcf640e120f248069c0c321e759571b8058 WITH fact {\"namespace\":\"agent\",\"object\":\"Enterprise\",\"relation\":\"tier\",\"subject\":\"acme\"}\nSUPERSEDE 2dfca9a43c528882c9bf16255ef89f271712d3adb3c0f28bc9c55d59fa5b9063 WITH fact {\"namespace\":\"agent\",\"object\":\"Enterprise\",\"relation\":\"tier\",\"subject\":\"acme\"}",
   "confidence": 0.8,
@@ -244,43 +284,4 @@
   "status": "pending",
   "summary": "Skill \"parse_invoices\" isn't improving: practiced 12× but proficiency is still 0.25",
   "target_ref": "entity:skills/parse_invoices"
-}
-{
-  "analyzer": "waiser.tool_failure/1",
-  "cal": "ADD fact {\"confidence\":0.8333333333333334,\"namespace\":\"agent\",\"object\":\"rate limited # retry later\",\"relation\":\"fails_with\",\"subject\":\"stripe_refund\"}",
-  "confidence": 0.8333333333333334,
-  "dedup_key": "waiser.tool_failure\u001fentity:lessons/stripe_refund\u001fcluster_failure",
-  "destructive": false,
-  "evidence": [
-    "12b5f2c680f4d2c389267a91b03137097aeefdbb429521f3843b112e7bb1cfe8",
-    "49680fe34a403f600b09516d9edb7d2b29214d4425cd2e631ad161c3c80593d0",
-    "9ee0f66fc7cfb9a7845daad0ba18c25a0eeabbdf78b9b902017bd73343f4bbc5",
-    "a8849ae77cdb1fac0d172a86a3f813e7e1d59e39bd27cd44e5dcbe8abf0b4282",
-    "b5a548354c4c292926eef57d9e373360a38d5e2686445535d3b7ea4f602762fd"
-  ],
-  "hash": "e0255b6b438fbfd7b1b95124dec4ad4c1575b42beca600a6a0633133675709de",
-  "metric": {
-    "baseline": 0.0,
-    "horizons_ms": [
-      86400000,
-      604800000,
-      2592000000
-    ],
-    "metric": "tool_error_recurrence",
-    "n": 6,
-    "query": "RECALL tools WHERE tool_name = \"stripe_refund\" AND is_error SINCE <applied_at> | COUNT",
-    "review_after_ms": 86400000,
-    "subject": "stripe_refund",
-    "unit": "count",
-    "window": "30d"
-  },
-  "origin": {
-    "kind": "builtin"
-  },
-  "proposal": "cal",
-  "rollbackable": true,
-  "severity": "high",
-  "status": "pending",
-  "summary": "Tool \"stripe_refund\" failed 5 times (83% of calls): rate limited # retry later",
-  "target_ref": "entity:lessons/stripe_refund"
 }

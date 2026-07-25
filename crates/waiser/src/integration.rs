@@ -1015,3 +1015,128 @@ fn status_of(e: &Engine, sub: &TestSubstrate, hash: &str) -> RecStatus {
         .unwrap()
         .status
 }
+
+// ── Regression: mechanism-traced findings fixed 2026-07-25 ──────────────────
+
+/// #A6F1 — a tool lesson's outcome metric is scoped to its failure signature;
+/// an unrelated later failure of the SAME tool must not read as a regression.
+#[test]
+fn tool_lesson_holds_on_unrelated_same_tool_failure() {
+    let t = 2_000_000;
+    let (e, mut sub, hash) = apply_lesson(t); // lesson signature = "rate_limited #"
+    // A different-signature failure of the same tool, after the apply.
+    for _ in 0..3 {
+        sub.add_tool_call_at("stripe_refund", true, "insufficient_funds 402", t + 2 * DAY);
+    }
+    e.run(&mut sub.inner, &RunOptions::default(), t + 31 * DAY).unwrap();
+    let series: Vec<_> = e
+        .outcomes(&sub.inner)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.rec_hash == hash)
+        .collect();
+    assert!(!series.is_empty(), "the metric was measured");
+    assert!(
+        series.iter().all(|o| o.verdict == "held"),
+        "an unrelated-signature failure must not regress the lesson: {:?}",
+        series.iter().map(|o| (o.horizon_ms, o.verdict.clone())).collect::<Vec<_>>()
+    );
+    assert!(
+        !e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|r| r.analyzer.starts_with("waiser.outcome_review")),
+        "no revert proposed for an unrelated failure"
+    );
+}
+
+/// #A6F2 — the value-identical auto-apply gate fails closed when the superseded
+/// grain carries information the {s,r,o,ns} replacement can't preserve.
+#[test]
+fn auto_apply_blocks_dropped_expiry() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise"); // canonical (earliest)
+    sub.add_fact_valid_to("acme", "tier", "Enterprise", 999_999); // dup WITH an expiry
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 0, "a dup carrying a valid_to must not auto-apply (expiry would be lost)");
+    assert!(
+        e.recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .iter()
+            .any(|r| r.analyzer.starts_with("waiser.duplicate_sweep")),
+        "it stays pending for human review"
+    );
+}
+
+/// A bare-value duplicate (only s/r/o/ns, no expiry) still auto-applies — the
+/// narrowed A6F2 guard must not block legitimate consolidation.
+#[test]
+fn auto_apply_still_consolidates_plain_duplicates() {
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    sub.add_fact("acme", "tier", "Enterprise");
+    let policy = Policy::from_json(
+        r#"{"auto_apply_enabled": true,
+            "auto_apply": [{"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}]}"#,
+    )
+    .unwrap();
+    let e = Engine::with_builtins().with_policy(policy);
+    let r = e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+    assert_eq!(r.auto_applied, 1, "plain value-identical duplicates still consolidate");
+}
+
+/// #A6F4 — an empty/whitespace error signature yields no (unappliable) lesson.
+#[test]
+fn empty_signature_cluster_not_proposed() {
+    let mut sub = TestSubstrate::new();
+    for _ in 0..6 {
+        sub.add_tool_call("flaky", true, "   "); // whitespace-only error body → sig ""
+    }
+    let drafts = sub.analyze(&crate::analyzers::tool_failure::ToolFailureClustering::new(), 10_000);
+    assert!(drafts.is_empty(), "an empty-signature cluster must not be proposed, got {}", drafts.len());
+}
+
+/// #A6F3 — rejection cooldown backs off exponentially (7d → 14d), not a flat 7d.
+#[test]
+fn rejection_cooldown_doubles() {
+    let e = Engine::with_builtins();
+    let scopes = ScopeSet::all();
+    let reject_at = |sub: &mut TestSubstrate, now: i64| -> String {
+        e.run(&mut sub.inner, &RunOptions::default(), now).unwrap();
+        let rec = e
+            .recommendations(&sub.inner, Some(RecStatus::Pending))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.analyzer.starts_with("waiser.contradiction"))
+            .expect("a contradiction recommendation");
+        let dk = rec.dedup_key.clone();
+        e.review(&mut sub.inner, &rec.hash, Decision::Reject, "user:a", ObserverType::Human, &scopes, "no", now)
+            .unwrap();
+        dk
+    };
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "deploy_target", "us-east-1");
+    sub.add_fact("acme", "deploy_target", "eu-west-1"); // contradiction
+    let t0 = 10_000;
+    let dk = reject_at(&mut sub, t0);
+    let cooldown = |sub: &TestSubstrate, dk: &str| -> i64 {
+        use crate::substrate::OmsSubstrate;
+        crate::config::WaiserPersisted::from_value(sub.inner.load_state().unwrap())
+            .unwrap()
+            .cooldowns
+            .get(dk)
+            .copied()
+            .unwrap()
+    };
+    assert_eq!(cooldown(&sub, &dk) - t0, 7 * DAY, "first rejection = 7d");
+    // Re-propose after the first cooldown elapses, reject again.
+    let t1 = cooldown(&sub, &dk) + 1;
+    reject_at(&mut sub, t1);
+    assert_eq!(cooldown(&sub, &dk) - t1, 14 * DAY, "second rejection doubles to 14d");
+}

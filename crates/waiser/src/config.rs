@@ -34,6 +34,12 @@ pub struct WaiserPersisted {
     /// Rejection cooldowns keyed by dedup_key → cooldown-until epoch-ms.
     #[serde(default)]
     pub cooldowns: BTreeMap<String, i64>,
+    /// How many times each dedup_key has been rejected — drives the exponential
+    /// backoff of `cooldowns` (7d, 14d, 28d, …) so a repeatedly-rejected finding
+    /// stops re-surfacing on a fixed cadence. Omitted when empty (no churn for
+    /// states without a rejection).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldown_strikes: BTreeMap<String, u32>,
     /// Applied-recommendation records (inverse plan, metric, timing).
     #[serde(default)]
     pub applied: BTreeMap<String, AppliedRecord>,
@@ -61,6 +67,7 @@ impl Default for WaiserPersisted {
             audit_heads: BTreeMap::new(),
             creators: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
+            cooldown_strikes: BTreeMap::new(),
             applied: BTreeMap::new(),
             measured: BTreeMap::new(),
             outcomes: BTreeMap::new(),

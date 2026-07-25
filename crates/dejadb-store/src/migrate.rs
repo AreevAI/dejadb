@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use dejadb_core::error::{DejaDbError, Result};
+use dejadb_core::error::{DejaDbError, Hash, Result};
 use dejadb_core::format::serialize::serialize_grain;
 use dejadb_core::types::{Event, Fact, Grain, Role};
 use serde_json::{json, Value};
@@ -300,6 +300,41 @@ pub fn migrate_payload(
 /// add, UPDATE → supersede, DELETE → forget — with original timestamps, so
 /// the pre-import evolution is queryable via `HISTORY`. (The official
 /// mem0→Zep and mem0→Supermemory guides drop this history; we keep it.)
+/// Content-address of the first grain a mem0 history chain would ADD (its first
+/// ADD/UPDATE event carrying non-empty text). Recomputed deterministically from
+/// the same `import_fact` inputs, so it matches the grain a prior run stored —
+/// used to detect a re-import even after the chain was DELETEd, which forgets
+/// its grains and empties `history()` (so the history guard alone would
+/// re-process it, double-counting and — if interrupted mid-chain — resurrecting
+/// a deleted memory).
+fn first_chain_grain_hash(ns: &str, subject: &str, id: &str, evs: &[&Value]) -> Option<Hash> {
+    for e in evs {
+        let action = as_str(e, &["event", "action"]).unwrap_or("").to_ascii_uppercase();
+        if action != "ADD" && action != "UPDATE" {
+            continue;
+        }
+        let Some(text) =
+            as_str(e, &["new_memory", "new_value", "memory"]).filter(|t| !t.trim().is_empty())
+        else {
+            continue;
+        };
+        let ts = parse_ts(e.get("created_at").or_else(|| e.get("updated_at")));
+        let f = import_fact(
+            ns,
+            subject,
+            "mem0_memory",
+            text,
+            "mem0",
+            json!({ "id": id, "event": action }),
+            ts,
+            None,
+            Vec::new(),
+        );
+        return serialize_grain(&f).ok().map(|(_, h)| h);
+    }
+    None
+}
+
 pub fn migrate_mem0(
     m: &mut DejaDB,
     ns: &str,
@@ -345,11 +380,26 @@ pub fn migrate_mem0(
                 }
             }
         }
+        // Every grain hash this file has ever recorded (an OP_ADD record
+        // survives a later forget), snapshotted before replay so a chain
+        // imported by a PRIOR run — even one later DELETEd — is recognized.
+        let ever_added: std::collections::HashSet<Hash> = m
+            .changes_since(0, usize::MAX / 2)?
+            .into_iter()
+            .filter(|o| o.op == crate::OP_ADD)
+            .map(|o| o.hash)
+            .collect();
         for (id, evs) in chains {
             let subject = subject_of(&id);
-            // Re-run safety: a chain already in the store was imported
-            // before — leave it (and any edits made since) alone.
-            if !m.history(ns, &subject, "mem0_memory")?.is_empty() {
+            // Re-run safety: skip a chain already imported — present, edited, OR
+            // deleted. history() catches present/edited chains; the
+            // content-address probe additionally catches delete-terminated ones
+            // (their grains are forgotten, so history() is empty), which a
+            // re-run would otherwise re-add then re-delete.
+            let already = first_chain_grain_hash(ns, &subject, &id, &evs)
+                .is_some_and(|h| ever_added.contains(&h))
+                || !m.history(ns, &subject, "mem0_memory")?.is_empty();
+            if already {
                 rep.skipped += evs.len();
                 rep.note(format!("mem0 {id}: already imported — skipped"));
                 handled.insert(id);

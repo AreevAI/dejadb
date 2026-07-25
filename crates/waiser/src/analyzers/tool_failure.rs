@@ -114,6 +114,13 @@ impl Analyzer for ToolFailureClustering {
 
         let mut drafts = Vec::new();
         for ((tool, signature), mut members) in clusters {
+            // An empty/whitespace-only error body normalizes to "" — a lesson
+            // with object="" would trip the store's non-empty-object validation
+            // (VAL-E001) at apply time, so it can never be applied. Drop the
+            // cluster rather than queue an unappliable recommendation.
+            if signature.is_empty() {
+                continue;
+            }
             let count = members.len();
             let total = tool_totals.get(&tool).copied().unwrap_or(count).max(1);
             let rate = count as f64 / total as f64;
@@ -192,8 +199,15 @@ impl Analyzer for ToolFailureClustering {
                     window: format!("{}d", ctx.params().get_int("window_days")),
                     subject: Some(tool.clone()),
                     namespace: None,
-                    relation: None,
-                    query: format!("RECALL tools WHERE tool_name = \"{tool}\" AND is_error SINCE <applied_at> | COUNT"),
+                    // The metric is scoped to THIS failure signature, not the
+                    // whole tool — `relation` carries it so measure_metric can
+                    // count only recurrences of the same signature. Without it a
+                    // later, unrelated failure of the same tool reads as a
+                    // regression and reverts a still-valid lesson.
+                    relation: Some(signature.clone()),
+                    query: format!(
+                        "RECALL tools WHERE tool_name = \"{tool}\" AND is_error AND signature = \"{signature}\" SINCE <applied_at> | COUNT"
+                    ),
                     review_after_ms: 86_400_000,
                     // Re-measure at 1 day, 1 week, 1 month — a late recurrence
                     // (held at 1d, regressed at 30d) is caught by the schedule.
@@ -208,7 +222,9 @@ impl Analyzer for ToolFailureClustering {
 
 /// Normalize an error message into a stable signature: lowercase, first ~80
 /// chars, digit runs → `#`, path-like tokens → `<path>`. Regex-free (std only).
-fn normalize_signature(content: &str) -> String {
+/// `pub(crate)` so the Verify gate (`measure_metric`) can re-derive the same
+/// signature when scoping a `tool_error_recurrence` re-measurement.
+pub(crate) fn normalize_signature(content: &str) -> String {
     let lowered: String = content.trim().to_lowercase().chars().take(80).collect();
     let mut out = String::with_capacity(lowered.len());
     for token in lowered.split_whitespace() {

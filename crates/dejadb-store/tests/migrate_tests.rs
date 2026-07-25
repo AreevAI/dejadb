@@ -66,6 +66,29 @@ fn mem0_delete_event_forgets_the_chain() {
     assert!(m.latest("main", "mem0/m-9", "mem0_memory").unwrap().is_none());
 }
 
+// Regression (#A4F5): re-importing a delete-terminated chain must be idempotent
+// — its grains are forgotten (history() is empty), so the history-based guard
+// alone would re-add then re-delete, resurrecting the memory if interrupted.
+#[test]
+fn mem0_delete_terminated_rerun_is_idempotent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut m = open(&dir, "mem0delrerun.db");
+    let history = json!([
+        { "memory_id": "m-9", "event": "ADD", "new_memory": "Lives in Berlin",
+          "created_at": "2024-01-01T00:00:00Z" },
+        { "memory_id": "m-9", "event": "DELETE", "created_at": "2024-02-01T00:00:00Z" }
+    ]);
+    let r1 = migrate_mem0(&mut m, "main", None, Some(&history)).unwrap();
+    assert_eq!((r1.added, r1.forgotten), (1, 1));
+
+    // Re-run the SAME history: recognized as already imported, not re-processed.
+    let r2 = migrate_mem0(&mut m, "main", None, Some(&history)).unwrap();
+    assert_eq!(r2.added, 0, "must not re-add a delete-terminated chain");
+    assert_eq!(r2.forgotten, 0, "and must not re-forget");
+    assert!(r2.skipped >= 1, "it is skipped");
+    assert!(m.latest("main", "mem0/m-9", "mem0_memory").unwrap().is_none(), "stays deleted");
+}
+
 #[test]
 fn mem0_export_only_and_rerun_is_idempotent() {
     let dir = tempfile::TempDir::new().unwrap();

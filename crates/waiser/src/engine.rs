@@ -881,10 +881,16 @@ impl Engine {
         p.status_index.insert(rec_hash.into(), to);
         if to == RecStatus::Rejected {
             if let Ok(rec) = load_rec(sub, rec_hash) {
-                // Cooldown (doubling keyed on dedup_key; base 7d).
-                let base = 7 * 86_400_000;
-                let until = now_ms + base;
-                p.cooldowns.insert(rec.dedup_key, until);
+                // Exponential backoff keyed on dedup_key: 7d, 14d, 28d, … capped
+                // at 90d, so a finding a reviewer keeps rejecting stops
+                // re-surfacing on a fixed 7d cadence (was a flat 7d despite the
+                // "doubling" comment).
+                const BASE_MS: i64 = 7 * 86_400_000;
+                const CAP_MS: i64 = 90 * 86_400_000;
+                let strikes = p.cooldown_strikes.entry(rec.dedup_key.clone()).or_insert(0);
+                let interval = BASE_MS.saturating_mul(1_i64 << (*strikes).min(31)).min(CAP_MS);
+                *strikes = strikes.saturating_add(1);
+                p.cooldowns.insert(rec.dedup_key, now_ms + interval);
             }
         }
         sub.store_state(&p.to_value()?)?;
@@ -1301,7 +1307,10 @@ fn measure_metric<S: SubstrateRead>(
     since_ms: i64,
 ) -> Result<Option<f64>> {
     match metric.metric.as_str() {
-        // How many times did this tool fail again after the lesson was applied?
+        // How many times did this tool fail again *with the same signature*
+        // after the lesson was applied? Scoped to the signature (metric.relation)
+        // so an unrelated later failure of the same tool is not read as a
+        // regression of this specific lesson.
         "tool_error_recurrence" => {
             let Some(tool) = &metric.subject else { return Ok(None) };
             let tools = sub.grains_of_type(
@@ -1312,6 +1321,15 @@ fn measure_metric<S: SubstrateRead>(
             let n = tools
                 .iter()
                 .filter(|t| t.tool_name() == Some(tool.as_str()) && t.is_error())
+                .filter(|t| {
+                    // No stored signature (legacy metric) → fall back to the
+                    // whole-tool count so old recommendations still measure.
+                    metric.relation.as_deref().is_none_or(|sig| {
+                        crate::analyzers::tool_failure::normalize_signature(
+                            t.tool_content().unwrap_or(""),
+                        ) == sig
+                    })
+                })
                 .count();
             Ok(Some(n as f64))
         }
@@ -1380,6 +1398,19 @@ fn supersede_is_value_identical<S: SubstrateRead>(sub: &S, line: &str) -> bool {
     let Ok(Some(grain)) = sub.grain(&target) else {
         return false;
     };
+    // An expiry lives OUTSIDE `fields`, so the replacement (built from a fixed
+    // field set) can never carry it — consolidating away a grain that has a
+    // valid_to would silently drop the expiry, invisibly to the field-by-field
+    // check below. Fail closed. (A dup that additionally carries an extra
+    // *content* field the replacement omits is a real but subtler info-loss;
+    // catching it soundly needs a full canonical-vs-extra comparison rather
+    // than this replacement-scoped check, since a real fact's fields also carry
+    // OMS metadata like `confidence` that consolidation legitimately keeps —
+    // left as a follow-up so this narrow fix can't block valid consolidations.)
+    if grain.valid_to_ms.is_some() {
+        return false;
+    }
+    // Forward check: every replacement field equals the grain's value.
     fields.iter().all(|(k, v)| {
         if k == "namespace" {
             return v
