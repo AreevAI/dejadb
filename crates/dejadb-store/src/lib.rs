@@ -1411,129 +1411,12 @@ impl DejaDB {
     }
 
     fn add_batch_inner(&mut self, grains: &[&dyn AddableDyn]) -> Result<Vec<Hash>> {
-        // Serialize + extract + dictionary-encode before entering the txn.
-        let mut preps = Vec::with_capacity(grains.len());
-        for g in grains {
-            let (blob, hash) = g.serialize_dyn()?;
-            preps.push(self.prep_from_blob(blob, hash)?);
-        }
-
-        let first_seq = self.next_seq;
-        self.next_seq += preps.len() as i64;
-        let first_op = self.next_op;
-        self.next_op += preps.len() as i64;
-        let hlc0 = self.next_hlc();
-        self.hlc_last = hlc0 + preps.len() as i64 - 1;
-
+        let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(grains)?;
         let conn = &self.conn;
         let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         self.rt.block_on(async {
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                let mut st_g = conn
-                    .prepare(
-                        "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
-                    )
-                    .await
-                    .map_err(db_err)?;
-                let mut st_t = conn
-                    .prepare("INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
-                    .await
-                    .map_err(db_err)?;
-                let mut st_o = conn
-                    .prepare("INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
-                    .await
-                    .map_err(db_err)?;
-                let mut st_e = conn
-                    .prepare("INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)")
-                    .await
-                    .map_err(db_err)?;
-                let mut st_l = conn
-                    .prepare("INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)")
-                    .await
-                    .map_err(db_err)?;
-                let mut st_th = conn
-                    .prepare("INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)")
-                    .await
-                    .map_err(db_err)?;
-                for (i, pr) in preps.iter().enumerate() {
-                    let seq = first_seq + i as i64;
-                    st_g.execute((
-                        pi(seq),
-                        pb(pr.hash.as_bytes().to_vec()),
-                        pi(pr.ns_id),
-                        pi(pr.gtype),
-                        pi(pr.created),
-                        opt_i(pr.s),
-                        opt_i(pr.p),
-                        opt_i(pr.o),
-                        opt_i(pr.vf),
-                        opt_i(pr.vt),
-                        pi(pr.created),
-                        match &pr.text { Some(t) => pt(t), None => Value::Null },
-                        pb(pr.blob.clone()),
-                    ))
-                    .await
-                    .map_err(db_err)?;
-                    if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
-                        st_t.execute((pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)))
-                            .await
-                            .map_err(db_err)?;
-                        if pr.osp {
-                            st_o.execute((pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)))
-                                .await
-                                .map_err(db_err)?;
-                        }
-                        st_e.execute((
-                            pi(pr.ns_id),
-                            pi(s),
-                            pi(p),
-                            pi(o),
-                            pi(seq),
-                            pb(pr.hash.as_bytes().to_vec()),
-                        ))
-                        .await
-                        .map_err(db_err)?;
-                        conn.execute(
-                            "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3",
-                            (pi(pr.ns_id), pi(s), pi(p)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                        conn.execute(
-                            "INSERT INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                            (pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    if let Some(sess) = pr.session {
-                        st_th
-                            .execute((pi(pr.ns_id), pi(sess), pi(seq)))
-                            .await
-                            .map_err(db_err)?;
-                    }
-                    if let Some(ref emb) = pr.embedding {
-                        conn.execute(
-                            "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
-                            (pi(seq), pt(&vec_to_json(emb))),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    st_l.execute((
-                        pi(first_op + i as i64),
-                        pi(hlc0 + i as i64),
-                        pi(OP_ADD),
-                        pb(pr.hash.as_bytes().to_vec()),
-                    ))
-                    .await
-                    .map_err(db_err)?;
-                }
-                Ok::<(), DejaDbError>(())
-            }
-            .await;
+            let r = insert_prepped(conn, &preps, first_seq, first_op, hlc0).await;
             match r {
                 Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
                 Err(e) => {
@@ -1543,6 +1426,30 @@ impl DejaDB {
             }
         })?;
         Ok(hashes)
+    }
+
+    /// Serialize + dictionary-encode `grains` and reserve their seq/op/hlc
+    /// counters — the pre-transaction half of an add, performing NO writes. Kept
+    /// separate from [`insert_prepped`] so `supersede`/`merge_heads` can run the
+    /// insert body inside their OWN atomic transaction, alongside the index
+    /// flip, instead of committing the add first and flipping in a second txn.
+    fn prep_and_reserve(
+        &mut self,
+        grains: &[&dyn AddableDyn],
+    ) -> Result<(Vec<GrainPrep>, i64, i64, i64)> {
+        // Serialize + extract + dictionary-encode before entering the txn.
+        let mut preps = Vec::with_capacity(grains.len());
+        for g in grains {
+            let (blob, hash) = g.serialize_dyn()?;
+            preps.push(self.prep_from_blob(blob, hash)?);
+        }
+        let first_seq = self.next_seq;
+        self.next_seq += preps.len() as i64;
+        let first_op = self.next_op;
+        self.next_op += preps.len() as i64;
+        let hlc0 = self.next_hlc();
+        self.hlc_last = hlc0 + preps.len() as i64 - 1;
+        Ok((preps, first_seq, first_op, hlc0))
     }
 
     // ----- read path -----
@@ -1847,7 +1754,16 @@ impl DejaDB {
         }
 
         new_grain.common_mut().derived_from = Some(old.to_hex());
-        let new_hash = self.add(new_grain)?;
+        // Prep the new grain and reserve its counters WITHOUT writing, so the
+        // insert body runs inside the SAME transaction as the flip below — the
+        // add and the supersession commit atomically. (Previously add() committed
+        // in its own txn, then a second txn flipped the old grain; a crash or
+        // error between them left the new grain current while the old stayed
+        // un-superseded, so recall surfaced both values — the OMS-L2 "atomic"
+        // guarantee this method documents.)
+        let new_dyn: &dyn AddableDyn = &*new_grain;
+        let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(&[new_dyn])?;
+        let new_hash = preps[0].hash;
         let now = now_ms();
 
         let op_seq = self.next_op;
@@ -1857,6 +1773,7 @@ impl DejaDB {
         self.rt.block_on(async {
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
             let r = async {
+                insert_prepped(conn, &preps, first_seq, first_op, hlc0).await?;
                 conn.execute(
                     "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
                     (pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)),
@@ -3159,49 +3076,72 @@ impl DejaDB {
         };
         ctx.insert("merge_parents".into(), serde_json::json!(parents));
         merged.common_mut().context = Some(serde_json::Value::Object(ctx));
-        let merge_hash = self.add(merged)?; // add() collapses heads to {merge}
+        // Insert the merge grain AND close every tip in ONE transaction. A merge
+        // that committed the add first and then closed tips in separate
+        // (autocommit) statements could crash mid-loop, leaving heads={merge}
+        // while some parent tips stayed cur=1 (heads/recall disagreement).
+        let merged_dyn: &dyn AddableDyn = &*merged;
+        let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(&[merged_dyn])?;
+        let merge_hash = preps[0].hash;
         let now = now_ms();
-        let conn = &self.conn;
-        for (tip, _) in &tips {
-            let seq = self.rt.block_on(async {
-                let mut rows = conn
-                    .query("SELECT seq, svt FROM grains WHERE hash=?1", (pb(tip.as_bytes().to_vec()),))
-                    .await
-                    .map_err(db_err)?;
-                Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                    Some(row) => {
-                        let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                        let svt = v_i64(&row.get_value(1).map_err(db_err)?);
-                        (svt.is_none()).then_some(seq)
-                    }
-                    None => None,
-                })
-            })?;
-            if let Some(seq) = seq {
-                self.rt.block_on(async {
-                    conn.execute(
-                        "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
-                        (pb(merge_hash.as_bytes().to_vec()), pi(now), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute("UPDATE triples SET cur=0 WHERE seq=?1", (pi(seq),))
-                        .await
-                        .map_err(db_err)?;
-                    conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(seq),))
-                        .await
-                        .map_err(db_err)?;
-                    Ok::<(), DejaDbError>(())
-                })?;
-            }
-        }
-        // Record the fork-closure in the op-log so it replicates. A merge that
-        // ships only its OP_ADD leaves every downstream replica with the parent
-        // tips still open (a phantom fork). One OP_SUPERSEDE(merge_hash) carries
-        // it; the merge grain's context.merge_parents lets import close all tips
-        // (see superseded_parents + the import OP_SUPERSEDE branch).
+        // Reserve the fork-closure OP_SUPERSEDE slot (written inside the txn so it
+        // replicates; the merge grain's context.merge_parents lets import close
+        // all tips — see superseded_parents + the import OP_SUPERSEDE branch).
+        let op_seq = self.next_op;
+        self.next_op += 1;
         let hlc = self.next_hlc();
-        self.log_op(OP_SUPERSEDE, &merge_hash, hlc)?;
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            conn.execute("BEGIN", ()).await.map_err(db_err)?;
+            let r = async {
+                insert_prepped(conn, &preps, first_seq, first_op, hlc0).await?; // OP_ADD; collapses heads to {merge}
+                for (tip, _) in &tips {
+                    let seq = {
+                        let mut rows = conn
+                            .query("SELECT seq, svt FROM grains WHERE hash=?1", (pb(tip.as_bytes().to_vec()),))
+                            .await
+                            .map_err(db_err)?;
+                        match rows.next().await.map_err(db_err)? {
+                            Some(row) => {
+                                let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
+                                let svt = v_i64(&row.get_value(1).map_err(db_err)?);
+                                (svt.is_none()).then_some(seq)
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(seq) = seq {
+                        conn.execute(
+                            "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
+                            (pb(merge_hash.as_bytes().to_vec()), pi(now), pi(seq)),
+                        )
+                        .await
+                        .map_err(db_err)?;
+                        conn.execute("UPDATE triples SET cur=0 WHERE seq=?1", (pi(seq),))
+                            .await
+                            .map_err(db_err)?;
+                        conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(seq),))
+                            .await
+                            .map_err(db_err)?;
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                    (pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(merge_hash.as_bytes().to_vec())),
+                )
+                .await
+                .map_err(db_err)?;
+                Ok::<(), DejaDbError>(())
+            }
+            .await;
+            match r {
+                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            }
+        })?;
         Ok(merge_hash)
     }
 
@@ -3919,6 +3859,126 @@ pub mod telemetry;
 
 pub use asyncdb::AsyncDejaDB;
 pub use telemetry::{AccessStat, BudgetStat, QueryStat, RecallEvent, Telemetry, TelemetryMode};
+
+/// The insert body of an add — the grain row, triples/osp, entity_latest, head
+/// collapse+insert, thread index, embedding, and the OP_ADD op-log row — WITHOUT
+/// `BEGIN`/`COMMIT`. Runs inside a transaction the caller already opened, so
+/// `supersede`/`merge_heads` can perform the grain insert AND the index flip in
+/// ONE atomic transaction (previously they committed the add, then flipped in a
+/// separate txn — a crash or error between the two left a torn state: the new
+/// grain durable and current while the old grain stayed un-superseded). The
+/// caller reserves `first_seq`/`first_op`/`hlc0` via [`DejaDB::prep_and_reserve`]
+/// and owns the surrounding transaction.
+async fn insert_prepped(
+    conn: &Connection,
+    preps: &[GrainPrep],
+    first_seq: i64,
+    first_op: i64,
+    hlc0: i64,
+) -> Result<()> {
+    let mut st_g = conn
+        .prepare(
+            "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
+        )
+        .await
+        .map_err(db_err)?;
+    let mut st_t = conn
+        .prepare("INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
+        .await
+        .map_err(db_err)?;
+    let mut st_o = conn
+        .prepare("INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
+        .await
+        .map_err(db_err)?;
+    let mut st_e = conn
+        .prepare("INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)")
+        .await
+        .map_err(db_err)?;
+    let mut st_l = conn
+        .prepare("INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)")
+        .await
+        .map_err(db_err)?;
+    let mut st_th = conn
+        .prepare("INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)")
+        .await
+        .map_err(db_err)?;
+    for (i, pr) in preps.iter().enumerate() {
+        let seq = first_seq + i as i64;
+        st_g.execute((
+            pi(seq),
+            pb(pr.hash.as_bytes().to_vec()),
+            pi(pr.ns_id),
+            pi(pr.gtype),
+            pi(pr.created),
+            opt_i(pr.s),
+            opt_i(pr.p),
+            opt_i(pr.o),
+            opt_i(pr.vf),
+            opt_i(pr.vt),
+            pi(pr.created),
+            match &pr.text { Some(t) => pt(t), None => Value::Null },
+            pb(pr.blob.clone()),
+        ))
+        .await
+        .map_err(db_err)?;
+        if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
+            st_t.execute((pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)))
+                .await
+                .map_err(db_err)?;
+            if pr.osp {
+                st_o.execute((pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)))
+                    .await
+                    .map_err(db_err)?;
+            }
+            st_e.execute((
+                pi(pr.ns_id),
+                pi(s),
+                pi(p),
+                pi(o),
+                pi(seq),
+                pb(pr.hash.as_bytes().to_vec()),
+            ))
+            .await
+            .map_err(db_err)?;
+            conn.execute(
+                "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3",
+                (pi(pr.ns_id), pi(s), pi(p)),
+            )
+            .await
+            .map_err(db_err)?;
+            conn.execute(
+                "INSERT INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                (pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        if let Some(sess) = pr.session {
+            st_th
+                .execute((pi(pr.ns_id), pi(sess), pi(seq)))
+                .await
+                .map_err(db_err)?;
+        }
+        if let Some(ref emb) = pr.embedding {
+            conn.execute(
+                "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
+                (pi(seq), pt(&vec_to_json(emb))),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        st_l.execute((
+            pi(first_op + i as i64),
+            pi(hlc0 + i as i64),
+            pi(OP_ADD),
+            pb(pr.hash.as_bytes().to_vec()),
+        ))
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
 
 /// Every parent hash a grain supersedes: the linear `derived_from`, plus any
 /// `context.merge_parents` recorded by a merge commit. Used by bundle import to
