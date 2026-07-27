@@ -21,6 +21,16 @@ must publish bottom-up.
 
 - Bump `version` in `[workspace.package]` in the root `Cargo.toml` (all crates
   inherit it via `version.workspace = true`).
+- **Also bump the two bindings' OWN version files** — they do NOT inherit the
+  workspace version, and a workspace-only bump makes the npm/PyPI publish
+  workflows silently no-op over the already-published version (a "successful"
+  run that ships nothing):
+  - `crates/dejadb-js/package.json` → `"version"` (standalone npm package).
+  - `crates/dejadb-py/pyproject.toml` → `[project] version` (maturin reads this,
+    NOT Cargo's `version.workspace`).
+  After a release, verify the registries actually flipped:
+  `npm view dejadb version`, `curl -s https://pypi.org/pypi/dejadb/json | jq -r .info.version` —
+  a green workflow is not proof the version changed.
 - Move the `[Unreleased]` section of `CHANGELOG.md` under a new dated version
   heading; add a fresh empty `[Unreleased]`.
 - Commit: `Release vX.Y.Z`. Tag: `git tag vX.Y.Z`.
