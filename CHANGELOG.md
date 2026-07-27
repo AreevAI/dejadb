@@ -118,6 +118,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The npm Linux addons no longer require a bleeding-edge glibc.** 1.0.1's
+  `dejadb-linux-x64-gnu` / `dejadb-linux-arm64-gnu` were built straight on
+  `ubuntu-latest`, so they linked `GLIBC_2.39` and failed to load on every
+  Debian 12–based host — including 64-bit Raspberry Pi OS Bookworm — with
+  napi's misleading "Cannot find native binding … npm optional dependencies
+  bug" (the real error is `GLIBC_2.39 not found`). Both legs now build
+  *natively inside* a Debian 11 container (aarch64 on the free arm64 runner,
+  so nothing cross-compiles), which puts the floor at `GLIBC_2.31` —
+  Debian 11+, Ubuntu 20.04+, Raspberry Pi OS Bullseye+ — and `release-npm`
+  fails the build if an addon ever needs more than that again. PyPI wheels
+  were never affected (maturin's manylinux images already floor at 2.17).
+  **Needs a patch release to reach users**: npm versions are immutable, so the
+  broken 1.0.1 platform packages stay as they are.
 - **Auto-apply now enforces the exact-equality shape check** duplicate_sweep's
   docs promised: a granted consolidation auto-applies only when every
   SUPERSEDE replacement is value-identical (case-fold; `namespace` against the
