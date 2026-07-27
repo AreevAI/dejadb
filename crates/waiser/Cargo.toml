@@ -11,9 +11,6 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["ai-agents", "memory", "governance", "self-improvement", "oms"]
 categories = ["algorithms"]
-# Developed as a workspace member during the churn phase; lifted to its own
-# repo when semantics freeze (proposal §10). Not published from this workspace.
-publish = false
 
 # The engine crate must never depend on a dejadb-* sibling (proposal §10);
 # CI greps this Cargo.toml to enforce it. serde only — dependency-light.

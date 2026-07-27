@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-27
+
 ### Added
 
 - **`deja recall-hook --with-waiser`** — the UserPromptSubmit hook now closes
@@ -118,6 +120,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Correctness hardening (feature-combination bug-hunt).** Serialization now
+  rejects non-finite floats and non-canonical trailing-byte blobs at the
+  write⇒read boundary, preserves nested user-JSON keys that collide with OMS
+  short codes, and NFC-normalizes map keys. `forget()` reconciles the fork-head
+  index; `supersede` and `merge_heads` are single-transaction atomic; a
+  supersession replicates correctly across two hops. Hybrid recall's FTS and
+  vector legs fail open (never error) on hostile query text or an embedder
+  dimension mismatch. `get_blob` validates the `cas://` URI instead of
+  panicking. Census + JSON renders one valid array, and TOON rows no longer
+  carry a `[CURRENT]`/`[OUTDATED]` marker that corrupted the column schema.
+- **CAL scoping.** Saved-query bodies stay read-only even when parameterized,
+  and a nested `ASSEMBLE`'s `WITH` recall-tuning options scope to that assemble
+  instead of leaking to the enclosing `EXPLAIN`/`COALESCE` query.
+- **Waiser.** Tool-failure lessons re-measure against their exact failure
+  signature, so an unrelated later failure of the same tool no longer reverts a
+  valid lesson; rejection cooldowns now back off exponentially; empty-signature
+  clusters and auto-apply consolidations that would drop an expiry are refused;
+  mem0 history re-import is idempotent for delete-terminated chains.
 - **The npm Linux addons no longer require a bleeding-edge glibc.** 1.0.1's
   `dejadb-linux-x64-gnu` / `dejadb-linux-arm64-gnu` were built straight on
   `ubuntu-latest`, so they linked `GLIBC_2.39` and failed to load on every
