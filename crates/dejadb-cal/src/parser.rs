@@ -187,10 +187,6 @@ struct Parser {
     nesting_depth: usize,
     /// Original input text — used by `reconstruct_body_text` for DEFINE QUERY bodies.
     input: String,
-    /// Non-dedup options from an ASSEMBLE `WITH dedup, ...` list, parsed
-    /// inside `parse_assemble` but belonging to the statement-level WITH
-    /// options. Drained by `parse_statement_full`.
-    pending_with_options: Vec<WithOption>,
 }
 
 impl Parser {
@@ -201,7 +197,6 @@ impl Parser {
             warnings: vec![],
             nesting_depth: 0,
             input: input.to_string(),
-            pending_with_options: vec![],
         }
     }
 
@@ -1151,9 +1146,8 @@ impl Parser {
         let mut pipeline = self.parse_pipeline()?;
 
         // Parse trailing clauses in any order: WITH options, FORMAT, WITH VARS,
-        // and post-pipeline WHERE filters. Start from any statement-level
-        // options an ASSEMBLE `WITH dedup, ...` list already surfaced.
-        let mut with_options = std::mem::take(&mut self.pending_with_options);
+        // and post-pipeline WHERE filters.
+        let mut with_options: Vec<WithOption> = Vec::new();
         let mut format = None;
         let mut user_vars = HashMap::new();
 
@@ -3478,13 +3472,15 @@ impl Parser {
         // ASSEMBLE-specific WITH option).  Otherwise leave WITH for the
         // top-level WITH parser to handle (e.g. `WITH rerank`).
         //
-        // The list may mix dedup with general options
-        // (`WITH dedup, recency_weight(0.7)`), so parse it with the full
-        // WITH parser and keep only dedup here; the rest go to
-        // `pending_with_options` for `parse_statement_full`. The old
-        // dedup-only loop stopped at the first non-dedup option and the
-        // remainder of the list was silently dropped.
-        let assemble_with = if self.at_exact(&Token::With)
+        // The list may mix dedup with general recall-tuning options
+        // (`WITH dedup, recency_weight(0.7)`), so parse it with the full WITH
+        // parser: `dedup` stays in `assemble_with`, and the rest go onto the
+        // AssembleStmt's OWN `with_options` — scoped to this assemble's recall.
+        // (They used to be pushed onto the shared `pending_with_options` field
+        // and drained by the enclosing `parse_statement_full`, which bound them
+        // to the WRONG query when the ASSEMBLE was nested under EXPLAIN /
+        // COALESCE / parens / brace / an assemble-source.)
+        let (assemble_with, assemble_with_options) = if self.at_exact(&Token::With)
             && matches!(
                 self.peek_ahead(1),
                 Some(SpannedToken {
@@ -3493,17 +3489,16 @@ impl Parser {
                 })
             ) {
             let mut aw = Vec::new();
+            let mut opts = Vec::new();
             for opt in self.parse_with_clause()? {
                 match opt {
-                    WithOption::Dedup { field } => {
-                        aw.push(AssembleWithOption::Dedup { field });
-                    }
-                    other => self.pending_with_options.push(other),
+                    WithOption::Dedup { field } => aw.push(AssembleWithOption::Dedup { field }),
+                    other => opts.push(other),
                 }
             }
-            aw
+            (aw, opts)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let span_end = self.prev_span();
@@ -3518,6 +3513,7 @@ impl Parser {
             format,
             for_whom,
             assemble_with,
+            with_options: assemble_with_options,
             streaming: false,
             span: Some(Span::new(
                 span_start.start,
@@ -5580,31 +5576,66 @@ mod tests {
 
     #[test]
     fn test_assemble_with_mixed_dedup_list_keeps_all_options() {
-        // `WITH dedup, <general options>` on ASSEMBLE used to silently drop
-        // everything after dedup (the tail parsed as ignored trailing input).
+        // `WITH dedup, <general options>` on ASSEMBLE: `dedup` stays
+        // assemble-scoped, and the rest are kept on the AssembleStmt's OWN
+        // `with_options` (not silently dropped, and not routed to the enclosing
+        // query) so they scope to this assemble's recall.
         let q = p("ASSEMBLE \"ctx\" FROM a: (RECALL facts), b: (RECALL events) \
                    BUDGET 400 tokens FORMAT sml \
                    WITH dedup, recency_weight(0.7), provenance");
-        match &q.statement {
-            CalStatement::Assemble(a) => {
-                assert_eq!(a.assemble_with.len(), 1, "dedup stays assemble-scoped");
+        let CalStatement::Assemble(a) = &q.statement else {
+            panic!("expected Assemble, got {:?}", q.statement);
+        };
+        assert_eq!(a.assemble_with.len(), 1, "dedup stays assemble-scoped");
+        assert!(
+            a.with_options.iter().any(|o| matches!(o, WithOption::RecencyWeight { .. })),
+            "recency_weight kept on the assemble: {:?}",
+            a.with_options
+        );
+        assert!(
+            a.with_options.iter().any(|o| matches!(o, WithOption::Provenance)),
+            "provenance kept on the assemble: {:?}",
+            a.with_options
+        );
+        assert!(
+            q.with_options.is_empty(),
+            "options stay assemble-scoped, not on the enclosing query: {:?}",
+            q.with_options
+        );
+    }
+
+    /// Regression (#A3F2): a NESTED ASSEMBLE's `WITH dedup, <opts>` options stay
+    /// on the inner ASSEMBLE — they must not leak to the enclosing EXPLAIN /
+    /// COALESCE query (the shared `pending_with_options` field used to bind them
+    /// to the wrong statement when the ASSEMBLE was nested).
+    #[test]
+    fn test_nested_assemble_with_options_do_not_leak() {
+        fn inner_assemble(stmt: &CalStatement) -> &AssembleStmt {
+            match stmt {
+                CalStatement::Assemble(a) => a,
+                CalStatement::Explain(e) => inner_assemble(&e.inner),
+                CalStatement::Coalesce(c) => inner_assemble(&c.branches[0].query),
+                other => panic!("expected an ASSEMBLE (possibly wrapped), got {:?}", other),
             }
-            other => panic!("expected Assemble, got {:?}", other),
         }
-        assert!(
-            q.with_options
-                .iter()
-                .any(|o| matches!(o, WithOption::RecencyWeight { .. })),
-            "recency_weight must survive: {:?}",
-            q.with_options
-        );
-        assert!(
-            q.with_options
-                .iter()
-                .any(|o| matches!(o, WithOption::Provenance)),
-            "provenance must survive: {:?}",
-            q.with_options
-        );
+        // FORMAT before WITH forces the trailing clause onto the assemble-level
+        // path (otherwise the last source greedily consumes it).
+        let src = "ASSEMBLE \"ctx\" FROM a: (RECALL facts), b: (RECALL events) \
+                   FORMAT sml WITH dedup, query_expansion";
+        for wrapped in [format!("EXPLAIN {src}"), format!("COALESCE {{ {src} }} OR {{ RECALL facts }}")] {
+            let q = p(&wrapped);
+            assert!(
+                q.with_options.is_empty(),
+                "{wrapped:?}: options leaked to the wrapper query: {:?}",
+                q.with_options
+            );
+            let a = inner_assemble(&q.statement);
+            assert!(
+                a.with_options.iter().any(|o| matches!(o, WithOption::QueryExpansion)),
+                "{wrapped:?}: query_expansion must scope to the inner assemble: {:?}",
+                a.with_options
+            );
+        }
     }
 
     // ── 1. Simple RECALL ──────────────────────────────────────────────────

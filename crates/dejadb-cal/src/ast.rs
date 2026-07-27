@@ -293,6 +293,14 @@ pub struct AssembleStmt {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assemble_with: Vec<AssembleWithOption>,
 
+    /// Recall-tuning options from the same `WITH dedup, <opts>` clause as
+    /// `assemble_with` — everything that isn't `dedup` (e.g. `query_expansion`,
+    /// `recency_weight`, `rerank`). Held on the ASSEMBLE itself, NOT routed to
+    /// the enclosing query, so they scope to this assemble's recall even when it
+    /// is nested (EXPLAIN / COALESCE / parens / brace / assemble-source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with_options: Vec<WithOption>,
+
     /// `STREAM ASSEMBLE ...` — enable SSE streaming (FR-004).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streaming: bool,

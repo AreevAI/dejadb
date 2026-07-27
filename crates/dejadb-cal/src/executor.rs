@@ -3369,6 +3369,27 @@ impl CalExecutor {
         query: &CalQuery,
         exec_warnings: &mut Vec<String>,
     ) -> std::result::Result<CalResultPayload, CalError> {
+        // The ASSEMBLE's own recall-tuning options (the non-dedup tail of its
+        // `WITH dedup, <opts>` clause) live on the AssembleStmt so they scope to
+        // THIS assemble even when it is nested (EXPLAIN/COALESCE/…). Fold them
+        // into the query's with_options once, here, so every downstream consumer
+        // — the streaming payload, the AssembleEngine's per-source recall, the
+        // post-merge pass, and the single-source surrogate — sees them.
+        let merged;
+        let query = if assemble.with_options.is_empty() {
+            query
+        } else {
+            merged = CalQuery {
+                with_options: query
+                    .with_options
+                    .iter()
+                    .chain(&assemble.with_options)
+                    .cloned()
+                    .collect(),
+                ..query.clone()
+            };
+            &merged
+        };
         // FR-004: Streaming ASSEMBLE — return the statement + WITH options
         // for the HTTP handler to stream. The handler applies post-merge
         // options (rerank, dedup, diversity, etc.) before streaming grains.
@@ -8540,6 +8561,7 @@ mod tests {
             format: None,
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8603,6 +8625,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8667,6 +8690,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8740,6 +8764,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8821,6 +8846,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8884,6 +8910,7 @@ mod tests {
             format: None,
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -8955,6 +8982,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -9032,6 +9060,7 @@ mod tests {
             )),
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
@@ -9106,6 +9135,7 @@ mod tests {
             format: None,
             for_whom: None,
             assemble_with: Vec::new(),
+            with_options: Vec::new(),
             streaming: false,
             span: None,
         };
