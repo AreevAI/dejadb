@@ -27,7 +27,17 @@ edges.
 DejaDB is written in Rust and ships as a Rust library, the `deja` command-line
 binary, an MCP server, and Python (`import dejadb`) and Node
 (`require('dejadb')`) bindings. It runs anywhere Rust and Turso run — Linux,
-macOS, and edge devices.
+macOS, and Windows on x86-64, plus **arm64** everywhere (Apple Silicon, arm64
+servers, and 64-bit Raspberry Pi OS).
+
+Edge devices are supported and measured, not assumed. On a **$35 Raspberry
+Pi 3 B from 2016** — 1 GB RAM, 1.2 GHz Cortex-A53, consumer microSD, the
+slowest 64-bit Pi — DejaDB serves recall at a flat **~361 µs from 500 to 8,000
+grains** in ~50 MiB of RAM, installed from the wheel in 16 seconds with no
+compiler ([RESULTS.md §6](crates/dejadb-bench/RESULTS.md), which also projects
+the same workload on a Pi 5). Two caveats: install the wheel rather than
+building on-device (`cargo install` peaks at 2.0 GiB RSS, so it cannot link in
+1 GB), and 32-bit ARM has no published artifact — use the 64-bit image.
 
 ### Is it free? What license?
 

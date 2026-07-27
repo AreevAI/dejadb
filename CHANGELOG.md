@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Edge/arm64 reference numbers, measured on a Raspberry Pi 3 B v1.2** —
+  `crates/dejadb-bench/scripts/edge_bench.py` runs the read/write/vector paths
+  on the device itself and emits the markdown for
+  [RESULTS.md §6](crates/dejadb-bench/RESULTS.md). Headline: recall is **flat
+  at ~361 µs from 500 to 8,000 grains** in ~50 MiB on a 1 GB / 1.2 GHz A53
+  (12× the M4 Max figure, including the Python-binding FFI), while single-grain
+  writes with a live FTS index degrade to 200 ms/grain against **4 ms/grain**
+  bulk-loaded — so on edge hardware the write strategy, not the corpus size,
+  is what needs designing. Vector recall works but the embedding model is ~98%
+  of it (270 ms of a 275 ms `nearest()`), so prefer BM25 or off-device
+  embedding there. README and FAQ now state arm64/Raspberry Pi support
+  concretely, including that `cargo install` cannot link in 1 GB of RAM (2.0
+  GiB peak) — use the wheel or cross-compile. The harness samples the ARM clock
+  throughout every phase and asserts that recall benchmarks actually hit, so
+  the published figures are all at the device's rated clock. Context for the
+  headline: this is a **February 2016, $35, 1 GB board** reading from a
+  consumer microSD card that manages ~200 durable IOPS; §6 also projects what
+  the same workload should look like on a Pi 5.
+
 ## [1.0.2] - 2026-07-27
 
 ### Added
