@@ -26,6 +26,12 @@ where a network memory call can't. **Your agent's memory is a file you own.**
 *Status: `1.0.1` — the `.mg` format and CAL are stable and documented (conformant
 with the Open Memory Spec, OMS).*
 
+## Watch the 2½-minute overview
+
+[![DejaDB in 2½ minutes — grains, CAL, and the Waiser learning loop](https://img.youtube.com/vi/HqNcgkTIryQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=HqNcgkTIryQ)
+
+Grains → context assembly → CAL → the loop → Waiser, in one animated pass.
+
 ## Screenshots
 
 The web console — browse memories, inspect the graph, and run CAL with a live
