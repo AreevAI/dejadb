@@ -28,7 +28,7 @@ with the Open Memory Spec, OMS).*
 
 ## Watch the 2½-minute overview
 
-[![DejaDB in 2½ minutes — grains, CAL, and the Waiser learning loop](https://img.youtube.com/vi/HqNcgkTIryQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=HqNcgkTIryQ)
+[![DejaDB in 2½ minutes — grains, CAL, and the Waiser learning loop](demo/screens/video-cover.png)](https://www.youtube.com/watch?v=HqNcgkTIryQ)
 
 Grains → context assembly → CAL → the loop → Waiser, in one animated pass.
 
