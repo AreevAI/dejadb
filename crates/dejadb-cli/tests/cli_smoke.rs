@@ -247,3 +247,34 @@ fn boolean_flag_does_not_swallow_short_db_flag() {
     );
     assert!(err.contains("shipped"), "expected ops shipped from {db}: {err}");
 }
+
+/// Regression (#16): opening an encrypted memory without the passphrase used
+/// to fail with a bare STO-E001 "file is not a database". When a `<db>.kdf`
+/// sidecar exists and no key was given, the error must say the file is
+/// encrypted and point at `--passphrase-env`.
+#[test]
+fn encrypted_open_without_passphrase_hints_at_kdf_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("enc.db");
+    let db = db.to_str().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_deja"))
+        .args(["add", "alice", "likes", "tea", "-d", db, "--passphrase-env", "DEJA_TEST_PASS"])
+        .env("DEJA_TEST_PASS", "correct horse")
+        .output()
+        .expect("spawn deja");
+    assert!(
+        out.status.success(),
+        "encrypted add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Same file, no passphrase: must fail, and must say why.
+    let (ok, _out, err) = deja(&["recall", "alice", "-d", db]);
+    assert!(!ok, "recall without the passphrase unexpectedly succeeded");
+    assert!(err.contains(".kdf exists"), "no encryption hint in: {err}");
+    assert!(
+        err.contains("--passphrase-env"),
+        "no --passphrase-env pointer in: {err}"
+    );
+}
