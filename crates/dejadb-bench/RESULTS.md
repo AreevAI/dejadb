@@ -208,112 +208,97 @@ write-back    p50 494.2µs p95 1085.7µs             (off audio thread in prod)
 verdict: PASS
 ```
 
-## 6. Edge reference — Raspberry Pi 3 B (2016 hardware, $35, 1 GB RAM)
+## 6. Edge reference — measured on real devices
 
-**A ten-year-old $35 computer serves agent memory in microseconds.** The
-Raspberry Pi 3 Model B launched in February 2016 with a 1.2 GHz Cortex-A53 and
-1 GB of RAM, boots off a consumer microSD card, and — with no server, no
-network hop and no tuning — answers recall in **~361 µs, flat from 500 to 8,000
-grains**, in about 50 MiB of RAM. That is the floor of what DejaDB runs on, not
-a target it strains to hit.
+**A ten-year-old $35 computer serves agent memory in microseconds, and a 2018
+mini-PC matches a 2024 laptop.** Both numbers below come from the same harness
+(`crates/dejadb-bench/scripts/edge_bench.py`), run on the devices themselves,
+with the CPU clock sampled throughout every phase so nothing is published at a
+reduced clock.
 
-*Run: 2026-07-27 on the device · Raspberry Pi 3 B rev a02082 (BCM2837, 4×
-Cortex-A53 @1.2GHz, 905 MiB usable RAM) · storage: SanDisk 64 GB microSDXC
-(`SC64G`, made 07/2018), measured on this board at **23.2 MB/s** sequential
-read, **18.7 MB/s** sequential write, and **825 kB/s for 4 KiB synced writes**
-(~200 durable IOPS) · Raspberry Pi OS Lite **arm64** Trixie 2026-06-18, kernel
-6.18.34, glibc 2.41, Python 3.13.5 · `dejadb 1.0.2` from the PyPI
-`manylinux_2_17_aarch64` wheel — installed in 16 s, no compiler, no build.*
+| | Raspberry Pi 3 Model B | Intel NUC8i3BEH |
+|---|---|---|
+| class | Feb 2016, $35 SBC | 2018 mini-PC |
+| CPU | 4× Cortex-A53 @1.2 GHz | Core i3-8109U, 2c/4t @3.0–3.6 GHz |
+| RAM | 905 MiB usable | 7.1 GiB |
+| storage | SanDisk 64 GB microSDXC (`SC64G`) | WD 250 GB NVMe (`WDS250G3X0C`) |
+| …measured here | 23.2 MB/s read · 18.7 MB/s write · **825 kB/s** 4 KiB dsync (~200 durable IOPS) | 2.4 GB/s read · 919 MB/s write · **3.1 MB/s** 4 KiB dsync (~770 durable IOPS) |
+| OS | RPi OS Lite **arm64** Trixie · kernel 6.18 · glibc 2.41 · Py 3.13 | Ubuntu Server 26.04 · kernel 7.0 · glibc 2.43 · Py 3.14 |
+| install | `pip install dejadb` — 16 s, no compiler | `pip install dejadb` — 16 s, no compiler |
 
 ```
 pip install dejadb                                   # wheel; never build on-device
 crates/dejadb-bench/scripts/edge_bench.py --vector   # emits the tables below
 ```
 
-**Install note:** `cargo install
-dejadb` cannot work on 1 GB — the LTO link peaks at 2.0 GiB RSS. Use the wheel,
-or cross-compile `aarch64-unknown-linux-gnu`. 32-bit Raspberry Pi OS is not
-supported (no armhf wheel, no CI leg); use the 64-bit image.
+### Results
 
-### Read path — flat in corpus size
+| operation | Pi 3 B (2016 ARM) | NUC8i3BEH (2018 x86) | for reference: §5 M4 Max, Rust API |
+|---|---|---|---|
+| recall p50 @ 500 / 2k / 8k grains | 348 / 360 / **361 µs** | 29 / 29 / **30 µs** | 30.2 µs @13k |
+| recall p99 @8k | 591 µs | 67 µs | 60.7 µs |
+| recall *miss* | 27 µs | 3 µs | — |
+| `latest()` head read @8k | 690 µs | 51 µs | 9.2 µs |
+| CAL `RECALL FACTS ABOUT` @8k | 2.79 ms | 0.26 ms | — |
+| **`migrate` bulk import** (index deferred) | **3.90–4.04 ms/grain** | **0.37–0.39 ms/grain** | — |
+| `add_fact` single txn, FTS live (empty → @500) | 26.3 → **201.2 ms** | 4.0 → **24.5 ms** | 304 ms @13k (§5) |
+| DejaDB vector scan @ 500 / 2k | 9.4 / 34.9 ms | 0.9 / 3.7 ms | — |
+| embed one query (all-MiniLM-L6-v2) | 270 ms | **23 ms** | — |
+| end-to-end `nearest()` (model + scan) | ~280 ms | **24 ms** | — |
+| RSS: engine / with model resident | ~50 / 348 MiB | ~102 / 409 MiB | — |
 
-Bulk-loaded, FTS index live. Every figure in this section was taken with the
-ARM clock sampled throughout the phase and certified at its rated 1200 MHz.
+Three readings matter more than the individual numbers.
 
-| grains | recall hit p50 | p99 | recall miss p50 | `latest()` p50 | CAL p50 | RSS |
-|---|---|---|---|---|---|---|
-| 500 | 348 µs | 579 µs | 27 µs | 655 µs | 1.63 ms | 44 MiB |
-| 2,000 | 360 µs | 606 µs | 27 µs | 689 µs | 1.80 ms | 66 MiB |
-| 8,000 | **361 µs** | 591 µs | 27 µs | 690 µs | 2.79 ms | 50 MiB |
+**Recall is flat in corpus size on both.** 16× the data, same latency — 348→361 µs
+on the Pi, 29→30 µs on the NUC — because recall is an indexed point lookup, not
+a scan. A device can accumulate memory for months and answer as fast on day 200
+as on day 1. That is the property that makes an unattended edge deployment
+sustainable, and it holds across a 12× hardware gap. (A *miss* costs 27 µs / 3 µs,
+so any recall benchmark that doesn't assert a hit reports ~10× better than reality.)
 
-**The memory can grow without recall getting slower** — 16× the corpus, same
-latency, because recall is an indexed point lookup rather than a scan. This is
-the property that makes an edge deployment sustainable: a device that
-accumulates memory for months answers as fast on day 200 as on day 1. Against
-§5's M4 Max figure (30.2 µs at 13k) the Pi is ~12×, which buys you a laptop-
-class engine on hardware that costs less than a month of a hosted memory
-service — and includes the Python-binding FFI + JSON round-trip that the Rust
-API skips.
+**A 2018 mini-PC lands within a whisker of a 2024 laptop.** The NUC's 30 µs recall
+matches §5's 30.2 µs on an M4 Max — and does it *through* the Python binding's FFI
+and JSON round-trip, which the Rust benchmark skips. You do not need current
+hardware to run this well.
 
-### Write path — where the SD card decides everything
+**The write path is the one thing to design for, on both.** Single-grain
+transactions against a live FTS index degrade as the index fills (26→201 ms on
+the Pi, 4→24.5 ms on the NUC) while the deferred-index bulk path stays flat —
+a **50× gap on SD and still 63× on NVMe**. Storage explains why the gap survives
+better hardware: durable 4 KiB writes only improve ~4× from SD to consumer NVMe
+(200 → 770 IOPS), because fsync latency, not bandwidth, is what a live index
+pays per transaction. So on any device: bulk-load through `migrate` /
+`defer_text_index()`, and run write-heavy workloads with
+`DejaDbOptions { index_text: false }` (the voice/edge profile).
 
-| path | cost |
-|---|---|
-| `add_fact`, one txn each, FTS live (empty file) | 26.3 ms/grain |
-| `add_fact`, one txn each, FTS live (@500 grains) | **201.2 ms/grain** |
-| `migrate` bulk import, index deferred (to 500 / 2k / 8k) | **3.90 / 3.98 / 4.04 ms/grain** |
-
-Finding #1 again, and on an SD card the consequences are stark: **~50× between
-the two paths**, widening as the index fills. The card is the reason — at
-~200 durable 4 KiB IOPS, every single-grain transaction that also updates a
-live FTS index pays several synchronous round-trips to flash. The deferred-
-index bulk path stays **flat at ~4 ms/grain** to 8k because it amortises them.
-
-So on any SD-backed device: bulk-load through `migrate` / `defer_text_index()`,
-and run write-heavy workloads with `DejaDbOptions { index_text: false }` (the
-voice/edge profile). Do that and the write path stops being a consideration.
-A USB SSD or an NVMe-capable board removes the ceiling entirely.
-
-### Vector recall — the engine is not the bottleneck
-
-| leg | measurement |
-|---|---|
-| DejaDB vector scan, 500 grains | 9.4 ms p50 (22.1 p99) |
-| DejaDB vector scan, 2,000 grains | 34.9 ms p50 (58.3 p99) |
-| all-MiniLM-L6-v2 load / resident | 10.9 s / **+179 MiB** |
-| embed one query | **270 ms** p50 (batched 239 ms/text) |
-| process RSS with model resident | 348 MiB of 905 |
-
-Brute-force cosine costs ~17 µs/grain and scales linearly, so a full semantic
-recall is **embed + scan ≈ 280 ms, of which ~98% is the model** — DejaDB's own
-share is single-digit milliseconds. Three good options follow on 2016-era
-silicon: run the BM25 + `EnglishExpander` edge profile with no embedder at all,
-embed off-device and hand DejaDB the vectors, or accept ~280 ms for a semantic
-turn. The same arithmetic applies to ingest: embedding dominates, so a corpus
-of any size should be embedded off-device and bulk-imported.
+**Vector recall** is dominated by the embedding model on both — 270 of ~280 ms on
+the Pi (~98%), 23 of 24 ms on the NUC (~96%); DejaDB's own scan is 0.9–35 ms.
+On 2016-era ARM that means preferring the BM25 + `EnglishExpander` edge profile
+or embedding off-device. On the NUC, 24 ms end-to-end makes on-device semantic
+recall comfortably interactive.
 
 ### What this looks like on current hardware
 
-The numbers above are the **worst case DejaDB supports**. A Raspberry Pi 5
-changes all three variables that bound this board: a Cortex-A76 at 2.4 GHz
-(published single-thread benchmarks put it ~5× the Pi 3 B), NVMe over PCIe
-instead of a 200-IOPS SD card (two orders of magnitude on synced small writes),
-and 4–16 GB of RAM instead of 1 GB.
+The Pi 3 B is the **worst case DejaDB supports**, and the NUC is already
+eight-year-old hardware. A Raspberry Pi 5 changes the three variables that bound
+the Pi 3: a Cortex-A76 at 2.4 GHz (~5× the core), NVMe over PCIe instead of a
+200-IOPS card, and 4–16 GB of RAM.
 
 *Projected, not measured — stated so nobody mistakes it for a result:*
 
-| | Pi 3 B (measured) | Pi 5 (projected) | why |
-|---|---|---|---|
-| recall p50 | 361 µs | **~60–90 µs** | CPU + FFI bound; ~5× core |
-| bulk import | 3.9 ms/grain | **sub-millisecond** | CPU + sequential I/O |
-| single `add_fact`, FTS live | 201 ms | **~5–20 ms** | fsync-bound; NVMe ≫ SD |
-| embed (MiniLM, on-device) | 270 ms | **~50–70 ms** | ~5× core, wider SIMD |
-| build from source | impossible (1 GB) | comfortable | 2.0 GiB link peak |
+| | Pi 3 B (measured) | Pi 5 (projected) |
+|---|---|---|
+| recall p50 | 361 µs | ~60–90 µs |
+| bulk import | 3.9 ms/grain | sub-millisecond |
+| single `add_fact`, FTS live | 201 ms | ~5–20 ms |
+| embed (MiniLM, on-device) | 270 ms | ~50–70 ms |
+| build from source | impossible (1 GB) | comfortable |
 
-At the projected read latency a Pi 5 is within a small multiple of the M4 Max
-figures in §5 — an entire agent memory stack, private and offline, on a board
-that costs less than a dinner. Anyone can check these in one command:
-`edge_bench.py --vector` prints the same tables for whatever device it runs on.
+The NUC column above is partial corroboration: on x86 with NVMe, recall already
+lands at 30 µs and bulk import at 0.39 ms/grain — ahead of what this table
+projects for a Pi 5, so the projection is conservative in the right direction.
+Anyone can check it in one command: `edge_bench.py --vector` prints these tables
+for whatever device it runs on.
 
 ### Method — how these numbers are kept honest
 
@@ -321,12 +306,12 @@ that costs less than a dinner. Anyone can check these in one command:
 benchmarks routinely mislead:
 
 - **Recall benchmarks must hit.** A query for a subject that was never imported
-  measures the miss path — 27 µs against 361 µs here, a 13× flattering error
-  that looks like a spectacular result. The harness asserts a non-empty result
-  before timing.
+  measures the miss path — 27 µs against 361 µs on the Pi, a 13× flattering
+  error that looks like a spectacular result. The harness asserts a non-empty
+  result before timing.
 - **The clock is sampled during a phase, never after.** It recovers to nominal
   within milliseconds of the load ending, so a run measured at a reduced clock
-  reads back as full-speed if you check once it is over.
+  reads back as full speed if you check once it is over.
 - **On a Pi, only `vcgencmd` knows the clock.** `/sys/.../scaling_cur_freq`
   reports the governor's *request*; it read a flat 1200 MHz across 412 samples
   of a phase the firmware was actually running at 600 MHz.
@@ -354,10 +339,14 @@ benchmarks routinely mislead:
 3. **`forget` leaves the object string in the terms dictionary and WAL**
    (T3b). Fine under the crypto-erasure story, but a `terms` GC (or at least
    a docs note) would tighten it.
-4. **The read path is flat in corpus size on slow silicon; the write path is
-   not** (§6). A Pi 3 serves recall at a steady ~361 µs from 500 to 8,000
-   grains, so an edge deployment is bounded by *write* strategy and by storage
-   (~200 durable IOPS on a microSD card), not by how much it remembers. The FTS tax of finding #1 is the whole story
+4. **The read path is flat in corpus size; the write path is bounded by fsync**
+   (§6). Recall holds steady from 500 to 8,000 grains on both measured devices
+   (~361 µs on a Pi 3, ~30 µs on a 2018 NUC), so an edge deployment is bounded
+   by *write* strategy, not by how much it remembers. Better storage does not
+   rescue the live-index path: durable 4 KiB writes improve only ~4× from
+   microSD to consumer NVMe (200 → 770 IOPS), because a single-grain txn pays
+   fsync latency, not bandwidth — hence 50× (SD) and still 63× (NVMe) between
+   the live-index and deferred-index paths. The FTS tax of finding #1 is the whole story
    there: 200 ms/grain live versus 4 ms/grain deferred, at only 500 grains.
 5. **Two traps make edge benchmarks lie**, both now guarded by
    `scripts/edge_bench.py`: a recall benchmark that doesn't assert a *hit*

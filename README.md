@@ -388,14 +388,16 @@ Every surface above fits inside 0.6% of a 50 ms audio frame; the two transport
 rows show the cost is the network hop, not the store — the whole argument for
 embedding it.
 
-**On edge hardware** — a **$35 Raspberry Pi 3 B from 2016** (1 GB RAM,
-1.2 GHz Cortex-A53, booting off a consumer microSD card) serves recall at
-**~361 µs, flat from 500 to 8,000 grains**, in ~50 MiB of RAM, straight from
-`pip install dejadb`. 16× the corpus, same latency — a device can accumulate
-memory for months and answer as fast on day 200 as on day 1. The write path is
-the one thing to design for on SD (4 ms/grain bulk-loaded vs 200 ms with a live
-FTS index). Measured on the device with the clock certified during every phase,
-plus a projection for current Pi hardware:
+**On edge hardware** — benchmarked on the devices themselves, not extrapolated.
+A **$35 Raspberry Pi 3 B from 2016** (1 GB RAM, 1.2 GHz Cortex-A53, consumer
+microSD) serves recall at **~361 µs, flat from 500 to 8,000 grains**; an
+**Intel NUC8i3BEH from 2018** (i3-8109U, NVMe) does the same in **~30 µs** —
+matching the M4 Max figure above, through the Python binding's FFI. Both install
+with `pip install dejadb` in 16 seconds, no compiler. 16× the corpus, same
+latency: a device can accumulate memory for months and answer as fast on day 200
+as on day 1. The write path is the one thing to design for (bulk-load at
+0.4–4 ms/grain vs 24–201 ms with a live FTS index). Clock-certified per phase,
+with a projection for current Pi hardware:
 [RESULTS.md §6](crates/dejadb-bench/RESULTS.md).
 
 ## Documentation
