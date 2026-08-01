@@ -53,6 +53,9 @@ Turso transitively includes [tantivy](https://github.com/quickwit-oss/tantivy)
 | lru | MIT |
 | tracing | MIT |
 | rmpv / rmp | MIT |
+| argon2, zeroize | MIT OR Apache-2.0 |
+| getrandom | MIT OR Apache-2.0 |
+| ureq (dejadb-llm only) | MIT OR Apache-2.0 |
 | pyo3 (dejadb-py only) | MIT OR Apache-2.0 |
 
 "MIT OR Apache-2.0" dependencies are used under Apache-2.0. Full license

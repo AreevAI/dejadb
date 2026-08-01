@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-08-01
+
 ### Added
 
 - **Edge benchmark numbers, measured on two real devices** —
@@ -26,6 +28,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peak) — use the wheel or cross-compile. The harness samples the CPU clock
   throughout every phase and asserts that recall benchmarks actually hit, so
   every published figure is at the device's rated clock.
+- **Regression tests** — opening an encrypted memory without the passphrase
+  must point at the `.kdf` sidecar and `--passphrase-env` (the 1.0.2 fix for
+  issue #16 shipped untested); and the LLM-provider HTTP path now has a
+  loopback mock-server test (request line, headers, body, JSON round-trip,
+  status-error mapping) instead of being exercised only at compile time.
+
+### Changed
+
+- **LLM-provider HTTP client migrated to ureq 3** (`dejadb-llm`). Same
+  blocking, dependency-light posture. The single read timeout now applies to
+  each receive phase separately (awaiting the response, then the body — a slow
+  LLM still gets the full 120 s in each), and a response over the 10 MiB cap
+  is now an error instead of ureq 2's silent truncation. Non-2xx statuses
+  still surface as `LlmBackend` errors naming the URL.
+- **Dependency refresh**: turso 0.7.1 (storage engine — recall and write
+  latency re-measured at parity with the RESULTS.md baselines before
+  merging), tokio 1.53.1, serde_json 1.0.151, `@napi-rs/cli` 3.7.4,
+  `actions/setup-python` v7.
+- `THIRD-PARTY-NOTICES.md` now attributes all runtime direct dependencies
+  (added argon2, zeroize, getrandom, ureq).
 
 ## [1.0.2] - 2026-07-27
 
@@ -328,5 +350,8 @@ and OMS-conformant; content addresses and error codes are contracts from here._
 - Argon2id key derivation with zeroization of key material.
 - `cargo-deny` supply-chain gate and a pinned encryption dependency.
 
-[Unreleased]: https://github.com/AreevAI/dejadb/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/AreevAI/dejadb/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/AreevAI/dejadb/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/AreevAI/dejadb/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/AreevAI/dejadb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/AreevAI/dejadb/releases/tag/v1.0.0
