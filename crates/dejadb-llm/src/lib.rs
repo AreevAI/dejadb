@@ -31,25 +31,32 @@ const CONNECT_SECS: u64 = 30;
 const READ_SECS: u64 = 120; // the reflection loop is async/batchy — a slow call is fine
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(CONNECT_SECS))
-        .timeout_read(Duration::from_secs(READ_SECS))
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(CONNECT_SECS)))
+        // ureq 2's single read timeout maps to two phases in ureq 3: waiting
+        // for the response head (the LLM thinking) and streaming the body.
+        .timeout_recv_response(Some(Duration::from_secs(READ_SECS)))
+        .timeout_recv_body(Some(Duration::from_secs(READ_SECS)))
         .build()
+        .into()
 }
 
 /// POST a JSON body and return the parsed JSON response. `headers` is a slice of
 /// (name, value). Maps transport / non-2xx / decode faults to `Error::LlmBackend`.
 fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
-    let mut req = agent().post(url).set("Content-Type", "application/json");
+    let mut req = agent().post(url).header("Content-Type", "application/json");
     for (k, v) in headers {
-        req = req.set(k, v);
+        req = req.header(*k, *v);
     }
     let body = serde_json::to_string(body)
         .map_err(|e| Error::LlmBackend(format!("encode request: {e}")))?;
     let text = req
-        .send_string(&body)
+        .send(&body)
         .map_err(|e| Error::LlmBackend(format!("{url}: {e}")))?
-        .into_string()
+        .body_mut()
+        // Same 10 MiB cap as ureq 2's into_string(), but overflow is now an
+        // error instead of silent truncation.
+        .read_to_string()
         .map_err(|e| Error::LlmBackend(format!("read response: {e}")))?;
     serde_json::from_str(&text).map_err(|e| Error::LlmBackend(format!("decode response: {e}")))
 }
@@ -460,6 +467,72 @@ mod tests {
         // Ollama needs no key.
         assert_eq!(resolve("ollama:llama3.1", None, None).unwrap().model(), "llama3.1");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    /// `post_json` end-to-end over a real loopback socket (regression for the
+    /// ureq 2→3 migration): the request line, Content-Type, custom headers,
+    /// and body must arrive as sent; the JSON response must round-trip; and a
+    /// non-2xx status must surface as an `Error::LlmBackend` naming the URL.
+    #[test]
+    fn post_json_round_trips_over_loopback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reqs = Vec::new();
+            for (status_line, body) in [
+                ("HTTP/1.1 200 OK", r#"{"pong":true}"#),
+                ("HTTP/1.1 401 Unauthorized", r#"{"error":"bad key"}"#),
+            ] {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..pos]).to_ascii_lowercase();
+                        let cl: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        if req.len() >= pos + 4 + cl {
+                            break;
+                        }
+                    }
+                }
+                reqs.push(String::from_utf8_lossy(&req).to_string());
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+            reqs
+        });
+
+        let url = format!("http://{addr}/v1/chat/completions");
+
+        // 200: the response JSON round-trips.
+        let v = post_json(&url, &[("Authorization", "Bearer k")], &json!({"ping": 1})).unwrap();
+        assert_eq!(v["pong"], true);
+
+        // 401: surfaced as an LlmBackend error naming the URL.
+        let e = match post_json(&url, &[], &json!({})) {
+            Err(e) => e,
+            Ok(v) => panic!("expected a status error, got {v}"),
+        };
+        assert!(e.to_string().contains(&url), "{e}");
+
+        let reqs = server.join().unwrap();
+        assert!(reqs[0].starts_with("POST /v1/chat/completions"), "{}", reqs[0]);
+        let lower = reqs[0].to_ascii_lowercase();
+        assert!(lower.contains("content-type: application/json"), "{}", reqs[0]);
+        assert!(lower.contains("authorization: bearer k"), "{}", reqs[0]);
+        assert!(reqs[0].ends_with(r#"{"ping":1}"#), "{}", reqs[0]);
     }
 
     #[test]
