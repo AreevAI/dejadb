@@ -123,8 +123,9 @@ and are the source of truth. Ranges:
 | `CAL-E092` | Invalid query — store rejected input as invalid (not a budget overrun) |
 | `CAL-E100` | Unsupported CAL version |
 | `CAL-E110`–`E116` | Multi-format, user vars, scope, LLM-dependent options |
+| `CAL-E117`–`E119` | Template limits and inheritance (OMS CAL §10.7–§10.8) |
 | `CAL-E120` | Invalid JSON+CAL |
-| `CAL-W001`–`W010` | Warnings (unknown relation, deprecated operator, …) |
+| `CAL-W001`–`W012` | Warnings (unknown relation, deprecated operator, `{{#each}}` cap, bounded `CONTRADICTIONS` scan, …) |
 
 `CAL-E116` is the "needs an external LLM, not implemented" error for
 `WITH hyde` / `WITH llm_rerank` — DejaDB takes no LLM dependency by policy.

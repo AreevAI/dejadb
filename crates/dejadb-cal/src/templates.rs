@@ -29,7 +29,17 @@ use super::executor::CalGrainResult;
 // ---------------------------------------------------------------------------
 
 /// Maximum template source size in bytes (64KB).
-pub const MAX_TEMPLATE_SIZE: usize = 65_536;
+/// OMS CAL §10.8 — max template body size.
+pub const MAX_TEMPLATE_SIZE: usize = 4_096;
+
+/// OMS CAL §10.8 — max conditional nesting depth.
+pub const MAX_TEMPLATE_NESTING: usize = 5;
+
+/// OMS CAL §10.8 — max `{{#each}}` iterations.
+pub const MAX_EACH_ITERATIONS: usize = 200;
+
+/// OMS CAL §10.8 — max custom templates per namespace (built-ins excluded).
+pub const MAX_TEMPLATES: usize = 50;
 
 /// Maximum rendered output size in bytes (1MB).
 pub const MAX_RENDER_OUTPUT_SIZE: usize = 1_048_576;
@@ -119,6 +129,45 @@ const ALLOWED_FIELDS: &[&str] = &[
     "subject_did",
     "is_withdrawal",
     "basis",
+];
+
+/// CAL §10.5 grain-level variables, without the `grain.` prefix. These are
+/// the spec's own names — the ones that are computed (content projection,
+/// humanized relation, relative time, disclosure sections) rather than read
+/// straight off the grain.
+const SPEC_GRAIN_VARIABLES: &[&str] = &[
+    "content",
+    "type",
+    "subject",
+    "relation",
+    "humanized_relation",
+    "object",
+    "confidence",
+    "importance",
+    "tags",
+    "created_at",
+    "relative_time",
+    "score",
+    "hash",
+    "is_full",
+    "is_summary",
+];
+
+/// CAL §10.5 assembly-level variables (the `assembly.` namespace).
+const SPEC_ASSEMBLY_VARIABLES: &[&str] = &["name", "intent", "source_count", "grain_count"];
+
+/// CAL §10.5 budget variables (the `budget.` namespace).
+const SPEC_BUDGET_VARIABLES: &[&str] =
+    &["total", "used", "remaining", "unit", "utilization"];
+
+/// CAL §10.5 source-level variables (the `source.` namespace).
+const SPEC_SOURCE_VARIABLES: &[&str] = &[
+    "label",
+    "index",
+    "priority",
+    "grain_count",
+    "tokens_used",
+    "truncated",
 ];
 
 /// The full closed set of valid template variable names (fields + metadata + direct).
@@ -298,13 +347,172 @@ pub struct Filter {
 // Template struct
 // ---------------------------------------------------------------------------
 
+/// The six sections of a template body (OMS CAL §10.6).
+///
+/// A sectioned template inverts who drives iteration. In the whole-result
+/// form the author writes `{{#each grains}}` and owns the loop; here the
+/// engine owns it, which is what lets it choose a *different* body per grain
+/// — `ELEMENT` at full disclosure, `ELEMENT_SUMMARY` when the budget is
+/// tight — and interleave `SOURCE_BREAK` between ASSEMBLE sources.
+///
+/// `None` means the section was not defined and is inherited from the parent
+/// (§10.7), which is why these are `Option` rather than empty node lists: an
+/// explicitly empty `SOURCE_BREAK { }` must override a parent's, not fall
+/// back to it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TemplateSections {
+    /// Emitted once, before any element.
+    pub header: Option<Vec<TemplateNode>>,
+    /// Emitted per grain at full disclosure.
+    pub element: Option<Vec<TemplateNode>>,
+    /// Emitted per grain when the render is squeezed below full disclosure.
+    pub element_summary: Option<Vec<TemplateNode>>,
+    /// Emitted per grain the budget dropped, so a template can account for
+    /// what an `ASSEMBLE` left out rather than presenting a trimmed set as if
+    /// it were everything. Fed by `SourceMeta::omitted` on the multi-source
+    /// path and by the split-off tail on the single-source one; a bare
+    /// `RECALL` has no budget, so nothing is omitted and the section is inert.
+    pub element_omit: Option<Vec<TemplateNode>>,
+    /// Emitted between sources — not before the first, not after the last.
+    pub source_break: Option<Vec<TemplateNode>>,
+    /// Emitted once, after every element.
+    pub footer: Option<Vec<TemplateNode>>,
+}
+
+impl TemplateSections {
+    /// True when no section is defined at all.
+    pub fn is_empty(&self) -> bool {
+        self.header.is_none()
+            && self.element.is_none()
+            && self.element_summary.is_none()
+            && self.element_omit.is_none()
+            && self.source_break.is_none()
+            && self.footer.is_none()
+    }
+
+    /// Fill each undefined section from `parent` (§10.7, depth 1).
+    fn inherit_from(&mut self, parent: &TemplateSections) {
+        fn fill(child: &mut Option<Vec<TemplateNode>>, parent: &Option<Vec<TemplateNode>>) {
+            if child.is_none() {
+                child.clone_from(parent);
+            }
+        }
+        fill(&mut self.header, &parent.header);
+        fill(&mut self.element, &parent.element);
+        fill(&mut self.element_summary, &parent.element_summary);
+        fill(&mut self.element_omit, &parent.element_omit);
+        fill(&mut self.source_break, &parent.source_break);
+        fill(&mut self.footer, &parent.footer);
+    }
+}
+
+/// One source of grains in a sectioned render.
+///
+/// A bare `RECALL` has a single unlabelled source; an `ASSEMBLE` has one per
+/// `FROM` clause, in priority order.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderSource<'a> {
+    /// The `FROM` label, or `""` for a single-source render.
+    pub label: &'a str,
+    /// The grains belonging to this source.
+    pub grains: &'a [CalGrainResult],
+    /// Grains the budget forced out of this source, rendered through
+    /// `ELEMENT_OMIT` so a template can account for what was dropped.
+    pub omitted: &'a [CalGrainResult],
+    /// 1-based `PRIORITY` rank; 0 when the statement set no priority.
+    pub priority: usize,
+    /// Tokens this source consumed.
+    pub tokens_used: usize,
+    /// Whether the budget cut grains from this source.
+    pub truncated: bool,
+}
+
+impl<'a> RenderSource<'a> {
+    /// A single unlabelled source — the shape a bare `RECALL` renders with.
+    pub fn single(grains: &'a [CalGrainResult]) -> Self {
+        Self {
+            label: "",
+            grains,
+            omitted: &[],
+            priority: 0,
+            tokens_used: 0,
+            truncated: false,
+        }
+    }
+}
+
+/// Assembly-level render context — CAL §10.5 `assembly.*` and `budget.*`.
+///
+/// Only an `ASSEMBLE` has these; a bare `RECALL` renders with `None`, and the
+/// variables resolve to empty rather than erroring, per §10.8's rule that an
+/// undefined variable renders as the empty string.
+#[derive(Debug, Clone, Default)]
+pub struct AssemblyContext {
+    /// Context name (`ASSEMBLE <name>`).
+    pub name: String,
+    /// `FOR "..."` text.
+    pub intent: String,
+    /// Number of sources.
+    pub source_count: usize,
+    /// Total grains included after budget trimming.
+    pub grain_count: usize,
+    /// Budget granted.
+    pub budget_total: u64,
+    /// Budget consumed.
+    pub budget_used: u64,
+    /// `"tokens"` or `"grains"`.
+    pub budget_unit: String,
+}
+
+impl AssemblyContext {
+    fn budget_remaining(&self) -> u64 {
+        self.budget_total.saturating_sub(self.budget_used)
+    }
+
+    fn budget_utilization(&self) -> f64 {
+        if self.budget_total == 0 {
+            0.0
+        } else {
+            self.budget_used as f64 / self.budget_total as f64
+        }
+    }
+}
+
+/// Everything a FORMAT render needs about the statement that produced the
+/// grains.
+///
+/// A bare `RECALL` renders with the default (no assembly, one implicit
+/// source); an `ASSEMBLE` fills both, which is what makes `SOURCE_BREAK`,
+/// `ELEMENT_OMIT` and the `assembly.`/`source.`/`budget.` namespaces
+/// meaningful.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RenderPlan<'a> {
+    pub assembly: Option<&'a AssemblyContext>,
+    pub sources: Option<&'a [RenderSource<'a>]>,
+}
+
+/// What a render knows beyond the grain in hand.
+///
+/// Kept separate from [`RenderContext`] because it is meaningful only inside
+/// a sectioned render: `source.*` changes as the engine walks sources, which
+/// a whole-result template has no way to observe.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderEnv<'a> {
+    /// Assembly and budget context, when rendering an `ASSEMBLE`.
+    pub assembly: Option<&'a AssemblyContext>,
+    /// The source being rendered, with its 0-based index.
+    pub source: Option<(&'a RenderSource<'a>, usize)>,
+}
+
 /// A parsed, validated template ready for rendering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Template {
     /// Original source text (preserved for `get_template` responses).
     source: String,
-    /// Parsed AST nodes.
+    /// Parsed AST nodes — the whole-result form. Empty when sectioned.
     nodes: Vec<TemplateNode>,
+    /// Parsed sections — the §10.6 form. `None` when whole-result.
+    sections: Option<Box<TemplateSections>>,
 }
 
 impl Template {
@@ -314,8 +522,29 @@ impl Template {
     }
 
     /// Return the parsed node tree (for introspection/debugging).
+    ///
+    /// Empty for a sectioned template — use [`Template::sections`].
     pub fn nodes(&self) -> &[TemplateNode] {
         &self.nodes
+    }
+
+    /// Return the parsed sections, or `None` for a whole-result template.
+    pub fn sections(&self) -> Option<&TemplateSections> {
+        self.sections.as_deref()
+    }
+
+    /// True when this template uses the §10.6 sectioned form.
+    pub fn is_sectioned(&self) -> bool {
+        self.sections.is_some()
+    }
+
+    /// Build a sectioned template from already-parsed sections.
+    pub fn from_sections(source: impl Into<String>, sections: TemplateSections) -> Self {
+        Self {
+            source: source.into(),
+            nodes: Vec::new(),
+            sections: Some(Box::new(sections)),
+        }
     }
 }
 
@@ -451,7 +680,7 @@ pub fn parse_template(source: &str) -> CalResult<Template> {
 
     // 2. Scan characters, building a Vec<TemplateNode>.
     let chars: Vec<char> = source.chars().collect();
-    let nodes = parse_nodes(&chars, 0, &mut 0, false, None)?;
+    let nodes = parse_nodes(&chars, 0, &mut 0, 0, false, None)?;
 
     // 3. Validate: known variables in proper context.
     validate_variables(&nodes, None)?;
@@ -459,7 +688,94 @@ pub fn parse_template(source: &str) -> CalResult<Template> {
     Ok(Template {
         source: source.to_string(),
         nodes,
+        sections: None,
     })
+}
+
+/// Recognise a sectioned template source and parse it (§10.6).
+///
+/// Returns `None` when `source` is an ordinary whole-result template, which
+/// is what lets one `source: &str` column carry both forms: persistence, the
+/// facade signature and `get_template` all stay unchanged, and the form is
+/// recovered on load.
+///
+/// Detection reuses the CAL lexer, so what counts as sectioned here is
+/// exactly what the parser would accept — the text must tokenize to nothing
+/// but section keywords carrying bodies.
+pub fn parse_sectioned_source(source: &str) -> Option<crate::ast::TemplateSectionSources> {
+    use crate::lexer::{Lexer, SectionBody, Token};
+
+    let tokens = Lexer::tokenize(source).ok()?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut out = crate::ast::TemplateSectionSources::default();
+    for st in tokens {
+        let (slot, body) = match &st.token {
+            Token::Header(b) => (&mut out.header, b),
+            Token::Element(b) => (&mut out.element, b),
+            Token::ElementSummary(b) => (&mut out.element_summary, b),
+            Token::ElementOmit(b) => (&mut out.element_omit, b),
+            Token::SourceBreak(b) => (&mut out.source_break, b),
+            Token::Footer(b) => (&mut out.footer, b),
+            // Anything else means this is not a sectioned source.
+            _ => return None,
+        };
+        match body {
+            SectionBody::Body(text) => *slot = Some(text.clone()),
+            SectionBody::Bare => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parse every section body of a sectioned source into render-ready nodes.
+pub fn parse_sections(src: &crate::ast::TemplateSectionSources) -> CalResult<TemplateSections> {
+    let parse = |s: &Option<String>| -> CalResult<Option<Vec<TemplateNode>>> {
+        match s {
+            Some(text) => Ok(Some(parse_section(text)?)),
+            None => Ok(None),
+        }
+    };
+    Ok(TemplateSections {
+        header: parse(&src.header)?,
+        element: parse(&src.element)?,
+        element_summary: parse(&src.element_summary)?,
+        element_omit: parse(&src.element_omit)?,
+        source_break: parse(&src.source_break)?,
+        footer: parse(&src.footer)?,
+    })
+}
+
+/// Parse a template source in either form.
+///
+/// Sectioned when the text is a run of §10.6 sections, whole-result
+/// otherwise. This is the entry point the registry uses so a template
+/// reloaded from a file comes back in the form it was defined in.
+pub fn parse_template_any(source: &str) -> CalResult<Template> {
+    match parse_sectioned_source(source) {
+        Some(src) => Ok(Template::from_sections(source, parse_sections(&src)?)),
+        None => parse_template(source),
+    }
+}
+
+/// Parse and validate one section body (§10.6).
+///
+/// Same grammar, variable set and limits as a whole-result template; the only
+/// difference is that the engine, not the author, supplies the grain context.
+pub fn parse_section(source: &str) -> CalResult<Vec<TemplateNode>> {
+    if source.len() > MAX_TEMPLATE_SIZE {
+        return Err(CalError::TemplateTooLarge {
+            size: source.len(),
+            max: MAX_TEMPLATE_SIZE,
+            span: Some(Span::zero()),
+        });
+    }
+    let chars: Vec<char> = source.chars().collect();
+    let nodes = parse_nodes(&chars, 0, &mut 0, 0, false, None)?;
+    validate_variables(&nodes, None)?;
+    Ok(nodes)
 }
 
 /// Parse template nodes from a character slice. `in_each` tracks whether we
@@ -471,9 +787,19 @@ fn parse_nodes(
     chars: &[char],
     start: usize,
     pos: &mut usize,
+    depth: usize,
     in_each: bool,
     stop_tag: Option<&str>,
 ) -> CalResult<Vec<TemplateNode>> {
+    // §10.8: bound conditional nesting. Checked before any work, so it also
+    // caps parser recursion on hostile input.
+    if depth > MAX_TEMPLATE_NESTING {
+        return Err(CalError::TemplateNestingTooDeep {
+            max: MAX_TEMPLATE_NESTING,
+            span: Some(make_span(start, start)),
+        });
+    }
+
     let mut nodes = Vec::new();
     *pos = start;
 
@@ -547,7 +873,7 @@ fn parse_nodes(
                             span: Some(make_span(tag_start, *pos)),
                         });
                     }
-                    let body = parse_nodes(chars, *pos, pos, true, Some("each"))?;
+                    let body = parse_nodes(chars, *pos, pos, depth + 1, true, Some("each"))?;
                     nodes.push(TemplateNode::Each {
                         collection: collection.to_string(),
                         body,
@@ -561,7 +887,7 @@ fn parse_nodes(
                             span: Some(make_span(tag_start, *pos)),
                         });
                     }
-                    let if_body = parse_nodes(chars, *pos, pos, in_each, Some("if"))?;
+                    let if_body = parse_nodes(chars, *pos, pos, depth + 1, in_each, Some("if"))?;
 
                     // Check if we got an {{else}} sentinel
                     let has_else = if_body
@@ -573,7 +899,7 @@ fn parse_nodes(
                             .into_iter()
                             .filter(|n| !matches!(n, TemplateNode::Comment(c) if c == "__else__"))
                             .collect();
-                        let else_body = parse_nodes(chars, *pos, pos, in_each, Some("if"))?;
+                        let else_body = parse_nodes(chars, *pos, pos, depth + 1, in_each, Some("if"))?;
                         (if_nodes, else_body)
                     } else {
                         (if_body, Vec::new())
@@ -595,12 +921,27 @@ fn parse_nodes(
                             ),
                             span: Some(make_span(tag_start, *pos)),
                         })?;
-                    let body = parse_nodes(chars, *pos, pos, in_each, Some("grain_type"))?;
+                    let body = parse_nodes(chars, *pos, pos, depth + 1, in_each, Some("grain_type"))?;
                     nodes.push(TemplateNode::GrainTypeBlock { grain_type, body });
                 } else {
-                    return Err(CalError::TemplateSyntaxError {
-                        detail: format!("unknown section type \"{}\"", section),
-                        span: Some(make_span(tag_start, *pos)),
+                    // §10.2 conditional block: `{{#var}}...{{/var}}` renders
+                    // the body when `var` is truthy. This is what makes the
+                    // §10.5 `{{#grain.is_full}}` / `{{#grain.is_summary}}`
+                    // sections usable, and what the §10.6 example's
+                    // `{{#grain.confidence}}` needs.
+                    let field = section.to_string();
+                    if field.contains(char::is_whitespace) {
+                        return Err(CalError::TemplateSyntaxError {
+                            detail: format!("unknown section type \"{}\"", section),
+                            span: Some(make_span(tag_start, *pos)),
+                        });
+                    }
+                    validate_variable_name(&field, None)?;
+                    let if_body = parse_nodes(chars, *pos, pos, depth + 1, in_each, Some(&field))?;
+                    nodes.push(TemplateNode::Condition {
+                        field,
+                        if_body,
+                        else_body: Vec::new(),
                     });
                 }
                 continue;
@@ -615,7 +956,7 @@ fn parse_nodes(
                         span: Some(make_span(tag_start, *pos)),
                     });
                 }
-                let body = parse_nodes(chars, *pos, pos, in_each, Some(&field))?;
+                let body = parse_nodes(chars, *pos, pos, depth + 1, in_each, Some(&field))?;
                 nodes.push(TemplateNode::InvertedSection { field, body });
                 continue;
             }
@@ -914,6 +1255,32 @@ fn validate_variable_name(name: &str, _grain_type_ctx: Option<&str>) -> CalResul
         return Ok(());
     }
 
+    // CAL §10.5 namespaced variables. The set stays closed: a `grain.` name
+    // must still resolve to a spec grain variable or an allowed grain field.
+    if matches!(name, "disclosure.level" | "timestamp") {
+        return Ok(());
+    }
+    if let Some(field) = name.strip_prefix("grain.") {
+        if SPEC_GRAIN_VARIABLES.contains(&field) || ALLOWED_FIELDS.contains(&field) {
+            return Ok(());
+        }
+    }
+    if let Some(field) = name.strip_prefix("assembly.") {
+        if SPEC_ASSEMBLY_VARIABLES.contains(&field) {
+            return Ok(());
+        }
+    }
+    if let Some(field) = name.strip_prefix("budget.") {
+        if SPEC_BUDGET_VARIABLES.contains(&field) {
+            return Ok(());
+        }
+    }
+    if let Some(field) = name.strip_prefix("source.") {
+        if SPEC_SOURCE_VARIABLES.contains(&field) {
+            return Ok(());
+        }
+    }
+
     // Try to suggest a close match.
     let suggestion = find_closest_variable(name);
     Err(CalError::TemplateUnknownVariable {
@@ -955,16 +1322,186 @@ fn simple_edit_distance(a: &str, b: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Resolve a template variable against grain fields and render context.
+/// CAL §10.3.3 `humanize()` — strip a namespace prefix and turn underscores
+/// into spaces, so `"mg:works_at"` reads as `"works at"`. The raw relation
+/// stays available in the machine envelope.
+pub fn humanize_relation(relation: &str) -> String {
+    let stripped = relation.rsplit(':').next().unwrap_or(relation);
+    stripped.replace('_', " ")
+}
+
+/// CAL §10.3.4 time humanization. Full ISO stays in the machine envelope.
+///
+/// Granularity only ever coarsens as the age grows — minutes, hours, days,
+/// weeks, months, years. Reporting 29 days as "4w ago" and 31 days as
+/// "31d ago" read as two different scales for two neighbouring instants.
+///
+/// Accepts either epoch milliseconds or epoch seconds: anything past
+/// 100_000_000_000 cannot be a plausible timestamp in seconds (year 5138) but
+/// is an ordinary one in milliseconds (1973 onward).
+pub fn humanize_time(created_ms: i64, now_secs: i64) -> String {
+    let created_secs = if created_ms > 100_000_000_000 { created_ms / 1000 } else { created_ms };
+    let age = now_secs.saturating_sub(created_secs);
+    const DAY: i64 = 86_400;
+    if age < 3600 {
+        format!("{}m ago", (age / 60).max(0))
+    } else if age < DAY {
+        format!("{}h ago", age / 3600)
+    } else if age < 7 * DAY {
+        let d = age / DAY;
+        if d <= 1 { "yesterday".to_string() } else { format!("{d}d ago") }
+    } else if age < 30 * DAY {
+        format!("{}w ago", age / (7 * DAY))
+    } else if age < 365 * DAY {
+        format!("{}mo ago", age / (30 * DAY))
+    } else {
+        format!("{}y ago", age / (365 * DAY))
+    }
+}
+
+/// CAL §10.3.2 Content Projection Model — the text content of a rendered
+/// element, per grain type. Everything else stays a metadata attribute or
+/// remains in the machine envelope.
+fn project_content(grain: &CalGrainResult) -> ResolvedValue {
+    let f = &grain.fields;
+    let get = |k: &str| f.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let text = match grain.grain_type.as_str() {
+        "fact" => {
+            let rel = get("relation").unwrap_or_default();
+            let obj = get("object").unwrap_or_default();
+            let humanized = humanize_relation(&rel);
+            match (humanized.is_empty(), obj.is_empty()) {
+                (true, _) => obj,
+                (_, true) => humanized,
+                _ => format!("{humanized} {obj}"),
+            }
+        }
+        "event" => get("content").unwrap_or_default(),
+        "goal" | "tool" | "observation" | "consensus" => get("object").unwrap_or_default(),
+        "reasoning" => get("conclusion").unwrap_or_default(),
+        "state" => get("plan").or_else(|| get("state_value")).unwrap_or_default(),
+        "workflow" => match f.get("nodes").and_then(|v| v.as_array()) {
+            Some(nodes) => nodes
+                .iter()
+                .filter_map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> "),
+            None => String::new(),
+        },
+        "consent" => get("purpose").unwrap_or_default(),
+        "skill" => get("description").unwrap_or_default(),
+        "recommendation" => get("summary").unwrap_or_default(),
+        _ => get("content").or_else(|| get("object")).unwrap_or_default(),
+    };
+    if text.is_empty() { ResolvedValue::Null } else { ResolvedValue::Str(text) }
+}
+
+/// CAL §10.5 grain-level variables, resolved under the `grain.` namespace.
+/// `name` arrives with the prefix already stripped.
+fn resolve_grain_var(field: &str, grain: &CalGrainResult, ctx: &RenderContext) -> ResolvedValue {
+    match field {
+        "content" => project_content(grain),
+        "type" => ResolvedValue::Str(grain.grain_type.clone()),
+        "hash" => ResolvedValue::Str(grain.hash.clone()),
+        "score" => ResolvedValue::Number(grain.score),
+        "humanized_relation" => match grain.fields.get("relation").and_then(|v| v.as_str()) {
+            Some(r) => ResolvedValue::Str(humanize_relation(r)),
+            None => ResolvedValue::Null,
+        },
+        "relative_time" => match grain.fields.get("created_at").and_then(|v| v.as_i64()) {
+            Some(ms) => ResolvedValue::Str(humanize_time(ms, ctx.now_secs)),
+            None => ResolvedValue::Null,
+        },
+        "is_full" => ResolvedValue::Bool(ctx.tier == DisclosureTier::Full),
+        "is_summary" => ResolvedValue::Bool(ctx.tier == DisclosureTier::Summary),
+        // Everything else is a plain grain field, behind the same closed set.
+        _ => {
+            if !ALLOWED_FIELDS.contains(&field) {
+                return ResolvedValue::Null;
+            }
+            resolve_from_fields(&grain.fields, field)
+        }
+    }
+}
+
 fn resolve_variable(
     name: &str,
     grain: Option<&CalGrainResult>,
     index: Option<usize>,
     ctx: &RenderContext,
+    env: &RenderEnv<'_>,
 ) -> ResolvedValue {
     // 0. User-injected display variables ($prefix).
     if let Some(var_name) = name.strip_prefix('$') {
         return match ctx.user_vars.get(var_name) {
             Some(val) => ResolvedValue::Str(val.clone()),
+            None => ResolvedValue::Null,
+        };
+    }
+
+    // 0b. CAL §10.5 namespaced variables. `grain.*` needs a grain; the
+    // assembly-level ones are answered from the render context.
+    match name {
+        "disclosure.level" => {
+            return ResolvedValue::Str(
+                match ctx.tier {
+                    DisclosureTier::Summary => "summary",
+                    DisclosureTier::Headlines => "headlines",
+                    DisclosureTier::Full => "full",
+                }
+                .to_string(),
+            )
+        }
+        "timestamp" => return ResolvedValue::Integer(ctx.now_secs),
+        _ => {}
+    }
+
+    // CAL §10.5 assembly-, budget- and source-level variables. Absent
+    // context resolves to Null, which §10.8 renders as the empty string —
+    // the same template works for RECALL and ASSEMBLE.
+    if let Some(field) = name.strip_prefix("assembly.") {
+        let Some(a) = env.assembly else {
+            return ResolvedValue::Null;
+        };
+        return match field {
+            "name" => ResolvedValue::Str(a.name.clone()),
+            "intent" => ResolvedValue::Str(a.intent.clone()),
+            "source_count" => ResolvedValue::Integer(a.source_count as i64),
+            "grain_count" => ResolvedValue::Integer(a.grain_count as i64),
+            _ => ResolvedValue::Null,
+        };
+    }
+    if let Some(field) = name.strip_prefix("budget.") {
+        let Some(a) = env.assembly else {
+            return ResolvedValue::Null;
+        };
+        return match field {
+            "total" => ResolvedValue::Integer(a.budget_total as i64),
+            "used" => ResolvedValue::Integer(a.budget_used as i64),
+            "remaining" => ResolvedValue::Integer(a.budget_remaining() as i64),
+            "unit" => ResolvedValue::Str(a.budget_unit.clone()),
+            "utilization" => ResolvedValue::Number(a.budget_utilization()),
+            _ => ResolvedValue::Null,
+        };
+    }
+    if let Some(field) = name.strip_prefix("source.") {
+        let Some((src, idx)) = env.source else {
+            return ResolvedValue::Null;
+        };
+        return match field {
+            "label" => ResolvedValue::Str(src.label.to_string()),
+            "index" => ResolvedValue::Integer(idx as i64),
+            "priority" => ResolvedValue::Integer(src.priority as i64),
+            "grain_count" => ResolvedValue::Integer(src.grains.len() as i64),
+            "tokens_used" => ResolvedValue::Integer(src.tokens_used as i64),
+            "truncated" => ResolvedValue::Bool(src.truncated),
+            _ => ResolvedValue::Null,
+        };
+    }
+
+    if let Some(field) = name.strip_prefix("grain.") {
+        return match grain {
+            Some(g) => resolve_grain_var(field, g, ctx),
             None => ResolvedValue::Null,
         };
     }
@@ -1310,15 +1847,184 @@ pub fn render_with_limit(
     ctx: &RenderContext,
     max_output_size: usize,
 ) -> CalResult<String> {
+    if let Some(sections) = template.sections() {
+        return render_sectioned(
+            sections,
+            &[RenderSource::single(grains)],
+            ctx,
+            None,
+            max_output_size,
+        );
+    }
     let mut output = String::with_capacity(grains.len().min(1024) * 128);
     render_nodes(
         &template.nodes,
         grains,
         None,
         ctx,
+        &RenderEnv::default(),
         &mut output,
         max_output_size,
     )?;
+    Ok(output)
+}
+
+/// Report whether rendering `template` over `grain_count` grains will hit the
+/// §10.8 `{{#each}}` iteration cap.
+///
+/// Truncating the output silently would read as "these are all the grains",
+/// so the caller turns this into a `CAL-W011`. Only the whole-result form can
+/// trip it — a sectioned template has the engine drive iteration.
+pub fn each_iteration_cap(template: &Template, grain_count: usize) -> Option<(usize, usize)> {
+    (grain_count > MAX_EACH_ITERATIONS && nodes_contain_each(template.nodes()))
+        .then_some((MAX_EACH_ITERATIONS, grain_count))
+}
+
+/// Whether a node tree drives its own iteration with `{{#each}}`.
+///
+/// Two callers need this: the §10.8 cap warning, and `render_sectioned`, which
+/// uses it to decide whether the whole-result grain slice is worth materializing
+/// at all.
+fn nodes_contain_each(nodes: &[TemplateNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        TemplateNode::Each { .. } => true,
+        TemplateNode::Condition {
+            if_body, else_body, ..
+        } => nodes_contain_each(if_body) || nodes_contain_each(else_body),
+        TemplateNode::InvertedSection { body, .. }
+        | TemplateNode::GrainTypeBlock { body, .. } => nodes_contain_each(body),
+        _ => false,
+    })
+}
+
+/// Render sources through a sectioned template (OMS CAL §10.6).
+///
+/// HEADER once, then each source's grains through `ELEMENT` (or
+/// `ELEMENT_SUMMARY` when disclosure is below full), with `SOURCE_BREAK`
+/// *between* sources, then FOOTER. Pieces are joined with newlines: the flat
+/// semantic model is line-oriented, and section bodies have their brace
+/// layout trimmed, so the separator has to come from the engine.
+pub fn render_sectioned(
+    sections: &TemplateSections,
+    sources: &[RenderSource<'_>],
+    ctx: &RenderContext,
+    assembly: Option<&AssemblyContext>,
+    max_output_size: usize,
+) -> CalResult<String> {
+    // A grain's body: ELEMENT at full disclosure, ELEMENT_SUMMARY when
+    // squeezed. Either falls back to the other so a template that defines
+    // only one still renders at every tier.
+    let (primary, fallback) = match ctx.tier {
+        DisclosureTier::Full => (&sections.element, &sections.element_summary),
+        _ => (&sections.element_summary, &sections.element),
+    };
+    let element = primary.as_ref().or(fallback.as_ref());
+
+    // `render_nodes` only reads the whole-result slice to drive `{{#each}}`,
+    // which a sectioned template has no reason to use — the engine already
+    // iterates. So flatten the sources only when some section actually asks
+    // for it, rather than deep-cloning every grain (JSON payload and all) on
+    // every render that will never look at the result.
+    let needs_all_grains = [
+        &sections.header,
+        &sections.element,
+        &sections.element_summary,
+        &sections.element_omit,
+        &sections.source_break,
+        &sections.footer,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|nodes| nodes_contain_each(nodes));
+    let all_grains: Vec<CalGrainResult> = if needs_all_grains {
+        sources.iter().flat_map(|s| s.grains.iter().cloned()).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut emitted = 0usize;
+    // Running total, not a re-sum per grain: summing every piece on every
+    // iteration makes the guard quadratic in the grain count, and the guard
+    // exists for exactly the large renders that would suffer most.
+    let mut rendered_bytes = 0usize;
+
+    let render_one = |nodes: &[TemplateNode],
+                      current: Option<(&CalGrainResult, usize)>,
+                      env: &RenderEnv<'_>,
+                      pieces: &mut Vec<String>,
+                      rendered_bytes: &mut usize|
+     -> CalResult<()> {
+        let mut buf = String::new();
+        render_nodes(nodes, &all_grains, current, ctx, env, &mut buf, max_output_size)?;
+        *rendered_bytes += buf.len();
+        pieces.push(buf);
+        Ok(())
+    };
+
+    // HEADER and FOOTER sit outside any source, so `source.*` is unbound
+    // there — §10.5 scopes those variables to an element run.
+    let outer = RenderEnv {
+        assembly,
+        source: None,
+    };
+
+    if let Some(header) = &sections.header {
+        render_one(header, None, &outer, &mut pieces, &mut rendered_bytes)?;
+    }
+
+    for (s_idx, source) in sources.iter().enumerate() {
+        if s_idx > 0 {
+            if let Some(brk) = &sections.source_break {
+                render_one(brk, None, &outer, &mut pieces, &mut rendered_bytes)?;
+            }
+        }
+        let env = RenderEnv {
+            assembly,
+            source: Some((source, s_idx)),
+        };
+        if let Some(element) = element {
+            for grain in source.grains {
+                render_one(element, Some((grain, emitted)), &env, &mut pieces, &mut rendered_bytes)?;
+                emitted += 1;
+                // F1 safety: bound the output as we go, not only at the end.
+                if rendered_bytes > max_output_size {
+                    return Err(CalError::RenderOutputTooLarge {
+                        size: rendered_bytes,
+                        max: max_output_size,
+                        span: None,
+                    });
+                }
+            }
+        }
+        // Grains the budget dropped, after the ones that survived.
+        if let Some(omit) = &sections.element_omit {
+            for grain in source.omitted {
+                render_one(omit, Some((grain, emitted)), &env, &mut pieces, &mut rendered_bytes)?;
+                emitted += 1;
+                if rendered_bytes > max_output_size {
+                    return Err(CalError::RenderOutputTooLarge {
+                        size: rendered_bytes,
+                        max: max_output_size,
+                        span: None,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(footer) = &sections.footer {
+        render_one(footer, None, &outer, &mut pieces, &mut rendered_bytes)?;
+    }
+
+    let output = pieces.join("\n");
+    if output.len() > max_output_size {
+        return Err(CalError::RenderOutputTooLarge {
+            size: output.len(),
+            max: max_output_size,
+            span: None,
+        });
+    }
     Ok(output)
 }
 
@@ -1328,6 +2034,7 @@ fn render_nodes(
     grains: &[CalGrainResult],
     current_grain: Option<(&CalGrainResult, usize)>,
     ctx: &RenderContext,
+    env: &RenderEnv<'_>,
     output: &mut String,
     max_output_size: usize,
 ) -> CalResult<()> {
@@ -1338,7 +2045,7 @@ fn render_nodes(
             TemplateNode::Variable { name, filters } => {
                 let grain = current_grain.map(|(g, _)| g);
                 let index = current_grain.map(|(_, i)| i);
-                let mut value = resolve_variable(name, grain, index, ctx);
+                let mut value = resolve_variable(name, grain, index, ctx, env);
                 for filter in filters {
                     value = apply_filter(&value, filter, ctx)?;
                 }
@@ -1346,8 +2053,11 @@ fn render_nodes(
             }
 
             TemplateNode::Each { body, .. } => {
-                for (i, grain) in grains.iter().enumerate() {
-                    render_nodes(body, grains, Some((grain, i)), ctx, output, max_output_size)?;
+                // §10.8 caps iteration at 200. `{{#each grains}}` is the
+                // pre-§10.6 whole-result form; a sectioned template has the
+                // engine drive iteration and is not bounded by this.
+                for (i, grain) in grains.iter().take(MAX_EACH_ITERATIONS).enumerate() {
+                    render_nodes(body, grains, Some((grain, i)), ctx, env, output, max_output_size)?;
                     // F1 safety: check output size after each grain iteration.
                     if output.len() > max_output_size {
                         return Err(CalError::RenderOutputTooLarge {
@@ -1366,15 +2076,16 @@ fn render_nodes(
             } => {
                 let grain = current_grain.map(|(g, _)| g);
                 let index = current_grain.map(|(_, i)| i);
-                let value = resolve_variable(field, grain, index, ctx);
+                let value = resolve_variable(field, grain, index, ctx, env);
                 if value.is_truthy() {
-                    render_nodes(if_body, grains, current_grain, ctx, output, max_output_size)?;
+                    render_nodes(if_body, grains, current_grain, ctx, env, output, max_output_size)?;
                 } else if !else_body.is_empty() {
                     render_nodes(
                         else_body,
                         grains,
                         current_grain,
                         ctx,
+                        env,
                         output,
                         max_output_size,
                     )?;
@@ -1384,16 +2095,16 @@ fn render_nodes(
             TemplateNode::InvertedSection { field, body } => {
                 let grain = current_grain.map(|(g, _)| g);
                 let index = current_grain.map(|(_, i)| i);
-                let value = resolve_variable(field, grain, index, ctx);
+                let value = resolve_variable(field, grain, index, ctx, env);
                 if !value.is_truthy() {
-                    render_nodes(body, grains, current_grain, ctx, output, max_output_size)?;
+                    render_nodes(body, grains, current_grain, ctx, env, output, max_output_size)?;
                 }
             }
 
             TemplateNode::GrainTypeBlock { grain_type, body } => {
                 if let Some((grain, _)) = current_grain {
                     if grain.grain_type == *grain_type {
-                        render_nodes(body, grains, current_grain, ctx, output, max_output_size)?;
+                        render_nodes(body, grains, current_grain, ctx, env, output, max_output_size)?;
                     }
                 }
             }
@@ -1659,6 +2370,13 @@ impl TemplateRegistry {
         }
         // 3. Validate parent exists (if specified).
         if let Some(p) = parent {
+            // §10.7: `data` emits structural JSON, not template text.
+            if p.eq_ignore_ascii_case("data") {
+                return Err(CalError::CannotExtendData {
+                    name: name.to_string(),
+                    span: None,
+                });
+            }
             if !self.templates.contains_key(p) {
                 return Err(CalError::TemplateParentNotFound {
                     name: name.to_string(),
@@ -1674,9 +2392,24 @@ impl TemplateRegistry {
                 });
             }
         }
-        // 4. Parse and validate.
-        let template = parse_template(source)?;
-        // 5. Store.
+        // 4. §10.8 caps custom templates per namespace. Redefining an
+        //    existing one is always allowed — it does not grow the set.
+        if !self.templates.contains_key(name) {
+            let custom = self.templates.values().filter(|e| !e.builtin).count();
+            if custom >= MAX_TEMPLATES {
+                return Err(CalError::TooManyTemplates {
+                    count: custom,
+                    max: MAX_TEMPLATES,
+                    span: None,
+                });
+            }
+        }
+
+        // 5. Parse and validate. `parse_template_any` recovers the §10.6
+        //    sectioned form, so a template reloaded from a file comes back in
+        //    the form it was defined in.
+        let template = parse_template_any(source)?;
+        // 6. Store.
         self.templates.insert(
             name.to_string(),
             TemplateEntry {
@@ -1700,6 +2433,18 @@ impl TemplateRegistry {
     /// Get a template by name.
     pub fn get(&self, name: &str) -> Option<&TemplateEntry> {
         self.templates.get(name)
+    }
+
+    /// Record the grain types a template's `FOR` clause narrowed it to.
+    ///
+    /// Separate from [`TemplateRegistry::register`] because the `FOR` clause is
+    /// carried by the statement, not by the template body — but it still has to
+    /// survive a round-trip through the file, or a reloaded template quietly
+    /// loses what the user wrote.
+    pub fn set_grain_types(&mut self, name: &str, grain_types: &[String]) {
+        if let Some(entry) = self.templates.get_mut(name) {
+            entry.grain_types = grain_types.to_vec();
+        }
     }
 
     /// List all templates (name + description + builtin flag).
@@ -1769,8 +2514,51 @@ impl TemplateRegistry {
         }
     }
 
-    /// Load the 6 built-in templates.
+    /// Load the built-in templates.
+    ///
+    /// Two groups. The §10.1 semantic presets (`structured`, `readable`,
+    /// `compact`) are sectioned, exist so `EXTENDS` has something to inherit
+    /// from, and deliberately define only element-level sections — a template
+    /// extending them must supply its own HEADER/FOOTER, and `readable` being
+    /// the default parent must not silently wrap every template in one.
+    /// `data` is intentionally absent: §10.7 forbids extending it.
+    ///
+    /// The rest are DejaDB's own named templates and remain whole-result.
     fn load_builtins(&mut self) {
+        self.insert_builtin_sectioned(
+            "structured",
+            "ELEMENT {\n\
+             <{{grain.type}} subject=\"{{grain.subject}}\"{{#grain.confidence}} \
+             confidence=\"{{grain.confidence}}\"{{/grain.confidence}}>\
+             {{grain.content}}</{{grain.type}}>\n\
+             }\n\
+             ELEMENT_SUMMARY {\n\
+             <{{grain.type}} subject=\"{{grain.subject}}\">{{grain.content}}</{{grain.type}}>\n\
+             }\n",
+            "OMS §10.1 structured/sml preset — one SML element per grain",
+        );
+        self.insert_builtin_sectioned(
+            "readable",
+            "ELEMENT {\n\
+             - **{{grain.subject}}** {{grain.content}}{{#grain.confidence}} \
+             _({{grain.confidence | percent}})_{{/grain.confidence}}\n\
+             }\n\
+             ELEMENT_SUMMARY {\n\
+             - {{grain.subject}} {{grain.content}}\n\
+             }\n",
+            "OMS §10.1 readable/markdown preset — the default parent",
+        );
+        self.insert_builtin_sectioned(
+            "compact",
+            "ELEMENT {\n\
+             {{grain.subject}} {{grain.content}}\n\
+             }\n\
+             ELEMENT_SUMMARY {\n\
+             {{grain.content}}\n\
+             }\n",
+            "OMS §10.1 compact/text preset — minimal, token-efficient",
+        );
+
         // -- triples --
         let triples_src = "{{#each grains}}{{subject}} {{relation | humanize}} {{object}}{{#if confidence}} ({{confidence | percent}}){{/if}}\n{{/each}}";
         self.insert_builtin(
@@ -1886,6 +2674,38 @@ impl TemplateRegistry {
 
     /// Insert a built-in template. Panics only in debug if the template is
     /// malformed (they are compile-time constants and always valid).
+    /// Register a §10.6 sectioned built-in from its canonical section text.
+    fn insert_builtin_sectioned(&mut self, name: &str, source: &str, description: &str) {
+        let template = match parse_template_any(source) {
+            Ok(t) => t,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                panic!("built-in template \"{}\" failed to parse: {}", name, e);
+                #[cfg(not(debug_assertions))]
+                {
+                    let _ = e;
+                    return;
+                }
+            }
+        };
+        debug_assert!(
+            template.is_sectioned(),
+            "built-in preset \"{name}\" must parse as sectioned"
+        );
+        self.templates.insert(
+            name.to_string(),
+            TemplateEntry {
+                template,
+                builtin: true,
+                parent: None,
+                description: description.to_string(),
+                grain_types: Vec::new(),
+                last_run_at: None,
+                updated_at: None,
+            },
+        );
+    }
+
     fn insert_builtin(&mut self, name: &str, source: &str, description: &str) {
         let template = match parse_template(source) {
             Ok(t) => t,
@@ -1924,6 +2744,19 @@ impl TemplateRegistry {
 /// Resolve template inheritance (1-level max). Returns the effective template
 /// after merging parent and child GrainTypeBlocks.
 pub fn resolve_inheritance(entry: &TemplateEntry, registry: &TemplateRegistry) -> Template {
+    // §10.7: the default parent is `readable`. It applies only to sectioned
+    // templates — a whole-result body has no sections to inherit into — and
+    // `readable` deliberately defines no HEADER/FOOTER, so the effect is to
+    // supply the ELEMENT_SUMMARY the engine needs under budget pressure, not
+    // to wrap every template in a header.
+    let default_parent = entry.parent.is_none()
+        && entry.template.is_sectioned()
+        && !entry.builtin;
+    if default_parent {
+        if let Some(readable) = registry.get("readable") {
+            return merge_templates(&readable.template, &entry.template);
+        }
+    }
     let Some(ref parent_name) = entry.parent else {
         return entry.template.clone();
     };
@@ -1941,7 +2774,19 @@ pub fn resolve_inheritance(entry: &TemplateEntry, registry: &TemplateRegistry) -
 /// 1. Start with parent's nodes.
 /// 2. For each GrainTypeBlock in child, replace matching block in parent.
 /// 3. New GrainTypeBlocks from child are appended.
-fn merge_templates(parent: &Template, child: &Template) -> Template {
+pub fn merge_templates(parent: &Template, child: &Template) -> Template {
+    // Sectioned inheritance is per section (§10.7): the child keeps every
+    // section it defines and takes the rest from the parent. Only meaningful
+    // when both are sectioned — a sectioned child of a whole-result parent
+    // has no sections to inherit, so it stands alone.
+    if let Some(child_sections) = child.sections() {
+        let mut merged = child_sections.clone();
+        if let Some(parent_sections) = parent.sections() {
+            merged.inherit_from(parent_sections);
+        }
+        return Template::from_sections(child.source.clone(), merged);
+    }
+
     let mut merged_nodes = parent.nodes.clone();
 
     for child_node in &child.nodes {
@@ -1990,6 +2835,7 @@ fn merge_templates(parent: &Template, child: &Template) -> Template {
     Template {
         source: child.source.clone(),
         nodes: merged_nodes,
+        sections: None,
     }
 }
 
@@ -2038,6 +2884,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
     }
 
@@ -2057,6 +2904,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
     }
 
@@ -2073,6 +2921,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
     }
 
@@ -2090,7 +2939,111 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
+    }
+
+    // ── CAL §10.3 / §10.5 spec conformance ──────────────────────────
+
+    #[test]
+    fn test_humanize_relation_per_spec() {
+        // §10.3.3: strip namespace, underscores to spaces, custom kept as-is.
+        assert_eq!(humanize_relation("mg:prefers"), "prefers");
+        assert_eq!(humanize_relation("works_at"), "works at");
+        assert_eq!(humanize_relation("acme:similar_to"), "similar to");
+        assert_eq!(humanize_relation("knows"), "knows");
+    }
+
+    #[test]
+    fn test_humanize_time_buckets_per_spec() {
+        // §10.3.4 buckets, measured back from a fixed "now".
+        let now = 1_000_000_000i64;
+        let ago = |secs: i64| humanize_time((now - secs) * 1000, now);
+        assert_eq!(ago(23 * 60), "23m ago");
+        assert_eq!(ago(3 * 3600), "3h ago");
+        assert_eq!(ago(86_400), "yesterday");
+        assert_eq!(ago(2 * 86_400), "2d ago");
+        assert_eq!(ago(14 * 86_400), "2w ago");
+        assert_eq!(ago(45 * 86_400), "1mo ago");
+        assert_eq!(ago(400 * 86_400), "1y ago");
+    }
+
+    /// Granularity may only coarsen with age. 29 days reading as "4w ago" and
+    /// 31 days as "31d ago" is two scales for two neighbouring instants.
+    #[test]
+    fn test_humanize_time_granularity_only_coarsens() {
+        let now = 1_000_000_000i64;
+        let unit = |secs: i64| {
+            let s = humanize_time((now - secs) * 1000, now);
+            s.trim_end_matches(" ago")
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .to_string()
+        };
+        // "yesterday" carries no unit suffix; every other bucket does.
+        let order = ["m", "h", "d", "w", "mo", "y"];
+        let rank = |u: &str| order.iter().position(|o| *o == u);
+        let mut last = 0usize;
+        for days in [0, 1, 3, 10, 29, 31, 200, 400, 1000] {
+            let u = unit(days * 86_400 + 1);
+            let Some(r) = rank(&u) else { continue };
+            assert!(r >= last, "granularity went backwards at {days}d: {u:?}");
+            last = r;
+        }
+    }
+
+    #[test]
+    fn test_content_projection_per_grain_type() {
+        // §10.3.2: each grain type has its own text-content rule.
+        let mk = |ty: &str, fields: serde_json::Value| CalGrainResult {
+            hash: "h".into(),
+            grain_type: ty.into(),
+            fields,
+            score: 0.0,
+            is_deterministic: true,
+            contested_by: None,
+            explanation: None,
+            score_breakdown: None,
+        };
+        let content = |g: &CalGrainResult| match project_content(g) {
+            ResolvedValue::Str(s) => s,
+            _ => String::new(),
+        };
+        // Fact: humanize(relation) + " " + object
+        assert_eq!(
+            content(&mk("fact", serde_json::json!({"relation": "works_at", "object": "acme"}))),
+            "works at acme"
+        );
+        // Event: content
+        assert_eq!(
+            content(&mk("event", serde_json::json!({"content": "asked about pricing"}))),
+            "asked about pricing"
+        );
+        // Reasoning: conclusion, not content
+        assert_eq!(
+            content(&mk("reasoning", serde_json::json!({"conclusion": "prioritise reliability"}))),
+            "prioritise reliability"
+        );
+        // Consent: purpose
+        assert_eq!(
+            content(&mk("consent", serde_json::json!({"purpose": "access dashboards"}))),
+            "access dashboards"
+        );
+        // Workflow: nodes joined readably
+        assert_eq!(
+            content(&mk("workflow", serde_json::json!({"nodes": ["a", "b", "c"]}))),
+            "a -> b -> c"
+        );
+    }
+
+    /// The variable set stays closed — a `grain.` prefix is not a wildcard.
+    #[test]
+    fn test_grain_namespace_is_still_a_closed_set() {
+        assert!(validate_variable_name("grain.subject", None).is_ok());
+        assert!(validate_variable_name("grain.content", None).is_ok());
+        assert!(validate_variable_name("grain.relative_time", None).is_ok());
+        assert!(validate_variable_name("disclosure.level", None).is_ok());
+        assert!(validate_variable_name("grain.not_a_field", None).is_err());
+        assert!(validate_variable_name("nonsense.thing", None).is_err());
     }
 
     fn test_ctx() -> RenderContext {
@@ -2392,17 +3345,17 @@ mod tests {
         let grain = make_fact("john", "mg:likes", "coffee", 0.94);
 
         assert_eq!(
-            resolve_variable("_index", Some(&grain), Some(2), &ctx).to_display(),
+            resolve_variable("_index", Some(&grain), Some(2), &ctx, &RenderEnv::default()).to_display(),
             "2"
         );
         assert_eq!(
-            resolve_variable("_count", Some(&grain), Some(0), &ctx).to_display(),
+            resolve_variable("_count", Some(&grain), Some(0), &ctx, &RenderEnv::default()).to_display(),
             "5"
         );
-        assert!(resolve_variable("_first", Some(&grain), Some(0), &ctx).is_truthy());
-        assert!(!resolve_variable("_first", Some(&grain), Some(1), &ctx).is_truthy());
-        assert!(resolve_variable("_last", Some(&grain), Some(4), &ctx).is_truthy());
-        assert!(!resolve_variable("_last", Some(&grain), Some(3), &ctx).is_truthy());
+        assert!(resolve_variable("_first", Some(&grain), Some(0), &ctx, &RenderEnv::default()).is_truthy());
+        assert!(!resolve_variable("_first", Some(&grain), Some(1), &ctx, &RenderEnv::default()).is_truthy());
+        assert!(resolve_variable("_last", Some(&grain), Some(4), &ctx, &RenderEnv::default()).is_truthy());
+        assert!(!resolve_variable("_last", Some(&grain), Some(3), &ctx, &RenderEnv::default()).is_truthy());
     }
 
     #[test]
@@ -2411,15 +3364,15 @@ mod tests {
         let ctx = test_ctx();
 
         assert_eq!(
-            resolve_variable("hash", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("hash", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "abc123"
         );
         assert_eq!(
-            resolve_variable("grain_type", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("grain_type", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "fact"
         );
         assert_eq!(
-            resolve_variable("score", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("score", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "0.95"
         );
     }
@@ -2430,15 +3383,15 @@ mod tests {
         let ctx = test_ctx();
 
         assert_eq!(
-            resolve_variable("subject", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("subject", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "john"
         );
         assert_eq!(
-            resolve_variable("relation", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("relation", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "mg:likes"
         );
         assert_eq!(
-            resolve_variable("object", Some(&grain), None, &ctx).to_display(),
+            resolve_variable("object", Some(&grain), None, &ctx, &RenderEnv::default()).to_display(),
             "coffee"
         );
     }
@@ -2449,7 +3402,7 @@ mod tests {
         let ctx = test_ctx();
 
         // A field not in ALLOWED_FIELDS should return Null.
-        assert!(!resolve_variable("secret_internal_field", Some(&grain), None, &ctx).is_truthy());
+        assert!(!resolve_variable("secret_internal_field", Some(&grain), None, &ctx, &RenderEnv::default()).is_truthy());
     }
 
     // -----------------------------------------------------------------------
@@ -2928,12 +3881,108 @@ mod tests {
         assert!(reg.get("triples").unwrap().builtin);
     }
 
+    // ── OMS CAL §10.8 limits ──────────────────────────────────────────
+
+    #[test]
+    fn test_limit_template_body_size() {
+        assert_eq!(MAX_TEMPLATE_SIZE, 4_096, "§10.8 max template body size");
+        let ok = "x".repeat(MAX_TEMPLATE_SIZE);
+        assert!(parse_template(&ok).is_ok());
+        let too_big = "x".repeat(MAX_TEMPLATE_SIZE + 1);
+        assert!(matches!(
+            parse_template(&too_big),
+            Err(CalError::TemplateTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_limit_conditional_nesting_depth() {
+        // Nesting is bounded at 5; this also caps parser recursion.
+        let nest = |n: usize| {
+            let mut t = String::new();
+            for _ in 0..n {
+                t.push_str("{{#grain.confidence}}");
+            }
+            t.push('x');
+            for _ in 0..n {
+                t.push_str("{{/grain.confidence}}");
+            }
+            t
+        };
+        assert!(parse_template(&nest(MAX_TEMPLATE_NESTING)).is_ok());
+        assert!(matches!(
+            parse_template(&nest(MAX_TEMPLATE_NESTING + 2)),
+            Err(CalError::TemplateNestingTooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn test_limit_each_iterations() {
+        // §10.8 caps {{#each}} at 200. This is the pre-§10.6 whole-result
+        // form; a sectioned template has the engine drive iteration and is
+        // not bounded by it.
+        let grains: Vec<CalGrainResult> = (0..MAX_EACH_ITERATIONS + 50)
+            .map(|i| CalGrainResult {
+                hash: format!("{i:064}"),
+                grain_type: "fact".into(),
+                score: 1.0,
+                fields: serde_json::json!({ "subject": "s" }),
+                is_deterministic: true,
+                contested_by: None,
+                explanation: None,
+                score_breakdown: None,
+            })
+            .collect();
+        let t = parse_template("{{#each grains}}x{{/each}}").unwrap();
+        let ctx = RenderContext {
+            now_secs: 0,
+            tier: DisclosureTier::Full,
+            total_count: grains.len(),
+            user_vars: HashMap::new(),
+        };
+        assert_eq!(render(&t, &grains, &ctx).unwrap().len(), MAX_EACH_ITERATIONS);
+    }
+
+    #[test]
+    fn test_limit_templates_per_namespace() {
+        let mut reg = TemplateRegistry::new();
+        for i in 0..MAX_TEMPLATES {
+            reg.register(&format!("t{i}"), "{{grain.content}}", "", None)
+                .unwrap_or_else(|e| panic!("template {i} should register: {e}"));
+        }
+        assert!(matches!(
+            reg.register("one_too_many", "{{grain.content}}", "", None),
+            Err(CalError::TooManyTemplates { .. })
+        ));
+        // Redefining an existing one does not grow the set, so it is allowed.
+        assert!(reg.register("t0", "{{grain.subject}}", "", None).is_ok());
+    }
+
+    #[test]
+    fn test_data_preset_cannot_be_extended() {
+        let mut reg = TemplateRegistry::new();
+        assert!(matches!(
+            reg.register("x", "{{grain.content}}", "", Some("data")),
+            Err(CalError::CannotExtendData { .. })
+        ));
+    }
+
     #[test]
     fn test_registry_builtin_count() {
         let reg = TemplateRegistry::new();
         let list = reg.list();
-        assert_eq!(list.len(), 6);
+        // 3 OMS §10.1 presets (structured/readable/compact) + 6 DejaDB
+        // named templates. `data` is deliberately absent — §10.7 forbids
+        // extending it, and it is a renderer, not a template.
+        assert_eq!(list.len(), 9);
         assert!(list.iter().all(|e| e.builtin));
+        for preset in ["structured", "readable", "compact"] {
+            assert!(
+                reg.get(preset).is_some_and(|e| e.template.is_sectioned()),
+                "preset {preset} must exist and be sectioned"
+            );
+        }
+        assert!(reg.get("data").is_none(), "`data` is not an extendable template");
     }
 
     #[test]
@@ -2948,7 +3997,7 @@ mod tests {
         .unwrap();
         assert!(reg.get("my_template").is_some());
         assert!(!reg.get("my_template").unwrap().builtin);
-        assert_eq!(reg.list().len(), 7);
+        assert_eq!(reg.list().len(), 10);
     }
 
     #[test]
@@ -3261,6 +4310,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let t =
             parse_template("{{#each grains}}{{subject}} {{relation}} {{object}}{{/each}}").unwrap();

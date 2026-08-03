@@ -1128,6 +1128,75 @@ impl DejaDB {
         self.index_text
     }
 
+    // ── CAL host metadata (saved queries, custom templates) ─────────────
+    //
+    // These are *not* memories. A saved query or a custom template is
+    // host-managed metadata that belongs to the file so it travels with it
+    // and works from the CLI and MCP as well as the console — so it rides
+    // the `meta` k/v table, not the grain store. One row per entry
+    // (`qry:<name>`, `tpl:<name>`) so recording a last-run timestamp does
+    // not rewrite the whole set.
+
+    /// Read every `meta` row whose key starts with `prefix`, returning
+    /// `(key-without-prefix, value)` pairs.
+    pub fn meta_scan(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let conn = &self.conn;
+        // `%` and `_` are LIKE wildcards, so a prefix containing either would
+        // silently widen the scan. Escape them and say so with ESCAPE; the
+        // `strip_prefix` check below is the backstop, not the mechanism.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        self.rt.block_on(async {
+            let mut out = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT k, v FROM meta WHERE k LIKE ?1 ESCAPE '\\'",
+                    (pt(&pattern),),
+                )
+                .await
+                .map_err(db_err)?;
+            while let Some(row) = rows.next().await.map_err(db_err)? {
+                if let (Value::Text(k), Value::Text(v)) = (
+                    row.get_value(0).map_err(db_err)?,
+                    row.get_value(1).map_err(db_err)?,
+                ) {
+                    if let Some(rest) = k.strip_prefix(prefix) {
+                        out.push((rest.to_string(), v));
+                    }
+                }
+            }
+            Ok::<_, DejaDbError>(out)
+        })
+    }
+
+    /// Upsert a single `meta` row.
+    pub fn meta_put(&self, key: &str, value: &str) -> Result<()> {
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)",
+                (pt(key), pt(value)),
+            )
+            .await
+            .map_err(db_err)?;
+            Ok::<_, DejaDbError>(())
+        })
+    }
+
+    /// Delete a single `meta` row. A missing key is not an error.
+    pub fn meta_delete(&self, key: &str) -> Result<()> {
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            conn.execute("DELETE FROM meta WHERE k = ?1", (pt(key),))
+                .await
+                .map_err(db_err)?;
+            Ok::<_, DejaDbError>(())
+        })
+    }
+
     /// Drop the FTS index ahead of a bulk load. Turso's experimental FTS
     /// costs ~150ms of commit bookkeeping per write transaction while the
     /// index exists — a tax bulk imports cannot amortize. With the index
@@ -4028,6 +4097,64 @@ mod tests {
     //! items (fns, methods, struct fields), so we test them directly.
     use super::*;
     use tempfile::TempDir;
+
+    // ---- CAL host metadata (meta_scan / meta_put / meta_delete) ---------
+
+    #[test]
+    fn meta_rows_round_trip_and_scan_by_prefix() {
+        let dir = TempDir::new().unwrap();
+        let m = DejaDB::open(dir.path().join("m.db").to_str().unwrap()).unwrap();
+
+        m.meta_put("qry:brief", "{\"body\":\"a\"}").unwrap();
+        m.meta_put("qry:wide", "{\"body\":\"b\"}").unwrap();
+        m.meta_put("tpl:card", "{\"source\":\"c\"}").unwrap();
+
+        let mut queries = m.meta_scan("qry:").unwrap();
+        queries.sort();
+        assert_eq!(
+            queries,
+            vec![
+                ("brief".to_string(), "{\"body\":\"a\"}".to_string()),
+                ("wide".to_string(), "{\"body\":\"b\"}".to_string()),
+            ],
+            "scan returns this prefix's rows with the prefix stripped"
+        );
+        assert_eq!(m.meta_scan("tpl:").unwrap().len(), 1);
+
+        // Upsert, not insert: a second put replaces.
+        m.meta_put("qry:brief", "{\"body\":\"z\"}").unwrap();
+        assert_eq!(m.meta_scan("qry:").unwrap().len(), 2);
+
+        m.meta_delete("qry:brief").unwrap();
+        assert_eq!(m.meta_scan("qry:").unwrap().len(), 1);
+        // A missing key is not an error — drop is idempotent.
+        m.meta_delete("qry:brief").unwrap();
+    }
+
+    /// `%` and `_` are LIKE wildcards. An unescaped prefix would quietly match
+    /// rows it does not own — `a_b:` matching `axb:` — and hand a caller
+    /// another namespace's metadata.
+    #[test]
+    fn meta_scan_treats_like_wildcards_as_literals() {
+        let dir = TempDir::new().unwrap();
+        let m = DejaDB::open(dir.path().join("m.db").to_str().unwrap()).unwrap();
+
+        m.meta_put("a_b:mine", "1").unwrap();
+        m.meta_put("axb:theirs", "2").unwrap();
+        m.meta_put("pre%fix:mine", "3").unwrap();
+        m.meta_put("preXfix:theirs", "4").unwrap();
+
+        assert_eq!(
+            m.meta_scan("a_b:").unwrap(),
+            vec![("mine".to_string(), "1".to_string())],
+            "`_` must not match an arbitrary character"
+        );
+        assert_eq!(
+            m.meta_scan("pre%fix:").unwrap(),
+            vec![("mine".to_string(), "3".to_string())],
+            "`%` must not match an arbitrary run"
+        );
+    }
 
     // ---- pure string / format helpers ----------------------------------
 

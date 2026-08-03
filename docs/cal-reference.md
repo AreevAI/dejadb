@@ -92,6 +92,11 @@ RECALL facts ABOUT "seating preferences" LIMIT 10
 RECALL facts LIKE "window"
 ```
 
+`RECALL *` is the explicit spelling of "any grain type" and means exactly the
+same as omitting the type. It is still subject to the anchoring rule below: a
+`*` recall must carry a subject filter or a free-text query, because `*` is not
+a *specific* grain type and `LIMIT`/`RECENT` alone cannot bound an untyped scan.
+
 Every `RECALL` needs a subject filter or a free-text query (`LIKE`/`ABOUT`) —
 a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
 
@@ -169,7 +174,7 @@ WITH dedup(object)
 
 Source labels are plain identifiers; `PRIORITY` labels must match them
 (`CAL-E035`). `ASSEMBLE` is CAL's context-composition statement: it pulls from
-labeled sources (including read-only [facade mounts](../ARCHITECTURE.md#54-assemble-and-facade-mounts),
+labeled sources (including read-only [facade mounts](../ARCHITECTURE.md#55-assemble-and-facade-mounts),
 addressed by the `alias.inner` *namespace string* inside a source's `RECALL` —
 e.g. `WHERE namespace = "org.policies"`), applies per-source token budgets and
 priorities, deduplicates, and renders one budgeted block. `STREAM ASSEMBLE ...` enables
@@ -265,7 +270,8 @@ exists; there is no bulk/user/scope erasure from CAL (see [§8](#8-deletion-narr
 | `DESCRIBE TEMPLATES` / `DESCRIBE QUERIES` | List registered templates / saved queries |
 | `EXPLAIN <query>` | Return a query plan for a statement |
 | `BATCH { stmt1 ; stmt2 ; ... }` | Run several statements as one batch (up to 10 entries; optional labels) |
-| `DEFINE TEMPLATE "name" ... AS "<source>"` | Register a reusable output template |
+| `DEFINE TEMPLATE <name> AS "<source>"` | Register a reusable output template (ELEMENT shorthand) |
+| `DEFINE TEMPLATE <name> [EXTENDS <parent>] HEADER { } ELEMENT { } …` | Register a sectioned template (OMS CAL §10.6) |
 | `DEFINE QUERY "name"($params) AS { body }` | Register a saved, parameterized query |
 | `DROP TEMPLATE "name"` / `DROP QUERY "name"` | Remove a template or saved query |
 | `RUN "name"($p = v, ...)` | Execute a saved query with bindings |
@@ -293,6 +299,19 @@ RUN "session_prompt"($user = "john", $session = "call-42")
 Saved-query limits: 100 per namespace, 8 KiB body, 10 parameters. Saved-query
 bodies get an extra read-only verification pass, so a saved query can never
 smuggle in a write or a blocked keyword.
+
+Saved queries and custom templates are **host metadata carried by the memory
+file**, not memories: they persist as `meta` rows (`qry:<name>`, `tpl:<name>`)
+and so travel with the `.db` — the same set is visible from the CLI, MCP and
+the web console. They are never grains, never content-addressed, and never
+appear in recall results.
+
+An entry the file carries that the running build cannot load — a template
+written before a limit was tightened, a row from a newer version — is skipped
+rather than failing the open, and reported: on stderr from `deja cal` / `repl`
+/ `serve` / `ui` / `hub`, and in `warnings` on `GET /api/config`. It stays in
+the file, so an older or newer build can still read it; overwriting the entry
+is what loses it.
 
 ### 3.4 The `WHERE` clause
 
@@ -377,12 +396,64 @@ compiled in) return an honest error rather than silently degrading.
 |---|---|
 | `sml` | Structured Memory Language (compact, Claude-class) |
 | `toon` | TOON compact tabular blocks |
-| `markdown` | Markdown |
+| `markdown` | Markdown — one assertion per line (see below) |
 | `json` | JSON |
 | `yaml` | YAML |
 | `text` / `table` / `csv` / `triples` | Plain text / Markdown table / CSV / `S R O` triples |
-| `preset "<name>"` | A named preset |
-| `template "<source>"` | An inline template (Mustache-subset) |
+| `structured` / `readable` / `compact` / `data` | OMS §10.1 semantic presets — aliases for `sml` / `markdown` / `text` / `json` |
+| `TEMPLATE <name>` | A registered template — **bare** name, quoting makes it a body |
+| `TEMPLATE "<source>"` | An inline template body — **quoted** (ELEMENT shorthand) |
+| `TEMPLATE { ELEMENT { … } }` | Inline sections |
+| `preset "<name>"` | A registered template, older spelling of `TEMPLATE <name>` |
+
+`FORMAT <fmt>` may also be written `AS <fmt>` (§7 `as_clause`), including the
+bracketed multi-format list.
+
+A `TEMPLATE` **name** follows the same rules as the name in
+`DEFINE TEMPLATE <name>`, so words that happen to be CAL keywords
+(`recent`, `scope`, …) work in both places. A *quoted* argument is never a
+name — `FORMAT TEMPLATE "..."` is always an inline body.
+
+### What `markdown` renders
+
+`FORMAT markdown` produces one line per grain, stating what the memory asserts:
+
+```
+- **john** prefers window seat *(0.95, 2026-01-13)*
+- **user**: what's the refund window?
+- **stripe_refund** failed: rate_limited 429
+```
+
+The trailing italics carry only what changes how much weight to give the line —
+confidence when it is below 1.0, the date, and `superseded`. Storage
+bookkeeping (namespace, grain type, raw epochs, the content address) is left
+out: this output exists to be pasted into a prompt, and none of it helps a
+model reason. Use `FORMAT json` when you need the full envelope, or a
+`FORMAT TEMPLATE` to choose the fields yourself. A `GROUP BY` render keeps its
+group headings.
+
+### Template sections and limits
+
+A sectioned template's `ELEMENT` renders once per grain, `ELEMENT_SUMMARY`
+replaces it when the budget squeezes the render below full disclosure, and
+`ELEMENT_OMIT` accounts for grains the budget dropped. `SOURCE_BREAK` goes
+between `ASSEMBLE` sources — not before the first. `HEADER`/`FOOTER` bracket
+the whole render and are the only place `assembly.*` and `budget.*` make
+sense; `source.*` is bound only inside an element run.
+
+Sections you do not define are inherited from `EXTENDS <parent>`, defaulting
+to `readable`. The three preset parents (`structured`, `readable`, `compact`)
+define element-level sections only, so inheriting never adds a header you did
+not ask for. `data` cannot be extended (`CAL-E119`).
+
+| Limit (OMS CAL §10.8) | Value |
+|---|---|
+| Template body | 4096 bytes (`CAL-E040`) |
+| Templates per namespace | 50 (`CAL-E118`) |
+| Conditional nesting | 5 (`CAL-E117`) |
+| `{{#each}}` iterations | 200 — emits `CAL-W011` when it truncates |
+| Template name | 64 chars |
+| Inheritance depth | 1 |
 
 ```sql
 RECALL facts WHERE subject = "john" FORMAT sml
@@ -490,7 +561,7 @@ The parser and executor enforce these hard bounds:
 RECALL facts WHERE subject = "john" AND relation = "prefers" FORMAT sml
 
 -- Count everything in a namespace
-RECALL * WHERE namespace = "caller" | COUNT
+RECALL facts WHERE namespace = "caller" | COUNT
 
 -- Add a fact (REASON is mandatory)
 ADD fact SET subject = "john" SET relation = "allergic_to" SET object = "peanuts"

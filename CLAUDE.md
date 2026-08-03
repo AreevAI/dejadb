@@ -85,7 +85,9 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
    write parallelism. Single writer per file; cross-file queries go through
    ASSEMBLE with facade mounts, not shared connections. Files are
    self-describing: the `meta` table carries file-truths (`text_index`,
-   `entity_relations`, embedding provenance). Bare `open()` honors them;
+   `entity_relations`, embedding provenance) and CAL host metadata — saved
+   queries and custom templates ride there as `qry:<name>`/`tpl:<name>` rows,
+   so they travel with the file rather than living in any one client. Bare `open()` honors them;
    `open_with()` deliberately re-stamps and reports changes via
    `open_warnings()`. Host config (embedder capability, executor limits) is
    per-process and never persisted in the file.

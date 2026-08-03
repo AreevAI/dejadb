@@ -123,6 +123,100 @@ pub fn is_destructive_keyword(word: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Template section bodies
+// ---------------------------------------------------------------------------
+
+/// The body of a template section (OMS CAL §10.6).
+///
+/// Section bodies hold arbitrary *template text*: prose, apostrophes, angle
+/// brackets, an odd number of quotes, words that happen to be CAL keywords.
+/// None of that is CAL, so the lexer captures the body as one raw slice
+/// instead of tokenizing it — otherwise a template containing `don't` or a
+/// lone `"` would fail to lex the whole query.
+///
+/// `Bare` means the keyword appeared *without* a `{ ... }` body, so it is
+/// being used as an ordinary word (a field name, an alias). The parser treats
+/// that case as an identifier, which keeps `WHERE header = "x"` working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionBody {
+    /// Keyword used as a plain word — no `{` followed.
+    Bare,
+    /// Raw section text, outer braces removed and layout trimmed.
+    Body(String),
+}
+
+/// Capture a brace-delimited section body from the raw input.
+///
+/// Brace matching is mustache-aware: `{{` and `}}` are interpolation
+/// delimiters and are stepped over as pairs, so `ELEMENT { {{grain.type}} }`
+/// nests correctly. Single braces nest normally, which lets a body contain a
+/// JSON object. An unterminated body yields `Bare` so the parser reports the
+/// error with a span rather than the lexer failing the whole query.
+fn section_body(lex: &mut logos::Lexer<Token>) -> SectionBody {
+    let rest = lex.remainder();
+    let bytes = rest.as_bytes();
+
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return SectionBody::Bare;
+    }
+
+    let body_start = i + 1;
+    let mut depth = 1usize;
+    let mut j = body_start;
+    while j < bytes.len() {
+        match bytes[j] {
+            // `{{` / `}}` are mustache delimiters, not nesting.
+            b'{' if bytes.get(j + 1) == Some(&b'{') => j += 2,
+            b'}' if bytes.get(j + 1) == Some(&b'}') => j += 2,
+            b'{' => {
+                depth += 1;
+                j += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            _ => j += 1,
+        }
+    }
+    if depth != 0 {
+        return SectionBody::Bare;
+    }
+
+    // ASCII braces cannot occur inside a multi-byte UTF-8 sequence, so these
+    // byte offsets are always char boundaries.
+    let raw = &rest[body_start..j];
+    lex.bump(j + 1);
+    SectionBody::Body(trim_section_text(raw))
+}
+
+/// Strip the layout that separates a section body from its braces.
+///
+/// `ELEMENT {\n<fact>…</fact>\n  }` should render `<fact>…</fact>`, not a
+/// leading blank line and a trailing indent. Removes at most one newline at
+/// each end (with the horizontal whitespace hugging it), so a body that
+/// deliberately starts or ends with a blank line keeps it.
+fn trim_section_text(raw: &str) -> String {
+    let mut s = raw;
+    let lead = s.len() - s.trim_start_matches([' ', '\t', '\r']).len();
+    if let Some(rest) = s[lead..].strip_prefix('\n') {
+        s = rest;
+    }
+    let end_trimmed = s.trim_end_matches([' ', '\t', '\r']);
+    if let Some(rest) = end_trimmed.strip_suffix('\n') {
+        s = rest;
+    }
+    s.to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Token enum
 // ---------------------------------------------------------------------------
 
@@ -326,23 +420,25 @@ pub enum Token {
     #[token("EXTENDS", ignore(ascii_case))]
     Extends,
 
-    #[token("HEADER", ignore(ascii_case))]
-    Header,
+    // Template sections (OMS CAL §10.6). Each carries its raw body — see
+    // [`SectionBody`] for why the body is not tokenized.
+    #[token("HEADER", section_body, ignore(ascii_case))]
+    Header(SectionBody),
 
-    #[token("ELEMENT", ignore(ascii_case))]
-    Element,
+    #[token("ELEMENT", section_body, ignore(ascii_case))]
+    Element(SectionBody),
 
-    #[token("ELEMENT_SUMMARY", ignore(ascii_case))]
-    ElementSummary,
+    #[token("ELEMENT_SUMMARY", section_body, ignore(ascii_case))]
+    ElementSummary(SectionBody),
 
-    #[token("ELEMENT_OMIT", ignore(ascii_case))]
-    ElementOmit,
+    #[token("ELEMENT_OMIT", section_body, ignore(ascii_case))]
+    ElementOmit(SectionBody),
 
-    #[token("SOURCE_BREAK", ignore(ascii_case))]
-    SourceBreak,
+    #[token("SOURCE_BREAK", section_body, ignore(ascii_case))]
+    SourceBreak(SectionBody),
 
-    #[token("FOOTER", ignore(ascii_case))]
-    Footer,
+    #[token("FOOTER", section_body, ignore(ascii_case))]
+    Footer(SectionBody),
 
     #[token("OF", ignore(ascii_case))]
     Of,
@@ -776,12 +872,12 @@ impl Token {
             Token::Query => "QUERY".into(),
             Token::Run => "RUN".into(),
             Token::Extends => "EXTENDS".into(),
-            Token::Header => "HEADER".into(),
-            Token::Element => "ELEMENT".into(),
-            Token::ElementSummary => "ELEMENT_SUMMARY".into(),
-            Token::ElementOmit => "ELEMENT_OMIT".into(),
-            Token::SourceBreak => "SOURCE_BREAK".into(),
-            Token::Footer => "FOOTER".into(),
+            Token::Header(_) => "HEADER".into(),
+            Token::Element(_) => "ELEMENT".into(),
+            Token::ElementSummary(_) => "ELEMENT_SUMMARY".into(),
+            Token::ElementOmit(_) => "ELEMENT_OMIT".into(),
+            Token::SourceBreak(_) => "SOURCE_BREAK".into(),
+            Token::Footer(_) => "FOOTER".into(),
             Token::Of => "OF".into(),
             Token::On => "ON".into(),
             Token::When => "WHEN".into(),
@@ -1644,5 +1740,108 @@ mod tests {
     fn test_with_vars_sequence() {
         let tokens = tok("WITH VARS");
         assert_eq!(tokens, vec![Token::With, Token::Vars]);
+    }
+
+    // ── Template section bodies (OMS CAL §10.6) ───────────────────────────
+
+    /// Pull the single section body out of a one-section input.
+    fn body(input: &str) -> String {
+        match tok(input).into_iter().next().expect("a token") {
+            Token::Header(SectionBody::Body(s))
+            | Token::Element(SectionBody::Body(s))
+            | Token::ElementSummary(SectionBody::Body(s))
+            | Token::ElementOmit(SectionBody::Body(s))
+            | Token::SourceBreak(SectionBody::Body(s))
+            | Token::Footer(SectionBody::Body(s)) => s,
+            other => panic!("expected a section body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_section_body_is_captured_raw() {
+        // Only *newline* layout is stripped; horizontal spacing is content,
+        // so a one-line body keeps the spaces the author typed.
+        assert_eq!(
+            body(r#"ELEMENT { <fact>{{grain.content}}</fact> }"#),
+            " <fact>{{grain.content}}</fact> "
+        );
+    }
+
+    #[test]
+    fn test_section_body_strips_one_newline_of_layout_at_each_end() {
+        // The spec writes bodies on their own lines; the braces' layout is not
+        // part of the rendering.
+        assert_eq!(body("HEADER {\n<context>\n  }"), "<context>");
+        // A deliberate blank line survives — only one newline is consumed.
+        assert_eq!(body("HEADER {\n\n<context>\n\n  }"), "\n<context>\n");
+        // Single-line bodies keep their interior spacing.
+        assert_eq!(body("FOOTER { x }"), " x ");
+    }
+
+    #[test]
+    fn test_section_brace_matching_is_mustache_aware() {
+        // `{{` / `}}` are interpolation delimiters, not nesting.
+        assert_eq!(body("ELEMENT {{{grain.type}}}"), "{{grain.type}}");
+        // Single braces nest, so a body may contain a JSON object.
+        assert_eq!(
+            body(r#"ELEMENT { {"t": "{{grain.type}}"} }"#),
+            r#" {"t": "{{grain.type}}"} "#
+        );
+    }
+
+    #[test]
+    fn test_section_body_may_contain_text_that_is_not_cal() {
+        // This is the whole reason bodies are captured raw: none of these
+        // tokenize as CAL, and before the raw capture each one failed the
+        // entire query.
+        assert_eq!(body("ELEMENT { don't }"), " don't ");
+        assert_eq!(body("ELEMENT { 50% off — \"quoted }"), " 50% off — \"quoted ");
+        // A destructive keyword is just prose inside a template body.
+        assert_eq!(body("ELEMENT { DELETE the old note }"), " DELETE the old note ");
+    }
+
+    #[test]
+    fn test_section_keywords_are_still_ordinary_words_without_a_body() {
+        // `header` as a field name must keep working.
+        assert_eq!(
+            tok(r#"WHERE header = "x""#),
+            vec![
+                Token::Where,
+                Token::Header(SectionBody::Bare),
+                Token::Eq,
+                Token::StringLiteral("x".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unterminated_section_body_is_left_for_the_parser() {
+        // No closing brace: the lexer must not swallow the rest of the query
+        // or fail outright — the parser reports it with a span.
+        assert_eq!(
+            tok("ELEMENT { unclosed"),
+            vec![
+                Token::Element(SectionBody::Bare),
+                Token::LBrace,
+                Token::Ident("unclosed".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_six_sections_lex() {
+        let toks = tok("HEADER {a} ELEMENT {b} ELEMENT_SUMMARY {c} \
+                        ELEMENT_OMIT {d} SOURCE_BREAK {e} FOOTER {f}");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Header(SectionBody::Body("a".into())),
+                Token::Element(SectionBody::Body("b".into())),
+                Token::ElementSummary(SectionBody::Body("c".into())),
+                Token::ElementOmit(SectionBody::Body("d".into())),
+                Token::SourceBreak(SectionBody::Body("e".into())),
+                Token::Footer(SectionBody::Body("f".into())),
+            ]
+        );
     }
 }

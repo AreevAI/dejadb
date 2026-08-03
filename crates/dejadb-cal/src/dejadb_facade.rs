@@ -13,9 +13,25 @@ use dejadb_core::format::deserialize::DeserializedGrain;
 use dejadb_core::types::Grain;
 use dejadb_store::DejaDB;
 
-use crate::facade::CalStoreFacade;
+use crate::ast::QueryParam;
+use crate::errors::CalError;
+use crate::facade::{CalStoreFacade, TemplateInfo};
 use crate::json_build::{build_grain_from_json, GrainSink};
-use crate::store_types::{DiversityMethod, RecallParams, SearchHit, VersionEntry};
+use crate::queries::{PersistedQuery, QueryEntry, QueryListEntry, QueryRegistry};
+use crate::store_types::{DiversityMethod, ForkGroupInfo, RecallParams, SearchHit, VersionEntry};
+use crate::templates::{PersistedTemplate, TemplateRegistry};
+
+/// `meta` key prefixes for CAL host metadata. One row per entry, so recording
+/// a last-run timestamp does not rewrite the whole set.
+const QRY_PREFIX: &str = "qry:";
+const TPL_PREFIX: &str = "tpl:";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// CalStoreFacade implementation over an embedded `DejaDB` store.
 pub struct DejaDbFacade {
@@ -25,6 +41,17 @@ pub struct DejaDbFacade {
     /// Read-only mounted memories (org/category replicas): alias → store.
     /// A recall with namespace "alias.inner" routes to the mount (§8).
     mounts: std::collections::HashMap<String, Mutex<DejaDB>>,
+    /// Saved queries and custom templates are *host metadata* carried by the
+    /// file (`meta` rows), not memories — they travel with the .db so the
+    /// CLI, MCP and console all see the same set. Rehydrated on first use.
+    queries: Mutex<Option<QueryRegistry>>,
+    templates: Mutex<Option<TemplateRegistry>>,
+    /// Entries the file carries that this process could not load — a template
+    /// that outgrew the §10.8 body limit, a set past the per-file cap, a row
+    /// written by a newer version. Reported alongside `DejaDB::open_warnings`
+    /// so a silently smaller set of saved queries is something the operator
+    /// sees rather than discovers.
+    meta_warnings: Mutex<Vec<String>>,
 }
 
 impl DejaDbFacade {
@@ -40,6 +67,9 @@ impl DejaDbFacade {
             namespace,
             user,
             mounts: std::collections::HashMap::new(),
+            queries: Mutex::new(None),
+            templates: Mutex::new(None),
+            meta_warnings: Mutex::new(Vec::new()),
         }
     }
 
@@ -141,11 +171,374 @@ impl GrainSink for SupersedeSink<'_> {
     }
 }
 
+impl DejaDbFacade {
+    /// Note an entry the file carries that this process could not load.
+    ///
+    /// Skipping is deliberate — one unloadable row must not make the whole
+    /// memory unusable — but skipping *silently* is not: a saved query that
+    /// vanishes without a word looks like it was never written.
+    fn note_meta_warning(&self, kind: &str, name: &str, why: impl std::fmt::Display) {
+        self.meta_warnings
+            .lock()
+            .expect("meta warnings poisoned")
+            .push(format!(
+                "{kind} \"{name}\" is in the file but could not be loaded ({why}); \
+                 it is not available in this process and will be lost if you overwrite it"
+            ));
+    }
+
+    /// Saved queries and templates the file carries that this process could not
+    /// load. Empty when everything in the file is usable here.
+    pub fn meta_warnings(&self) -> Vec<String> {
+        self.meta_warnings
+            .lock()
+            .expect("meta warnings poisoned")
+            .clone()
+    }
+
+    /// Run `f` against the saved-query registry, rehydrating it from the
+    /// file's `meta` rows on first use. A row that fails to parse or register
+    /// is skipped rather than failing the whole open — one bad entry must not
+    /// make the memory unusable — but it is recorded in [`Self::meta_warnings`].
+    fn with_queries<R>(&self, f: impl FnOnce(&mut QueryRegistry) -> R) -> R {
+        let mut guard = self.queries.lock().expect("query registry poisoned");
+        if guard.is_none() {
+            let mut reg = QueryRegistry::new();
+            match self.with_store(|m| m.meta_scan(QRY_PREFIX)) {
+                Ok(rows) => {
+                    for (name, json) in rows {
+                        match serde_json::from_str::<PersistedQuery>(&json) {
+                            Ok(p) => {
+                                if let Err(e) = reg.register_full(
+                                    &name,
+                                    &p.body,
+                                    &p.description,
+                                    &p.params,
+                                    p.last_run_at,
+                                    p.updated_at,
+                                ) {
+                                    self.note_meta_warning("saved query", &name, e);
+                                }
+                            }
+                            Err(e) => self.note_meta_warning("saved query", &name, e),
+                        }
+                    }
+                }
+                Err(e) => self.note_meta_warning("saved queries", "*", e),
+            }
+            *guard = Some(reg);
+        }
+        f(guard.as_mut().expect("initialised directly above"))
+    }
+
+    /// Same for custom templates.
+    fn with_templates<R>(&self, f: impl FnOnce(&mut TemplateRegistry) -> R) -> R {
+        let mut guard = self.templates.lock().expect("template registry poisoned");
+        if guard.is_none() {
+            let mut reg = TemplateRegistry::new();
+            match self.with_store(|m| m.meta_scan(TPL_PREFIX)) {
+                Ok(rows) => {
+                    for (name, json) in rows {
+                        match serde_json::from_str::<PersistedTemplate>(&json) {
+                            Ok(p) => {
+                                match reg.register(
+                                    &name,
+                                    &p.source,
+                                    &p.description,
+                                    p.parent.as_deref(),
+                                ) {
+                                    Ok(()) => {
+                                        reg.restore_timestamps(&name, p.last_run_at, p.updated_at);
+                                        // The FOR clause lives on the statement,
+                                        // not in the body, so it only survives a
+                                        // reload if it is put back explicitly.
+                                        reg.set_grain_types(&name, &p.grain_types);
+                                    }
+                                    Err(e) => self.note_meta_warning("template", &name, e),
+                                }
+                            }
+                            Err(e) => self.note_meta_warning("template", &name, e),
+                        }
+                    }
+                }
+                Err(e) => self.note_meta_warning("templates", "*", e),
+            }
+            *guard = Some(reg);
+        }
+        f(guard.as_mut().expect("initialised directly above"))
+    }
+
+    fn persist_query(&self, name: &str, p: &PersistedQuery) -> Result<()> {
+        let json = serde_json::to_string(p)
+            .map_err(|e| DejaDbError::Validation(format!("saved query \"{name}\": {e}")))?;
+        self.with_store(|m| m.meta_put(&format!("{QRY_PREFIX}{name}"), &json))
+    }
+
+    fn snapshot_query(&self, name: &str) -> Option<PersistedQuery> {
+        self.with_queries(|reg| {
+            reg.get(name).map(|e| PersistedQuery {
+                body: e.body.clone(),
+                description: e.description.clone(),
+                params: e.params.clone(),
+                last_run_at: e.last_run_at,
+                updated_at: e.updated_at,
+            })
+        })
+    }
+
+    fn snapshot_template(&self, name: &str) -> Option<PersistedTemplate> {
+        self.with_templates(|reg| {
+            reg.get(name).filter(|e| !e.builtin).map(|e| PersistedTemplate {
+                source: e.template.source().to_string(),
+                description: e.description.clone(),
+                parent: e.parent.clone(),
+                grain_types: e.grain_types.clone(),
+                last_run_at: e.last_run_at,
+                updated_at: e.updated_at,
+            })
+        })
+    }
+}
+
 impl CalStoreFacade for DejaDbFacade {
     /// Record one assembly-budget sample into the telemetry sidecar (feeds the
     /// `budget_pressure` analyzer). Best-effort: telemetry never fails a query.
     fn note_assembly_budget(&self, overflow: bool) {
         let _ = self.with_store(|m| m.telemetry_note_budget(overflow));
+    }
+
+    // ── CAL host metadata: saved queries and custom templates ───────────
+    //
+    // The registry owns the rules (name shape, per-namespace cap, body size,
+    // parameter count), so every write validates in memory first and only
+    // then touches the file. If the file write fails the in-memory entry is
+    // rolled back, so the registry never runs ahead of what is persisted.
+
+    fn define_query(
+        &self,
+        name: &str,
+        body: &str,
+        description: Option<&str>,
+        params: &[QueryParam],
+    ) -> Result<()> {
+        let existing = self.snapshot_query(name);
+        self.with_queries(|reg| reg.register(name, body, description.unwrap_or(""), params))
+            .map_err(DejaDbError::Validation)?;
+        let Some(p) = self.snapshot_query(name) else {
+            return Err(DejaDbError::Internal(format!(
+                "saved query \"{name}\" vanished after registration"
+            )));
+        };
+        if let Err(e) = self.persist_query(name, &p) {
+            // Roll the registry back to whatever was there before.
+            self.with_queries(|reg| {
+                let _ = reg.delete(name);
+                if let Some(prev) = &existing {
+                    let _ = reg.register_full(
+                        name,
+                        &prev.body,
+                        &prev.description,
+                        &prev.params,
+                        prev.last_run_at,
+                        prev.updated_at,
+                    );
+                }
+            });
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn drop_query(&self, name: &str) -> Result<()> {
+        // Snapshot before deleting: if the file write fails the registry has to
+        // go back, or the entry is gone here and still on disk — it would
+        // reappear on the next open, which reads as the drop never happening.
+        let existing = self.snapshot_query(name);
+        self.with_queries(|reg| reg.delete(name))
+            .map_err(DejaDbError::Validation)?;
+        if let Err(e) = self.with_store(|m| m.meta_delete(&format!("{QRY_PREFIX}{name}"))) {
+            if let Some(prev) = &existing {
+                self.with_queries(|reg| {
+                    let _ = reg.register_full(
+                        name,
+                        &prev.body,
+                        &prev.description,
+                        &prev.params,
+                        prev.last_run_at,
+                        prev.updated_at,
+                    );
+                });
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn list_queries(&self) -> Vec<QueryListEntry> {
+        self.with_queries(|reg| reg.list())
+    }
+
+    fn get_query(&self, name: &str) -> Option<QueryEntry> {
+        self.with_queries(|reg| reg.get(name).cloned())
+    }
+
+    fn update_query_last_run(&self, name: &str) -> Result<()> {
+        let now = now_secs();
+        let updated = self.with_queries(|reg| {
+            let e = reg.get(name)?;
+            // Built-ins are not persisted, and a re-run within the same second
+            // cannot change the one-second-resolution timestamp — so it would
+            // be a write transaction that rewrites the row with what it
+            // already holds.
+            if e.builtin || e.last_run_at == Some(now) {
+                return None;
+            }
+            let (body, description, params, updated_at) = (
+                e.body.clone(),
+                e.description.clone(),
+                e.params.clone(),
+                e.updated_at,
+            );
+            reg.register_full(
+                name,
+                &body,
+                &description,
+                &params,
+                Some(now),
+                updated_at,
+            )
+            .ok()?;
+            Some(PersistedQuery {
+                body,
+                description,
+                params,
+                last_run_at: Some(now),
+                updated_at,
+            })
+        });
+        match updated {
+            Some(p) => self.persist_query(name, &p),
+            None => Ok(()),
+        }
+    }
+
+    fn define_template(
+        &self,
+        name: &str,
+        source: &str,
+        description: Option<&str>,
+        parent: Option<&str>,
+        grain_types: &[String],
+    ) -> Result<()> {
+        let existing = self.snapshot_template(name);
+        self.with_templates(|reg| {
+            reg.register(name, source, description.unwrap_or(""), parent)?;
+            // The FOR clause rides the statement, not the body — set it on the
+            // entry too, so the in-memory and persisted views agree.
+            reg.set_grain_types(name, grain_types);
+            Ok(())
+        })
+        .map_err(|e: CalError| DejaDbError::Validation(e.to_string()))?;
+        let p = PersistedTemplate {
+            source: source.to_string(),
+            description: description.unwrap_or("").to_string(),
+            parent: parent.map(str::to_string),
+            grain_types: grain_types.to_vec(),
+            last_run_at: None,
+            updated_at: Some(now_secs()),
+        };
+        let json = serde_json::to_string(&p)
+            .map_err(|e| DejaDbError::Validation(format!("template \"{name}\": {e}")))?;
+        if let Err(e) = self.with_store(|m| m.meta_put(&format!("{TPL_PREFIX}{name}"), &json)) {
+            // Roll the registry back to whatever was there before, so it never
+            // runs ahead of what is persisted.
+            self.with_templates(|reg| {
+                let _ = reg.delete(name);
+                if let Some(prev) = &existing {
+                    if reg
+                        .register(name, &prev.source, &prev.description, prev.parent.as_deref())
+                        .is_ok()
+                    {
+                        reg.restore_timestamps(name, prev.last_run_at, prev.updated_at);
+                        reg.set_grain_types(name, &prev.grain_types);
+                    }
+                }
+            });
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn drop_template(&self, name: &str) -> Result<()> {
+        let existing = self.snapshot_template(name);
+        self.with_templates(|reg| reg.delete(name))
+            .map_err(|e| DejaDbError::Validation(e.to_string()))?;
+        if let Err(e) = self.with_store(|m| m.meta_delete(&format!("{TPL_PREFIX}{name}"))) {
+            if let Some(prev) = &existing {
+                self.with_templates(|reg| {
+                    if reg
+                        .register(name, &prev.source, &prev.description, prev.parent.as_deref())
+                        .is_ok()
+                    {
+                        reg.restore_timestamps(name, prev.last_run_at, prev.updated_at);
+                        reg.set_grain_types(name, &prev.grain_types);
+                    }
+                });
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn list_templates(&self) -> Vec<TemplateInfo> {
+        self.with_templates(|reg| reg.list())
+    }
+
+    fn get_template(&self, name: &str) -> Option<TemplateInfo> {
+        // Direct lookup, not `list().find()`: this runs on the FORMAT render
+        // path, and building the whole list (every source string cloned) to
+        // throw all but one away is work proportional to the registry on every
+        // rendered query.
+        self.with_templates(|reg| {
+            reg.get(name).map(|e| TemplateInfo {
+                name: name.to_string(),
+                description: e.description.clone(),
+                builtin: e.builtin,
+                parent: e.parent.clone(),
+                grain_types: e.grain_types.clone(),
+                source: e.template.source().to_string(),
+                last_run_at: e.last_run_at,
+                updated_at: e.updated_at,
+            })
+        })
+    }
+
+    fn record_template_run(&self, name: &str) {
+        let persisted = self.with_templates(|reg| {
+            let before = reg.get(name).and_then(|e| e.last_run_at);
+            reg.record_run(name);
+            let entry = reg.get(name)?;
+            // `last_run_at` has one-second resolution, so a second render in
+            // the same second cannot change what is on disk. Skipping that
+            // write matters: this runs on the FORMAT path, and a rendered
+            // recall should not cost a write transaction per call.
+            if entry.builtin || entry.last_run_at == before {
+                return None;
+            }
+            Some(PersistedTemplate {
+                source: entry.template.source().to_string(),
+                description: entry.description.clone(),
+                parent: entry.parent.clone(),
+                grain_types: entry.grain_types.clone(),
+                last_run_at: entry.last_run_at,
+                updated_at: entry.updated_at,
+            })
+        });
+        if let Some(p) = persisted {
+            if let Ok(json) = serde_json::to_string(&p) {
+                let _ = self.with_store(|m| m.meta_put(&format!("{TPL_PREFIX}{name}"), &json));
+            }
+        }
     }
 
     fn recall(&self, params: &RecallParams) -> Result<Vec<SearchHit>> {
@@ -264,6 +657,23 @@ impl CalStoreFacade for DejaDbFacade {
                 created_at: e.created_at,
                 confidence: e.confidence,
                 superseded_by: e.superseded_by,
+            })
+            .collect())
+    }
+
+    fn open_forks(&self) -> Result<Vec<ForkGroupInfo>> {
+        let groups = self.with_store(|m| m.open_forks())?;
+        Ok(groups
+            .into_iter()
+            .map(|f| ForkGroupInfo {
+                namespace: f.namespace,
+                subject: f.subject,
+                relation: f.relation,
+                // `DejaDB::heads` orders `created_at DESC, hash DESC` — the same
+                // tuple the provisional-head election uses — so tip 0 is the
+                // value recall serves. Preserve that order; CONTRADICTIONS
+                // reports every other tip as a peer of it.
+                heads: f.heads.iter().map(|h| h.to_hex()).collect(),
             })
             .collect())
     }

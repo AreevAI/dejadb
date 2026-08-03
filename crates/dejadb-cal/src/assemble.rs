@@ -99,6 +99,11 @@ pub struct SourceMeta {
     pub tokens_used: u32,
     /// Number of grains contributed by this source.
     pub grain_count: usize,
+    /// Grains the budget forced out of this source, kept so a template's
+    /// `ELEMENT_OMIT` section can account for them. Render-time only — not
+    /// part of the wire payload, so the API shape is unchanged.
+    #[serde(skip)]
+    pub omitted: Vec<CalGrainResult>,
 }
 
 impl<'a> AssembleEngine<'a> {
@@ -222,6 +227,14 @@ impl<'a> AssembleEngine<'a> {
 
         let labels: Vec<&str> = source_results.iter().map(|(l, _)| l.as_str()).collect();
         let allocations = allocate_budget(&labels, budget_tokens, &stmt.priority);
+        // Snapshot per-source allocations in source order so the trim loop can
+        // take ownership of the grains: `allocations` borrows `labels`, which
+        // borrows `source_results`.
+        let per_source: Vec<u32> = labels
+            .iter()
+            .map(|l| allocations.get(l).copied().unwrap_or(0))
+            .collect();
+        let source_count = source_results.len();
 
         // 5. Trim grains per source to fit allocated budget (single-pass greedy).
         let mut final_grains: Vec<CalGrainResult> = Vec::new();
@@ -229,27 +242,33 @@ impl<'a> AssembleEngine<'a> {
         let mut remaining_budget = budget_tokens;
         let mut dropped = 0usize; // grains the budget forced us to omit
 
-        for (label, grains) in &source_results {
-            let allocated = allocations
-                .get(label.as_str())
-                .copied()
-                .unwrap_or(remaining_budget / source_results.len().max(1) as u32);
+        for (i, (label, mut grains)) in source_results.into_iter().enumerate() {
+            let allocated = match per_source.get(i).copied() {
+                Some(a) if a > 0 => a,
+                _ => remaining_budget / source_count.max(1) as u32,
+            };
 
             // Use the smaller of allocated or remaining budget.
             let effective_allocation = allocated.min(remaining_budget);
 
-            let (trimmed, tokens_used) = self.trim_to_budget(grains, effective_allocation);
-            dropped += grains.len().saturating_sub(trimmed.len());
+            // Split rather than copy: the kept grains and the omitted tail are
+            // both already in `grains`, and cloning either would hold a second
+            // copy of an assembly's whole result set for the life of the query
+            // — which is the opposite of what a budget is for.
+            let (keep, tokens_used) = self.budget_prefix(&grains, effective_allocation);
+            let omitted = grains.split_off(keep);
+            dropped += omitted.len();
             remaining_budget = remaining_budget.saturating_sub(tokens_used);
 
             meta.push(SourceMeta {
-                label: label.clone(),
+                label,
                 tokens_allocated: effective_allocation,
                 tokens_used,
-                grain_count: trimmed.len(),
+                grain_count: grains.len(),
+                omitted,
             });
 
-            final_grains.extend(trimmed);
+            final_grains.extend(grains);
         }
 
         let total_tokens = meta.iter().map(|m| m.tokens_used).sum();
@@ -456,20 +475,20 @@ impl<'a> AssembleEngine<'a> {
 
     /// Trim a grain list to fit within a token budget.
     /// Returns (trimmed grains, tokens actually used).
-    fn trim_to_budget(&self, grains: &[CalGrainResult], budget: u32) -> (Vec<CalGrainResult>, u32) {
-        let mut result = Vec::new();
+    fn budget_prefix(&self, grains: &[CalGrainResult], budget: u32) -> (usize, u32) {
+        let mut kept = 0usize;
         let mut tokens_used: u32 = 0;
 
         for grain in grains {
             let grain_tokens = estimate_grain_tokens(grain);
-            if tokens_used + grain_tokens > budget && !result.is_empty() {
+            if tokens_used + grain_tokens > budget && kept > 0 {
                 break;
             }
             tokens_used += grain_tokens;
-            result.push(grain.clone());
+            kept += 1;
         }
 
-        (result, tokens_used)
+        (kept, tokens_used)
     }
 
     // -----------------------------------------------------------------------
@@ -702,6 +721,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let tokens = estimate_grain_tokens(&grain);
         // Should be roughly chars / 4, at least 1.

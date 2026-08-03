@@ -151,6 +151,23 @@ pub struct ScoreBreakdown {
     pub final_score: f64,
 }
 
+/// One open fork: a `(namespace, subject, relation)` key that currently has
+/// more than one live head.
+///
+/// A fork is created when two writers supersede — or independently add — the
+/// same key and their histories are then synced. Immutability means both tips
+/// survive; this is how CAL's `CONTRADICTIONS` clause finds them. Mirrors
+/// `dejadb_store::ForkGroup`, but stays hash-hex so the facade contract does
+/// not leak store types.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkGroupInfo {
+    pub namespace: String,
+    pub subject: String,
+    pub relation: String,
+    /// Every live tip, provisional head first (the value recall serves).
+    pub heads: Vec<String>,
+}
+
 /// A search result with score information.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
