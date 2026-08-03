@@ -1566,9 +1566,40 @@ impl DejaDB {
         gtype: Option<dejadb_core::types::GrainType>,
         limit: usize,
     ) -> Result<Vec<DeserializedGrain>> {
+        self.recent_inner(ns, gtype, limit, false)
+    }
+
+    /// `recent`, restricted to grains nothing has superseded.
+    ///
+    /// Supersession is index-layer state — the blob is immutable and carries no
+    /// marker — so a caller reading grains back cannot tell a stale version from
+    /// the head that replaced it. Recall needs that distinction; a scan that
+    /// feeds an analyzer generally does not, which is why `recent` keeps its
+    /// everything-in-order behaviour and this is a separate entry point.
+    pub fn recent_live(
+        &mut self,
+        ns: &str,
+        gtype: Option<dejadb_core::types::GrainType>,
+        limit: usize,
+    ) -> Result<Vec<DeserializedGrain>> {
+        self.recent_inner(ns, gtype, limit, true)
+    }
+
+    fn recent_inner(
+        &mut self,
+        ns: &str,
+        gtype: Option<dejadb_core::types::GrainType>,
+        limit: usize,
+        live_only: bool,
+    ) -> Result<Vec<DeserializedGrain>> {
         let ns_id = match self.term_lookup(ns) {
             Some(x) => x,
             None => return Ok(Vec::new()),
+        };
+        let live = if live_only {
+            " AND superseded_by IS NULL"
+        } else {
+            ""
         };
         // The `gtype` column stores the enum ordinal (see `extract_view`:
         // `view.grain_type as u8`), not the .mg header type-byte.
@@ -1579,14 +1610,14 @@ impl DejaDB {
             let mut rows = match gt_ord {
                 Some(gt) => conn
                     .query(
-                        "SELECT blob FROM grains WHERE ns=?1 AND gtype=?2 ORDER BY seq DESC LIMIT ?3",
+                        &format!("SELECT blob FROM grains WHERE ns=?1 AND gtype=?2{live} ORDER BY seq DESC LIMIT ?3"),
                         (pi(ns_id), pi(gt), pi(limit as i64)),
                     )
                     .await
                     .map_err(db_err)?,
                 None => conn
                     .query(
-                        "SELECT blob FROM grains WHERE ns=?1 ORDER BY seq DESC LIMIT ?2",
+                        &format!("SELECT blob FROM grains WHERE ns=?1{live} ORDER BY seq DESC LIMIT ?2"),
                         (pi(ns_id), pi(limit as i64)),
                     )
                     .await

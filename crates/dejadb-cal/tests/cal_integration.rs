@@ -1515,3 +1515,55 @@ fn a_zero_priority_source_gets_no_budget() {
         "a 0-weight source must not be funded, got {unfunded} grains"
     );
 }
+
+/// A `WHERE` with no subject and no free-text query falls to a recent-by-type
+/// scan, which takes no structural predicates — so `relation` was dropped on
+/// the floor and the query answered with every grain of that type. Returning
+/// more than was asked for is worse than returning nothing: the caller has no
+/// way to tell the filter never ran.
+///
+/// The same scan reads the grains table straight through, and supersession is
+/// index-layer state, so a stale version came back alongside the head that
+/// replaced it — both presented as current.
+#[test]
+fn an_unanchored_where_applies_its_filters_and_serves_heads() {
+    use dejadb_core::types::{Fact, Grain};
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+    let facade = facade_at(&path);
+
+    // Two relations, each a superseded root plus the head that replaced it.
+    facade
+        .with_store(|m| {
+            for k in ["plan", "city"] {
+                let mut root = Fact::new("john", k, "base").confidence(0.9);
+                root.common.namespace = Some("caller".to_string());
+                let root_hash = m.add(&root)?;
+                let mut v2 = Fact::new("john", k, "current").confidence(0.9);
+                v2.common.namespace = Some("caller".to_string());
+                m.supersede(&root_hash, &mut v2)?;
+            }
+            Ok::<_, dejadb_core::error::DejaDbError>(())
+        })
+        .unwrap();
+
+    let count = |q: &str| match ex.execute(q, &facade).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => grains.len(),
+        other => panic!("expected Grains, got: {other:?}"),
+    };
+
+    assert_eq!(count(r#"RECALL facts WHERE relation = "plan""#), 1, "relation must filter");
+    assert_eq!(count(r#"RECALL facts WHERE relation = "city""#), 1, "relation must filter");
+    assert_eq!(count(r#"RECALL facts WHERE relation = "nope""#), 0, "no match is an answer");
+    // No relation filter at all: still heads only, not every version ever written.
+    assert_eq!(count(r#"RECALL facts RECENT 10"#), 2, "recall serves heads");
+    // `WITH superseded` opts the history back in.
+    assert_eq!(
+        count(r#"RECALL facts WHERE relation = "plan" WITH superseded"#),
+        2,
+        "WITH superseded must widen the scan back to the whole chain"
+    );
+    // The anchored leg is unchanged.
+    assert_eq!(count(r#"RECALL facts WHERE subject = "john" AND relation = "plan""#), 1);
+}

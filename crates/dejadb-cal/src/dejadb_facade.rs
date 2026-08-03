@@ -570,8 +570,23 @@ impl CalStoreFacade for DejaDbFacade {
         // — whose WHERE conditions (session_id, observer_id, object, …) are
         // applied as post-filters below and by the executor. Bare `RECALL *`
         // (no grain type) with no anchor is still rejected as too broad.
-        let raw = if params.subject.is_none() && params.query.is_none() {
+        // Which leg ran matters below: `recent` takes no structural predicates
+        // and does not know about supersession, so this path has to reapply
+        // both itself.
+        let unanchored = params.subject.is_none() && params.query.is_none();
+        let raw = if unanchored {
             match params.grain_type {
+                // Heads only, unless `WITH superseded` asked otherwise. The
+                // anchored leg already serves heads; this one read the grains
+                // table straight through, so a superseded value came back
+                // alongside the head that replaced it and recall reported both
+                // as current. Supersession is index-layer state, so the
+                // distinction has to be made in the query, not after it.
+                Some(_) if params.exclude_superseded != Some(false) => m.recent_live(
+                    ns,
+                    params.grain_type,
+                    k.saturating_mul(Self::RECALL_OVERFETCH),
+                )?,
                 Some(_) => m.recent(
                     ns,
                     params.grain_type,
@@ -612,6 +627,18 @@ impl CalStoreFacade for DejaDbFacade {
 
         let hits = raw
             .into_iter()
+            // `relation` reaches the anchored leg as a store-side predicate,
+            // but `recent` takes no predicates at all — so on that path the
+            // filter was simply dropped and `RECALL facts WHERE relation = "x"`
+            // answered with every grain of that type. Silently returning more
+            // than was asked for is worse than returning nothing.
+            .filter(|g| {
+                !unanchored
+                    || match &params.relation {
+                        Some(r) => g.get_str("relation") == Some(r.as_str()),
+                        None => true,
+                    }
+            })
             .filter(|g| match &params.object {
                 Some(o) => g.get_str("object") == Some(o.as_str()),
                 None => true,

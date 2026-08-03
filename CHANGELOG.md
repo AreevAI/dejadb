@@ -104,6 +104,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An unanchored `WHERE` applies its filters, and serves heads.** A `RECALL`
+  with no subject and no free-text query falls to a recent-by-type scan, which
+  takes no structural predicates — so `RECALL facts WHERE relation = "x"`
+  silently dropped the filter and answered with **every** grain of that type.
+  Returning more than was asked for is worse than returning nothing: nothing in
+  the result tells the caller the filter never ran. The same scan read the
+  grains table straight through, and supersession is index-layer state, so a
+  stale version came back next to the head that replaced it, both presented as
+  current. `relation` is now applied on that path and the scan serves heads
+  only; `WITH superseded` opts the full chain back in (on this leg — the
+  anchored leg's `WITH superseded` remains the known bug its ignored golden
+  test documents). New `DejaDB::recent_live`, so scans that legitimately want
+  every version — Waiser's analyzers — keep `recent` unchanged.
 - **`CONTRADICTIONS` no longer answers "nothing is contested" about a memory
   that is.** The clause filters after recall, so the recall's `LIMIT` — 50 by
   default — also bounded which forks could be seen: a fork sitting below the
