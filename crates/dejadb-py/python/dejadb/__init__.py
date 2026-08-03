@@ -1,0 +1,15 @@
+"""DejaDB — embedded memory engine for AI agents.
+
+Re-exports the native extension module (`dejadb.dejadb`). Convenience
+functions for scripts and notebooks live in `dejadb.helpers` (imported
+explicitly, never eagerly — the core surface stays exactly the native class).
+"""
+from .dejadb import *  # noqa: F401,F403
+from . import dejadb as _native
+
+__doc__ = _native.__doc__ or __doc__
+# A pyo3 module defines no `__all__`, so name the public surface here rather
+# than letting `from dejadb import *` re-export whatever the extension happens
+# to carry.
+__all__ = list(getattr(_native, "__all__", None)
+               or [n for n in dir(_native) if not n.startswith("_")])

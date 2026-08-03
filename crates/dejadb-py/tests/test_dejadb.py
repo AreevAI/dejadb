@@ -317,8 +317,13 @@ def test_open_warnings_is_json_list(tmp_path):
 
 def test_waiser_loop_rollback_and_outcomes(tmp_path):
     m = make_db(tmp_path)
-    for _ in range(4):
-        m.record_tool_call("stripe_refund", "rate_limited 429", True)
+    # Distinct payloads per call: grains are content-addressed, so four
+    # byte-identical failures recorded inside the same millisecond hash to the
+    # same address and the fourth is rejected. Whether four identical failures
+    # in one millisecond should be four grains is an engine question; this test
+    # is about the Waiser loop, so it records four distinguishable ones.
+    for i in range(4):
+        m.record_tool_call("stripe_refund", f"rate_limited 429 (attempt {i})", True)
     m.record_tool_call("stripe_refund", "ok", False)
 
     run = json.loads(m.waiser_run())

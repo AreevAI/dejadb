@@ -29,11 +29,15 @@ Repository = "https://github.com/AreevAI/dejadb"
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
-# The Rust extension module is named `dejadb` (`[lib] name` in Cargo.toml and
-# the `#[pymodule] fn dejadb` in src/lib.rs). abi3-py39 is enabled via the
-# pyo3 feature in Cargo.toml, so a single wheel works on CPython >= 3.9.
+# Mixed Rust/Python layout: the pure-Python package lives in python/dejadb
+# (the __init__ shim plus dejadb.helpers), and the Rust extension module is
+# placed inside it as `dejadb.dejadb` (`[lib] name` in Cargo.toml and the
+# `#[pymodule] fn dejadb` in src/lib.rs supply the final path segment).
+# abi3-py39 is enabled via the pyo3 feature in Cargo.toml, so a single wheel
+# works on CPython >= 3.9.
 [tool.maturin]
-module-name = "dejadb"
+module-name = "dejadb.dejadb"
+python-source = "python"
 # Ship both license texts in the sdist/wheel (MIT and Apache-2.0 each require
 # the notice travel with the distribution).
 include = ["LICENSE-MIT", "LICENSE-APACHE"]
