@@ -31,6 +31,17 @@ must publish bottom-up.
   After a release, verify the registries actually flipped:
   `npm view dejadb version`, `curl -s https://pypi.org/pypi/dejadb/json | jq -r .info.version` —
   a green workflow is not proof the version changed.
+- **Regenerate `crates/dejadb-js/index.js` in the same commit.** It is a
+  *generated* file that hard-codes the expected version in every platform arm
+  (`bindingPackageVersion !== '<ver>'`). Bumping package.json without
+  regenerating leaves it asserting the previous version, so a user with
+  `NAPI_RS_ENFORCE_VERSION_CHECK` set gets "native binding package version
+  mismatch" against a correctly-installed package. 1.0.3 shipped with it stuck
+  at 1.0.1 for exactly this reason.
+  ```bash
+  (cd crates/dejadb-js && ./node_modules/.bin/napi build --platform --release)
+  git diff crates/dejadb-js/index.js   # must be version lines ONLY
+  ```
 - Move the `[Unreleased]` section of `CHANGELOG.md` under a new dated version
   heading; add a fresh empty `[Unreleased]`.
 - Commit: `Release vX.Y.Z`. Tag: `git tag vX.Y.Z`.
