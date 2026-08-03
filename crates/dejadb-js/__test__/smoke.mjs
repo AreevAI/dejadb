@@ -175,7 +175,11 @@ test('passphrase constructor rejects a wrong key on reopen', () => {
 test('waiser: record tool calls, run, review, apply', () => {
   const m = makeDb('caller')
   // 4 failures + 1 success for one tool → tool-failure clustering fires.
-  for (let i = 0; i < 4; i++) m.recordToolCall('stripe_refund', 'rate_limited 429', true)
+  // Distinct payloads per call: grains are content-addressed, so four
+  // byte-identical failures recorded inside the same millisecond hash to the
+  // same address and the fourth is rejected. This test is about the Waiser
+  // loop, so it records four distinguishable failures.
+  for (let i = 0; i < 4; i++) m.recordToolCall('stripe_refund', `rate_limited 429 (attempt ${i})`, true)
   m.recordToolCall('stripe_refund', 'ok', false)
 
   const run = JSON.parse(m.waiserRun())
