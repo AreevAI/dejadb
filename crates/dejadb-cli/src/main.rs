@@ -78,6 +78,9 @@ COMMANDS:
                                       (auto recall-before-prompt + capture-on-stop)
   memtool  '<COMMAND-JSON>'           Anthropic memory-tool ops on grains
   ui       [--addr HOST:PORT] [--allow-remote] [--token-env VAR] [--no-destructive-ops]  web console (default 127.0.0.1:7437)
+  hub      --token-env VAR [--dir DIR] [--addr HOST:PORT] [--allow-remote]
+                                      sync hub: many apps, one shared memory
+                                      (segment push/pull; default 127.0.0.1:7438)
 
 Namespace defaults to \"shared\". Exit code 0 on success.
 --db is optional for one-shot commands: it falls back to $DEJADB_DB, then
@@ -153,6 +156,21 @@ fn resolve_db(args: &HashMap<String, String>, require_explicit: bool) -> Result<
 
 /// True when a `host:port` (or bare host) names a loopback interface. Used to
 /// refuse binding the unauthenticated `ui` console to a routable address.
+/// Print any saved query or template the file carries that this build cannot
+/// load, the same way `open_warnings` is printed.
+///
+/// Forces the registries to rehydrate first — they load lazily, so a verb that
+/// never touches one would otherwise report nothing and the operator would find
+/// out by noticing a saved query had gone missing.
+fn report_meta_warnings(facade: &dejadb_cal::DejaDbFacade) {
+    use dejadb_cal::CalStoreFacade;
+    let _ = facade.list_queries();
+    let _ = facade.list_templates();
+    for w in facade.meta_warnings() {
+        eprintln!("deja: warning: {w}");
+    }
+}
+
 fn addr_is_loopback(addr: &str) -> bool {
     let a = addr.trim();
     // IPv6 bracketed form: [::1]:port
@@ -444,7 +462,7 @@ fn run() -> Result<(), String> {
     let (flags, positional) = parse_args(&argv[1..]);
     // Long-lived / exposed surfaces must name their memory explicitly rather
     // than silently defaulting to the personal file.
-    let db = resolve_db(&flags, matches!(cmd.as_str(), "serve" | "ui"))?;
+    let db = resolve_db(&flags, matches!(cmd.as_str(), "serve" | "ui" | "hub"))?;
     let ns = flag(&flags, "ns").unwrap_or_else(|| "shared".to_string());
 
     // print-only verbs never open the store (paths may be untilde-expanded)
@@ -697,6 +715,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .ok_or_else(|| "usage: deja cal '<QUERY>' --db <file>".to_string())?
                 .clone();
             let facade = DejaDbFacade::with_session(m, Some(ns), None);
+            report_meta_warnings(&facade);
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
@@ -900,6 +919,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 return Err("only --mcp transport is available (deja serve --mcp)".to_string());
             }
             let mut facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns), None);
+            report_meta_warnings(&facade);
             // Optional read-only mounts for cross-file ASSEMBLE:
             //   --mount alias=path[,alias=path...]
             // A recall/query in namespace "alias.inner" routes to the mount;
@@ -1111,6 +1131,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         "repl" => {
             use std::io::{BufRead, Write as IoWrite};
             let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns.clone()), None);
+            report_meta_warnings(&facade);
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
@@ -1211,6 +1232,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             }
 
             let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns), None);
+            report_meta_warnings(&facade);
             let mut server = dejadb_server::UiServer::new(facade, db.clone());
             if allow_remote {
                 server = server.allow_remote(true);
@@ -1248,6 +1270,49 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             }
             eprintln!(
                 "deja console → http://{}  (Ctrl-C to stop)",
+                listener.local_addr().map_err(|e| e.to_string())?
+            );
+            server.serve(listener).map_err(|e| e.to_string())?;
+        }
+        // dejad: the sync hub. Unlike `ui`, this is a network service by
+        // design — other apps push and pull segments against one shared
+        // memory — so the token is mandatory, not optional. Reads stay open
+        // (same contract as the library `into_hub`); every write needs the key,
+        // and a pushed segment can only ever *add* grains.
+        "hub" => {
+            let addr = flag(&flags, "addr").unwrap_or_else(|| "127.0.0.1:7438".to_string());
+            let dir = flag(&flags, "dir").unwrap_or_else(|| "./segments".to_string());
+            let var = flag(&flags, "token-env").ok_or_else(|| {
+                "deja hub requires --token-env <VAR>: hub writes are gated by a shared key. \
+                 Generate one (openssl rand -hex 16), export it, and pass the variable name."
+                    .to_string()
+            })?;
+            let token = std::env::var(&var)
+                .map_err(|_| format!("--token-env {var}: environment variable is not set"))?;
+            if token.trim().is_empty() {
+                return Err(format!("--token-env {var}: token is empty"));
+            }
+            if !addr_is_loopback(&addr) && flag(&flags, "allow-remote").is_none() {
+                return Err(format!(
+                    "refusing to bind the hub to a non-loopback address ({addr}). It is \
+                     authenticated, but still plaintext HTTP — the token and every memory \
+                     crossing the wire are in the clear. Terminate TLS in front of it, or \
+                     pass --allow-remote to accept that risk."
+                ));
+            }
+            let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns), None);
+            report_meta_warnings(&facade);
+            let server = dejadb_server::UiServer::new(facade, db.clone())
+                .into_hub(Some(token), &dir)
+                .map_err(|e| format!("hub segment dir '{dir}': {e}"))?;
+            let listener = dejadb_server::UiServer::bind(&addr).map_err(|e| e.to_string())?;
+            eprintln!(
+                "deja: hub writes require the token in ${var} (Authorization: Bearer …); \
+                 reads are open"
+            );
+            eprintln!("deja: segments under {dir}");
+            eprintln!(
+                "deja hub → http://{}  (Ctrl-C to stop)",
                 listener.local_addr().map_err(|e| e.to_string())?
             );
             server.serve(listener).map_err(|e| e.to_string())?;

@@ -425,6 +425,10 @@ impl UiServer {
                         ));
                     }
                 }
+                // Saved queries and templates the file carries that this build
+                // cannot load. Same class of thing as an open warning — the
+                // file and the host disagree — so it belongs in the same list.
+                warnings.extend(self.facade.meta_warnings());
                 ok_json(json!({
                     "ok": true,
                     "db": self.db_label,
@@ -540,6 +544,27 @@ impl UiServer {
                     }
                     rows.reverse();
                     Ok((total, rows))
+                });
+                // Scope the browse to the session namespace, the way CAL
+                // already scopes recall. Without this the rail lists entities
+                // (`john`, `bob`) that every query on this console then reports
+                // as missing, because the two disagree about what is in view.
+                // Rows we cannot attribute — tombstone stubs, grains erased
+                // since — are kept: dropping them would hide an erasure.
+                let built = built.map(|(total, rows)| {
+                    let Some(ns) = self.facade.session_namespace() else {
+                        return (total, rows);
+                    };
+                    let kept = rows
+                        .into_iter()
+                        .filter(|r| {
+                            r["fields"]
+                                .get("namespace")
+                                .and_then(Value::as_str)
+                                .is_none_or(|got| got == ns)
+                        })
+                        .collect();
+                    (total, kept)
                 });
                 match built {
                     Ok((total, rows)) => ok_json(json!({"ok": true, "total_ops": total, "grains": rows})),

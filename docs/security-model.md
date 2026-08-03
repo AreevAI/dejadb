@@ -65,9 +65,14 @@ top of that.
 - Sync ships **bundles/segments** (`.mgb`) of immutable grains between files and
   peers. Applied grains are re-hashed on import; a grain whose content does not
   match its content address (SHA-256) is rejected.
-- The **hub** (`dejad`) requires a **bearer token** on all mutating and
-  segment endpoints; the token is compared in **constant time**. Segment names
-  are sanitized to a single path component (no directory traversal).
+- The **hub** (`dejad`, started with `deja hub --dir DIR --token-env VAR`)
+  requires a **bearer token** on all mutating and segment endpoints — including
+  `GET /api/segment*`, so listing and pulling bundles are gated too, not just
+  pushes. The token is compared in **constant time**. Segment names are
+  sanitized to a single path component (no directory traversal). `--token-env`
+  is **mandatory** for `deja hub`: unlike the console there is no
+  trusted-local-operator default, because a hub exists to be written to by other
+  machines. A pushed segment can only ever *add* grains — import never deletes.
 - The **web console** (`deja ui`) is unauthenticated by default (loopback,
   trusted local operator). Pass `--token-env <VAR>` to require a shared secret
   on **every** request — the console page, all reads, and all writes. Browsers
@@ -86,9 +91,9 @@ top of that.
 ### Known limitations in transit
 
 - ⚠️ **No TLS.** All HTTP is plaintext. For any non-loopback deployment, front
-  the console/hub with a **TLS-terminating reverse proxy**. The `deja ui`
-  console refuses to bind a non-loopback address unless you pass
-  `--allow-remote` (and even then warns loudly). `--token-env` authentication
+  the console/hub with a **TLS-terminating reverse proxy**. Both `deja ui` and
+  `deja hub` refuse to bind a non-loopback address unless you pass
+  `--allow-remote` (and even then warn loudly). `--token-env` authentication
   is **not** a substitute for TLS: the token and all memory still cross the
   wire in the clear, so `--token-env` guards against unauthorized clients but
   not against a network eavesdropper — use it *with* a TLS proxy off-loopback.
