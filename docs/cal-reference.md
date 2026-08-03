@@ -82,7 +82,7 @@ and internal use but are intentionally not reachable from text — see
 ```
 RECALL <plural> [ABOUT "<free text>"] [WHERE <condition>]
        [RECENT <n>] [SINCE "..."] [UNTIL "..."] [LIKE "..."]
-       [BETWEEN "..." AND "..."] [LIMIT <n>]
+       [BETWEEN "..." AND "..."] [CONTRADICTIONS [OF (<sub-query>)]] [LIMIT <n>]
 ```
 
 ```sql
@@ -107,6 +107,54 @@ a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
 - `RECENT n` is shorthand for "newest n" (`ORDER BY created_at DESC LIMIT n`).
 - `SINCE` / `UNTIL` / `BETWEEN ... AND ...` are temporal filters accepting
   absolute dates or relative expressions (`"3 days ago"`).
+- `CONTRADICTIONS` keeps only *contested* grains — see below.
+
+##### `CONTRADICTIONS` — what is still disputed
+
+When two writers change the same `(subject, relation)` and later sync, both
+versions survive as live **heads** (a fork — see ARCHITECTURE.md §3). Recall
+then answers with a deterministically-elected *provisional* head, which looks
+like a settled value. `CONTRADICTIONS` asks the opposite question:
+
+```sql
+-- only the grains that are currently contested
+RECALL facts CONTRADICTIONS
+
+-- scoped: contested grains among the keys the sub-query selected
+RECALL facts CONTRADICTIONS OF (RECALL facts WHERE subject = "john")
+```
+
+Each returned grain carries `contested_by` — the hashes of the other live tips
+for its key — so a model can see *what* it disagrees with, not merely that
+something is disputed:
+
+```json
+{ "hash": "ecb1af…", "fields": { "object": "enterprise" },
+  "contested_by": ["ef8c16…"] }
+```
+
+The clause applies **after** every other filter, so it composes with
+`ABOUT`/`WHERE`/`SINCE` rather than overriding them, and **before** `LIMIT`:
+`LIMIT` bounds the contested grains, not the search that found them, so
+`CONTRADICTIONS LIMIT 10` means "ten contested grains" and never "contested
+among the first ten". The candidate scan widens to the executor's `max_limit`
+(1000 by default) rather than stopping at the recall's usual limit.
+
+An empty result is therefore a meaningful answer: nothing in scope is
+contested. The one exception is announced — if the scan itself hit `max_limit`,
+the query carries `CAL-W012` and the empty result covers only the grains it
+managed to examine. Narrow with `WHERE`/`ABOUT`/`SINCE` when you see it.
+
+To keep your normal result set and merely mark the disputed parts of it, use
+[`WITH contradiction_detection`](#5-with-options) instead.
+
+This detects **structural** contradiction — divergent writes to one key. Two
+independently-added facts that merely disagree in meaning ("prefers tea" vs
+"prefers coffee") are not a fork and are not reported here; that is a semantic
+judgement, and belongs to the Waiser verifier (`docs/waiser.md`).
+
+Resolve a fork with `deja merge` (or `DejaDB::merge_heads`), which supersedes
+every tip with one merged grain and records all parents.
 
 Set operations combine `RECALL`s:
 
@@ -375,6 +423,7 @@ representative selection:
 | `WITH multi_hop(2)` | Entity-graph multi-hop retrieval (1–3 hops) |
 | `WITH recency_weight(0.3)` / `WITH min_score(0.6)` | Scoring controls |
 | `WITH conflict_resolution` | Keep only the newest grain per `(subject, relation)` |
+| `WITH contradiction_detection` | Keep everything, but stamp `contested_by` on grains that are live tips of an open fork |
 | `WITH annotate_relative_time` | Add "2 weeks ago"-style labels |
 | `WITH progressive_disclosure(summary)` | OMS progressive-disclosure level |
 

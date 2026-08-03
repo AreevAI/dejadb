@@ -1616,6 +1616,21 @@ impl CalExecutor {
             params.limit = Some(self.config.default_limit as usize);
         }
 
+        // ── CONTRADICTIONS widens the candidate scan ─────────────────────
+        //
+        // The clause filters *after* recall, so whatever LIMIT bounded the
+        // recall also bounds which forks can be seen. Left alone, the default
+        // limit would make "nothing is contested" mean "nothing among the
+        // newest 50" — the exact false all-clear this clause exists to
+        // prevent. So scan as wide as CAL allows and re-apply the caller's
+        // LIMIT to the *contested* grains afterwards: LIMIT bounds the answer,
+        // not the search for it.
+        let contradictions_limit = if recall.contradictions.is_some() {
+            params.limit.replace(self.config.max_limit as usize)
+        } else {
+            None
+        };
+
         // WITH options.
         self.apply_with_options(&query.with_options, &mut params)?;
 
@@ -1648,6 +1663,10 @@ impl CalExecutor {
         let hits = store
             .recall(&params)
             .map_err(|e| map_store_err(e, recall.span))?;
+
+        // A recall that came back exactly full was cut off by the limit, so
+        // anything CONTRADICTIONS says about grains beyond it is unknown.
+        let scan_was_bounded = params.limit.is_some_and(|l| hits.len() >= l);
 
         let mut grains = hits_to_grain_results(&hits);
 
@@ -1700,6 +1719,82 @@ impl CalExecutor {
                             .all(|c| grain_matches_set_condition(grain, c))
                 });
             }
+        }
+
+        // ── CONTRADICTIONS — restrict to grains that are contested ───────
+        //
+        // A fork is `(ns, subject, relation)` with more than one live head, which
+        // happens when two writers diverge and then sync: immutability keeps both
+        // tips, and recall serves a deterministically-elected provisional head.
+        // Plain recall therefore answers with a value that *looks* settled. This
+        // clause is how an agent asks the opposite question — "what do I hold
+        // that is still disputed?" — without an operator running `deja forks`.
+        //
+        // Runs last, after every other filter, so `CONTRADICTIONS` composes with
+        // ABOUT/WHERE/SINCE rather than overriding them — and before LIMIT, so
+        // the limit bounds the contested grains rather than the search.
+        if let Some(ref clause) = recall.contradictions {
+            // `CONTRADICTIONS OF (sub-query)` narrows the fork set to the keys
+            // that sub-query selected. Execute it with the pipeline and FORMAT
+            // stripped: those belong to the enclosing statement, and letting them
+            // reach the inner query is the leak that bit nested ASSEMBLE.
+            let scope = match clause.inner {
+                Some(ref inner) => {
+                    let inner_query = CalQuery {
+                        statement: (**inner).clone(),
+                        pipeline: Vec::new(),
+                        format: None,
+                        ..query.clone()
+                    };
+                    let payload = self.execute_statement(
+                        &inner_query.statement,
+                        store,
+                        &inner_query,
+                        exec_warnings,
+                    )?;
+                    match payload {
+                        CalResultPayload::Grains { ref grains, .. } => Some(
+                            contradiction_scope_keys(grains, params.namespace.as_deref()),
+                        ),
+                        // A sub-query that yields no grain set (COUNT, EXISTS, a
+                        // formatted string) selects no keys to scope by. Treat it
+                        // as an empty scope rather than silently ignoring the
+                        // tail, so the query cannot over-report.
+                        _ => {
+                            exec_warnings.push(
+                                "CONTRADICTIONS OF (...) sub-query returned no grains; \
+                                 no keys to scope by"
+                                    .into(),
+                            );
+                            Some(std::collections::HashSet::new())
+                        }
+                    }
+                }
+                None => None,
+            };
+            apply_fork_status(&mut grains, store, true, scope.as_ref(), exec_warnings);
+
+            // Even a max_limit scan can be cut off. Saying so is the whole
+            // point: an agent may act on "nothing is contested", so it must
+            // learn when that answer only covers part of the memory.
+            if scan_was_bounded {
+                exec_warnings.push(
+                    super::errors::CalWarning::ContradictionScanBounded {
+                        scanned: self.config.max_limit as usize,
+                    }
+                    .to_string(),
+                );
+            }
+
+            // The caller's LIMIT applies to the contested grains, not to the
+            // scan that found them (see where `contradictions_limit` is taken).
+            if let Some(limit) = contradictions_limit {
+                grains.truncate(limit);
+            }
+        } else if params.detect_contradictions == Some(true) {
+            // `WITH contradiction_detection` — annotate, don't filter. The agent
+            // gets its normal context back, with disputed grains marked.
+            apply_fork_status(&mut grains, store, false, None, exec_warnings);
         }
 
         let count = grains.len();
@@ -4238,6 +4333,108 @@ fn hits_to_grain_results(hits: &[crate::store_types::SearchHit]) -> Vec<CalGrain
             explanation: hit.explanation.clone(),
             is_deterministic: false,
             contested_by: None,
+        })
+        .collect()
+}
+
+/// Stamp fork status onto recalled grains, and optionally drop the uncontested.
+///
+/// Two surfaces share this. `CONTRADICTIONS` keeps **only** contested grains —
+/// the agent asked for the conflicts. `WITH contradiction_detection` keeps
+/// everything and merely marks what is disputed — the agent asked for its normal
+/// context, plus a warning about which parts of it are not settled.
+///
+/// `restrict_to` is the `(namespace, subject, relation)` key set from a
+/// `CONTRADICTIONS OF (sub-query)` tail; `None` considers every open fork.
+///
+/// **Fail-open**, matching the recall path: a facade that cannot enumerate heads
+/// reports no forks and the query degrades to "nothing is contested" with a
+/// warning, rather than turning a working recall into a failed one. The one
+/// exception is a *filtering* query, which yields nothing — claiming "no
+/// conflicts" when the check did not run would be a false all-clear, and this
+/// clause exists precisely so an agent can trust that answer.
+fn apply_fork_status(
+    grains: &mut Vec<CalGrainResult>,
+    store: &dyn CalStoreFacade,
+    filter: bool,
+    restrict_to: Option<&std::collections::HashSet<(String, String, String)>>,
+    exec_warnings: &mut Vec<String>,
+) {
+    let forks = match store.open_forks() {
+        Ok(f) => f,
+        Err(e) => {
+            exec_warnings.push(format!(
+                "contradiction detection unavailable ({e}); fork status not applied"
+            ));
+            if filter {
+                grains.clear();
+            }
+            return;
+        }
+    };
+
+    // hash -> every *other* live tip contesting the same key.
+    let mut peers: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &forks {
+        if let Some(keys) = restrict_to {
+            if !keys.contains(&(
+                f.namespace.clone(),
+                f.subject.clone(),
+                f.relation.clone(),
+            )) {
+                continue;
+            }
+        }
+        for (i, head) in f.heads.iter().enumerate() {
+            let others: Vec<String> = f
+                .heads
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, o)| o.clone())
+                .collect();
+            peers.insert(head.clone(), others);
+        }
+    }
+
+    if filter {
+        grains.retain(|g| peers.contains_key(&g.hash));
+    }
+    for g in grains.iter_mut() {
+        if let Some(others) = peers.get(&g.hash) {
+            g.contested_by = Some(others.clone());
+        }
+    }
+}
+
+/// The `(namespace, subject, relation)` keys a `CONTRADICTIONS OF (...)`
+/// sub-query selected.
+///
+/// Keyed on the full fork identity, not just `(subject, relation)`: the same
+/// subject and relation in two namespaces are two different keys, and matching
+/// on the pair alone would let a fork in one namespace be reported as in scope
+/// because an unrelated grain in another namespace happened to share them.
+/// A grain that does not carry its namespace is attributed to the namespace the
+/// recall was scoped to, which is where it came from.
+///
+/// Grains with no subject or no relation (an Event, say) contribute no key and
+/// so narrow nothing — the tail restricts the fork set, it never widens it.
+fn contradiction_scope_keys(
+    grains: &[CalGrainResult],
+    default_ns: Option<&str>,
+) -> std::collections::HashSet<(String, String, String)> {
+    grains
+        .iter()
+        .filter_map(|g| {
+            let s = g.fields.get("subject").and_then(|v| v.as_str())?;
+            let r = g.fields.get("relation").and_then(|v| v.as_str())?;
+            let ns = g
+                .fields
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .or(default_ns)
+                .unwrap_or_default();
+            Some((ns.to_string(), s.to_string(), r.to_string()))
         })
         .collect()
 }

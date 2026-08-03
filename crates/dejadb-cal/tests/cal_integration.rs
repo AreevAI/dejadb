@@ -1112,3 +1112,358 @@ fn each_iteration_cap_emits_cal_w011() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CONTRADICTIONS — fork-aware recall
+// ---------------------------------------------------------------------------
+
+/// Build a store holding a real open fork: two writers supersede the same head
+/// and their histories are synced, so both tips stay live.
+///
+/// `created_at` is fixed so the provisional-head election (max `created_at`,
+/// then hash) is deterministic — the same reason `fork_merge_tests` pins it.
+fn setup_forked() -> (CalExecutor, DejaDbFacade, TempDir) {
+    use dejadb_core::types::{Fact, Grain};
+
+    let dir = TempDir::new().unwrap();
+    let pa = dir.path().join("a.db");
+    let pb = dir.path().join("b.db");
+    let bundle_v1 = dir.path().join("v1.mgb");
+    let bundle_b = dir.path().join("b.mgb");
+
+    let fact = |s: &str, r: &str, o: &str| {
+        let mut f = Fact::new(s, r, o).confidence(0.9);
+        f.common.namespace = Some("caller".to_string());
+        f
+    };
+
+    let mut a = DejaDB::open(pa.to_str().unwrap()).unwrap();
+    // An uncontested fact, to prove CONTRADICTIONS filters rather than
+    // returning everything.
+    a.add(&fact("john", "city", "berlin")).unwrap();
+    let v1 = a.add(&fact("john", "plan", "basic")).unwrap();
+    let st = a.bundle_since(0, bundle_v1.to_str().unwrap()).unwrap();
+
+    let mut b = DejaDB::open(pb.to_str().unwrap()).unwrap();
+    b.import_bundle(bundle_v1.to_str().unwrap()).unwrap();
+
+    let mut v2a = fact("john", "plan", "pro");
+    v2a.common.created_at = Some(1_800_000_000_000);
+    a.supersede(&v1, &mut v2a).unwrap();
+    let mut v2b = fact("john", "plan", "enterprise");
+    v2b.common.created_at = Some(1_800_000_000_500);
+    b.supersede(&v1, &mut v2b).unwrap();
+
+    b.bundle_since(st.last_op_seq, bundle_b.to_str().unwrap())
+        .unwrap();
+    a.import_bundle(bundle_b.to_str().unwrap()).unwrap();
+    assert_eq!(a.heads("caller", "john", "plan").unwrap().len(), 2);
+
+    let facade = DejaDbFacade::with_session(a, Some("caller".to_string()), None);
+    (CalExecutor::new(CalExecutorConfig::default()), facade, dir)
+}
+
+fn grains_of(payload: CalResultPayload) -> Vec<serde_json::Value> {
+    match payload {
+        CalResultPayload::Grains { grains, .. } => grains
+            .iter()
+            .map(|g| serde_json::to_value(g).unwrap())
+            .collect(),
+        other => panic!("expected Grains, got {other:?}"),
+    }
+}
+
+#[test]
+fn contradictions_returns_only_contested_grains() {
+    let (ex, facade, _d) = setup_forked();
+
+    // Plain recall answers with the uncontested fact too, and says nothing
+    // about the disputed one — this is the blind spot CONTRADICTIONS closes.
+    let plain = grains_of(ex.execute(r#"RECALL facts"#, &facade).unwrap().result);
+    let objects: Vec<&str> = plain
+        .iter()
+        .filter_map(|g| g["fields"]["object"].as_str())
+        .collect();
+    assert!(objects.contains(&"berlin"), "plain recall: {objects:?}");
+    assert!(
+        plain.iter().all(|g| g["contested_by"].is_null()),
+        "plain recall must not stamp fork status"
+    );
+
+    let contested = grains_of(
+        ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade)
+            .unwrap()
+            .result,
+    );
+    let objects: Vec<&str> = contested
+        .iter()
+        .filter_map(|g| g["fields"]["object"].as_str())
+        .collect();
+    assert_eq!(
+        contested.len(),
+        2,
+        "both tips of the fork, nothing else: {objects:?}"
+    );
+    assert!(
+        objects.contains(&"pro") && objects.contains(&"enterprise"),
+        "both disputed values surface: {objects:?}"
+    );
+    assert!(
+        !objects.contains(&"berlin"),
+        "uncontested fact must be filtered out: {objects:?}"
+    );
+
+    // Each tip names the other, so an agent can see *what* it disagrees with
+    // rather than just that two rows exist.
+    for g in &contested {
+        let peers = g["contested_by"].as_array().expect("contested_by present");
+        assert_eq!(peers.len(), 1, "one peer tip each");
+        let self_hash = g["hash"].as_str().unwrap();
+        assert_ne!(peers[0].as_str().unwrap(), self_hash, "peer is the other tip");
+    }
+}
+
+#[test]
+fn contradictions_composes_with_other_clauses() {
+    let (ex, facade, _d) = setup_forked();
+
+    // WHERE narrows first; CONTRADICTIONS filters what survives.
+    let hits = grains_of(
+        ex.execute(
+            r#"RECALL facts WHERE subject = "john" AND relation = "plan" CONTRADICTIONS"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert_eq!(hits.len(), 2);
+
+    // A key with no fork yields nothing — the clause reports absence of
+    // conflict, it does not fall back to returning the value.
+    let hits = grains_of(
+        ex.execute(
+            r#"RECALL facts WHERE subject = "john" AND relation = "city" CONTRADICTIONS"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(hits.is_empty(), "uncontested key: {hits:?}");
+}
+
+#[test]
+fn contradictions_of_subquery_scopes_to_its_keys() {
+    let (ex, facade, _d) = setup_forked();
+
+    // Sub-query selects the contested key → the fork is in scope.
+    let hits = grains_of(
+        ex.execute(
+            r#"RECALL facts CONTRADICTIONS OF (RECALL facts WHERE subject = "john" AND relation = "plan")"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert_eq!(hits.len(), 2, "fork is inside the sub-query's keys");
+
+    // Sub-query selects only an uncontested key → the fork is out of scope,
+    // even though it is still open.
+    let hits = grains_of(
+        ex.execute(
+            r#"RECALL facts CONTRADICTIONS OF (RECALL facts WHERE subject = "john" AND relation = "city")"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(hits.is_empty(), "fork scoped out: {hits:?}");
+}
+
+#[test]
+fn with_contradiction_detection_annotates_without_filtering() {
+    let (ex, facade, _d) = setup_forked();
+
+    let hits = grains_of(
+        ex.execute(r#"RECALL facts WITH contradiction_detection"#, &facade)
+            .unwrap()
+            .result,
+    );
+
+    let uncontested: Vec<_> = hits
+        .iter()
+        .filter(|g| g["fields"]["object"] == "berlin")
+        .collect();
+    assert_eq!(uncontested.len(), 1, "uncontested grain is still returned");
+    assert!(
+        uncontested[0]["contested_by"].is_null(),
+        "settled grain carries no fork marker"
+    );
+
+    let disputed: Vec<_> = hits
+        .iter()
+        .filter(|g| !g["contested_by"].is_null())
+        .collect();
+    assert_eq!(disputed.len(), 2, "both tips marked: {hits:?}");
+}
+
+#[test]
+fn contradictions_on_a_store_with_no_forks_is_empty_not_an_error() {
+    let (ex, facade, _d) = setup();
+    ex.execute(
+        r#"ADD fact SET subject = "john" SET relation = "likes" SET object = "rust" SET namespace = "caller" REASON "t""#,
+        &facade,
+    )
+    .unwrap();
+
+    let out = ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap();
+    assert!(grains_of(out.result).is_empty(), "no forks → no contradictions");
+}
+
+/// Regression: `CONTRADICTIONS` filters *after* recall, so whatever LIMIT
+/// bounded the recall used to bound which forks could be seen. With the default
+/// limit that made "nothing is contested" mean "nothing among the newest 50" —
+/// a false all-clear from the one clause an agent is meant to trust.
+///
+/// Burying the fork under more than `default_limit` newer, uncontested facts
+/// reproduces it: before the fix the scan stopped at 50 and the query answered
+/// "nothing is contested" about a memory that plainly was.
+#[test]
+fn contradictions_are_not_hidden_by_the_default_limit() {
+    use dejadb_core::types::{Fact, Grain};
+    let (ex, facade, _d) = setup_forked();
+
+    // Newer than the fork tips (created_at 1_800_000_000_xxx), so every one of
+    // these sorts ahead of them and fills the default 50-grain window.
+    facade
+        .with_store(|m| {
+            for i in 0..60u64 {
+                let mut f = Fact::new(&format!("filler{i}"), "note", "irrelevant").confidence(0.9);
+                f.common.namespace = Some("caller".to_string());
+                f.common.created_at = Some(1_900_000_000_000 + i as i64);
+                m.add(&f)?;
+            }
+            Ok::<_, dejadb_core::error::DejaDbError>(())
+        })
+        .unwrap();
+
+    // The fillers really do bury the fork: an executor that cannot scan past
+    // 50 finds nothing — which is exactly the old behaviour, and why the
+    // assertion below is worth making.
+    let narrow = CalExecutor::new(CalExecutorConfig {
+        max_limit: 50,
+        default_limit: 50,
+        ..CalExecutorConfig::default()
+    });
+    let out = narrow.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap();
+    assert!(
+        grains_of(out.result).is_empty() && out.warnings.iter().any(|w| w.starts_with("CAL-W012")),
+        "the fixture must actually bury the fork, and say so when it cannot see past it"
+    );
+
+    let found = grains_of(ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap().result);
+    assert_eq!(
+        found.len(),
+        2,
+        "both tips must be found however deep they sit: {found:?}"
+    );
+}
+
+/// `LIMIT` bounds the answer, not the search for it: `CONTRADICTIONS LIMIT 1`
+/// means "one contested grain", never "contested among the first grain".
+#[test]
+fn contradictions_limit_bounds_the_contested_grains_not_the_scan() {
+    let (ex, facade, _d) = setup_forked();
+
+    let one = grains_of(
+        ex.execute(r#"RECALL facts CONTRADICTIONS LIMIT 1"#, &facade)
+            .unwrap()
+            .result,
+    );
+    assert_eq!(one.len(), 1, "LIMIT 1 must yield one contested grain: {one:?}");
+    assert!(
+        one[0]["contested_by"].as_array().is_some_and(|a| !a.is_empty()),
+        "the returned grain must itself be contested: {one:?}"
+    );
+}
+
+/// An answer that only covers part of the memory must say so. `CONTRADICTIONS`
+/// is the one clause whose *empty* result an agent may act on, so a scan cut
+/// short by `max_limit` is announced as `CAL-W012` rather than passing for a
+/// complete all-clear.
+#[test]
+fn a_bounded_contradiction_scan_is_announced() {
+    let (_ex, facade, _d) = setup_forked();
+    let ex = CalExecutor::new(CalExecutorConfig {
+        max_limit: 1,
+        default_limit: 1,
+        ..CalExecutorConfig::default()
+    });
+
+    let out = ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap();
+    assert!(
+        out.warnings.iter().any(|w| w.starts_with("CAL-W012")),
+        "a truncated scan must not read as a clean all-clear, got: {:?}",
+        out.warnings
+    );
+
+    // The unbounded case stays quiet — the warning has to mean something.
+    let (ex, facade, _d) = setup_forked();
+    let out = ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap();
+    assert!(
+        !out.warnings.iter().any(|w| w.starts_with("CAL-W012")),
+        "a complete scan must not warn, got: {:?}",
+        out.warnings
+    );
+}
+
+/// A fork is keyed `(namespace, subject, relation)`. Scoping on
+/// `(subject, relation)` alone let a fork in one namespace be reported as in
+/// scope because an unrelated grain in another namespace shared the pair.
+#[test]
+fn contradictions_scope_does_not_leak_across_namespaces() {
+    let (ex, facade, _d) = setup_forked();
+
+    // Same subject and relation as the fork, but a different namespace, and
+    // uncontested. Selecting it must not pull the `caller` fork into scope.
+    ex.execute(
+        r#"ADD fact SET subject = "john" SET relation = "plan" SET object = "none" SET namespace = "other" REASON "t""#,
+        &facade,
+    )
+    .unwrap();
+
+    let scoped = grains_of(
+        ex.execute(
+            r#"RECALL facts CONTRADICTIONS OF (RECALL facts WHERE subject = "john" AND relation = "plan" AND namespace = "other")"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(
+        scoped.is_empty(),
+        "a fork in `caller` is not in scope for a sub-query that selected `other`: {scoped:?}"
+    );
+}
+
+#[test]
+fn merging_a_fork_clears_the_contradiction() {
+    use dejadb_core::types::{Fact, Grain};
+    let (ex, facade, _d) = setup_forked();
+
+    assert_eq!(
+        grains_of(ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap().result).len(),
+        2
+    );
+
+    // Resolve it the way an operator (or an agent with write approval) would.
+    let mut merged = Fact::new("john", "plan", "enterprise (migrated from pro)").confidence(0.95);
+    merged.common.namespace = Some("caller".to_string());
+    facade
+        .with_store(|m| m.merge_heads("caller", "john", "plan", &mut merged))
+        .unwrap();
+
+    let after = grains_of(ex.execute(r#"RECALL facts CONTRADICTIONS"#, &facade).unwrap().result);
+    assert!(
+        after.is_empty(),
+        "merge closes the fork, so nothing is contested: {after:?}"
+    );
+}

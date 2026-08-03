@@ -274,10 +274,16 @@ the index layer, never as edits.
   forever. For an agent, cross-channel disagreement is context, not an error.
   *Surfacing:* `deja forks` enumerates every open fork and `deja merge
   --subject S --relation R --object O` closes one. Recall itself does **not**
-  stamp a contested marker — that would add a per-hit head probe to the
-  microsecond hot path — so surfacing is an explicit operator query, not a
-  recall-time cost. The `CONTRADICTIONS` CAL clause parses but is not yet wired
-  to the executor.
+  stamp a contested marker by default — that would add a per-hit head probe to
+  the microsecond hot path — so surfacing is opt-in rather than a recall-time
+  cost. Two CAL surfaces make it reachable by the agent itself, not just an
+  operator: `RECALL … CONTRADICTIONS` returns **only** contested grains
+  (optionally scoped by a `OF (sub-query)` tail), and `WITH
+  contradiction_detection` returns the normal result set with disputed grains
+  stamped. Both fill `contested_by` on each grain with the other live tips, so
+  a model sees *what* disagrees, not merely that something does. One
+  `GROUP BY … HAVING COUNT(*) > 1` over `heads` per query, applied after every
+  other filter, and fail-open like the rest of the recall path.
 - **Tombstones and erasure.** Removal is never an in-place delete (which would
   leave recoverable data in free pages and the WAL). `forget` writes a
   tombstone to the op-log and drops the grain from the hot index. The strong
