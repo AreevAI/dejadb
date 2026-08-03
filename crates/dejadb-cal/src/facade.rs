@@ -25,7 +25,7 @@
 //! compile. All methods take `&self` and use concrete types only (no generics
 //! or associated types).
 
-use crate::store_types::{RecallParams, SearchHit};
+use crate::store_types::{ForkGroupInfo, RecallParams, SearchHit};
 use crate::store_types::VersionEntry;
 use dejadb_core::error::{Hash, Result};
 use dejadb_core::format::deserialize::DeserializedGrain;
@@ -180,6 +180,22 @@ pub trait CalStoreFacade: Send + Sync {
         Err(dejadb_core::error::DejaDbError::Internal(
             "template management not available".into(),
         ))
+    }
+
+    // ── Fork inspection (CONTRADICTIONS) ─────────────────────────────────
+
+    /// Every `(namespace, subject, relation)` that currently has more than one
+    /// live head. Maps to `DejaDB::open_forks()`.
+    ///
+    /// Backs the `CONTRADICTIONS` recall clause. One indexed `GROUP BY … HAVING
+    /// COUNT(*) > 1` over `heads` — cheap enough to run per query, which is why
+    /// CONTRADICTIONS filters after recall rather than adding a per-hit probe to
+    /// the microsecond hot path.
+    ///
+    /// Default implementation reports no forks, so a facade that does not track
+    /// heads degrades to "nothing is contested" rather than erroring.
+    fn open_forks(&self) -> Result<Vec<ForkGroupInfo>> {
+        Ok(Vec::new())
     }
 
     // ── Reranking (post-merge ASSEMBLE) ──────────────────────────────────
@@ -350,6 +366,10 @@ impl Default for CalCapabilities {
                 "FORGET".into(),
                 "PURGE".into(),
                 "DROP".into(),
+                // Saved queries and custom templates persist in the file's
+                // host metadata, so the engine can honestly claim them.
+                "DEFINE".into(),
+                "RUN".into(),
             ],
             max_sources: 8,
             max_let_bindings: 5,
@@ -762,8 +782,11 @@ mod tests {
         let caps = CalCapabilities::default();
         assert_eq!(caps.cal_version, 1);
         assert_eq!(caps.conformance_level, 2);
-        assert_eq!(caps.supported_statements.len(), 15);
+        assert_eq!(caps.supported_statements.len(), 17);
         assert!(caps.supported_statements.contains(&"RECALL".to_string()));
+        // Saved queries and templates persist in the file's host metadata.
+        assert!(caps.supported_statements.contains(&"DEFINE".to_string()));
+        assert!(caps.supported_statements.contains(&"RUN".to_string()));
         assert!(caps.supported_statements.contains(&"EXISTS".to_string()));
         assert!(caps.supported_statements.contains(&"ASSEMBLE".to_string()));
         assert!(caps.supported_statements.contains(&"HISTORY".to_string()));

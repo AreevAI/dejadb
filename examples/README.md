@@ -6,6 +6,7 @@ installs). See [`docs/waiser.md`](../docs/waiser.md) for the full guide.
 
 | Dir | What |
 |---|---|
+| [`colab/`](colab/) | Runnable Colab/Jupyter notebooks: the full self-improving-agent loop plus five business-scenario walkthroughs (wrong-lesson rollback, detect/review/govern, Hermes comparison, enterprise architecture) — keyless deterministic floor, optional LLM discovery |
 | [`policy/`](policy/) | Three `waiser-policy.json` variants (solo / team / locked-down prod) |
 | [`import/`](import/) | A tool-call JSONL sample + walkthrough → Tool grains → tool-failure clustering |
 | [`ci/`](ci/) | A GitHub Actions job that fails the build on pending high-severity recommendations |

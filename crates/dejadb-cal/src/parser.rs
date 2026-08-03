@@ -39,9 +39,10 @@ use super::ast::{
 };
 use super::ast::{
     DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, QueryParam, RunQueryStmt,
+    TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
-use super::lexer::{is_destructive_keyword, Lexer, SpannedToken, Token};
+use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
 
 // ---------------------------------------------------------------------------
 // Hard limits
@@ -1154,6 +1155,8 @@ impl Parser {
         loop {
             if self.at_exact(&Token::Format) && format.is_none() {
                 format = Some(self.parse_format()?);
+            } else if self.at_exact(&Token::As) && format.is_none() && !self.peek_next_is_of() {
+                format = Some(self.parse_as_format()?);
             } else if self.at_exact(&Token::With) {
                 if self.peek_next_is_vars() {
                     if user_vars.is_empty() {
@@ -1449,7 +1452,11 @@ impl Parser {
         // common field set is available in WHERE clauses (§6.2). Bug 2.
         // When no grain type is provided we fall back to the `All` wildcard,
         // which already represents "no type filter" downstream.
-        let grain_type = if self.at_exact(&Token::Where)
+        let grain_type = if self.eat_exact(&Token::Asterisk) {
+            // `RECALL *` — the explicit spelling of "any grain type"; the
+            // same thing omitting the grain type already means.
+            GrainTypePlural::All
+        } else if self.at_exact(&Token::Where)
             || self.at_exact(&Token::Recent)
             || self.at_exact(&Token::Since)
             || self.at_exact(&Token::Until)
@@ -2883,7 +2890,19 @@ impl Parser {
 
     fn parse_format(&mut self) -> CalResult<FormatClause> {
         self.expect_exact(&Token::Format)?;
+        self.parse_format_value()
+    }
 
+    /// Parse `AS <format>` — §7 `as_clause`, per-query format control.
+    ///
+    /// Same value grammar as `FORMAT`, including bracketed multi-format
+    /// lists. `AS OF` belongs to HISTORY and is matched before this.
+    fn parse_as_format(&mut self) -> CalResult<FormatClause> {
+        self.expect_exact(&Token::As)?;
+        self.parse_format_value()
+    }
+
+    fn parse_format_value(&mut self) -> CalResult<FormatClause> {
         // Check for multi-format list: FORMAT [json, markdown, ...]
         if self.at_exact(&Token::LBracket) {
             return self.parse_format_list();
@@ -2940,9 +2959,30 @@ impl Parser {
         loop {
             let spec = self.parse_single_format_spec()?;
 
-            // Optional alias: `AS <identifier>`
+            // Optional alias: `AS <name>`. A user-chosen output name is a
+            // label, not an identifier — several perfectly ordinary alias
+            // words (DATA, READABLE, COMPACT) are keyword tokens, so
+            // `parse_identifier` would reject the reference manual's own
+            // example `FORMAT [json AS data, markdown AS readable]`.
             let alias = if self.eat_exact(&Token::As) {
-                Some(self.parse_identifier()?)
+                let span = self.current_span();
+                let name = self.parse_label()?;
+                // Defence in depth (invariant 3): an alias is only a key in the
+                // output map and cannot destroy anything, but the destructive
+                // vocabulary stays out of CAL text everywhere it can appear.
+                if is_destructive_keyword(&name) {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "an output name".into(),
+                        found: name,
+                        span: Some(span),
+                        suggestion: Some(
+                            "Choose a different alias — CAL keeps destructive \
+                             words out of its grammar entirely."
+                                .into(),
+                        ),
+                    });
+                }
+                Some(name)
             } else {
                 None
             };
@@ -3030,13 +3070,78 @@ impl Parser {
                 self.advance();
                 Ok(FormatSpec::Triples)
             }
+            // §10.1 semantic presets. These are aliases, not distinct
+            // renderers: `structured`/`sml`, `readable`/`markdown`,
+            // `compact`/`text`, `data`/`json`.
+            Some(SpannedToken {
+                token: Token::Structured,
+                ..
+            }) => {
+                self.advance();
+                Ok(FormatSpec::Sml)
+            }
+            Some(SpannedToken {
+                token: Token::Readable,
+                ..
+            }) => {
+                self.advance();
+                Ok(FormatSpec::Markdown)
+            }
+            Some(SpannedToken {
+                token: Token::Compact,
+                ..
+            }) => {
+                self.advance();
+                Ok(FormatSpec::Text)
+            }
+            Some(SpannedToken {
+                token: Token::Data, ..
+            }) => {
+                self.advance();
+                Ok(FormatSpec::Json)
+            }
             Some(SpannedToken {
                 token: Token::Template,
                 ..
             }) => {
                 self.advance();
-                let template = self.parse_string_literal()?;
-                Ok(FormatSpec::Template { template })
+                // §10.6 / §10.6.1 — three forms, told apart by token class so
+                // no lookahead is needed:
+                //   TEMPLATE <ident>   a registered template
+                //   TEMPLATE "<text>"  an inline ELEMENT shorthand
+                //   TEMPLATE { ... }   inline sections
+                match self.peek() {
+                    // A name here is whatever `DEFINE TEMPLATE` accepted as
+                    // one, which is `parse_label`, not `parse_identifier`:
+                    // preset names (`structured`, `compact`, …) are keyword
+                    // tokens. Matching only `Ident` made a template nameable
+                    // but not referenceable.
+                    Some(st) if Self::is_word_token(&st.token) => {
+                        Ok(FormatSpec::TemplateRef {
+                            name: self.parse_template_name()?,
+                        })
+                    }
+                    Some(SpannedToken {
+                        token: Token::LBrace,
+                        ..
+                    }) => {
+                        self.advance();
+                        let sections = self.parse_template_sections()?;
+                        self.expect_exact(&Token::RBrace)?;
+                        if sections.is_empty() {
+                            return Err(CalError::TemplateSyntaxError {
+                                detail: "inline TEMPLATE must define at least one section"
+                                    .to_string(),
+                                span: Some(self.current_span()),
+                            });
+                        }
+                        Ok(FormatSpec::TemplateInline { sections })
+                    }
+                    _ => {
+                        let template = self.parse_string_literal()?;
+                        Ok(FormatSpec::Template { template })
+                    }
+                }
             }
             Some(SpannedToken {
                 token: Token::Ident(name),
@@ -3112,6 +3217,18 @@ impl Parser {
     ///
     /// Does NOT consume any tokens. Returns `false` if the current token
     /// is not `WITH` or if the next token is not `VARS`.
+    /// True when the next token after `AS` is `OF` — the HISTORY temporal
+    /// clause, which must not be mistaken for per-query format control.
+    fn peek_next_is_of(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos + 1),
+            Some(SpannedToken {
+                token: Token::Of,
+                ..
+            })
+        )
+    }
+
     fn peek_next_is_vars(&self) -> bool {
         if !self.at_exact(&Token::With) {
             return false;
@@ -5056,7 +5173,10 @@ impl Parser {
         self.expect_exact(&Token::Define)?;
         self.expect_exact(&Token::Template)?;
 
-        let name = self.parse_string_literal()?;
+        // §7 spells the name as a bare identifier. A quoted name is still
+        // accepted — it was the only form DejaDB ever wrote, and it is the
+        // only way to name a template containing a space.
+        let name = self.parse_template_name()?;
 
         let mut description = None;
         let mut parent = None;
@@ -5077,7 +5197,7 @@ impl Parser {
                     ..
                 }) => {
                     self.advance();
-                    parent = Some(self.parse_string_literal()?);
+                    parent = Some(self.parse_template_name()?);
                 }
                 Some(SpannedToken {
                     token: Token::For, ..
@@ -5114,17 +5234,50 @@ impl Parser {
             }
         }
 
-        // Require AS clause.
-        self.expect_exact(&Token::As)?;
-        let source_span = self.current_span();
-        let source = self.parse_string_literal()?;
-
-        if source.is_empty() {
-            return Err(CalError::TemplateSyntaxError {
-                detail: "template source cannot be empty".to_string(),
-                span: Some(source_span),
-            });
-        }
+        // Body: either the `AS "<text>"` shorthand (§10.6.1) or a section
+        // list (§10.6). Exactly one — a definition may not combine them.
+        let (source, sections) = if self.at_exact(&Token::As) {
+            self.advance();
+            let source_span = self.current_span();
+            let source = self.parse_string_literal()?;
+            if source.is_empty() {
+                return Err(CalError::TemplateSyntaxError {
+                    detail: "template source cannot be empty".to_string(),
+                    span: Some(source_span),
+                });
+            }
+            // §10.6.1: `AS "<text>"` is exactly `ELEMENT { <text> }`, so it
+            // desugars here and the rest of the pipeline only ever sees
+            // sections.
+            //
+            // Compatibility shim: a body that drives its own iteration with
+            // `{{#each grains}}` is a pre-§10.6 whole-result template. That
+            // construct is meaningless inside an ELEMENT body (the engine
+            // already supplies the grain) and reinterpreting it would render
+            // the whole result set once per grain, so those bodies keep the
+            // old semantics. Remove once no such templates remain in the wild.
+            if source.contains("{{#each") {
+                (source, None)
+            } else {
+                let sections = TemplateSectionSources {
+                    element: Some(source),
+                    ..Default::default()
+                };
+                (sections.to_source(), Some(sections))
+            }
+        } else {
+            let sections = self.parse_template_sections()?;
+            if sections.is_empty() {
+                return Err(CalError::TemplateSyntaxError {
+                    detail: "template body must be AS \"...\" or at least one \
+                             section (HEADER, ELEMENT, ELEMENT_SUMMARY, \
+                             ELEMENT_OMIT, SOURCE_BREAK, FOOTER)"
+                        .to_string(),
+                    span: Some(self.current_span()),
+                });
+            }
+            (sections.to_source(), Some(sections))
+        };
 
         let span_end = self.prev_span();
         Ok(CalStatement::DefineTemplate(DefineTemplateStmt {
@@ -5133,6 +5286,7 @@ impl Parser {
             parent,
             grain_types,
             source,
+            sections,
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,
@@ -5140,6 +5294,114 @@ impl Parser {
                 span_start.col,
             )),
         }))
+    }
+
+    /// Parse a run of `HEADER { ... } ELEMENT { ... } ...` sections (§10.6).
+    ///
+    /// Bodies arrive from the lexer already captured as raw text — see
+    /// [`super::lexer::SectionBody`] — so nothing here has to cope with
+    /// template prose that is not valid CAL.
+    fn parse_template_sections(&mut self) -> CalResult<TemplateSectionSources> {
+        let mut out = TemplateSectionSources::default();
+
+        loop {
+            let span = self.current_span();
+            let Some(st) = self.peek() else { break };
+            let (keyword, body) = match &st.token {
+                Token::Header(b) => ("HEADER", b),
+                Token::Element(b) => ("ELEMENT", b),
+                Token::ElementSummary(b) => ("ELEMENT_SUMMARY", b),
+                Token::ElementOmit(b) => ("ELEMENT_OMIT", b),
+                Token::SourceBreak(b) => ("SOURCE_BREAK", b),
+                Token::Footer(b) => ("FOOTER", b),
+                _ => break,
+            };
+            // A bare keyword is an ordinary word here, not a section.
+            let SectionBody::Body(text) = body else { break };
+            let text = text.clone();
+            self.advance();
+
+            let slot = match keyword {
+                "HEADER" => &mut out.header,
+                "ELEMENT" => &mut out.element,
+                "ELEMENT_SUMMARY" => &mut out.element_summary,
+                "ELEMENT_OMIT" => &mut out.element_omit,
+                "SOURCE_BREAK" => &mut out.source_break,
+                _ => &mut out.footer,
+            };
+            Self::set_section(slot, text, keyword, span)?;
+        }
+
+        Ok(out)
+    }
+
+    /// Parse a template name: a bare identifier (§7) or a quoted string.
+    ///
+    /// `template_name = identifier` in the spec. The quoted form stays
+    /// accepted because it is what DejaDB has always written and the only way
+    /// to spell a name containing a space; in `FORMAT` position the two are
+    /// deliberately *not* interchangeable — there a quoted argument is a
+    /// template body, never a name.
+    fn parse_template_name(&mut self) -> CalResult<String> {
+        if matches!(
+            self.peek(),
+            Some(SpannedToken {
+                token: Token::StringLiteral(_),
+                ..
+            })
+        ) {
+            return self.parse_string_literal();
+        }
+
+        let span = self.current_span();
+        // `AS` here means the name was omitted; without this guard the label
+        // parser would happily swallow it as the name.
+        if self.at_exact(&Token::As) {
+            return Err(CalError::UnexpectedToken {
+                expected: "a template name".into(),
+                found: "AS".into(),
+                span: Some(span),
+                suggestion: Some("Name the template: DEFINE TEMPLATE <name> AS \"...\"".into()),
+            });
+        }
+
+        // `parse_label`, not `parse_identifier`: preset names (`structured`,
+        // `compact`, …) are keyword tokens, and `EXTENDS structured` has to
+        // parse.
+        let name = self.parse_label()?;
+        // Defence in depth (invariant 3): a template name is inert, but the
+        // destructive vocabulary stays out of CAL text everywhere it can
+        // appear.
+        if is_destructive_keyword(&name) {
+            return Err(CalError::UnexpectedToken {
+                expected: "a template name".into(),
+                found: name,
+                span: Some(span),
+                suggestion: Some(
+                    "Choose a different name — CAL keeps destructive words out \
+                     of its grammar entirely."
+                        .into(),
+                ),
+            });
+        }
+        Ok(name)
+    }
+
+    /// Assign a section body, rejecting a second definition of the same one.
+    fn set_section(
+        slot: &mut Option<String>,
+        text: String,
+        keyword: &str,
+        span: Span,
+    ) -> CalResult<()> {
+        if slot.is_some() {
+            return Err(CalError::TemplateSyntaxError {
+                detail: format!("section {keyword} is defined twice"),
+                span: Some(span),
+            });
+        }
+        *slot = Some(text);
+        Ok(())
     }
 
     // -- DEFINE QUERY -----------------------------------------------------
@@ -9072,6 +9334,73 @@ mod tests {
                 "customers"
             )]))
         );
+    }
+
+    /// Regression: several natural alias words (DATA, READABLE, COMPACT) are
+    /// keyword tokens, so an alias parsed as a bare identifier rejected the
+    /// CAL reference manual's own example. An alias is a label, not an ident.
+    #[test]
+    fn test_format_alias_may_be_a_reserved_word() {
+        let q = p("RECALL facts FORMAT [json AS data, markdown AS readable]");
+        assert_eq!(
+            q.format,
+            Some(FormatClause::Multi(vec![
+                af_as(FormatSpec::Json, "data"),
+                af_as(FormatSpec::Markdown, "readable"),
+            ]))
+        );
+        let q = p("RECALL facts FORMAT [sml AS compact, json AS raw]");
+        assert_eq!(
+            q.format,
+            Some(FormatClause::Multi(vec![
+                af_as(FormatSpec::Sml, "compact"),
+                af_as(FormatSpec::Json, "raw"),
+            ]))
+        );
+    }
+
+    /// Invariant 3: the destructive vocabulary stays out of CAL text
+    /// everywhere it can appear, including as an output alias.
+    #[test]
+    fn test_format_alias_rejects_destructive_words() {
+        for word in ["delete", "erase", "truncate", "insert", "grant"] {
+            let q = format!("RECALL facts FORMAT [json AS {word}]");
+            parse(&q).expect_err(&format!("{word} must not be usable as an alias"));
+        }
+    }
+
+    /// A duplicate alias is still an error, reserved word or not.
+    #[test]
+    fn test_format_alias_reserved_word_duplicate_still_rejected() {
+        let e = pe("RECALL facts FORMAT [json AS data, markdown AS data]");
+        assert_eq!(e.code(), "CAL-E113", "expected duplicate-key error, got {e:?}");
+    }
+
+    // ── RECALL * ──────────────────────────────────────────────────────
+
+    /// `RECALL *` is the documented explicit spelling of "any grain type"
+    /// (CAL reference §4) and must mean the same as omitting the type.
+    #[test]
+    fn test_recall_star_is_all_grain_types() {
+        let starred = p(r#"RECALL * WHERE namespace = "caller""#);
+        let omitted = p(r#"RECALL WHERE namespace = "caller""#);
+        match (&starred.statement, &omitted.statement) {
+            (CalStatement::Recall(a), CalStatement::Recall(b)) => {
+                assert_eq!(a.grain_type, GrainTypePlural::All);
+                assert_eq!(a.grain_type, b.grain_type);
+            }
+            other => panic!("expected two Recall statements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_recall_star_through_a_pipeline() {
+        let q = p(r#"RECALL * WHERE namespace = "caller" | COUNT"#);
+        match &q.statement {
+            CalStatement::Recall(r) => assert_eq!(r.grain_type, GrainTypePlural::All),
+            other => panic!("expected Recall, got {other:?}"),
+        }
+        assert_eq!(q.pipeline.len(), 1);
     }
 
     #[test]

@@ -214,7 +214,7 @@ Applications partition memory into files along whatever boundary their domain
 needs — per user, per organization, per category, per conversation. Within a
 file, hot queries partition further by namespace, session, and thread. When a
 session needs to span several files, it does so through
-[ASSEMBLE with facade mounts](#54-assemble-and-facade-mounts), not through
+[ASSEMBLE with facade mounts](#55-assemble-and-facade-mounts), not through
 shared connections.
 
 ### 3.1 The index layer
@@ -274,10 +274,16 @@ the index layer, never as edits.
   forever. For an agent, cross-channel disagreement is context, not an error.
   *Surfacing:* `deja forks` enumerates every open fork and `deja merge
   --subject S --relation R --object O` closes one. Recall itself does **not**
-  stamp a contested marker — that would add a per-hit head probe to the
-  microsecond hot path — so surfacing is an explicit operator query, not a
-  recall-time cost. The `CONTRADICTIONS` CAL clause parses but is not yet wired
-  to the executor.
+  stamp a contested marker by default — that would add a per-hit head probe to
+  the microsecond hot path — so surfacing is opt-in rather than a recall-time
+  cost. Two CAL surfaces make it reachable by the agent itself, not just an
+  operator: `RECALL … CONTRADICTIONS` returns **only** contested grains
+  (optionally scoped by a `OF (sub-query)` tail), and `WITH
+  contradiction_detection` returns the normal result set with disputed grains
+  stamped. Both fill `contested_by` on each grain with the other live tips, so
+  a model sees *what* disagrees, not merely that something does. One
+  `GROUP BY … HAVING COUNT(*) > 1` over `heads` per query, applied after every
+  other filter, and fail-open like the rest of the recall path.
 - **Tombstones and erasure.** Removal is never an in-place delete (which would
   leave recoverable data in free pages and the WAL). `forget` writes a
   tombstone to the op-log and drops the grain from the hot index. The strong
@@ -353,7 +359,30 @@ result limit (1000), max pipeline stages (5), max `LET` bindings (5) with a
 before tokenization: bidirectional-override rejection (defeats visual spoofing)
 and NFC normalization.
 
-### 5.4 ASSEMBLE and facade mounts
+### 5.4 New syntax is a spec decision, not a product decision
+
+CAL syntax is an OMS conformance contract: a query that parses here must parse
+the same way in any other conforming implementation, or the contract is worth
+nothing. So the rule is that DejaDB does not *invent* CAL syntax — it
+implements what the spec already defines, and anything DejaDB genuinely needs
+first goes to the spec before it goes in the parser.
+
+Everything added to the surface since 1.0.3 is on the implements-the-spec side,
+and each carries the section it comes from: sectioned templates and inheritance
+(§10.6–§10.7), the `{{grain.*}}` / `{{assembly.*}}` / `{{source.*}}` /
+`{{budget.*}}` namespaces and content projection (§10.2–§10.5), the template
+limits (§10.8), the semantic presets `structured` / `readable` / `compact` /
+`data` (§10.1), `FORMAT TEMPLATE` in its three forms (§10.6, §10.6.1),
+`AS <format>` (§7 `as_clause`), and `RECALL *` (§4). `CONTRADICTIONS` was
+already in the grammar and unimplemented; wiring it changed no syntax.
+
+The corollary is that the extension points are deliberately *not* syntax.
+Saved queries, custom templates and presets let a deployment shape its own
+output vocabulary without touching the grammar — which is why they persist in
+the memory file rather than in a client, and why `data` cannot be extended
+(it is a renderer, not a template).
+
+### 5.5 ASSEMBLE and facade mounts
 
 `ASSEMBLE` is CAL's context-composition statement: it draws from multiple
 labeled sources, applies per-source token budgets and priorities, deduplicates,

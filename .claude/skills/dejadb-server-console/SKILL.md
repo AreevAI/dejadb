@@ -20,9 +20,13 @@ runtime (invariant 6: dependency-light). It serves the web console and the
   username, password = token); scripts via `Authorization: Bearer`. A 401 must
   carry `WWW-Authenticate: Basic` so browsers prompt. Base64 for Basic is
   **hand-rolled** (no dep) — keep it correct.
-- **`into_hub(token, dir)`** (`lib.rs:123`) — the separate `dejad` hub: **bearer
-  auth on POSTs** + the `/api/segment*` surface only (reads stay open) for
-  segment push/pull. `into_hub` is not `ui` with auth — different route set.
+- **`into_hub(token, dir)`** (`lib.rs:123`; CLI `deja hub --dir DIR
+  --token-env VAR`) — the separate `dejad` hub: **bearer auth on POSTs** + the
+  whole `/api/segment*` surface, which is gated on **reads too** (listing and
+  pulling a bundle both need the key); only the non-segment reads stay open.
+  `into_hub` is not `ui` with auth — different route set. `--token-env` is
+  mandatory for `deja hub`: there is no trusted-local-operator default,
+  because a hub exists to be written to by other machines.
 
 ## Security invariants — do not regress
 
@@ -49,11 +53,31 @@ runtime (invariant 6: dependency-light). It serves the web console and the
 ## The console (console.html)
 
 One embedded HTML file, **vanilla JS**, no build step, no external assets
-(dependency-light): memories / graph / query tabs, light + dark themes, a JSON
-tree viewer, and a grain inspector. **Design source of truth is the Paper file
-"DejaDB"** — reproduce visual changes there (or read exact values from it via
-the Paper tools) rather than eyeballing; keep the embedded file and the Paper
-design in sync.
+(dependency-light). Four pages behind hash routes — `#memory` (sentence list),
+`#graph` (canvas force-graph, focus + depth + rewind scrubber), `#activity`,
+`#suggestions`, `#connect/{agent,sync,settings}` — plus a slide-in memory panel.
+Light + dark, token for token. **Design source of truth is the Paper file
+"DejaDB", page "Console v2 — Redesign"** — reproduce visual changes there (or
+read exact values from it via the Paper tools) rather than eyeballing; keep the
+embedded file and the Paper design in sync.
+
+Two rules the UI depends on:
+
+- **Speak in sentences, not triples.** A grain renders as
+  "Prefers green tea", never `fact | john | prefers | green tea`. Content
+  addresses, grain types and CAL live behind **Developer mode** (`?dev=1` or
+  the rail toggle, persisted in `localStorage`) — never in the default view.
+- **`/api/browse` does not resolve heads.** A plain re-`ADD` of the same
+  `(namespace, subject, relation)` replaces the old value *without* logging a
+  SUPERSEDE, so the feed still marks the stale row as live. `markHeads()`
+  recomputes this client-side (newest `op_seq` per key wins); the graph does
+  the same *as of the rewind cut*. Delete that and the console starts showing
+  values the store has already replaced.
+
+Testing it: hash routes + `?dev=1` + `?theme=dark` make every page reachable
+headlessly — `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+--headless=new --virtual-time-budget=5000 --dump-dom "http://127.0.0.1:PORT/#graph"`
+renders the real JS and is enough to catch a blank list or a thrown boot.
 
 ## The gate — before you commit
 

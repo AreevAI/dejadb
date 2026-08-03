@@ -85,7 +85,9 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
    write parallelism. Single writer per file; cross-file queries go through
    ASSEMBLE with facade mounts, not shared connections. Files are
    self-describing: the `meta` table carries file-truths (`text_index`,
-   `entity_relations`, embedding provenance). Bare `open()` honors them;
+   `entity_relations`, embedding provenance) and CAL host metadata — saved
+   queries and custom templates ride there as `qry:<name>`/`tpl:<name>` rows,
+   so they travel with the file rather than living in any one client. Bare `open()` honors them;
    `open_with()` deliberately re-stamps and reports changes via
    `open_warnings()`. Host config (embedder capability, executor limits) is
    per-process and never persisted in the file.
@@ -122,17 +124,20 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
   token on **every** request — browsers via the native HTTP Basic prompt (any
   username, password = token), scripts via `Authorization: Bearer` — and a 401
   carries `WWW-Authenticate: Basic` so browsers prompt. `into_hub(token, dir)`
-  is the separate hub mode: bearer auth on POSTs + `/api/segment*` only (reads
-  open) for segment push/pull. Base64 for Basic is hand-rolled (no dep). Body
-  cap 1 MiB. Cross-origin POSTs are rejected via Origin check (drive-by
-  protection). The console is
-  one embedded HTML file (`console.html`, vanilla JS): memories/graph/query
-  tabs, light + dark themes, JSON tree viewer, grain inspector; design
-  source of truth is the Paper file "DejaDB". Read-only `GET /api/config`
-  reports effective config + file-vs-host reconciliation warnings.
+  is the separate hub mode (CLI `deja hub`, where `--token-env` is
+  **mandatory**): bearer auth on POSTs + the `/api/segment*` surface, which is
+  gated on **reads too** — only the non-segment reads are open. Base64 for
+  Basic is hand-rolled (no dep). Body cap 1 MiB. Cross-origin POSTs are
+  rejected via Origin check (drive-by protection). The console is
+  one embedded HTML file (`console.html`, vanilla JS, no build step) — a
+  plain-language memory browser with an interactive graph, the waiser review
+  queue, and a Developer-mode toggle that reveals hashes/op-log/CAL; design
+  source of truth is the Paper file "DejaDB", page "Console v2 — Redesign".
+  Read-only `GET /api/config` reports effective config + file-vs-host
+  reconciliation warnings.
   `tests/multichannel_tests.rs` is the §8 acceptance test (voice + WhatsApp +
   email sharing one memory via the hub).
-- **dejadb**: ~24 verbs (incl. `migrate` from other memory systems and
+- **dejadb**: ~25 verbs (incl. `hub`, `migrate` from other memory systems and
   `reindex`), hand-rolled `parse_args` → HashMap; global `--embed-cmd` installs
   a `CommandEmbed` for vector recall on any verb. Opens honor
   the file's meta declarations; `--index-text true|false` explicitly

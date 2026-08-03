@@ -282,6 +282,15 @@ pub struct CalGrainResult {
     /// inclusion is governed by the source's PRIORITY/BUDGET allocation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_deterministic: bool,
+    /// The other live heads that contest this grain's `(subject, relation)`.
+    ///
+    /// Present only when `CONTRADICTIONS` or `WITH contradiction_detection`
+    /// asked for fork status, and only on a grain that is itself a live tip of
+    /// an open fork. Non-empty means: another writer holds a different current
+    /// value for this key and neither has been merged. An agent should treat
+    /// the value as disputed rather than settled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contested_by: Option<Vec<String>>,
 }
 
 /// A single delta that was applied during ACCUMULATE.
@@ -603,6 +612,8 @@ impl CalExecutor {
             grouped_by.as_deref(),
             &query.user_vars,
             store,
+            None,
+            &mut exec_warnings,
         )?;
 
         // 6. Collect warnings from the AST + execution.
@@ -678,6 +689,8 @@ impl CalExecutor {
             grouped_by.as_deref(),
             &query.user_vars,
             store,
+            None,
+            &mut exec_warnings,
         )?;
 
         // Collect warnings from the AST + execution.
@@ -1603,6 +1616,21 @@ impl CalExecutor {
             params.limit = Some(self.config.default_limit as usize);
         }
 
+        // ── CONTRADICTIONS widens the candidate scan ─────────────────────
+        //
+        // The clause filters *after* recall, so whatever LIMIT bounded the
+        // recall also bounds which forks can be seen. Left alone, the default
+        // limit would make "nothing is contested" mean "nothing among the
+        // newest 50" — the exact false all-clear this clause exists to
+        // prevent. So scan as wide as CAL allows and re-apply the caller's
+        // LIMIT to the *contested* grains afterwards: LIMIT bounds the answer,
+        // not the search for it.
+        let contradictions_limit = if recall.contradictions.is_some() {
+            params.limit.replace(self.config.max_limit as usize)
+        } else {
+            None
+        };
+
         // WITH options.
         self.apply_with_options(&query.with_options, &mut params)?;
 
@@ -1635,6 +1663,10 @@ impl CalExecutor {
         let hits = store
             .recall(&params)
             .map_err(|e| map_store_err(e, recall.span))?;
+
+        // A recall that came back exactly full was cut off by the limit, so
+        // anything CONTRADICTIONS says about grains beyond it is unknown.
+        let scan_was_bounded = params.limit.is_some_and(|l| hits.len() >= l);
 
         let mut grains = hits_to_grain_results(&hits);
 
@@ -1689,6 +1721,82 @@ impl CalExecutor {
             }
         }
 
+        // ── CONTRADICTIONS — restrict to grains that are contested ───────
+        //
+        // A fork is `(ns, subject, relation)` with more than one live head, which
+        // happens when two writers diverge and then sync: immutability keeps both
+        // tips, and recall serves a deterministically-elected provisional head.
+        // Plain recall therefore answers with a value that *looks* settled. This
+        // clause is how an agent asks the opposite question — "what do I hold
+        // that is still disputed?" — without an operator running `deja forks`.
+        //
+        // Runs last, after every other filter, so `CONTRADICTIONS` composes with
+        // ABOUT/WHERE/SINCE rather than overriding them — and before LIMIT, so
+        // the limit bounds the contested grains rather than the search.
+        if let Some(ref clause) = recall.contradictions {
+            // `CONTRADICTIONS OF (sub-query)` narrows the fork set to the keys
+            // that sub-query selected. Execute it with the pipeline and FORMAT
+            // stripped: those belong to the enclosing statement, and letting them
+            // reach the inner query is the leak that bit nested ASSEMBLE.
+            let scope = match clause.inner {
+                Some(ref inner) => {
+                    let inner_query = CalQuery {
+                        statement: (**inner).clone(),
+                        pipeline: Vec::new(),
+                        format: None,
+                        ..query.clone()
+                    };
+                    let payload = self.execute_statement(
+                        &inner_query.statement,
+                        store,
+                        &inner_query,
+                        exec_warnings,
+                    )?;
+                    match payload {
+                        CalResultPayload::Grains { ref grains, .. } => Some(
+                            contradiction_scope_keys(grains, params.namespace.as_deref()),
+                        ),
+                        // A sub-query that yields no grain set (COUNT, EXISTS, a
+                        // formatted string) selects no keys to scope by. Treat it
+                        // as an empty scope rather than silently ignoring the
+                        // tail, so the query cannot over-report.
+                        _ => {
+                            exec_warnings.push(
+                                "CONTRADICTIONS OF (...) sub-query returned no grains; \
+                                 no keys to scope by"
+                                    .into(),
+                            );
+                            Some(std::collections::HashSet::new())
+                        }
+                    }
+                }
+                None => None,
+            };
+            apply_fork_status(&mut grains, store, true, scope.as_ref(), exec_warnings);
+
+            // Even a max_limit scan can be cut off. Saying so is the whole
+            // point: an agent may act on "nothing is contested", so it must
+            // learn when that answer only covers part of the memory.
+            if scan_was_bounded {
+                exec_warnings.push(
+                    super::errors::CalWarning::ContradictionScanBounded {
+                        scanned: self.config.max_limit as usize,
+                    }
+                    .to_string(),
+                );
+            }
+
+            // The caller's LIMIT applies to the contested grains, not to the
+            // scan that found them (see where `contradictions_limit` is taken).
+            if let Some(limit) = contradictions_limit {
+                grains.truncate(limit);
+            }
+        } else if params.detect_contradictions == Some(true) {
+            // `WITH contradiction_detection` — annotate, don't filter. The agent
+            // gets its normal context back, with disputed grains marked.
+            apply_fork_status(&mut grains, store, false, None, exec_warnings);
+        }
+
         let count = grains.len();
 
         // FORMAT clause — render into the requested format.
@@ -1697,7 +1805,7 @@ impl CalExecutor {
         // propagate its metadata to the renderer.
         if query.pipeline.is_empty() {
             if let Some(ref fmt) = query.format {
-                return apply_format_clause_to_grains(&grains, fmt, None, &query.user_vars, store);
+                return apply_format_clause_to_grains(&grains, fmt, None, &query.user_vars, store, &Default::default(), exec_warnings);
             }
         }
 
@@ -3185,6 +3293,8 @@ impl CalExecutor {
             grouped_by.as_deref(),
             &entry.user_vars,
             store,
+            None,
+            exec_warnings,
         )?;
 
         Ok(payload)
@@ -3437,6 +3547,14 @@ impl CalExecutor {
                     None,
                     &query.user_vars,
                     store,
+                    // `context_name` is the explicit `ASSEMBLE "name"`
+                    // override; `topic` is the bare name. `for_whom` is the
+                    // FOR clause, which is what §10.5 calls the intent.
+                    Some((
+                        assemble.context_name.as_deref().unwrap_or(&assemble.topic),
+                        assemble.for_whom.as_deref().unwrap_or(""),
+                    )),
+                    exec_warnings,
                 );
             }
             return Ok(result);
@@ -3482,6 +3600,7 @@ impl CalExecutor {
                                     score_breakdown: None,
                                     explanation: None,
                                     is_deterministic: true,
+                                    contested_by: None,
                                 });
                             }
                         }
@@ -3538,15 +3657,20 @@ impl CalExecutor {
         // For the single-source path, apply the budget as a grain-count
         // limit. The multi-source path uses the AssembleEngine with proper
         // token-counting; here grain count is a reasonable approximation.
-        let grains = if let Some(ref budget) = assemble.budget {
+        // Keep what the budget cut: a template's `ELEMENT_OMIT` section is how
+        // an assembly accounts for what it left out, and that has to work the
+        // same whether there is one source or several.
+        let (grains, omitted) = if let Some(ref budget) = assemble.budget {
+            let mut grains = grains;
             let limit = budget.tokens as usize;
             if grains.len() > limit {
-                grains.into_iter().take(limit).collect()
+                let dropped = grains.split_off(limit);
+                (grains, dropped)
             } else {
-                grains
+                (grains, Vec::new())
             }
         } else {
-            grains
+            (grains, Vec::new())
         };
 
         // ── WI-1.1: ASSEMBLE FORMAT clause ───────────────────────────────
@@ -3554,7 +3678,45 @@ impl CalExecutor {
         // If a FORMAT clause is present, render the grains into the
         // specified format and return a Formatted/MultiFormatted payload.
         if let Some(ref clause) = assemble.format {
-            return apply_format_clause_to_grains(&grains, clause, None, &query.user_vars, store);
+            // One source, but still an assembly: `assembly.*`, `budget.*` and
+            // `source.*` must resolve here exactly as they do on the
+            // multi-source path. Rendering with an empty plan is what silently
+            // blanked them.
+            let ctx = super::templates::AssemblyContext {
+                name: assemble
+                    .context_name
+                    .clone()
+                    .unwrap_or_else(|| assemble.topic.clone()),
+                intent: assemble.for_whom.clone().unwrap_or_default(),
+                source_count: 1,
+                grain_count: grains.len(),
+                budget_total: assemble.budget.as_ref().map_or(0, |b| b.tokens as u64),
+                budget_used: grains.len() as u64,
+                // The single-source path budgets by grain count, not tokens —
+                // say so rather than mislabel the unit.
+                budget_unit: "grains".to_string(),
+            };
+            let sources = [super::templates::RenderSource {
+                label: "",
+                grains: &grains,
+                omitted: &omitted,
+                priority: 1,
+                tokens_used: grains.len(),
+                truncated: !omitted.is_empty(),
+            }];
+            let plan = super::templates::RenderPlan {
+                assembly: Some(&ctx),
+                sources: Some(&sources),
+            };
+            return apply_format_clause_to_grains(
+                &grains,
+                clause,
+                None,
+                &query.user_vars,
+                store,
+                &plan,
+                exec_warnings,
+            );
         }
 
         let count = grains.len();
@@ -3758,6 +3920,7 @@ impl CalExecutor {
                                 score_breakdown: None,
                                 explanation: None,
                                 is_deterministic: true,
+                                contested_by: None,
                             })
                         })
                         .collect();
@@ -3781,6 +3944,7 @@ impl CalExecutor {
                                 score_breakdown: None,
                                 explanation: None,
                                 is_deterministic: true,
+                                contested_by: None,
                             })
                         })
                         .collect();
@@ -3803,6 +3967,7 @@ impl CalExecutor {
                             score_breakdown: None,
                             explanation: None,
                             is_deterministic: true,
+                            contested_by: None,
                         })
                         .collect();
                     let count = extracted.len();
@@ -4167,6 +4332,109 @@ fn hits_to_grain_results(hits: &[crate::store_types::SearchHit]) -> Vec<CalGrain
                 .map(|sb| serde_json::to_value(sb).unwrap_or(serde_json::Value::Null)),
             explanation: hit.explanation.clone(),
             is_deterministic: false,
+            contested_by: None,
+        })
+        .collect()
+}
+
+/// Stamp fork status onto recalled grains, and optionally drop the uncontested.
+///
+/// Two surfaces share this. `CONTRADICTIONS` keeps **only** contested grains —
+/// the agent asked for the conflicts. `WITH contradiction_detection` keeps
+/// everything and merely marks what is disputed — the agent asked for its normal
+/// context, plus a warning about which parts of it are not settled.
+///
+/// `restrict_to` is the `(namespace, subject, relation)` key set from a
+/// `CONTRADICTIONS OF (sub-query)` tail; `None` considers every open fork.
+///
+/// **Fail-open**, matching the recall path: a facade that cannot enumerate heads
+/// reports no forks and the query degrades to "nothing is contested" with a
+/// warning, rather than turning a working recall into a failed one. The one
+/// exception is a *filtering* query, which yields nothing — claiming "no
+/// conflicts" when the check did not run would be a false all-clear, and this
+/// clause exists precisely so an agent can trust that answer.
+fn apply_fork_status(
+    grains: &mut Vec<CalGrainResult>,
+    store: &dyn CalStoreFacade,
+    filter: bool,
+    restrict_to: Option<&std::collections::HashSet<(String, String, String)>>,
+    exec_warnings: &mut Vec<String>,
+) {
+    let forks = match store.open_forks() {
+        Ok(f) => f,
+        Err(e) => {
+            exec_warnings.push(format!(
+                "contradiction detection unavailable ({e}); fork status not applied"
+            ));
+            if filter {
+                grains.clear();
+            }
+            return;
+        }
+    };
+
+    // hash -> every *other* live tip contesting the same key.
+    let mut peers: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &forks {
+        if let Some(keys) = restrict_to {
+            if !keys.contains(&(
+                f.namespace.clone(),
+                f.subject.clone(),
+                f.relation.clone(),
+            )) {
+                continue;
+            }
+        }
+        for (i, head) in f.heads.iter().enumerate() {
+            let others: Vec<String> = f
+                .heads
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, o)| o.clone())
+                .collect();
+            peers.insert(head.clone(), others);
+        }
+    }
+
+    if filter {
+        grains.retain(|g| peers.contains_key(&g.hash));
+    }
+    for g in grains.iter_mut() {
+        if let Some(others) = peers.get(&g.hash) {
+            g.contested_by = Some(others.clone());
+        }
+    }
+}
+
+/// The `(namespace, subject, relation)` keys a `CONTRADICTIONS OF (...)`
+/// sub-query selected.
+///
+/// Keyed on the full fork identity, not just `(subject, relation)`: the same
+/// subject and relation in two namespaces are two different keys, and matching
+/// on the pair alone would let a fork in one namespace be reported as in scope
+/// because an unrelated grain in another namespace happened to share them.
+/// A grain that does not carry its namespace is attributed to the namespace the
+/// recall was scoped to, which is where it came from.
+///
+/// Grains with no subject or no relation (an Event, say) contribute no key and
+/// so narrow nothing — the tail restricts the fork set, it never widens it.
+fn contradiction_scope_keys(
+    grains: &[CalGrainResult],
+    default_ns: Option<&str>,
+) -> std::collections::HashSet<(String, String, String)> {
+    grains
+        .iter()
+        .filter_map(|g| {
+            let s = g.fields.get("subject").and_then(|v| v.as_str())?;
+            let r = g.fields.get("relation").and_then(|v| v.as_str())?;
+            let ns = g
+                .fields
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .or(default_ns)
+                .unwrap_or_default();
+            Some((ns.to_string(), s.to_string(), r.to_string()))
         })
         .collect()
 }
@@ -4321,20 +4589,68 @@ fn apply_format_clause(
     grouped_by: Option<&str>,
     user_vars: &HashMap<String, String>,
     store: &dyn CalStoreFacade,
+    // `(context name, FOR intent)` — only an ASSEMBLE has them, and they feed
+    // `{{assembly.name}}` / `{{assembly.intent}}`.
+    assemble_ident: Option<(&str, &str)>,
+    warnings: &mut Vec<String>,
 ) -> std::result::Result<CalResultPayload, CalError> {
     let Some(clause) = format else {
         return Ok(payload);
     };
 
-    // Extract grains from the payload.
-    let grains = match &payload {
-        CalResultPayload::Grains { grains, .. } => grains,
-        CalResultPayload::Assembled { grains, .. } => grains,
+    // Extract grains from the payload, plus the source structure when this
+    // came from an ASSEMBLE — that structure is what SOURCE_BREAK,
+    // ELEMENT_OMIT and the assembly./source./budget. namespaces render from,
+    // and flattening it here is what previously made them unreachable.
+    let (grains, assembled) = match &payload {
+        CalResultPayload::Grains { grains, .. } => (grains, None),
+        CalResultPayload::Assembled {
+            grains,
+            sources,
+            total_tokens,
+            budget_limit,
+            ..
+        } => (grains, Some((sources, *total_tokens, *budget_limit))),
         // Non-grain payloads pass through unchanged.
         _ => return Ok(payload),
     };
 
-    apply_format_clause_to_grains(grains, clause, grouped_by, user_vars, store)
+    let mut render_sources: Vec<super::templates::RenderSource<'_>> = Vec::new();
+    let mut assembly_ctx: Option<super::templates::AssemblyContext> = None;
+
+    if let Some((metas, total_tokens, budget_limit)) = assembled {
+        // `AssembleEngine` concatenates each source's surviving grains in
+        // order, so `grain_count` walks the boundaries back out.
+        let mut offset = 0usize;
+        for (i, m) in metas.iter().enumerate() {
+            let end = (offset + m.grain_count).min(grains.len());
+            render_sources.push(super::templates::RenderSource {
+                label: &m.label,
+                grains: &grains[offset..end],
+                omitted: &m.omitted,
+                priority: i + 1,
+                tokens_used: m.tokens_used as usize,
+                truncated: !m.omitted.is_empty(),
+            });
+            offset = end;
+        }
+        assembly_ctx = Some(super::templates::AssemblyContext {
+            name: assemble_ident.map(|(n, _)| n.to_string()).unwrap_or_default(),
+            intent: assemble_ident.map(|(_, i)| i.to_string()).unwrap_or_default(),
+            source_count: metas.len(),
+            grain_count: grains.len(),
+            budget_total: budget_limit.unwrap_or(0) as u64,
+            budget_used: total_tokens as u64,
+            budget_unit: "tokens".to_string(),
+        });
+    }
+
+    let plan = super::templates::RenderPlan {
+        assembly: assembly_ctx.as_ref(),
+        sources: (!render_sources.is_empty()).then_some(render_sources.as_slice()),
+    };
+
+    apply_format_clause_to_grains(grains, clause, grouped_by, user_vars, store, &plan, warnings)
 }
 
 /// Apply a `FormatClause` to a slice of grains, producing either
@@ -4352,6 +4668,8 @@ fn apply_format_clause_to_grains(
     grouped_by: Option<&str>,
     user_vars: &HashMap<String, String>,
     store: &dyn CalStoreFacade,
+    plan: &super::templates::RenderPlan<'_>,
+    warnings: &mut Vec<String>,
 ) -> std::result::Result<CalResultPayload, CalError> {
     match clause {
         FormatClause::Single(super::ast::FormatSpec::Json) if grouped_by.is_none() => {
@@ -4364,13 +4682,13 @@ fn apply_format_clause_to_grains(
             })
         }
         FormatClause::Single(spec) => {
-            format_grain_results(grains, spec, grouped_by, user_vars, store)
+            format_grain_results(grains, spec, grouped_by, user_vars, store, plan, warnings)
         }
         FormatClause::Multi(entries) => {
             let mut formats = HashMap::new();
             for entry in entries {
                 let rendered =
-                    format_grain_results(grains, &entry.spec, grouped_by, user_vars, store)?;
+                    format_grain_results(grains, &entry.spec, grouped_by, user_vars, store, plan, warnings)?;
                 if let CalResultPayload::Formatted { text, format, .. } = rendered {
                     let key = entry.alias.clone().unwrap_or(format);
                     formats.insert(key, text);
@@ -4400,6 +4718,8 @@ fn format_grain_results(
     grouped_by: Option<&str>,
     user_vars: &HashMap<String, String>,
     store: &dyn CalStoreFacade,
+    plan: &super::templates::RenderPlan<'_>,
+    warnings: &mut Vec<String>,
 ) -> std::result::Result<CalResultPayload, CalError> {
     let (text, format_name) = match format {
         super::ast::FormatSpec::Json => {
@@ -4442,12 +4762,10 @@ fn format_grain_results(
                     }
                 }
             } else {
+                // No per-grain heading: a hash and a type repeated above every
+                // line is noise in a prompt, and the assertion already names
+                // what it is about.
                 for grain in grains {
-                    md.push_str(&format!(
-                        "### {} ({})\n",
-                        grain.grain_type,
-                        &grain.hash[..8]
-                    ));
                     render_grain_markdown(&mut md, grain);
                 }
             }
@@ -4629,7 +4947,9 @@ fn format_grain_results(
             }
             (table, "table")
         }
-        super::ast::FormatSpec::Preset { name } => {
+        // `FORMAT TEMPLATE <name>` (§10.6) and the older `FORMAT preset "<name>"`
+        // resolve identically — both name a registered template.
+        super::ast::FormatSpec::Preset { name } | super::ast::FormatSpec::TemplateRef { name } => {
             // Look up the preset name in the template registry.
             let info = store
                 .get_template(name)
@@ -4638,7 +4958,24 @@ fn format_grain_results(
                     span: None,
                 })?;
             // Parse and render using the proper Mustache template engine.
-            let parsed = super::templates::parse_template(&info.source)?;
+            // `parse_template_any` recovers the §10.6 sectioned form, so a
+            // sectioned template renders through the engine-driven pipeline
+            // rather than being emitted as its own source text.
+            let mut parsed = super::templates::parse_template_any(&info.source)?;
+
+            // §10.7 inheritance. Registration validates the parent but the
+            // render path never applied it, so EXTENDS was inert; the default
+            // `readable` parent is what supplies ELEMENT_SUMMARY to a
+            // sectioned template that only defines ELEMENT.
+            let parent_name = info.parent.clone().or_else(|| {
+                (parsed.is_sectioned() && !info.builtin).then(|| "readable".to_string())
+            });
+            if let Some(parent_name) = parent_name {
+                if let Some(parent_info) = store.get_template(&parent_name) {
+                    let parent = super::templates::parse_template_any(&parent_info.source)?;
+                    parsed = super::templates::merge_templates(&parent, &parsed);
+                }
+            }
             let user_vars_map: std::collections::HashMap<String, String> = user_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -4652,40 +4989,101 @@ fn format_grain_results(
                 total_count: grains.len(),
                 user_vars: user_vars_map,
             };
-            let rendered = super::templates::render(&parsed, grains, &ctx)?;
+            let rendered = match parsed.sections() {
+                Some(sections) => super::templates::render_sectioned(
+                    sections,
+                    plan.sources
+                        .unwrap_or(&[super::templates::RenderSource::single(grains)]),
+                    &ctx,
+                    plan.assembly,
+                    super::templates::MAX_RENDER_OUTPUT_SIZE,
+                )?,
+                None => {
+                    // §10.8 caps {{#each}} at 200. Truncating quietly would
+                    // read as "these are all the grains", so say so.
+                    if let Some((rendered, total)) =
+                        super::templates::each_iteration_cap(&parsed, grains.len())
+                    {
+                        warnings.push(
+                            super::errors::CalWarning::EachIterationCapped {
+                                rendered,
+                                total,
+                                max: super::templates::MAX_EACH_ITERATIONS,
+                            }
+                            .to_string(),
+                        );
+                    }
+                    super::templates::render(&parsed, grains, &ctx)?
+                }
+            };
             store.record_template_run(name);
-            (rendered, "preset")
+            let key = match format {
+                super::ast::FormatSpec::Preset { .. } => "preset",
+                _ => "template",
+            };
+            (rendered, key)
         }
         super::ast::FormatSpec::Template { template } => {
-            // Templates are a WI-2 feature. For now, simple field substitution.
-            let mut result = String::new();
-            // Substitute user vars ({{$key}}) once in the template before
-            // per-grain field substitution — user vars are grain-independent.
-            let template_with_vars = {
-                let mut t = template.clone();
-                for (k, v) in user_vars {
-                    t = t.replace(&format!("{{{{${}}}}}", k), v);
-                }
-                t
+            // `FORMAT TEMPLATE "<text>"` is an inline template in the §10.6.1
+            // ELEMENT shorthand: the string renders one grain and the engine
+            // iterates. It goes through the same parser, variable set and
+            // limits as a registered template — this used to be naive string
+            // substitution, which silently ignored filters, conditionals and
+            // the closed variable set.
+            let user_vars_map: std::collections::HashMap<String, String> = user_vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let ctx = super::templates::RenderContext {
+                now_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                tier: super::templates::DisclosureTier::Full,
+                total_count: grains.len(),
+                user_vars: user_vars_map,
             };
-            for grain in grains {
-                let mut line = template_with_vars.clone();
-                if let serde_json::Value::Object(map) = &grain.fields {
-                    for (k, v) in map {
-                        let val_str = match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            _ => v.to_string(),
-                        };
-                        line = line.replace(&format!("{{{{{}}}}}", k), &val_str);
-                    }
-                }
-                // Also substitute {{hash}} and {{grain_type}}.
-                line = line.replace("{{hash}}", &grain.hash);
-                line = line.replace("{{grain_type}}", &grain.grain_type);
-                result.push_str(&line);
-                result.push('\n');
-            }
-            (result, "template")
+            let sections = super::templates::TemplateSections {
+                element: Some(super::templates::parse_section(template)?),
+                ..Default::default()
+            };
+            let rendered = super::templates::render_sectioned(
+                &sections,
+                plan.sources
+                    .unwrap_or(&[super::templates::RenderSource::single(grains)]),
+                &ctx,
+                plan.assembly,
+                super::templates::MAX_RENDER_OUTPUT_SIZE,
+            )?;
+            (rendered, "template")
+        }
+        super::ast::FormatSpec::TemplateInline { sections } => {
+            // `FORMAT TEMPLATE { HEADER { ... } ELEMENT { ... } }` — the same
+            // section pipeline as a registered template, defined at the point
+            // of use.
+            let user_vars_map: std::collections::HashMap<String, String> = user_vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let ctx = super::templates::RenderContext {
+                now_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                tier: super::templates::DisclosureTier::Full,
+                total_count: grains.len(),
+                user_vars: user_vars_map,
+            };
+            let parsed = super::templates::parse_sections(sections)?;
+            let rendered = super::templates::render_sectioned(
+                &parsed,
+                plan.sources
+                    .unwrap_or(&[super::templates::RenderSource::single(grains)]),
+                &ctx,
+                plan.assembly,
+                super::templates::MAX_RENDER_OUTPUT_SIZE,
+            )?;
+            (rendered, "template")
         }
     };
 
@@ -4824,26 +5222,163 @@ fn sml_escape(s: &str) -> String {
 ///
 /// When a `relation` field is present (e.g. speaker role "user"/"assistant"),
 /// it is rendered as a bold prefix on the `content` line for clarity.
+/// Render a grain as an assertion a model can read, not a dump of its row.
+///
+/// The point of `FORMAT markdown` is that the output can be pasted straight
+/// into a prompt, so it says the thing the memory asserts and keeps only the
+/// metadata that changes how much weight to give it. Storage bookkeeping —
+/// namespace, type, raw epochs, the content address — is noise in a prompt and
+/// is left out. This matches the shape the golden renders already pin
+/// (`**john** likes jazz *(0.80, 2026-01-05)*`).
 fn render_grain_markdown(out: &mut String, grain: &CalGrainResult) {
-    if let serde_json::Value::Object(map) = &grain.fields {
-        let relation = map.get("relation").and_then(|v| v.as_str()).unwrap_or("");
+    let serde_json::Value::Object(map) = &grain.fields else {
+        out.push('\n');
+        return;
+    };
+    let get = |k: &str| map.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let (subject, relation, object) = (get("subject"), get("relation"), get("object"));
+    let content = get("content");
+
+    // Each grain type keeps its text under a different key, so look for the
+    // strongest shape available rather than assuming one field.
+    let text = [content, get("body"), get("tool_content"), get("description")]
+        .into_iter()
+        .find(|t| !t.is_empty())
+        .unwrap_or_default();
+    let tool_name = get("tool_name");
+    let skill_name = get("name");
+
+    // The object must be present for this to be a triple. A grain with a
+    // subject and a relation but no object is a message whose relation is the
+    // speaker — matching on subject+relation alone silently dropped its text.
+    let line = if !subject.is_empty() && !relation.is_empty() && !object.is_empty() {
+        // A triple reads as a sentence: subject, then what is claimed of it.
+        format!("**{subject}** {relation} {object}")
+    } else if !content.is_empty() && !relation.is_empty() {
+        // A turn in a conversation: the relation names who said it.
+        format!("**{relation}**: {content}")
+    } else if !tool_name.is_empty() {
+        // Whether the call worked is the whole point of logging it.
+        let failed = map
+            .get("is_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let verb = if failed { "failed" } else { "returned" };
+        if text.is_empty() {
+            format!("**{tool_name}** {verb}")
+        } else {
+            format!("**{tool_name}** {verb}: {text}")
+        }
+    } else if !skill_name.is_empty() {
+        let mut line = format!("**{skill_name}**");
+        if !text.is_empty() {
+            line.push_str(&format!(" — {text}"));
+        }
+        if let Some(p) = map.get("proficiency").and_then(serde_json::Value::as_f64) {
+            let practised = map
+                .get("practice_count")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            line.push_str(&format!(" (proficiency {p:.2}, practised {practised}×)"));
+        }
+        line
+    } else if !subject.is_empty() && !text.is_empty() {
+        // Observations and goals: the subject is what it is about, the text is
+        // what was noticed or intended.
+        let mut line = format!("**{subject}**: {text}");
+        if let Some(state) = map.get("goal_state").and_then(|v| v.as_str()) {
+            let pct = map
+                .get("progress")
+                .and_then(serde_json::Value::as_f64)
+                .map(|p| format!(", {:.0}% done", p * 100.0))
+                .unwrap_or_default();
+            line.push_str(&format!(" ({state}{pct})"));
+        }
+        line
+    } else if !text.is_empty() {
+        // Free-text grains (events) carry the text; the relation is the
+        // speaker or role when there is one.
+        if relation.is_empty() {
+            text.to_string()
+        } else {
+            format!("**{relation}**: {text}")
+        }
+    } else if !subject.is_empty() {
+        format!("**{subject}**")
+    } else {
+        // Nothing triple-shaped and no text — fall back to the fields, so an
+        // unusual grain type still renders something truthful.
+        let mut pairs: Vec<String> = Vec::new();
         for (k, v) in map {
-            let val_str = match v {
-                serde_json::Value::String(s) => s.as_str(),
-                _ => {
-                    out.push_str(&format!("- **{}**: {}\n", k, v));
-                    continue;
-                }
-            };
-            // Prefix content with relation (speaker role) when available.
-            if k == "content" && !relation.is_empty() {
-                out.push_str(&format!("- **{}**: {}\n", relation, val_str));
-            } else {
-                out.push_str(&format!("- **{}**: {}\n", k, val_str));
+            if RENDER_SKIP.contains(&k.as_str()) {
+                continue;
+            }
+            match v {
+                serde_json::Value::String(sv) => pairs.push(format!("{k}: {sv}")),
+                other => pairs.push(format!("{k}: {other}")),
             }
         }
+        pairs.join(", ")
+    };
+
+    // Confidence earns its place only when it is not a plain assertion; a date
+    // is worth carrying because recency changes how a model should weigh it.
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(c) = map.get("confidence").and_then(serde_json::Value::as_f64) {
+        if c < 1.0 {
+            notes.push(format!("{c:.2}"));
+        }
+    }
+    if let Some(day) = map
+        .get("created_at")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(epoch_ms_to_date)
+    {
+        notes.push(day);
+    }
+    if map.get("superseded_by").is_some() {
+        notes.push("superseded".to_string());
+    }
+
+    out.push_str("- ");
+    out.push_str(&line);
+    if !notes.is_empty() {
+        out.push_str(&format!(" *({})*", notes.join(", ")));
     }
     out.push('\n');
+}
+
+/// Storage bookkeeping that never helps a model reason about the memory.
+const RENDER_SKIP: [&str; 8] = [
+    "type",
+    "namespace",
+    "created_at",
+    "confidence",
+    "derived_from",
+    "superseded_by",
+    "observer_id",
+    "observer_type",
+];
+
+/// `2026-01-05` from epoch millis — civil date from days since the epoch, so
+/// this needs no calendar crate and no local timezone.
+fn epoch_ms_to_date(ms: i64) -> Option<String> {
+    if ms <= 0 {
+        return None;
+    }
+    let days = ms.div_euclid(86_400_000);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    Some(format!("{y:04}-{m:02}-{d:02}"))
 }
 
 /// Render a single grain as a text line.
@@ -7410,6 +7945,7 @@ mod tests {
                 score_breakdown: None,
                 explanation: None,
                 is_deterministic: false,
+                contested_by: None,
             }],
             sources: vec![],
             total_tokens: 100,
@@ -7978,6 +8514,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         // String equality.
@@ -8011,6 +8548,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         // Gte
@@ -8060,6 +8598,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         assert!(super::grain_matches_condition(
@@ -8088,6 +8627,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         assert!(super::grain_matches_condition(
@@ -8118,6 +8658,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         // Missing field never matches Eq.
@@ -8329,6 +8870,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         assert!(super::grain_matches_condition(
@@ -8359,6 +8901,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         assert!(super::grain_matches_condition(
@@ -8408,6 +8951,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         assert!(super::grain_matches_condition(
             &grain,
@@ -8455,6 +8999,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let tool_grain = CalGrainResult {
             hash: "h2".into(),
@@ -8464,6 +9009,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
 
         assert!(super::grain_matches_set_condition(&user_grain, set));
@@ -8480,6 +9026,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         assert!(super::grain_matches_condition(
             &grain,
@@ -8720,10 +9267,20 @@ mod tests {
             } => {
                 assert_eq!(format, "markdown");
                 assert_eq!(grain_count, 1);
-                assert!(text.contains("###"), "Markdown should contain heading");
+                // Ungrouped markdown is a flat list of assertions: a `### fact
+                // (hash)` heading above every line is noise in a prompt, which
+                // is what this output is for. Grouped renders keep their
+                // group heading — see the GROUP BY tests.
                 assert!(
-                    text.contains("**subject**"),
-                    "Markdown should contain bold field"
+                    !text.contains("###"),
+                    "ungrouped markdown should not carry per-grain headings, got: {text}"
+                );
+                // The lead of each line is bold — under the old dump that was
+                // the literal field name (`**subject**:`), now it is the value
+                // the line is about, which is what a reader needs.
+                assert!(
+                    text.starts_with("- **"),
+                    "Markdown should render an assertion line, got: {text}"
                 );
             }
             other => panic!("expected Formatted, got: {:?}", other),
@@ -9668,6 +10225,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
     }
 
@@ -9684,6 +10242,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         }
     }
 
@@ -9747,13 +10306,16 @@ mod tests {
     }
 
     #[test]
-    fn test_render_markdown_no_relation_uses_content_key() {
+    fn test_render_markdown_no_relation_names_the_subject() {
         let grain = make_event_grain_result_no_relation("Hello world", "s000");
         let mut out = String::new();
         render_grain_markdown(&mut out, &grain);
+        // With no speaker to name, lead with what the text is about. The old
+        // output led with the literal field name (`**content**:`), which tells
+        // a reader nothing they cannot see.
         assert!(
-            out.contains("- **content**: Hello world"),
-            "Markdown should use 'content' key when no relation, got: {out}"
+            out.contains("- **s000**: Hello world"),
+            "Markdown should name the subject when there is no relation, got: {out}"
         );
     }
 
@@ -9831,6 +10393,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let mut out = String::new();
         render_grain_sml(&mut out, &cgr, "");
@@ -10030,6 +10593,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let semantic_high = CalGrainResult {
             hash: "22".repeat(32),
@@ -10039,6 +10603,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: false,
+            contested_by: None,
         };
         let deterministic = CalGrainResult {
             hash: "33".repeat(32),
@@ -10048,6 +10613,7 @@ mod tests {
             score_breakdown: None,
             explanation: None,
             is_deterministic: true,
+            contested_by: None,
         };
 
         let payload = CalResultPayload::Assembled {

@@ -82,7 +82,7 @@ and internal use but are intentionally not reachable from text — see
 ```
 RECALL <plural> [ABOUT "<free text>"] [WHERE <condition>]
        [RECENT <n>] [SINCE "..."] [UNTIL "..."] [LIKE "..."]
-       [BETWEEN "..." AND "..."] [LIMIT <n>]
+       [BETWEEN "..." AND "..."] [CONTRADICTIONS [OF (<sub-query>)]] [LIMIT <n>]
 ```
 
 ```sql
@@ -91,6 +91,11 @@ RECALL facts WHERE subject = "john" RECENT 5
 RECALL facts ABOUT "seating preferences" LIMIT 10
 RECALL facts LIKE "window"
 ```
+
+`RECALL *` is the explicit spelling of "any grain type" and means exactly the
+same as omitting the type. It is still subject to the anchoring rule below: a
+`*` recall must carry a subject filter or a free-text query, because `*` is not
+a *specific* grain type and `LIMIT`/`RECENT` alone cannot bound an untyped scan.
 
 Every `RECALL` needs a subject filter or a free-text query (`LIKE`/`ABOUT`) —
 a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
@@ -102,6 +107,54 @@ a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
 - `RECENT n` is shorthand for "newest n" (`ORDER BY created_at DESC LIMIT n`).
 - `SINCE` / `UNTIL` / `BETWEEN ... AND ...` are temporal filters accepting
   absolute dates or relative expressions (`"3 days ago"`).
+- `CONTRADICTIONS` keeps only *contested* grains — see below.
+
+##### `CONTRADICTIONS` — what is still disputed
+
+When two writers change the same `(subject, relation)` and later sync, both
+versions survive as live **heads** (a fork — see ARCHITECTURE.md §3). Recall
+then answers with a deterministically-elected *provisional* head, which looks
+like a settled value. `CONTRADICTIONS` asks the opposite question:
+
+```sql
+-- only the grains that are currently contested
+RECALL facts CONTRADICTIONS
+
+-- scoped: contested grains among the keys the sub-query selected
+RECALL facts CONTRADICTIONS OF (RECALL facts WHERE subject = "john")
+```
+
+Each returned grain carries `contested_by` — the hashes of the other live tips
+for its key — so a model can see *what* it disagrees with, not merely that
+something is disputed:
+
+```json
+{ "hash": "ecb1af…", "fields": { "object": "enterprise" },
+  "contested_by": ["ef8c16…"] }
+```
+
+The clause applies **after** every other filter, so it composes with
+`ABOUT`/`WHERE`/`SINCE` rather than overriding them, and **before** `LIMIT`:
+`LIMIT` bounds the contested grains, not the search that found them, so
+`CONTRADICTIONS LIMIT 10` means "ten contested grains" and never "contested
+among the first ten". The candidate scan widens to the executor's `max_limit`
+(1000 by default) rather than stopping at the recall's usual limit.
+
+An empty result is therefore a meaningful answer: nothing in scope is
+contested. The one exception is announced — if the scan itself hit `max_limit`,
+the query carries `CAL-W012` and the empty result covers only the grains it
+managed to examine. Narrow with `WHERE`/`ABOUT`/`SINCE` when you see it.
+
+To keep your normal result set and merely mark the disputed parts of it, use
+[`WITH contradiction_detection`](#5-with-options) instead.
+
+This detects **structural** contradiction — divergent writes to one key. Two
+independently-added facts that merely disagree in meaning ("prefers tea" vs
+"prefers coffee") are not a fork and are not reported here; that is a semantic
+judgement, and belongs to the Waiser verifier (`docs/waiser.md`).
+
+Resolve a fork with `deja merge` (or `DejaDB::merge_heads`), which supersedes
+every tip with one merged grain and records all parents.
 
 Set operations combine `RECALL`s:
 
@@ -169,7 +222,7 @@ WITH dedup(object)
 
 Source labels are plain identifiers; `PRIORITY` labels must match them
 (`CAL-E035`). `ASSEMBLE` is CAL's context-composition statement: it pulls from
-labeled sources (including read-only [facade mounts](../ARCHITECTURE.md#54-assemble-and-facade-mounts),
+labeled sources (including read-only [facade mounts](../ARCHITECTURE.md#55-assemble-and-facade-mounts),
 addressed by the `alias.inner` *namespace string* inside a source's `RECALL` —
 e.g. `WHERE namespace = "org.policies"`), applies per-source token budgets and
 priorities, deduplicates, and renders one budgeted block. `STREAM ASSEMBLE ...` enables
@@ -265,7 +318,8 @@ exists; there is no bulk/user/scope erasure from CAL (see [§8](#8-deletion-narr
 | `DESCRIBE TEMPLATES` / `DESCRIBE QUERIES` | List registered templates / saved queries |
 | `EXPLAIN <query>` | Return a query plan for a statement |
 | `BATCH { stmt1 ; stmt2 ; ... }` | Run several statements as one batch (up to 10 entries; optional labels) |
-| `DEFINE TEMPLATE "name" ... AS "<source>"` | Register a reusable output template |
+| `DEFINE TEMPLATE <name> AS "<source>"` | Register a reusable output template (ELEMENT shorthand) |
+| `DEFINE TEMPLATE <name> [EXTENDS <parent>] HEADER { } ELEMENT { } …` | Register a sectioned template (OMS CAL §10.6) |
 | `DEFINE QUERY "name"($params) AS { body }` | Register a saved, parameterized query |
 | `DROP TEMPLATE "name"` / `DROP QUERY "name"` | Remove a template or saved query |
 | `RUN "name"($p = v, ...)` | Execute a saved query with bindings |
@@ -293,6 +347,19 @@ RUN "session_prompt"($user = "john", $session = "call-42")
 Saved-query limits: 100 per namespace, 8 KiB body, 10 parameters. Saved-query
 bodies get an extra read-only verification pass, so a saved query can never
 smuggle in a write or a blocked keyword.
+
+Saved queries and custom templates are **host metadata carried by the memory
+file**, not memories: they persist as `meta` rows (`qry:<name>`, `tpl:<name>`)
+and so travel with the `.db` — the same set is visible from the CLI, MCP and
+the web console. They are never grains, never content-addressed, and never
+appear in recall results.
+
+An entry the file carries that the running build cannot load — a template
+written before a limit was tightened, a row from a newer version — is skipped
+rather than failing the open, and reported: on stderr from `deja cal` / `repl`
+/ `serve` / `ui` / `hub`, and in `warnings` on `GET /api/config`. It stays in
+the file, so an older or newer build can still read it; overwriting the entry
+is what loses it.
 
 ### 3.4 The `WHERE` clause
 
@@ -356,6 +423,7 @@ representative selection:
 | `WITH multi_hop(2)` | Entity-graph multi-hop retrieval (1–3 hops) |
 | `WITH recency_weight(0.3)` / `WITH min_score(0.6)` | Scoring controls |
 | `WITH conflict_resolution` | Keep only the newest grain per `(subject, relation)` |
+| `WITH contradiction_detection` | Keep everything, but stamp `contested_by` on grains that are live tips of an open fork |
 | `WITH annotate_relative_time` | Add "2 weeks ago"-style labels |
 | `WITH progressive_disclosure(summary)` | OMS progressive-disclosure level |
 
@@ -377,12 +445,64 @@ compiled in) return an honest error rather than silently degrading.
 |---|---|
 | `sml` | Structured Memory Language (compact, Claude-class) |
 | `toon` | TOON compact tabular blocks |
-| `markdown` | Markdown |
+| `markdown` | Markdown — one assertion per line (see below) |
 | `json` | JSON |
 | `yaml` | YAML |
 | `text` / `table` / `csv` / `triples` | Plain text / Markdown table / CSV / `S R O` triples |
-| `preset "<name>"` | A named preset |
-| `template "<source>"` | An inline template (Mustache-subset) |
+| `structured` / `readable` / `compact` / `data` | OMS §10.1 semantic presets — aliases for `sml` / `markdown` / `text` / `json` |
+| `TEMPLATE <name>` | A registered template — **bare** name, quoting makes it a body |
+| `TEMPLATE "<source>"` | An inline template body — **quoted** (ELEMENT shorthand) |
+| `TEMPLATE { ELEMENT { … } }` | Inline sections |
+| `preset "<name>"` | A registered template, older spelling of `TEMPLATE <name>` |
+
+`FORMAT <fmt>` may also be written `AS <fmt>` (§7 `as_clause`), including the
+bracketed multi-format list.
+
+A `TEMPLATE` **name** follows the same rules as the name in
+`DEFINE TEMPLATE <name>`, so words that happen to be CAL keywords
+(`recent`, `scope`, …) work in both places. A *quoted* argument is never a
+name — `FORMAT TEMPLATE "..."` is always an inline body.
+
+### What `markdown` renders
+
+`FORMAT markdown` produces one line per grain, stating what the memory asserts:
+
+```
+- **john** prefers window seat *(0.95, 2026-01-13)*
+- **user**: what's the refund window?
+- **stripe_refund** failed: rate_limited 429
+```
+
+The trailing italics carry only what changes how much weight to give the line —
+confidence when it is below 1.0, the date, and `superseded`. Storage
+bookkeeping (namespace, grain type, raw epochs, the content address) is left
+out: this output exists to be pasted into a prompt, and none of it helps a
+model reason. Use `FORMAT json` when you need the full envelope, or a
+`FORMAT TEMPLATE` to choose the fields yourself. A `GROUP BY` render keeps its
+group headings.
+
+### Template sections and limits
+
+A sectioned template's `ELEMENT` renders once per grain, `ELEMENT_SUMMARY`
+replaces it when the budget squeezes the render below full disclosure, and
+`ELEMENT_OMIT` accounts for grains the budget dropped. `SOURCE_BREAK` goes
+between `ASSEMBLE` sources — not before the first. `HEADER`/`FOOTER` bracket
+the whole render and are the only place `assembly.*` and `budget.*` make
+sense; `source.*` is bound only inside an element run.
+
+Sections you do not define are inherited from `EXTENDS <parent>`, defaulting
+to `readable`. The three preset parents (`structured`, `readable`, `compact`)
+define element-level sections only, so inheriting never adds a header you did
+not ask for. `data` cannot be extended (`CAL-E119`).
+
+| Limit (OMS CAL §10.8) | Value |
+|---|---|
+| Template body | 4096 bytes (`CAL-E040`) |
+| Templates per namespace | 50 (`CAL-E118`) |
+| Conditional nesting | 5 (`CAL-E117`) |
+| `{{#each}}` iterations | 200 — emits `CAL-W011` when it truncates |
+| Template name | 64 chars |
+| Inheritance depth | 1 |
 
 ```sql
 RECALL facts WHERE subject = "john" FORMAT sml
@@ -490,7 +610,7 @@ The parser and executor enforce these hard bounds:
 RECALL facts WHERE subject = "john" AND relation = "prefers" FORMAT sml
 
 -- Count everything in a namespace
-RECALL * WHERE namespace = "caller" | COUNT
+RECALL facts WHERE namespace = "caller" | COUNT
 
 -- Add a fact (REASON is mandatory)
 ADD fact SET subject = "john" SET relation = "allergic_to" SET object = "peanuts"

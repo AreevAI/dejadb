@@ -754,9 +754,75 @@ pub struct DefineTemplateStmt {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub grain_types: Vec<String>,
     /// Template source (Mustache-subset).
+    ///
+    /// For a sectioned body this holds [`TemplateSectionSources::to_source`],
+    /// so everything downstream that persists or displays a template keeps
+    /// working on one canonical text form.
     pub source: String,
+    /// Sectioned body (OMS CAL §10.6). `None` for the `AS "<text>"` form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<TemplateSectionSources>,
     #[serde(skip)]
     pub span: Option<Span>,
+}
+
+/// Raw section bodies of a §10.6 sectioned template.
+///
+/// Held as unparsed text: the AST is syntax and the template engine owns
+/// parsing, which also keeps the JSON-CAL wire form and the persisted form
+/// the same shape. `None` means the section was not written and is inherited
+/// from the parent (§10.7) — distinct from `Some("")`, which deliberately
+/// overrides the parent with nothing.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TemplateSectionSources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_omit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_break: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+}
+
+impl TemplateSectionSources {
+    /// True when no section was written.
+    pub fn is_empty(&self) -> bool {
+        self.header.is_none()
+            && self.element.is_none()
+            && self.element_summary.is_none()
+            && self.element_omit.is_none()
+            && self.source_break.is_none()
+            && self.footer.is_none()
+    }
+
+    /// Render back to canonical CAL section text.
+    ///
+    /// Round-trips through the lexer: it strips exactly one newline of layout
+    /// at each end of a body, which is what this emits.
+    pub fn to_source(&self) -> String {
+        let mut out = String::new();
+        for (kw, body) in [
+            ("HEADER", &self.header),
+            ("ELEMENT", &self.element),
+            ("ELEMENT_SUMMARY", &self.element_summary),
+            ("ELEMENT_OMIT", &self.element_omit),
+            ("SOURCE_BREAK", &self.source_break),
+            ("FOOTER", &self.footer),
+        ] {
+            if let Some(body) = body {
+                out.push_str(kw);
+                out.push_str(" {\n");
+                out.push_str(body);
+                out.push_str("\n}\n");
+            }
+        }
+        out
+    }
 }
 
 /// `DROP TEMPLATE "name"`
@@ -1244,8 +1310,23 @@ pub enum FormatSpec {
         name: String,
     },
     /// A custom template string.
+    ///
+    /// `FORMAT TEMPLATE "<text>"` — an inline template in the §10.6.1
+    /// `ELEMENT` shorthand: the string renders one grain, the engine
+    /// iterates.
     Template {
         template: String,
+    },
+    /// `FORMAT TEMPLATE <name>` — a reference to a registered template.
+    ///
+    /// Distinguished from `Template` by token class, not lookahead: a bare
+    /// identifier is always a name, a quoted string always a body.
+    TemplateRef {
+        name: String,
+    },
+    /// `FORMAT TEMPLATE { HEADER { ... } ELEMENT { ... } }` — inline sections.
+    TemplateInline {
+        sections: TemplateSectionSources,
     },
 }
 
@@ -1263,7 +1344,8 @@ impl FormatSpec {
             Self::Csv => "csv",
             Self::Table => "table",
             Self::Preset { name } => name.as_str(),
-            Self::Template { .. } => "template",
+            Self::TemplateRef { name } => name.as_str(),
+            Self::Template { .. } | Self::TemplateInline { .. } => "template",
         }
     }
 }

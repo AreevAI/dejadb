@@ -343,6 +343,25 @@ pub enum CalError {
         span: Option<Span>,
     },
 
+    // ── Template limits and inheritance, OMS CAL §10.7–§10.8
+    //    (CAL-E117 – CAL-E119) ─────────────────────────────────────────
+    /// CAL-E117 — Template conditional nesting exceeds the §10.8 limit.
+    #[error("CAL-E117: Template nesting too deep (max {max} levels)")]
+    TemplateNestingTooDeep { max: usize, span: Option<Span> },
+
+    /// CAL-E118 — Namespace is at the §10.8 template limit.
+    #[error("CAL-E118: Too many templates ({count}, max {max})")]
+    TooManyTemplates {
+        count: usize,
+        max: usize,
+        span: Option<Span>,
+    },
+
+    /// CAL-E119 — The `data` preset outputs structural JSON, not
+    /// template-driven text, so §10.7 forbids extending it.
+    #[error("CAL-E119: Template \"{name}\" cannot extend the 'data' preset")]
+    CannotExtendData { name: String, span: Option<Span> },
+
     // ── JSON wire format error (CAL-E120) ─────────────────────────────
     /// CAL-E120 — JSON wire format (`application/json+cal`) parse failure.
     #[error("CAL-E120: Invalid JSON+CAL: {detail}")]
@@ -637,6 +656,9 @@ impl CalError {
             Self::LetDepthExceeded { .. } => "CAL-E038",
             Self::CoalesceTooManyBranches { .. } => "CAL-E039",
             Self::AssembleTimeout { .. } => "CAL-E071",
+            Self::TemplateNestingTooDeep { .. } => "CAL-E117",
+            Self::TooManyTemplates { .. } => "CAL-E118",
+            Self::CannotExtendData { .. } => "CAL-E119",
             Self::InvalidJsonCal { .. } => "CAL-E120",
             Self::InvalidUtf8 { .. } => "CAL-E070",
             Self::TemplateTooLarge { .. } => "CAL-E040",
@@ -741,6 +763,9 @@ impl CalError {
             | Self::QueryNotFound { span, .. }
             | Self::DuplicateQueryName { span, .. }
             | Self::TooManyQueries { span, .. }
+            | Self::TemplateNestingTooDeep { span, .. }
+            | Self::TooManyTemplates { span, .. }
+            | Self::CannotExtendData { span, .. }
             | Self::QueryBodyTooLarge { span, .. }
             | Self::TooManyQueryParams { span, .. }
             | Self::MissingQueryParam { span, .. }
@@ -1093,6 +1118,15 @@ impl CalError {
             },
             Self::QueryNotFound { name, .. } => Self::QueryNotFound { name, span: s },
             Self::DuplicateQueryName { name, .. } => Self::DuplicateQueryName { name, span: s },
+            Self::CannotExtendData { name, .. } => Self::CannotExtendData { name, span: s },
+            Self::TemplateNestingTooDeep { max, .. } => {
+                Self::TemplateNestingTooDeep { max, span: s }
+            }
+            Self::TooManyTemplates { count, max, .. } => Self::TooManyTemplates {
+                count,
+                max,
+                span: s,
+            },
             Self::TooManyQueries { count, max, .. } => Self::TooManyQueries {
                 count,
                 max,
@@ -1313,6 +1347,24 @@ pub enum CalWarning {
     /// CAL-W010 — A WHERE field is not a recognized structural filter and
     /// was silently ignored during query execution.
     UnrecognizedWhereField { field: String, span: Option<Span> },
+
+    /// CAL-W011 — A `{{#each}}` block hit the OMS CAL §10.8 iteration cap,
+    /// so the rendered output covers only the first `max` grains. The result
+    /// set itself is complete; only this rendering is short.
+    EachIterationCapped {
+        rendered: usize,
+        total: usize,
+        max: usize,
+    },
+
+    /// CAL-W012 — A `CONTRADICTIONS` query's candidate scan hit the executor's
+    /// `max_limit`, so grains past it were never examined for fork status.
+    ///
+    /// This exists because the useful answer to `CONTRADICTIONS` is often the
+    /// *empty* one, and an agent may act on it. "Nothing is contested" and
+    /// "nothing among the first N is contested" are different claims; without
+    /// this warning the second would be indistinguishable from the first.
+    ContradictionScanBounded { scanned: usize },
 }
 
 impl CalWarning {
@@ -1329,6 +1381,8 @@ impl CalWarning {
             Self::IsCategoryOnNonRelation { .. } => "CAL-W008",
             Self::AssembleUnscopedSource { .. } => "CAL-W009",
             Self::UnrecognizedWhereField { .. } => "CAL-W010",
+            Self::EachIterationCapped { .. } => "CAL-W011",
+            Self::ContradictionScanBounded { .. } => "CAL-W012",
         }
     }
 
@@ -1345,6 +1399,7 @@ impl CalWarning {
             | Self::IsCategoryOnNonRelation { span, .. }
             | Self::AssembleUnscopedSource { span, .. }
             | Self::UnrecognizedWhereField { span, .. } => *span,
+            Self::EachIterationCapped { .. } | Self::ContradictionScanBounded { .. } => None,
         }
     }
 }
@@ -1409,6 +1464,22 @@ impl std::fmt::Display for CalWarning {
                     f,
                     "CAL-W010: WHERE field '{}' is not a recognized structural filter and was ignored",
                     field
+                )
+            }
+            Self::EachIterationCapped {
+                rendered,
+                total,
+                max,
+            } => {
+                write!(
+                    f,
+                    "CAL-W011: {{{{#each}}}} rendered {rendered} of {total} grains (§10.8 caps iteration at {max}) — the result set is complete, this rendering is not"
+                )
+            }
+            Self::ContradictionScanBounded { scanned } => {
+                write!(
+                    f,
+                    "CAL-W012: CONTRADICTIONS examined the first {scanned} matching grains (the executor's max_limit) — grains past that were not checked, so this is not a complete all-clear. Narrow the query with WHERE/ABOUT/SINCE to be sure."
                 )
             }
         }

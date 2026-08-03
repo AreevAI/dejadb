@@ -1,27 +1,3 @@
-### fact (4451640f)
-- **confidence**: 0.95
-- **created_at**: 1768262400000
-- **namespace**: personal
-- **object**: window seat
-- **relation**: prefers
-- **subject**: john
-- **type**: fact
-
-### fact (c8013f4b)
-- **confidence**: 0.9
-- **created_at**: 1768348800000
-- **namespace**: personal
-- **object**: coffee
-- **relation**: prefers
-- **subject**: john
-- **type**: fact
-
-### fact (32ba8886)
-- **confidence**: 0.9
-- **created_at**: 1768176000000
-- **namespace**: work
-- **object**: tea
-- **relation**: prefers
-- **subject**: bob
-- **type**: fact
-
+- **john** prefers window seat *(0.95, 2026-01-13)*
+- **john** prefers coffee *(0.90, 2026-01-14)*
+- **bob** prefers tea *(0.90, 2026-01-12)*
