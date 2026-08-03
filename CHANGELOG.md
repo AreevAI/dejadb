@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-08-04
+
 ### Changed — breaking
 
 - **`FORMAT markdown` renders assertions, not field dumps.** A grain used to
