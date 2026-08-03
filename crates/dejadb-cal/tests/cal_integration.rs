@@ -1467,3 +1467,51 @@ fn merging_a_fork_clears_the_contradiction() {
         "merge closes the fork, so nothing is contested: {after:?}"
     );
 }
+
+/// A `PRIORITY` clause that names some sources gives the unnamed ones weight
+/// 0.0 — a deliberate "this source gets nothing", not a missing entry. Reading
+/// a 0 allocation as "absent" and substituting an even share inverts the clause.
+///
+/// The zero-weight source has to be the one processed *first*: budget is
+/// consumed in source order, so if the funded source runs first it drains
+/// `remaining_budget` and the wrong fallback happens to land on ~0 anyway.
+#[test]
+fn a_zero_priority_source_gets_no_budget() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+    let facade = facade_at(&path);
+
+    for i in 0..8 {
+        ex.execute(
+            &format!(r#"ADD fact SET subject = "alice" SET relation = "r{i}" SET object = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i}" REASON "seed""#),
+            &facade,
+        ).unwrap();
+        ex.execute(
+            &format!(r#"ADD goal SET subject = "alice" SET object = "gggggggggggggggggggggggggggggg{i}" REASON "seed""#),
+            &facade,
+        ).unwrap();
+    }
+
+    // `f` is listed first but PRIORITY funds only `g`, so `f` is the 0-weight
+    // source and is reached while the whole budget is still unspent.
+    let out = ex
+        .execute(
+            r#"ASSEMBLE brief FROM f: (RECALL facts WHERE subject = "alice"), g: (RECALL goals RECENT 8) BUDGET 400 tokens PRIORITY g: 1.0"#,
+            &facade,
+        )
+        .expect("assemble");
+
+    let unfunded = match out.result {
+        CalResultPayload::Assembled { ref sources, .. } => {
+            sources.iter().find(|s| s.label == "f").expect("f source").grain_count
+        }
+        other => panic!("expected Assembled, got: {other:?}"),
+    };
+    // The budget trim always keeps at least one grain, so 1 is the floor an
+    // unfunded source can contribute — more than that means it was funded.
+    assert_eq!(
+        unfunded, 1,
+        "a 0-weight source must not be funded, got {unfunded} grains"
+    );
+}

@@ -230,9 +230,14 @@ impl<'a> AssembleEngine<'a> {
         // Snapshot per-source allocations in source order so the trim loop can
         // take ownership of the grains: `allocations` borrows `labels`, which
         // borrows `source_results`.
-        let per_source: Vec<u32> = labels
+        //
+        // `Option`, not a `u32` with 0 standing in for "absent": a PRIORITY
+        // clause that names some sources gives the rest weight 0.0, and that
+        // zero is a deliberate "this source gets nothing". Only a label with no
+        // entry at all falls back to an even share.
+        let per_source: Vec<Option<u32>> = labels
             .iter()
-            .map(|l| allocations.get(l).copied().unwrap_or(0))
+            .map(|l| allocations.get(l).copied())
             .collect();
         let source_count = source_results.len();
 
@@ -243,10 +248,11 @@ impl<'a> AssembleEngine<'a> {
         let mut dropped = 0usize; // grains the budget forced us to omit
 
         for (i, (label, mut grains)) in source_results.into_iter().enumerate() {
-            let allocated = match per_source.get(i).copied() {
-                Some(a) if a > 0 => a,
-                _ => remaining_budget / source_count.max(1) as u32,
-            };
+            let allocated = per_source
+                .get(i)
+                .copied()
+                .flatten()
+                .unwrap_or(remaining_budget / source_count.max(1) as u32);
 
             // Use the smaller of allocated or remaining budget.
             let effective_allocation = allocated.min(remaining_budget);
