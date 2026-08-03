@@ -6,6 +6,147 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **`FORMAT markdown` renders assertions, not field dumps.** A grain used to
+  render as a `### fact (4451640f)` heading plus one bullet per field
+  (`- **namespace**: personal`, `- **created_at**: 1768262400000`). It now
+  renders as the sentence the memory asserts —
+  `- **john** prefers window seat *(0.95, 2026-01-13)*` — keeping only the
+  metadata that changes how much weight to give it. The point of this format is
+  that its output can be pasted into a prompt, and storage bookkeeping
+  (namespace, grain type, raw epochs, the content address) is noise there.
+  **Anything parsing the old shape must be updated**; use `FORMAT json` for a
+  machine-readable envelope, or a custom `FORMAT TEMPLATE` to pick fields
+  yourself. Grouped renders keep their group heading.
+- **The template body limit is 4 KiB, down from 64 KiB** (OMS CAL §10.8,
+  `CAL-E040`), alongside new caps on nesting (5, `CAL-E117`), templates per
+  file (50, `CAL-E118`) and `{{#each}}` iterations (200, `CAL-W011`). A
+  template already in a memory file that exceeds a limit is **skipped on load
+  rather than failing the open**, and reported — see *Fixed* below.
+- **`FORMAT TEMPLATE "<text>"` goes through the template engine.** It used to
+  be naive string substitution that replaced `{{any_field}}` with whatever the
+  grain's JSON held, silently ignoring filters, conditionals and the closed
+  variable set. It is now parsed and validated like any other template, so a
+  variable outside that set is an error instead of a silent blank, and filters
+  and conditionals work. Inline bodies referring to fields that were never
+  valid template variables will now fail loudly.
+
+### Added
+
+- **Sectioned templates and the §10.5 variable namespaces (OMS CAL §10.5–§10.8).**
+  `DEFINE TEMPLATE <name> [EXTENDS <parent>] HEADER { … } ELEMENT { … }
+  ELEMENT_SUMMARY { … } ELEMENT_OMIT { … } SOURCE_BREAK { … } FOOTER { … }`
+  inverts who drives iteration: the engine walks the grains, which is what lets
+  it pick a different body per grain and interleave `SOURCE_BREAK` between
+  `ASSEMBLE` sources. Section bodies are captured raw by the lexer, so a
+  template may contain prose that is not CAL (`don't`, a lone quote, a word
+  that happens to be a keyword). Sections you do not define are inherited from
+  `EXTENDS`, defaulting to `readable`; `data` cannot be extended (`CAL-E119`).
+  Adds `{{grain.*}}`, `{{assembly.*}}`, `{{source.*}}`, `{{budget.*}}`,
+  `{{disclosure.level}}`, the §10.3.2 content-projection model,
+  `humanize()` on relations, and relative-time rendering.
+- **New `FORMAT` spellings.** `FORMAT TEMPLATE <name>` (registered),
+  `FORMAT TEMPLATE "<text>"` (inline `ELEMENT` shorthand), `FORMAT TEMPLATE
+  { … }` (inline sections); the §10.1 semantic presets `structured` /
+  `readable` / `compact` / `data` as aliases for `sml` / `markdown` / `text` /
+  `json`; `AS <format>` as a synonym for `FORMAT <format>` (§7 `as_clause`);
+  and `RECALL *` as the explicit spelling of "any grain type".
+- **Saved queries and custom templates persist in the memory file.** They ride
+  the `meta` table as `qry:<name>` / `tpl:<name>` rows — host metadata, not
+  memories: never grains, never content-addressed, never returned by recall.
+  They travel with the `.db`, so the CLI, MCP and console see one set.
+  New `DejaDB::meta_scan/meta_put/meta_delete`; `DEFINE`/`RUN` join
+  `CalCapabilities::supported_statements`.
+- **`CONTRADICTIONS` is wired to the executor — an agent can now ask what it
+  holds that is still disputed.** When two writers change the same
+  `(subject, relation)` and later sync, both versions survive as live heads and
+  recall answers with a deterministically-elected *provisional* head — a value
+  that looks settled but isn't. Finding those forks previously required an
+  operator to run `deja forks`. Two CAL surfaces now expose it in-query:
+  `RECALL … CONTRADICTIONS` returns **only** contested grains, optionally scoped
+  by an `OF (sub-query)` tail; `WITH contradiction_detection` returns the normal
+  result set with the disputed parts marked. Both stamp `contested_by` on each
+  grain — the hashes of the other live tips — so a model sees *what* disagrees,
+  not merely that something does. The clause applies after every other filter,
+  so it composes with `ABOUT`/`WHERE`/`SINCE`. Costs one
+  `GROUP BY … HAVING COUNT(*) > 1` over `heads` per query and only when asked
+  for, leaving the microsecond recall path untouched; fail-open like the rest of
+  recall, except that a *filtering* query yields nothing rather than a false
+  all-clear. Reaches every surface that speaks CAL (`deja cal`, the MCP
+  `dejadb_cal` tool, the console, both bindings). Detects **structural**
+  contradiction only — semantically incompatible facts that were never forked
+  remain Waiser's job. New `CalStoreFacade::open_forks()` (default: no forks) and
+  `store_types::ForkGroupInfo`. Covered by ten end-to-end tests in
+  `crates/dejadb-cal/tests/cal_integration.rs`.
+- **`deja hub`** — the sync hub (`dejad`) as a CLI verb: many apps, one shared
+  memory, segment push/pull, default `127.0.0.1:7438`. Unlike the console this
+  is a network service by construction, so `--token-env` is **mandatory** and a
+  non-loopback bind still needs `--allow-remote`. Segment reads are gated too,
+  not just pushes; a pushed segment can only ever *add* grains.
+- **A redesigned web console** for non-technical reviewers: a plain-language
+  memory browser with an interactive graph, the Waiser review queue, a CAL
+  workbench (cards, table, graph, formats, history, saved queries), and a
+  Developer-mode toggle that reveals hashes, the op log and CAL. Still one
+  embedded `console.html` with no build step.
+- **`dejadb.helpers`**, shipped inside the Python wheel: `fresh`, `facts` /
+  `show_facts`, `recs` / `show_recs`, `audit`, `outcomes`, `days_later`
+  (a context manager over the `WAISER_NOW_MS` clock-pin seam), `auto_model`
+  and `bar`. Imported explicitly — the core surface is still exactly the native
+  class. `dejadb-py` moves to maturin's mixed layout, so the native module is
+  now `dejadb.dejadb`; `import dejadb` is unchanged.
+- **Six Colab notebooks** under `examples/colab/` — the full tour plus five
+  business-scenario walkthroughs — each executed end to end with outputs baked
+  in. They require `dejadb >= 1.0.4` for the helpers.
+- New error codes: `CAL-E117` (template nesting), `CAL-E118` (templates per
+  file), `CAL-E119` (cannot extend `data`), `CAL-W011` (`{{#each}}` cap),
+  `CAL-W012` (bounded `CONTRADICTIONS` scan).
+
+### Fixed
+
+- **`CONTRADICTIONS` no longer answers "nothing is contested" about a memory
+  that is.** The clause filters after recall, so the recall's `LIMIT` — 50 by
+  default — also bounded which forks could be seen: a fork sitting below the
+  newest 50 grains was invisible, and the query returned a clean-looking empty
+  result. The candidate scan now widens to the executor's `max_limit`, `LIMIT`
+  applies to the *contested* grains rather than to the search for them, and a
+  scan that still hits the ceiling is announced as `CAL-W012` — this is the one
+  clause whose empty answer an agent is meant to trust.
+- **`CONTRADICTIONS OF (...)` no longer leaks across namespaces.** A fork is
+  keyed `(namespace, subject, relation)`; the scope set was keyed on
+  `(subject, relation)`, so an unrelated grain in another namespace sharing the
+  pair pulled a fork into scope.
+- **Single-source `ASSEMBLE … FORMAT` binds the assembly variables.** It
+  rendered with an empty plan, so `{{assembly.*}}`, `{{source.*}}`,
+  `{{budget.*}}` and `ELEMENT_OMIT` came back blank — populated on the
+  multi-source path and silently empty here. (`budget.unit` reports `grains` on
+  this path, which is what it budgets by.)
+- **A saved query or template the file carries but this build cannot load is
+  reported, not silently dropped.** Skipping one bad row is right — it must not
+  make the memory unusable — but it is now surfaced through `GET /api/config`
+  and on stderr from `deja cal` / `repl` / `serve` / `ui` / `hub`, so a
+  shrinking set of saved queries is something you are told about.
+- **A template's `FOR` clause survives a reopen.** It was written to the file
+  and then dropped on the way back in.
+- `DROP QUERY` / `DROP TEMPLATE` roll the in-memory registry back when the file
+  write fails, so it never runs ahead of what is persisted — matching what
+  `DEFINE` already did.
+- A template rendered twice in the same second no longer costs a write
+  transaction per render on the read path (`last_run_at` has one-second
+  resolution, so the second write stored what was already there).
+- `humanize()` time buckets only ever coarsen with age: 29 days read as
+  "4w ago" and 31 days as "31d ago"; the 30-day-to-a-year bucket is now months.
+- `DejaDB::meta_scan` escapes `%` and `_` in its prefix, so a prefix containing
+  a `LIKE` wildcard cannot match rows it does not own.
+- `dejadb.helpers.fresh` removes exactly the memory file and its known
+  sidecars. It globbed on the name as a prefix, so `fresh("h.db")` also deleted
+  a neighbouring `h.db.backup` — and `rmtree`'d a neighbouring directory.
+- `dejadb.helpers.days_later` restores a pre-existing `WAISER_NOW_MS` instead
+  of unsetting it, so the context manager nests.
+- An `ASSEMBLE` no longer holds a second copy of its whole result set: the
+  budget trim splits the grains it already owns instead of cloning both the
+  kept prefix and the dropped tail.
+
 ## [1.0.3] - 2026-08-01
 
 ### Added
