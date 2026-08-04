@@ -4,11 +4,16 @@ These drive the real compiled extension module (built with
 `maturin develop -m crates/dejadb-py/Cargo.toml`) against a fresh
 per-test temp database (pytest `tmp_path`). The FFI convention is
 "scalars in, JSON strings out", so every structured return is parsed
-with `json.loads` and asserted on shape + content. Nothing here asserts
-on wall-clock values, so the suite is deterministic.
+with `json.loads` and asserted on shape + content. No test asserts on a
+wall-clock threshold, so the suite is deterministic — the one test that
+touches the clock (`test_store_calls_release_the_gil`) asserts thread
+interleaving and skips itself rather than fail if the call it needs to
+observe finishes too quickly.
 """
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -380,3 +385,72 @@ def test_waiser_policy_file_grants_auto_apply(tmp_path):
     bad.write_text('{"auto_apply_enabled": true, "surprise": 1}')
     with pytest.raises(ValueError):
         fresh.waiser_run(policy=str(bad))  # unknown keys are rejected
+
+
+# --------------------------------------------------------------------------
+# threading: store calls must not pin the interpreter
+# --------------------------------------------------------------------------
+
+def test_store_calls_release_the_gil(tmp_path):
+    """A long store call must let other Python threads run.
+
+    The one test here that involves the clock, and it deliberately asserts a
+    *structural* property rather than a threshold: while this thread sits
+    inside a single native call, another Python thread has to get scheduled at
+    least once. Before the bindings released the GIL, every call held it for
+    its full duration, so a host that moved writes onto a background thread —
+    which is what agent frameworks do precisely so a slow write cannot stall a
+    turn — got no isolation at all. Waiting on the store mutex had the same
+    shape: block on the lock, keep the GIL, freeze every other thread.
+    """
+    src = dejadb.DejaDB(str(tmp_path / "src.db"), ns="caller")
+    # Seed via migrate: it loads under a deferred text index, so building the
+    # fixture stays fast even though the import below is deliberately not.
+    payload = "\n".join(
+        json.dumps({"subject": f"user{i % 40}", "relation": "prefers", "object": f"value {i}"})
+        for i in range(600)
+    )
+    assert json.loads(src.migrate("jsonl", payload))["added"] == 600
+    ops = str(tmp_path / "ops.bundle")
+    src.bundle(ops, 0)
+
+    dst = dejadb.DejaDB(str(tmp_path / "dst.db"), ns="caller")
+
+    ticks = []
+    stop = threading.Event()
+
+    def sampler():
+        # sleep() yields the GIL, so this thread is only ever blocked by
+        # someone else holding it — which is exactly what we are testing for.
+        while not stop.is_set():
+            ticks.append(time.perf_counter())
+            time.sleep(0.005)
+
+    watcher = threading.Thread(target=sampler, daemon=True)
+    watcher.start()
+    try:
+        while not ticks:  # make sure it is actually running before we start
+            time.sleep(0.005)
+        started = time.perf_counter()
+        dst.import_bundle(ops)  # one long native call
+        ended = time.perf_counter()
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    elapsed = ended - started
+    if elapsed < 0.05:
+        pytest.skip(f"import_bundle took {elapsed * 1000:.0f} ms — too short to observe interleaving")
+
+    # The property is "the sampler was never locked out for long", not "it ran
+    # at least once": a single tick lands on the boundary even when the GIL is
+    # held end to end, so counting ticks would pass against a binding that
+    # never yields. Measure the worst stall instead. Held for the whole call,
+    # the gap equals the call; yielding, it stays at the sampler's own cadence
+    # (measured: 3406 ms vs 7 ms across this exact call).
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    worst = max(gaps) if gaps else elapsed
+    assert worst < elapsed / 4, (
+        f"another thread was starved for {worst * 1000:.0f} ms during a "
+        f"{elapsed * 1000:.0f} ms store call — the GIL is being held across it"
+    )

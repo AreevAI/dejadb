@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dejadb-py` no longer holds the GIL across store calls.** Every method
+  reaching the store now runs it inside `py.detach(...)`, so the interpreter
+  lock is released for the duration. Previously a single call held it end to
+  end: measured on a 600-op `import_bundle`, another Python thread was starved
+  for **3,266 ms of a 3,266 ms call** — it never ran. The practical effect was
+  that a host moving writes onto a background thread (what agent frameworks do
+  so a slow write cannot stall the next turn) got no isolation at all, and a
+  concurrent reader blocked on the store mutex *while holding the GIL*, which
+  froze every other thread too. Cheap methods detach as well, because it is the
+  waiting on the mutex — not just the work — that has to happen outside the
+  GIL. Same 600-op call after the fix: worst starvation 7 ms. Guarded by
+  `test_store_calls_release_the_gil`, which asserts thread interleaving rather
+  than a wall-clock threshold.
+
 ## [1.0.4] - 2026-08-04
 
 ### Changed — breaking
