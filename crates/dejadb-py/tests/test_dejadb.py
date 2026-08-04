@@ -454,3 +454,72 @@ def test_store_calls_release_the_gil(tmp_path):
         f"another thread was starved for {worst * 1000:.0f} ms during a "
         f"{elapsed * 1000:.0f} ms store call — the GIL is being held across it"
     )
+
+
+# --------------------------------------------------------------------------
+# index_text, add_batch, search
+# --------------------------------------------------------------------------
+
+def test_index_text_defaults_to_the_file_declaration(tmp_path):
+    path = str(tmp_path / "decl.db")
+    # Explicit -> deliberate re-stamp, no warning on a file with no prior claim.
+    off = dejadb.DejaDB(path, ns="caller", index_text=False)
+    assert json.loads(off.open_warnings()) == []
+    del off
+
+    # Bare reopen honors what the file declares, silently.
+    bare = dejadb.DejaDB(path, ns="caller")
+    assert json.loads(bare.open_warnings()) == []
+    del bare
+
+    # Flipping it back on is a change the operator should see, not discover.
+    on = dejadb.DejaDB(path, ns="caller", index_text=True)
+    warnings = json.loads(on.open_warnings())
+    assert any("text_index" in w for w in warnings), warnings
+
+
+def test_search_finds_by_free_text(tmp_path):
+    m = make_db(tmp_path)
+    m.add_fact("john", "prefers", "window seat")
+    m.add_fact("mary", "prefers", "aisle seat")
+
+    hits = json.loads(m.search("window"))
+    assert [h["fields"]["object"] for h in hits] == ["window seat"]
+    assert len(hits[0]["hash"]) == HEX64
+
+    # Anchoring narrows without losing the free-text leg.
+    assert json.loads(m.search("seat", subject="mary"))[0]["fields"]["subject"] == "mary"
+
+
+def test_search_without_any_leg_raises_rather_than_answering_empty(tmp_path):
+    # No BM25 index and no embedder: there is nothing to rank on. Returning []
+    # would read as "no matching memories", which is a wrong answer rather than
+    # an empty one.
+    m = dejadb.DejaDB(str(tmp_path / "noleg.db"), ns="caller", index_text=False)
+    m.add_fact("john", "prefers", "window seat")
+    assert json.loads(m.recall("john"))  # structural recall still works
+    with pytest.raises(ValueError, match="text or vector leg"):
+        m.search("window")
+
+
+def test_add_batch_roundtrip(tmp_path):
+    m = make_db(tmp_path)
+    hashes = json.loads(m.add_batch(json.dumps([
+        {"grain_type": "fact", "fields": {"subject": "ann", "relation": "likes", "object": "tea"}},
+        {"type": "fact", "fields": {"subject": "bob", "relation": "likes", "object": "coffee"}},
+    ])))
+    assert len(hashes) == 2
+    assert all(len(h) == HEX64 for h in hashes)
+    assert json.loads(m.recall("ann"))[0]["fields"]["object"] == "tea"
+    assert json.loads(m.recall("bob"))[0]["fields"]["object"] == "coffee"
+
+
+def test_add_batch_rejects_the_whole_call_and_writes_nothing(tmp_path):
+    m = make_db(tmp_path)
+    before = json.loads(m.stats())["grains"]
+    with pytest.raises(ValueError):
+        m.add_batch(json.dumps([
+            {"grain_type": "fact", "fields": {"subject": "ann", "relation": "likes", "object": "tea"}},
+            {"grain_type": "fact"},  # no fields -> the batch is refused
+        ]))
+    assert json.loads(m.stats())["grains"] == before

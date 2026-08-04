@@ -2950,7 +2950,15 @@ impl CalExecutor {
                 let mut index_usage = Vec::new();
                 let mut filters = Vec::new();
 
-                if recall.about.is_some() {
+                // `LIKE` and `ABOUT` are the same free-text leg at execution —
+                // both set `RecallParams::query` (see `build_recall_params`).
+                // Reporting only `ABOUT` made EXPLAIN describe a `LIKE` recall
+                // as a structural `O(n) full scan` with no index, which is the
+                // opposite of what it runs. A planner that misreports is worse
+                // than one that says nothing.
+                let free_text = recall.about.is_some() || recall.like.is_some();
+
+                if free_text {
                     index_usage.push("bm25_fts".to_string());
                 }
 
@@ -2970,14 +2978,13 @@ impl CalExecutor {
                 }
 
                 // S-5: list filter names only, not values.
-                let routing =
-                    if recall.about.is_some() && !index_usage.contains(&"hexastore".to_string()) {
-                        "bm25".to_string()
-                    } else if recall.about.is_some() {
-                        "hybrid_rrf".to_string()
-                    } else {
-                        "structural".to_string()
-                    };
+                let routing = if free_text && !index_usage.contains(&"hexastore".to_string()) {
+                    "bm25".to_string()
+                } else if free_text {
+                    "hybrid_rrf".to_string()
+                } else {
+                    "structural".to_string()
+                };
 
                 (gt, routing, index_usage, filters)
             }
@@ -6548,6 +6555,38 @@ mod tests {
             }
             other => panic!("unexpected: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_explain_reports_like_as_the_bm25_leg_it_runs() {
+        // `LIKE` and `ABOUT` both set `RecallParams::query` and execute the
+        // same free-text leg, but the plan was derived from `ABOUT` alone, so
+        // a `LIKE` recall was described as a structural `O(n) full scan` over
+        // no index — the opposite of what it does. Both spellings must report
+        // the same plan.
+        let store = MockStore::empty();
+        let ex = exec();
+        let plan_of = |q: &str| match ex.execute(q, &store).unwrap().result {
+            CalResultPayload::Explain { plan } => plan,
+            other => panic!("unexpected: {:?}", other),
+        };
+
+        let like = plan_of(r#"EXPLAIN RECALL facts LIKE "window""#);
+        assert_eq!(like.query_routing, "bm25");
+        assert!(like.index_usage.contains(&"bm25_fts".to_string()));
+        assert!(
+            like.estimated_cost.starts_with("O(log n)"),
+            "LIKE must not be reported as a full scan, got: {}",
+            like.estimated_cost
+        );
+
+        let about = plan_of(r#"EXPLAIN RECALL facts ABOUT "window""#);
+        assert_eq!(like.query_routing, about.query_routing);
+        assert_eq!(like.index_usage, about.index_usage);
+
+        // Anchored, the same free text is the hybrid path for either spelling.
+        let anchored = plan_of(r#"EXPLAIN RECALL facts LIKE "window" WHERE subject = "john""#);
+        assert_eq!(anchored.query_routing, "hybrid_rrf");
     }
 
     // -----------------------------------------------------------------------

@@ -6,7 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`DejaDB(..., index_text=True|False)` in the Python binding**, matching the
+  CLI's `--index-text`. Left unset, the file's own declaration still wins;
+  passed explicitly it is a deliberate re-stamp and the change is reported via
+  `open_warnings()`. Turning it off is how a host trades the BM25 leg for write
+  latency that does not grow with the file — measured 300 writes in 98 ms with
+  it off, against a per-write cost that climbs past 60 ms at 4k grains with it
+  on (tursodatabase/turso#8170). Previously Python could only take the file
+  default.
+- **`search(query, subject=None, relation=None, k=10)` in the Python binding** —
+  free-text recall over the BM25 and vector legs, fused with the structural leg
+  when anchored. The same path as `deja search` and CAL's `RECALL ... ABOUT`.
+  `recall()` needs a subject you already have; reaching this otherwise meant
+  hand-writing CAL. With **neither** leg available it raises rather than
+  returning `[]`, which would read as "no matching memories" when the truth is
+  that the file cannot answer free-text queries at all.
+- **`add_batch(grains_json)` in the Python binding** and `cal_add_batch` on
+  `DejaDbFacade` — many grains in one store transaction, validated up front so
+  a malformed entry writes nothing. Worth ~1.6x over one-at-a-time adds (244 ->
+  148 µs/grain at 2k grains), saturating around a batch of 10, and **only with
+  the text index off**: with it on, per-row index cost swamps batching entirely
+  (~17 ms/grain at every batch size). For another system's export, `migrate()`
+  remains the better path — it already defers and rebuilds the index.
+
 ### Fixed
+
+- **`EXPLAIN` no longer misreports a `LIKE` recall.** `LIKE` and `ABOUT` are the
+  same free-text leg at execution — both set the recall's single query — but the
+  plan was derived from `ABOUT` alone, so `EXPLAIN RECALL facts LIKE "x"`
+  described a structural `O(n) full scan` over no index while actually running
+  BM25. Both spellings now report the same plan (`bm25`, or `hybrid_rrf` when
+  anchored). A planner that misreports is worse than one that says nothing.
+  `cal-reference.md` now states outright that `LIKE` is `ABOUT` spelled for the
+  SQL-familiar, not a substring filter.
 
 - **`dejadb-py` no longer holds the GIL across store calls.** Every method
   reaching the store now runs it inside `py.detach(...)`, so the interpreter

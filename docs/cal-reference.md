@@ -103,6 +103,11 @@ a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
 - `ABOUT "..."` runs semantic/free-text search (requires a full-text and/or
   vector leg; without them it returns a clear "unsupported" result rather than
   wrong data).
+- `LIKE "..."` is the **same free-text leg as `ABOUT`**, spelled for the
+  SQL-familiar — not a substring or wildcard filter, and not a separate scan.
+  Both set the one free-text query the recall takes, so the two cannot be
+  combined in a single `RECALL` (the parser rejects it). Use `WHERE ... =` for
+  exact structured matching.
 - `WHERE` is a structured filter (see [§3.4](#34-the-where-clause)).
 - `RECENT n` is shorthand for "newest n" (`ORDER BY created_at DESC LIMIT n`).
 - `SINCE` / `UNTIL` / `BETWEEN ... AND ...` are temporal filters accepting

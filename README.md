@@ -302,9 +302,17 @@ db.add(&Fact::new("john", "prefers", "dark mode"))?;
 import dejadb, json
 m = dejadb.DejaDB("john.db", ns="caller")
 m.add_fact("john", "prefers", "tea", confidence=0.95)
+m.recall("john")                     # JSON string, newest-first — needs a subject
+m.search("hot drinks", k=5)          # free text, when you don't have one
 m.cal('RECALL facts WHERE subject = "john"')
 m.memory_tool(json.dumps({"command": "view", "path": "/memories"}))  # Anthropic memory-tool backend
 ```
+
+`DejaDB(..., index_text=False)` turns the BM25 index off for this file (a
+deliberate re-stamp, reported by `open_warnings()`). That trades `search()`'s
+text leg — keep it working by installing an embedder — for write latency that
+stays flat as the file grows. `add_batch(...)` writes many grains in one
+transaction; to load another system's export, prefer `migrate()`.
 
 ### Node
 

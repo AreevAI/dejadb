@@ -110,7 +110,8 @@ struct DejaDB {
 #[pymethods]
 impl DejaDB {
     #[new]
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string()))]
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None))]
     fn new(
         py: Python<'_>,
         path: String,
@@ -118,6 +119,7 @@ impl DejaDB {
         passphrase: Option<String>,
         actor: String,
         telemetry: String,
+        index_text: Option<bool>,
     ) -> PyResult<Self> {
         // Recall-telemetry sidecar (host capability, §8): agents are the main
         // telemetry producers, so the binding default is `aggregate`; pass
@@ -130,10 +132,32 @@ impl DejaDB {
         // Opening builds the schema, creates indexes and loads the dictionary —
         // a bounded but real amount of I/O, and the one call a host is most
         // likely to make while other threads are already running.
+        //
+        // `index_text` follows the CLI's `--index-text`: left unset, the file's
+        // own declaration wins (the file-truth path). Passed explicitly it is a
+        // deliberate re-stamp, and the change is reported via `open_warnings()`.
+        // Turning it off is how a host trades the BM25 leg for flat write
+        // latency — with the index on, every write pays a cost that grows with
+        // the file (tursodatabase/turso#8170).
         let store = py
-            .detach(|| match passphrase {
-                Some(p) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
-                None => RustDejaDB::open_with_telemetry(&path, tel),
+            .detach(|| match (index_text, passphrase) {
+                (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
+                (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
+                (Some(want_text), pass) => {
+                    let key = match pass {
+                        Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
+                        None => None,
+                    };
+                    RustDejaDB::open_with(
+                        &path,
+                        dejadb_store::DejaDbOptions {
+                            index_text: want_text,
+                            encryption_key: key,
+                            telemetry: tel,
+                            ..dejadb_store::DejaDbOptions::default()
+                        },
+                    )
+                }
             })
             .map_err(err)?;
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
@@ -273,6 +297,108 @@ impl DejaDB {
             .or_insert_with(|| json!(ns.unwrap_or_else(|| self.ns.clone())));
         py.detach(|| self.facade.cal_add(&grain_type, &fields).map(|h| h.to_hex()))
             .map_err(err)
+    }
+
+    /// Add many grains in one store transaction. `grains_json` is a JSON list
+    /// of `{"grain_type": "fact", "fields": {...}}` objects (`"type"` is
+    /// accepted for `"grain_type"`); each `fields` object is validated exactly
+    /// as `add()` validates its own, so one malformed entry fails the call and
+    /// writes nothing. Returns a JSON list of hashes, in input order.
+    ///
+    /// Worth ~1.6x over the same grains through `add()` one at a time, and
+    /// only when the BM25 text index is off — with it on, per-row index cost
+    /// swamps any batching (see `index_text` on the constructor). For loading
+    /// another system's export, prefer `migrate()`, which already defers and
+    /// rebuilds the index around the load.
+    #[pyo3(signature = (grains_json, ns = None))]
+    fn add_batch(&self, py: Python<'_>, grains_json: String, ns: Option<String>) -> PyResult<String> {
+        let items: Vec<serde_json::Value> = serde_json::from_str(&grains_json).map_err(err)?;
+        let default_ns = ns.unwrap_or_else(|| self.ns.clone());
+        let mut entries = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let grain_type = item
+                .get("grain_type")
+                .or_else(|| item.get("type"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| err(format!("grain {i}: missing 'grain_type'")))?
+                .to_string();
+            let mut fields = item
+                .get("fields")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .ok_or_else(|| err(format!("grain {i}: missing 'fields' object")))?;
+            fields
+                .entry("namespace".to_string())
+                .or_insert_with(|| json!(default_ns));
+            entries.push((grain_type, fields));
+        }
+        let hashes = py
+            .detach(|| self.facade.cal_add_batch(&entries))
+            .map_err(err)?;
+        let out: Vec<String> = hashes.iter().map(|h| h.to_hex()).collect();
+        serde_json::to_string(&out).map_err(err)
+    }
+
+    /// Free-text recall over the BM25 (and vector, when an embedder is
+    /// installed) legs, fused with the structural leg when `subject` or
+    /// `relation` is given — the same path as the CLI's `deja search` and as
+    /// CAL's `RECALL ... ABOUT "..."`. Returns a JSON list string shaped like
+    /// `recall()`.
+    ///
+    /// This is what a per-turn agent host wants for "what do I know that
+    /// relates to what the user just said": `recall()` needs a subject you
+    /// already know, and getting here otherwise meant hand-writing CAL.
+    #[pyo3(signature = (query, subject = None, relation = None, k = 10, ns = None))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: String,
+        subject: Option<String>,
+        relation: Option<String>,
+        k: usize,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        // With neither leg available there is nothing to rank on, and
+        // `recall_hybrid` answers with an empty list — which reads as "you
+        // have no matching memories" when the truth is "this file cannot
+        // answer free-text queries at all". Say which.
+        let (has_text, has_vec) = py.detach(|| {
+            self.facade
+                .with_store(|m| (m.index_text_enabled(), m.embedder_dim().is_some()))
+        });
+        if !has_text && !has_vec {
+            return Err(err(
+                "search() needs a text or vector leg: this file has the BM25 index off \
+                 (index_text=False) and no embedder installed — reopen with \
+                 index_text=True, or call set_embedder()/set_embedder_command()",
+            ));
+        }
+        let grains = py
+            .detach(|| {
+                self.facade.with_store(|m| {
+                    m.recall_hybrid(
+                        &ns,
+                        subject.as_deref(),
+                        relation.as_deref(),
+                        Some(&query),
+                        k,
+                        None,
+                    )
+                })
+            })
+            .map_err(err)?;
+        let out: Vec<serde_json::Value> = grains
+            .iter()
+            .map(|g| {
+                json!({
+                    "hash": g.hash.to_hex(),
+                    "type": format!("{:?}", g.grain_type).to_lowercase(),
+                    "fields": g.fields,
+                })
+            })
+            .collect();
+        serde_json::to_string(&out).map_err(err)
     }
 
     /// Structural recall, newest-first. Returns a JSON list string.
