@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **Every `dejadb` Node method now returns a promise.** They used to run inline
+  on the thread calling into the addon — which in Node is the thread running
+  everything else — so a single `migrate` or `importBundle` held the event loop
+  for its whole duration and timers, sockets and any HTTP server in the process
+  stopped until it returned. Store calls now run on libuv's thread pool.
+  Measured on a 400-record `migrate`: a 5 ms timer fires **263 times** during
+  the call; before, it could not fire at all.
+
+  **Every call site needs `await`** (or `.then`), and errors arrive as
+  rejections rather than throws. The constructor stays synchronous, so opening a
+  file still fails at the line that opened it. One trap worth stating outright:
+  promises settle in completion order, not call order, and concurrent calls
+  contend for one lock inside the store — **await your writes** before the read
+  that expects to see them.
+
+  This is a major-version change for the npm package; the Rust, Python and CLI
+  surfaces are untouched.
+
 ### Changed
 
 - **The BM25 leg is now DejaDB's own inverted index, not Turso's `USING fts`.**

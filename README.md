@@ -320,11 +320,16 @@ transaction; to load another system's export, prefer `migrate()`.
 const { DejaDb } = require('dejadb')
 
 const mem = new DejaDb('john.db', 'caller')                  // 3rd arg: passphrase for AES-256 at rest
-mem.addFact('john', 'prefers', 'tea', 0.95)
-mem.recall('john')                                           // JSON string, newest-first
-mem.cal('RECALL facts WHERE subject = "john"')
-mem.memoryTool('{"command": "view", "path": "/memories"}')  // Anthropic memory-tool backend
+await mem.addFact('john', 'prefers', 'tea', 0.95)
+await mem.recall('john')                                     // JSON string, newest-first
+await mem.cal('RECALL facts WHERE subject = "john"')
+await mem.memoryTool('{"command": "view", "path": "/memories"}')  // Anthropic memory-tool backend
 ```
+
+Every method returns a promise — store calls run on libuv's thread pool rather
+than blocking the event loop. The constructor is the exception, so opening a
+file still fails at the line that opened it. **Await your writes**: promises
+settle in completion order, not call order.
 
 ### Encryption at rest
 
