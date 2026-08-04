@@ -1,6 +1,6 @@
 {
   "name": "dejadb",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Node.js bindings for DejaDB, the embedded memory engine for AI agents.",
   "license": "MIT OR Apache-2.0",
   "author": "MindGryd Software Private Limited",

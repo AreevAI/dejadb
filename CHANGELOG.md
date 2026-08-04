@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-08-04
+
+> **Node users: this release breaks every call site.** `dejadb` on npm went
+> from synchronous methods to promises, so `mem.recall(...)` now returns a
+> `Promise<string>` rather than a string and existing code fails at runtime
+> (typically `JSON.parse` on a promise). Add `await` — see the first entry
+> below. Shipped as a patch version to keep all three registries aligned, so a
+> `^1.0.4` range will pick it up; pin `1.0.4` if you are not ready. The Rust,
+> Python and CLI surfaces are unaffected.
+
 ### Changed — breaking
 
 - **Every `dejadb` Node method now returns a promise.** They used to run inline

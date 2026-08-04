@@ -578,7 +578,7 @@ checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "dejadb-cal"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "dejadb-core",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-context"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "dejadb-cal",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "hex",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-js"
-version = "1.0.3"
+version = "1.0.5"
 dependencies = [
  "dejadb-cal",
  "dejadb-context",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-llm"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-store"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "argon2",
  "dejadb-core",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-waiser"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "dejadb-cal",
  "dejadb-core",
@@ -3189,7 +3189,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waiser"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "serde",
  "serde_json",
