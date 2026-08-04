@@ -6,6 +6,113 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **Every `dejadb` Node method now returns a promise.** They used to run inline
+  on the thread calling into the addon — which in Node is the thread running
+  everything else — so a single `migrate` or `importBundle` held the event loop
+  for its whole duration and timers, sockets and any HTTP server in the process
+  stopped until it returned. Store calls now run on libuv's thread pool.
+  Measured on a 400-record `migrate`: a 5 ms timer fires **263 times** during
+  the call; before, it could not fire at all.
+
+  **Every call site needs `await`** (or `.then`), and errors arrive as
+  rejections rather than throws. The constructor stays synchronous, so opening a
+  file still fails at the line that opened it. One trap worth stating outright:
+  promises settle in completion order, not call order, and concurrent calls
+  contend for one lock inside the store — **await your writes** before the read
+  that expects to see them.
+
+  This is a major-version change for the npm package; the Rust, Python and CLI
+  surfaces are untouched.
+
+### Changed
+
+- **The BM25 leg is now DejaDB's own inverted index, not Turso's `USING fts`.**
+  With that index in place a single-row `INSERT` cost time proportional to the
+  rows already stored (1.6 ms at 500 grains, 57.9 ms at 3,000, still climbing;
+  batching did not amortize it), and a `MATCH` lookup cost the same whether one
+  row matched or every row did. Reproduced against bare `turso` with no DejaDB
+  code involved, and identical on `0.8.0-pre.2`, so it was not a version bump
+  away: [tursodatabase/turso#8170](https://github.com/tursodatabase/turso/issues/8170).
+  After: writes are flat (~0.4 ms at 4k grains) and a rare-term lookup is flat
+  (~0.4 ms); a term matching *every* document costs more as the corpus grows,
+  which is correct — cost now tracks matches rather than file size.
+
+  Scoring is textbook BM25 (`k1=1.2`, `b=0.75`). Tokenizing is deliberately
+  plain — lowercase, split on non-alphanumeric — with no stemming and no
+  stopwords, so results never depend on a language guess. **Ranking will differ
+  from the old index**, which stemmed. Existing files self-heal: the first open
+  rebuilds the index and reports it in `open_warnings()`.
+
+  **This layer is meant to be deleted when the upstream issue is fixed.**
+  `docs/facts/bm25-index.md` is the removal instructions, and the acceptance
+  test for deciding the fix is real.
+- The Hermes memory provider now defaults `index_text` **on**, reversing the
+  default it shipped with hours earlier — that default only existed to dodge
+  the write cost above, and there is no longer anything to dodge.
+
+### Added
+
+- **DejaDB as a Hermes Agent memory provider** (`examples/hermes/`), verified
+  against Hermes 0.16.0 through its real plugin loader, ABC and `MemoryManager`.
+  `prefetch()` is one budgeted CAL `ASSEMBLE` — **p50 0.83 ms at 2,080 grains**,
+  which matters because that hook sits on Hermes's synchronous turn path.
+  `MEMORY.md`/`USER.md` edits are mirrored as immutable grains, so wording an
+  agent consolidates away stays recallable. Ships with its limits written down:
+  Hermes never notifies providers of a `remove` (only `add`/`replace`), skills
+  are out of reach of a memory provider, and the plugin defaults `index_text`
+  **off** — the opposite of DejaDB's own default — because a per-turn writer
+  cannot absorb an index whose cost grows with the file.
+
+- **`DejaDB(..., index_text=True|False)` in the Python binding**, matching the
+  CLI's `--index-text`. Left unset, the file's own declaration still wins;
+  passed explicitly it is a deliberate re-stamp and the change is reported via
+  `open_warnings()`. Turning it off is how a host trades the BM25 leg for write
+  latency that does not grow with the file — measured 300 writes in 98 ms with
+  it off, against a per-write cost that climbs past 60 ms at 4k grains with it
+  on (tursodatabase/turso#8170). Previously Python could only take the file
+  default.
+- **`search(query, subject=None, relation=None, k=10)` in the Python binding** —
+  free-text recall over the BM25 and vector legs, fused with the structural leg
+  when anchored. The same path as `deja search` and CAL's `RECALL ... ABOUT`.
+  `recall()` needs a subject you already have; reaching this otherwise meant
+  hand-writing CAL. With **neither** leg available it raises rather than
+  returning `[]`, which would read as "no matching memories" when the truth is
+  that the file cannot answer free-text queries at all.
+- **`add_batch(grains_json)` in the Python binding** and `cal_add_batch` on
+  `DejaDbFacade` — many grains in one store transaction, validated up front so
+  a malformed entry writes nothing. Worth ~1.6x over one-at-a-time adds (244 ->
+  148 µs/grain at 2k grains), saturating around a batch of 10, and **only with
+  the text index off**: with it on, per-row index cost swamps batching entirely
+  (~17 ms/grain at every batch size). For another system's export, `migrate()`
+  remains the better path — it already defers and rebuilds the index.
+
+### Fixed
+
+- **`EXPLAIN` no longer misreports a `LIKE` recall.** `LIKE` and `ABOUT` are the
+  same free-text leg at execution — both set the recall's single query — but the
+  plan was derived from `ABOUT` alone, so `EXPLAIN RECALL facts LIKE "x"`
+  described a structural `O(n) full scan` over no index while actually running
+  BM25. Both spellings now report the same plan (`bm25`, or `hybrid_rrf` when
+  anchored). A planner that misreports is worse than one that says nothing.
+  `cal-reference.md` now states outright that `LIKE` is `ABOUT` spelled for the
+  SQL-familiar, not a substring filter.
+
+- **`dejadb-py` no longer holds the GIL across store calls.** Every method
+  reaching the store now runs it inside `py.detach(...)`, so the interpreter
+  lock is released for the duration. Previously a single call held it end to
+  end: measured on a 600-op `import_bundle`, another Python thread was starved
+  for **3,266 ms of a 3,266 ms call** — it never ran. The practical effect was
+  that a host moving writes onto a background thread (what agent frameworks do
+  so a slow write cannot stall the next turn) got no isolation at all, and a
+  concurrent reader blocked on the store mutex *while holding the GIL*, which
+  froze every other thread too. Cheap methods detach as well, because it is the
+  waiting on the mutex — not just the work — that has to happen outside the
+  GIL. Same 600-op call after the fix: worst starvation 7 ms. Guarded by
+  `test_store_calls_release_the_gil`, which asserts thread interleaving rather
+  than a wall-clock threshold.
+
 ## [1.0.4] - 2026-08-04
 
 ### Changed — breaking

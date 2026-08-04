@@ -4,11 +4,16 @@ These drive the real compiled extension module (built with
 `maturin develop -m crates/dejadb-py/Cargo.toml`) against a fresh
 per-test temp database (pytest `tmp_path`). The FFI convention is
 "scalars in, JSON strings out", so every structured return is parsed
-with `json.loads` and asserted on shape + content. Nothing here asserts
-on wall-clock values, so the suite is deterministic.
+with `json.loads` and asserted on shape + content. No test asserts on a
+wall-clock threshold, so the suite is deterministic — the one test that
+touches the clock (`test_store_calls_release_the_gil`) asserts thread
+interleaving and skips itself rather than fail if the call it needs to
+observe finishes too quickly.
 """
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -380,3 +385,141 @@ def test_waiser_policy_file_grants_auto_apply(tmp_path):
     bad.write_text('{"auto_apply_enabled": true, "surprise": 1}')
     with pytest.raises(ValueError):
         fresh.waiser_run(policy=str(bad))  # unknown keys are rejected
+
+
+# --------------------------------------------------------------------------
+# threading: store calls must not pin the interpreter
+# --------------------------------------------------------------------------
+
+def test_store_calls_release_the_gil(tmp_path):
+    """A long store call must let other Python threads run.
+
+    The one test here that involves the clock, and it deliberately asserts a
+    *structural* property rather than a threshold: while this thread sits
+    inside a single native call, another Python thread has to get scheduled at
+    least once. Before the bindings released the GIL, every call held it for
+    its full duration, so a host that moved writes onto a background thread —
+    which is what agent frameworks do precisely so a slow write cannot stall a
+    turn — got no isolation at all. Waiting on the store mutex had the same
+    shape: block on the lock, keep the GIL, freeze every other thread.
+    """
+    src = dejadb.DejaDB(str(tmp_path / "src.db"), ns="caller")
+    # Seed via migrate: it loads under a deferred text index, so building the
+    # fixture stays fast even though the import below is deliberately not.
+    payload = "\n".join(
+        json.dumps({"subject": f"user{i % 40}", "relation": "prefers", "object": f"value {i}"})
+        for i in range(600)
+    )
+    assert json.loads(src.migrate("jsonl", payload))["added"] == 600
+    ops = str(tmp_path / "ops.bundle")
+    src.bundle(ops, 0)
+
+    dst = dejadb.DejaDB(str(tmp_path / "dst.db"), ns="caller")
+
+    ticks = []
+    stop = threading.Event()
+
+    def sampler():
+        # sleep() yields the GIL, so this thread is only ever blocked by
+        # someone else holding it — which is exactly what we are testing for.
+        while not stop.is_set():
+            ticks.append(time.perf_counter())
+            time.sleep(0.005)
+
+    watcher = threading.Thread(target=sampler, daemon=True)
+    watcher.start()
+    try:
+        while not ticks:  # make sure it is actually running before we start
+            time.sleep(0.005)
+        started = time.perf_counter()
+        dst.import_bundle(ops)  # one long native call
+        ended = time.perf_counter()
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    elapsed = ended - started
+    if elapsed < 0.05:
+        pytest.skip(f"import_bundle took {elapsed * 1000:.0f} ms — too short to observe interleaving")
+
+    # The property is "the sampler was never locked out for long", not "it ran
+    # at least once": a single tick lands on the boundary even when the GIL is
+    # held end to end, so counting ticks would pass against a binding that
+    # never yields. Measure the worst stall instead. Held for the whole call,
+    # the gap equals the call; yielding, it stays at the sampler's own cadence
+    # (measured: 3406 ms vs 7 ms across this exact call).
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    worst = max(gaps) if gaps else elapsed
+    assert worst < elapsed / 4, (
+        f"another thread was starved for {worst * 1000:.0f} ms during a "
+        f"{elapsed * 1000:.0f} ms store call — the GIL is being held across it"
+    )
+
+
+# --------------------------------------------------------------------------
+# index_text, add_batch, search
+# --------------------------------------------------------------------------
+
+def test_index_text_defaults_to_the_file_declaration(tmp_path):
+    path = str(tmp_path / "decl.db")
+    # Explicit -> deliberate re-stamp, no warning on a file with no prior claim.
+    off = dejadb.DejaDB(path, ns="caller", index_text=False)
+    assert json.loads(off.open_warnings()) == []
+    del off
+
+    # Bare reopen honors what the file declares, silently.
+    bare = dejadb.DejaDB(path, ns="caller")
+    assert json.loads(bare.open_warnings()) == []
+    del bare
+
+    # Flipping it back on is a change the operator should see, not discover.
+    on = dejadb.DejaDB(path, ns="caller", index_text=True)
+    warnings = json.loads(on.open_warnings())
+    assert any("text_index" in w for w in warnings), warnings
+
+
+def test_search_finds_by_free_text(tmp_path):
+    m = make_db(tmp_path)
+    m.add_fact("john", "prefers", "window seat")
+    m.add_fact("mary", "prefers", "aisle seat")
+
+    hits = json.loads(m.search("window"))
+    assert [h["fields"]["object"] for h in hits] == ["window seat"]
+    assert len(hits[0]["hash"]) == HEX64
+
+    # Anchoring narrows without losing the free-text leg.
+    assert json.loads(m.search("seat", subject="mary"))[0]["fields"]["subject"] == "mary"
+
+
+def test_search_without_any_leg_raises_rather_than_answering_empty(tmp_path):
+    # No BM25 index and no embedder: there is nothing to rank on. Returning []
+    # would read as "no matching memories", which is a wrong answer rather than
+    # an empty one.
+    m = dejadb.DejaDB(str(tmp_path / "noleg.db"), ns="caller", index_text=False)
+    m.add_fact("john", "prefers", "window seat")
+    assert json.loads(m.recall("john"))  # structural recall still works
+    with pytest.raises(ValueError, match="text or vector leg"):
+        m.search("window")
+
+
+def test_add_batch_roundtrip(tmp_path):
+    m = make_db(tmp_path)
+    hashes = json.loads(m.add_batch(json.dumps([
+        {"grain_type": "fact", "fields": {"subject": "ann", "relation": "likes", "object": "tea"}},
+        {"type": "fact", "fields": {"subject": "bob", "relation": "likes", "object": "coffee"}},
+    ])))
+    assert len(hashes) == 2
+    assert all(len(h) == HEX64 for h in hashes)
+    assert json.loads(m.recall("ann"))[0]["fields"]["object"] == "tea"
+    assert json.loads(m.recall("bob"))[0]["fields"]["object"] == "coffee"
+
+
+def test_add_batch_rejects_the_whole_call_and_writes_nothing(tmp_path):
+    m = make_db(tmp_path)
+    before = json.loads(m.stats())["grains"]
+    with pytest.raises(ValueError):
+        m.add_batch(json.dumps([
+            {"grain_type": "fact", "fields": {"subject": "ann", "relation": "likes", "object": "tea"}},
+            {"grain_type": "fact"},  # no fields -> the batch is refused
+        ]))
+    assert json.loads(m.stats())["grains"] == before

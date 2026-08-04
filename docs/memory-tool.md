@@ -58,8 +58,8 @@ while True:
 const { DejaDb } = require('dejadb')
 const m = new DejaDb('agent.db', 'assistant')
 
-// inside your tool loop:
-const out = m.memoryTool(JSON.stringify(toolUse.input))
+// inside your tool loop (every method returns a promise):
+const out = await m.memoryTool(JSON.stringify(toolUse.input))
 ```
 
 ### CLI (inspect / script / test)

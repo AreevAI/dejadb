@@ -120,6 +120,32 @@ impl DejaDbFacade {
         build_grain_from_json(grain_type, fields, AddIfNovelSink { m: &mut m })
     }
 
+    /// Add many grains in one store transaction. Each entry is the same
+    /// `(grain_type, fields)` pair [`cal_add`](CalStoreFacade::cal_add) takes,
+    /// validated identically — the batching is in the write, not the parsing,
+    /// so a malformed entry fails the whole call and writes nothing.
+    ///
+    /// Worth roughly 1.6x over the same grains added one at a time (244 ->
+    /// 148 us/grain, measured at 2k grains), saturating around a batch of 10.
+    /// Note this only helps with the BM25 text index **off**: with it on, the
+    /// per-row index cost dominates so completely that batch size makes no
+    /// difference at all (~17ms/grain at every size) — see
+    /// `defer_text_index` and tursodatabase/turso#8170.
+    pub fn cal_add_batch(
+        &self,
+        entries: &[(String, serde_json::Map<String, serde_json::Value>)],
+    ) -> Result<Vec<Hash>> {
+        // Build every grain first so a bad entry is rejected before anything
+        // is written, then hand the whole set to the store as one batch.
+        let mut built: Vec<Box<dyn dejadb_store::AddableDyn>> = Vec::with_capacity(entries.len());
+        for (grain_type, fields) in entries {
+            build_grain_from_json(grain_type, fields, CollectSink { out: &mut built })?;
+        }
+        let refs: Vec<&dyn dejadb_store::AddableDyn> = built.iter().map(|b| b.as_ref()).collect();
+        let mut m = self.store.lock().unwrap();
+        m.add_batch(&refs)
+    }
+
     fn hit(grain: DeserializedGrain) -> SearchHit {
         let hash = grain.hash;
         SearchHit {
@@ -136,6 +162,19 @@ impl DejaDbFacade {
             superseded_by_hash: None,
             recall_source: None,
         }
+    }
+}
+
+/// Sink that keeps the built grain instead of writing it, so a whole batch
+/// can be validated up front and then written in one transaction.
+struct CollectSink<'a> {
+    out: &'a mut Vec<Box<dyn dejadb_store::AddableDyn>>,
+}
+impl GrainSink for CollectSink<'_> {
+    type Out = ();
+    fn consume<G: Grain + Clone + 'static>(self, grain: &G) -> Result<()> {
+        self.out.push(Box::new(grain.clone()));
+        Ok(())
     }
 }
 

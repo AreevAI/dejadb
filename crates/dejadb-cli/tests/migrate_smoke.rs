@@ -137,7 +137,12 @@ fn reindex_after_index_text_flip() {
     // flip the declaration and rebuild in one command
     let (ok, out, err) = deja(&["reindex", "--db", db, "--ns", "main", "--index-text", "true"]);
     assert!(ok, "reindex failed: {err}");
-    assert!(out.contains("1 rows backfilled"), "{out}");
+    // Both numbers matter and they are not the same: one grain needed its text
+    // column backfilled (it was written with indexing off), and one grain ends
+    // up in the index. On a file that already had text, the first is 0 while
+    // the second is the whole corpus.
+    assert!(out.contains("1 grains indexed"), "{out}");
+    assert!(out.contains("1 needed their text backfilled"), "{out}");
 
     let (ok, out, _) = deja(&["search", "--query", "matcha", "--db", db, "--ns", "main"]);
     assert!(ok);

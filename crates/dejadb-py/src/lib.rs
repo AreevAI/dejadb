@@ -50,9 +50,10 @@ fn parse_hash(hex: &str) -> PyResult<Hash> {
 }
 
 /// [`EmbedBackend`] over a Python callable `embed(text: str) -> list[float]`.
-/// The binding methods run on the interpreter thread already attached to
-/// Python; re-attaching from inside a store call on the same thread is safe
-/// (`Python::attach` is reentrant).
+/// Store calls run detached from the interpreter (see the note on
+/// [`DejaDB`]), so the embedder has to re-attach to call back into Python.
+/// That is the intended direction of travel, and re-attaching on a thread
+/// that is already attached is safe too (`Python::attach` is reentrant).
 struct PyEmbed {
     f: Py<PyAny>,
     dim: usize,
@@ -82,6 +83,22 @@ impl EmbedBackend for PyEmbed {
 }
 
 /// One memory = one file. Open with `dejadb.DejaDB("caller.db", ns="caller")`.
+///
+/// Every method that reaches the store runs it inside `py.detach(...)`, so the
+/// interpreter lock is released for the duration of the storage call. This is
+/// not an optimization — it is what makes the type usable from more than one
+/// thread. Two reasons:
+///
+/// 1. A slow call (a bulk `migrate`, a `verify`, a write on a file whose text
+///    index has gone linear) would otherwise stall *every* Python thread in the
+///    process. Agent hosts push writes onto a background thread precisely so a
+///    slow write cannot block the next turn; that only works if the binding
+///    actually yields.
+/// 2. `with_store` takes a mutex. Waiting on it while holding the GIL is worse
+///    than slow — the thread that holds the store cannot make progress on
+///    anything that needs the interpreter, so the two locks stack up. Cheap
+///    methods therefore detach as well: it is the *waiting* that has to happen
+///    outside the GIL, not just the work.
 #[pyclass]
 struct DejaDB {
     facade: DejaDbFacade,
@@ -93,13 +110,16 @@ struct DejaDB {
 #[pymethods]
 impl DejaDB {
     #[new]
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string()))]
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None))]
     fn new(
+        py: Python<'_>,
         path: String,
         ns: String,
         passphrase: Option<String>,
         actor: String,
         telemetry: String,
+        index_text: Option<bool>,
     ) -> PyResult<Self> {
         // Recall-telemetry sidecar (host capability, §8): agents are the main
         // telemetry producers, so the binding default is `aggregate`; pass
@@ -109,18 +129,45 @@ impl DejaDB {
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Same key rules as the
         // CLI's --passphrase-env: host-supplied, never stored in the file.
-        let store = match passphrase {
-            Some(p) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?,
-            None => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
-        };
+        // Opening builds the schema, creates indexes and loads the dictionary —
+        // a bounded but real amount of I/O, and the one call a host is most
+        // likely to make while other threads are already running.
+        //
+        // `index_text` follows the CLI's `--index-text`: left unset, the file's
+        // own declaration wins (the file-truth path). Passed explicitly it is a
+        // deliberate re-stamp, and the change is reported via `open_warnings()`.
+        // Turning it off is how a host trades the BM25 leg for flat write
+        // latency — with the index on, every write pays a cost that grows with
+        // the file (tursodatabase/turso#8170).
+        let store = py
+            .detach(|| match (index_text, passphrase) {
+                (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
+                (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
+                (Some(want_text), pass) => {
+                    let key = match pass {
+                        Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
+                        None => None,
+                    };
+                    RustDejaDB::open_with(
+                        &path,
+                        dejadb_store::DejaDbOptions {
+                            index_text: want_text,
+                            encryption_key: key,
+                            telemetry: tel,
+                            ..dejadb_store::DejaDbOptions::default()
+                        },
+                    )
+                }
+            })
+            .map_err(err)?;
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
         Ok(DejaDB { facade, ns, actor })
     }
 
     /// Reconciliation warnings from open (file-vs-host declaration changes,
     /// embedding-model mismatches). JSON list string.
-    fn open_warnings(&self) -> PyResult<String> {
-        let w = self.facade.with_store(|m| m.open_warnings().to_vec());
+    fn open_warnings(&self, py: Python<'_>) -> PyResult<String> {
+        let w = py.detach(|| self.facade.with_store(|m| m.open_warnings().to_vec()));
         serde_json::to_string(&w).map_err(err)
     }
 
@@ -130,14 +177,14 @@ impl DejaDB {
     /// afterwards are embedded — run `reindex_text()`-style backfills via
     /// `migrate`/re-adds, embeddings are not retro-computed.
     #[pyo3(signature = (embed, model = None))]
-    fn set_embedder(&self, embed: Py<PyAny>, model: Option<String>) -> PyResult<()> {
-        let dim = Python::attach(|py| {
-            embed
-                .call1(py, ("dimension probe",))?
-                .extract::<Vec<f32>>(py)
-        })
-        .map_err(err)?
-        .len();
+    fn set_embedder(&self, py: Python<'_>, embed: Py<PyAny>, model: Option<String>) -> PyResult<()> {
+        // The probe calls back into Python, so it stays attached; only the
+        // install below reaches the store.
+        let dim = embed
+            .call1(py, ("dimension probe",))
+            .and_then(|out| out.extract::<Vec<f32>>(py))
+            .map_err(err)?
+            .len();
         if dim == 0 {
             return Err(err("embedder returned an empty vector"));
         }
@@ -146,23 +193,27 @@ impl DejaDB {
             dim,
             model: model.unwrap_or_else(|| "python".to_string()),
         };
-        self.facade.with_store(|m| m.set_embedder(Box::new(backend)));
+        py.detach(|| self.facade.with_store(|m| m.set_embedder(Box::new(backend))));
         Ok(())
     }
 
     /// Install a command embedder (same contract as the CLI's --embed-cmd):
     /// the command gets the text on stdin and prints a JSON array of numbers.
     #[pyo3(signature = (cmd, model = None))]
-    fn set_embedder_command(&self, cmd: String, model: Option<String>) -> PyResult<()> {
-        let ce = CommandEmbed::new(&cmd, model.as_deref()).map_err(err)?;
-        self.facade.with_store(|m| m.set_embedder(Box::new(ce)));
-        Ok(())
+    fn set_embedder_command(&self, py: Python<'_>, cmd: String, model: Option<String>) -> PyResult<()> {
+        py.detach(|| -> Result<(), DejaDbError> {
+            let ce = CommandEmbed::new(&cmd, model.as_deref())?;
+            self.facade.with_store(|m| m.set_embedder(Box::new(ce)));
+            Ok(())
+        })
+        .map_err(err)
     }
 
     /// Backfill + rebuild the BM25 text index (e.g. after bulk loads, or on
     /// a file that flipped text indexing on later). Returns rows backfilled.
-    fn reindex_text(&self) -> PyResult<usize> {
-        self.facade.with_store(|m| m.rebuild_text_index()).map_err(err)
+    fn reindex_text(&self, py: Python<'_>) -> PyResult<usize> {
+        py.detach(|| self.facade.with_store(|m| m.rebuild_text_index()))
+            .map_err(err)
     }
 
     /// Import another memory system's export. `source`: mem0 | mem0-history |
@@ -174,22 +225,24 @@ impl DejaDB {
     #[pyo3(signature = (source, payload, history = None, ns = None))]
     fn migrate(
         &self,
+        py: Python<'_>,
         source: String,
         payload: String,
         history: Option<String>,
         ns: Option<String>,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        let rep = self
-            .facade
-            .with_store(|m| {
-                dejadb_store::migrate::migrate_payload(
-                    m,
-                    &ns,
-                    &source,
-                    &payload,
-                    history.as_deref(),
-                )
+        let rep = py
+            .detach(|| {
+                self.facade.with_store(|m| {
+                    dejadb_store::migrate::migrate_payload(
+                        m,
+                        &ns,
+                        &source,
+                        &payload,
+                        history.as_deref(),
+                    )
+                })
             })
             .map_err(err)?;
         Ok(rep.to_json().to_string())
@@ -200,9 +253,11 @@ impl DejaDB {
     /// With `idempotent=True`, if the current head for `(subject, relation)`
     /// already holds this exact object, no grain is written and the existing
     /// head's hash is returned (value-level dedup, not just byte-identical).
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
     #[pyo3(signature = (subject, relation, object, confidence = 0.9, ns = None, idempotent = false))]
     fn add_fact(
         &self,
+        py: Python<'_>,
         subject: String,
         relation: String,
         object: String,
@@ -216,41 +271,152 @@ impl DejaDB {
         fields.insert("object".into(), json!(object));
         fields.insert("confidence".into(), json!(confidence));
         fields.insert("namespace".into(), json!(ns.unwrap_or_else(|| self.ns.clone())));
-        if idempotent {
-            Ok(self.facade.cal_add_if_novel("fact", &fields).map_err(err)?.0.to_hex())
-        } else {
-            Ok(self.facade.cal_add("fact", &fields).map_err(err)?.to_hex())
-        }
+        py.detach(|| -> Result<String, DejaDbError> {
+            if idempotent {
+                Ok(self.facade.cal_add_if_novel("fact", &fields)?.0.to_hex())
+            } else {
+                Ok(self.facade.cal_add("fact", &fields)?.to_hex())
+            }
+        })
+        .map_err(err)
     }
 
     /// Add any grain type from a JSON fields object. Returns the hash.
     #[pyo3(signature = (grain_type, fields_json, ns = None))]
-    fn add(&self, grain_type: String, fields_json: String, ns: Option<String>) -> PyResult<String> {
+    fn add(
+        &self,
+        py: Python<'_>,
+        grain_type: String,
+        fields_json: String,
+        ns: Option<String>,
+    ) -> PyResult<String> {
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&fields_json).map_err(err)?;
         fields
             .entry("namespace".to_string())
             .or_insert_with(|| json!(ns.unwrap_or_else(|| self.ns.clone())));
-        Ok(self
-            .facade
-            .cal_add(&grain_type, &fields)
-            .map_err(err)?
-            .to_hex())
+        py.detach(|| self.facade.cal_add(&grain_type, &fields).map(|h| h.to_hex()))
+            .map_err(err)
+    }
+
+    /// Add many grains in one store transaction. `grains_json` is a JSON list
+    /// of `{"grain_type": "fact", "fields": {...}}` objects (`"type"` is
+    /// accepted for `"grain_type"`); each `fields` object is validated exactly
+    /// as `add()` validates its own, so one malformed entry fails the call and
+    /// writes nothing. Returns a JSON list of hashes, in input order.
+    ///
+    /// Worth ~1.6x over the same grains through `add()` one at a time, and
+    /// only when the BM25 text index is off — with it on, per-row index cost
+    /// swamps any batching (see `index_text` on the constructor). For loading
+    /// another system's export, prefer `migrate()`, which already defers and
+    /// rebuilds the index around the load.
+    #[pyo3(signature = (grains_json, ns = None))]
+    fn add_batch(&self, py: Python<'_>, grains_json: String, ns: Option<String>) -> PyResult<String> {
+        let items: Vec<serde_json::Value> = serde_json::from_str(&grains_json).map_err(err)?;
+        let default_ns = ns.unwrap_or_else(|| self.ns.clone());
+        let mut entries = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let grain_type = item
+                .get("grain_type")
+                .or_else(|| item.get("type"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| err(format!("grain {i}: missing 'grain_type'")))?
+                .to_string();
+            let mut fields = item
+                .get("fields")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .ok_or_else(|| err(format!("grain {i}: missing 'fields' object")))?;
+            fields
+                .entry("namespace".to_string())
+                .or_insert_with(|| json!(default_ns));
+            entries.push((grain_type, fields));
+        }
+        let hashes = py
+            .detach(|| self.facade.cal_add_batch(&entries))
+            .map_err(err)?;
+        let out: Vec<String> = hashes.iter().map(|h| h.to_hex()).collect();
+        serde_json::to_string(&out).map_err(err)
+    }
+
+    /// Free-text recall over the BM25 (and vector, when an embedder is
+    /// installed) legs, fused with the structural leg when `subject` or
+    /// `relation` is given — the same path as the CLI's `deja search` and as
+    /// CAL's `RECALL ... ABOUT "..."`. Returns a JSON list string shaped like
+    /// `recall()`.
+    ///
+    /// This is what a per-turn agent host wants for "what do I know that
+    /// relates to what the user just said": `recall()` needs a subject you
+    /// already know, and getting here otherwise meant hand-writing CAL.
+    #[pyo3(signature = (query, subject = None, relation = None, k = 10, ns = None))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: String,
+        subject: Option<String>,
+        relation: Option<String>,
+        k: usize,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        // With neither leg available there is nothing to rank on, and
+        // `recall_hybrid` answers with an empty list — which reads as "you
+        // have no matching memories" when the truth is "this file cannot
+        // answer free-text queries at all". Say which.
+        let (has_text, has_vec) = py.detach(|| {
+            self.facade
+                .with_store(|m| (m.index_text_enabled(), m.embedder_dim().is_some()))
+        });
+        if !has_text && !has_vec {
+            return Err(err(
+                "search() needs a text or vector leg: this file has the BM25 index off \
+                 (index_text=False) and no embedder installed — reopen with \
+                 index_text=True, or call set_embedder()/set_embedder_command()",
+            ));
+        }
+        let grains = py
+            .detach(|| {
+                self.facade.with_store(|m| {
+                    m.recall_hybrid(
+                        &ns,
+                        subject.as_deref(),
+                        relation.as_deref(),
+                        Some(&query),
+                        k,
+                        None,
+                    )
+                })
+            })
+            .map_err(err)?;
+        let out: Vec<serde_json::Value> = grains
+            .iter()
+            .map(|g| {
+                json!({
+                    "hash": g.hash.to_hex(),
+                    "type": format!("{:?}", g.grain_type).to_lowercase(),
+                    "fields": g.fields,
+                })
+            })
+            .collect();
+        serde_json::to_string(&out).map_err(err)
     }
 
     /// Structural recall, newest-first. Returns a JSON list string.
     #[pyo3(signature = (subject, relation = None, k = 16, ns = None))]
     fn recall(
         &self,
+        py: Python<'_>,
         subject: String,
         relation: Option<String>,
         k: usize,
         ns: Option<String>,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        let grains = self
-            .facade
-            .with_store(|m| m.recall(&ns, &subject, relation.as_deref(), k))
+        let grains = py
+            .detach(|| {
+                self.facade
+                    .with_store(|m| m.recall(&ns, &subject, relation.as_deref(), k))
+            })
             .map_err(err)?;
         let out: Vec<serde_json::Value> = grains
             .iter()
@@ -267,11 +433,16 @@ impl DejaDB {
 
     /// Current head for (subject, relation) — JSON string or None.
     #[pyo3(signature = (subject, relation, ns = None))]
-    fn latest(&self, subject: String, relation: String, ns: Option<String>) -> PyResult<Option<String>> {
+    fn latest(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        relation: String,
+        ns: Option<String>,
+    ) -> PyResult<Option<String>> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        let head = self
-            .facade
-            .with_store(|m| m.latest(&ns, &subject, &relation))
+        let head = py
+            .detach(|| self.facade.with_store(|m| m.latest(&ns, &subject, &relation)))
             .map_err(err)?;
         Ok(head.map(|g| {
             json!({
@@ -286,6 +457,7 @@ impl DejaDB {
     #[pyo3(signature = (old_hash, grain_type, fields_json, ns = None))]
     fn supersede(
         &self,
+        py: Python<'_>,
         old_hash: String,
         grain_type: String,
         fields_json: String,
@@ -297,17 +469,19 @@ impl DejaDB {
         fields
             .entry("namespace".to_string())
             .or_insert_with(|| json!(ns.unwrap_or_else(|| self.ns.clone())));
-        Ok(self
-            .facade
-            .cal_supersede(&old, &grain_type, &fields)
-            .map_err(err)?
-            .to_hex())
+        py.detach(|| {
+            self.facade
+                .cal_supersede(&old, &grain_type, &fields)
+                .map(|h| h.to_hex())
+        })
+        .map_err(err)
     }
 
     /// Erase a grain from the hot store (tombstoned). Host-level op.
-    fn forget(&self, hash: String) -> PyResult<()> {
+    fn forget(&self, py: Python<'_>, hash: String) -> PyResult<()> {
         let h = parse_hash(&hash)?;
-        self.facade.with_store(|m| m.forget(&h)).map_err(err)
+        py.detach(|| self.facade.with_store(|m| m.forget(&h)))
+            .map_err(err)
     }
 
     /// remember(): store content as an Observation; optional pre-extracted
@@ -316,6 +490,7 @@ impl DejaDB {
     #[pyo3(signature = (content, facts_json = None, observer = "python".to_string(), ns = None))]
     fn remember(
         &self,
+        py: Python<'_>,
         content: String,
         facts_json: Option<String>,
         observer: String,
@@ -337,9 +512,11 @@ impl DejaDB {
             None => Vec::new(),
         };
         let extractor = move |_c: &str| drafts.clone();
-        let res = self
-            .facade
-            .with_store(|m| m.remember(&ns, &content, &observer, Some(&extractor)))
+        let res = py
+            .detach(|| {
+                self.facade
+                    .with_store(|m| m.remember(&ns, &content, &observer, Some(&extractor)))
+            })
             .map_err(err)?;
         Ok(json!({
             "observation": res.observation.to_hex(),
@@ -349,35 +526,44 @@ impl DejaDB {
     }
 
     /// Execute CAL. Returns the wire-format payload as a JSON string.
-    fn cal(&self, query: String) -> PyResult<String> {
-        let ex = CalExecutor::new(CalExecutorConfig::default());
-        let res = ex.execute(&query, &self.facade).map_err(err)?;
+    fn cal(&self, py: Python<'_>, query: String) -> PyResult<String> {
+        let res = py
+            .detach(|| {
+                let ex = CalExecutor::new(CalExecutorConfig::default());
+                ex.execute(&query, &self.facade)
+            })
+            .map_err(err)?;
         serde_json::to_string(&res.result).map_err(err)
     }
 
     /// Anthropic memory-tool command (LR-13): pass the tool-call dict as
     /// JSON; returns the tool result text. Wire this as your MemoryToolHandler.
     #[pyo3(signature = (command_json, ns = None))]
-    fn memory_tool(&self, command_json: String, ns: Option<String>) -> PyResult<String> {
+    fn memory_tool(
+        &self,
+        py: Python<'_>,
+        command_json: String,
+        ns: Option<String>,
+    ) -> PyResult<String> {
         let cmd: serde_json::Value = serde_json::from_str(&command_json).map_err(err)?;
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        self.facade
-            .with_store(|m| {
+        py.detach(|| {
+            self.facade.with_store(|m| {
                 let mut t = MemoryTool::new(m, &ns);
                 t.execute(&cmd)
             })
-            .map_err(err)
+        })
+        .map_err(err)
     }
 
     /// Reverse provenance: grains distilled from `source_hash` (its
     /// `derived_from`), newest first, as a JSON list string. The
     /// credit-assignment / episode-unlearn query.
-    fn provenance(&self, source_hash: String) -> PyResult<String> {
+    fn provenance(&self, py: Python<'_>, source_hash: String) -> PyResult<String> {
         let h = source_hash.strip_prefix("sha256:").unwrap_or(&source_hash);
         let parent = parse_hash(h)?;
-        let kids = self
-            .facade
-            .with_store(|m| m.grains_derived_from(&parent))
+        let kids = py
+            .detach(|| self.facade.with_store(|m| m.grains_derived_from(&parent)))
             .map_err(err)?;
         let out: Vec<serde_json::Value> = kids
             .iter()
@@ -401,6 +587,7 @@ impl DejaDB {
     #[pyo3(signature = (text, subject = None, relation = None, k = 5, ns = None))]
     fn nearest(
         &self,
+        py: Python<'_>,
         text: String,
         subject: Option<String>,
         relation: Option<String>,
@@ -408,9 +595,14 @@ impl DejaDB {
         ns: Option<String>,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        let matches = self
-            .facade
-            .with_store(|m| m.nearest_semantic(&ns, subject.as_deref(), relation.as_deref(), &text, k))
+        // Detaching matters especially here: a Python embedder re-attaches from
+        // inside the store call, and it cannot do that if we never let go.
+        let matches = py
+            .detach(|| {
+                self.facade.with_store(|m| {
+                    m.nearest_semantic(&ns, subject.as_deref(), relation.as_deref(), &text, k)
+                })
+            })
             .map_err(err)?;
         let out: Vec<serde_json::Value> = matches
             .iter()
@@ -421,11 +613,16 @@ impl DejaDB {
 
     /// Supersession-chain history for (subject, relation), newest first.
     #[pyo3(signature = (subject, relation, ns = None))]
-    fn history(&self, subject: String, relation: String, ns: Option<String>) -> PyResult<String> {
+    fn history(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        relation: String,
+        ns: Option<String>,
+    ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
-        let versions = self
-            .facade
-            .with_store(|m| m.history(&ns, &subject, &relation))
+        let versions = py
+            .detach(|| self.facade.with_store(|m| m.history(&ns, &subject, &relation)))
             .map_err(err)?;
         let out: Vec<serde_json::Value> = versions
             .iter()
@@ -441,8 +638,10 @@ impl DejaDB {
     }
 
     /// Store statistics as JSON.
-    fn stats(&self) -> PyResult<String> {
-        let s = self.facade.with_store(|m| m.stats()).map_err(err)?;
+    fn stats(&self, py: Python<'_>) -> PyResult<String> {
+        let s = py
+            .detach(|| self.facade.with_store(|m| m.stats()))
+            .map_err(err)?;
         Ok(json!({
             "grains": s.grains, "current": s.current, "triples": s.triples,
             "terms": s.terms, "ops": s.ops, "events_indexed": s.events_indexed,
@@ -452,26 +651,26 @@ impl DejaDB {
 
     /// Incremental backup to a bundle file. Returns last_op_seq cursor.
     #[pyo3(signature = (path, since = 0))]
-    fn bundle(&self, path: String, since: i64) -> PyResult<i64> {
-        let st = self
-            .facade
-            .with_store(|m| m.bundle_since(since, &path))
+    fn bundle(&self, py: Python<'_>, path: String, since: i64) -> PyResult<i64> {
+        let st = py
+            .detach(|| self.facade.with_store(|m| m.bundle_since(since, &path)))
             .map_err(err)?;
         Ok(st.last_op_seq)
     }
 
     /// Apply a bundle (fast-forward, idempotent). Returns ops applied.
-    fn import_bundle(&self, path: String) -> PyResult<usize> {
-        let st = self
-            .facade
-            .with_store(|m| m.import_bundle(&path))
+    fn import_bundle(&self, py: Python<'_>, path: String) -> PyResult<usize> {
+        let st = py
+            .detach(|| self.facade.with_store(|m| m.import_bundle(&path)))
             .map_err(err)?;
         Ok(st.applied)
     }
 
     /// Integrity + content-address verification. Raises on failure.
-    fn verify(&self) -> PyResult<String> {
-        let r = self.facade.with_store(|m| m.verify()).map_err(err)?;
+    fn verify(&self, py: Python<'_>) -> PyResult<String> {
+        let r = py
+            .detach(|| self.facade.with_store(|m| m.verify()))
+            .map_err(err)?;
         if r.integrity != "ok" || r.hash_mismatches > 0 || r.undecodable > 0 {
             return Err(err(DejaDbError::Storage(format!(
                 "verification failed: integrity={} mismatches={} undecodable={}",
@@ -488,6 +687,7 @@ impl DejaDB {
     #[pyo3(signature = (name, result, is_error = false, thread = None))]
     fn record_tool_call(
         &self,
+        py: Python<'_>,
         name: String,
         result: String,
         is_error: bool,
@@ -501,8 +701,8 @@ impl DejaDB {
         if let Some(t) = thread {
             fields.insert("session_id".into(), json!(t));
         }
-        let h = self.facade.cal_add("tool", &fields).map_err(err)?;
-        Ok(h.to_hex())
+        py.detach(|| self.facade.cal_add("tool", &fields).map(|h| h.to_hex()))
+            .map_err(err)
     }
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an
@@ -515,6 +715,7 @@ impl DejaDB {
     #[pyo3(signature = (min_new = None, min_new_errors = None, if_stale = None, model = None, llm_cmd = None, ground_model = None, ground_cmd = None, analyzer_cmd = None, full_sweep = false, policy = None))]
     fn waiser_run(
         &self,
+        py: Python<'_>,
         min_new: Option<u64>,
         min_new_errors: Option<u64>,
         if_stale: Option<String>,
@@ -533,42 +734,48 @@ impl DejaDB {
             namespaces: Vec::new(),
             full_sweep,
         };
-        // Optional verified LLM reflection: `model="claude-sonnet"` (key from the
-        // env) attaches a built-in HTTP backend; `llm_cmd="..."` a subprocess.
-        let mut engine = Engine::with_builtins();
-        // Host policy file (§6.2) — mirrors the CLI's --policy. Host config,
-        // read per call, never persisted in the memory file.
-        if let Some(path) = policy {
-            let s = std::fs::read_to_string(&path)
-                .map_err(|e| err(format!("policy {path}: {e}")))?;
-            engine = engine.with_policy(waiser::Policy::from_json(&s).map_err(err)?);
-        }
-        if let Some(cmd) = llm_cmd {
-            let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
-            engine = engine.with_llm(Box::new(llm));
-        } else if let Some(spec) = model {
-            engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
-        }
-        // Optional separate grounding backend (defaults to the reflection model).
-        if let Some(cmd) = ground_cmd {
-            let g = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
-            engine = engine.with_ground_llm(Box::new(g));
-        } else if let Some(spec) = ground_model {
-            engine = engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
-        }
-        // Optional external analyzer (advisory only — never auto-applies).
-        if let Some(cmd) = analyzer_cmd {
-            engine.register(Box::new(waiser::CommandAnalyzer::new(&cmd).map_err(err)?));
-        }
-        let mut sub = BorrowedSubstrate::new(&self.facade);
-        let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;
+        // The longest call on this surface by far — a sweep plus, optionally,
+        // several LLM round trips. Holding the interpreter lock across it would
+        // freeze the host for the whole reflection pass.
+        let res = py.detach(|| -> PyResult<_> {
+            // Optional verified LLM reflection: `model="claude-sonnet"` (key from the
+            // env) attaches a built-in HTTP backend; `llm_cmd="..."` a subprocess.
+            let mut engine = Engine::with_builtins();
+            // Host policy file (§6.2) — mirrors the CLI's --policy. Host config,
+            // read per call, never persisted in the memory file.
+            if let Some(path) = policy {
+                let s = std::fs::read_to_string(&path)
+                    .map_err(|e| err(format!("policy {path}: {e}")))?;
+                engine = engine.with_policy(waiser::Policy::from_json(&s).map_err(err)?);
+            }
+            if let Some(cmd) = llm_cmd {
+                let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+                engine = engine.with_llm(Box::new(llm));
+            } else if let Some(spec) = model {
+                engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+            }
+            // Optional separate grounding backend (defaults to the reflection model).
+            if let Some(cmd) = ground_cmd {
+                let g = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+                engine = engine.with_ground_llm(Box::new(g));
+            } else if let Some(spec) = ground_model {
+                engine =
+                    engine.with_ground_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
+            }
+            // Optional external analyzer (advisory only — never auto-applies).
+            if let Some(cmd) = analyzer_cmd {
+                engine.register(Box::new(waiser::CommandAnalyzer::new(&cmd).map_err(err)?));
+            }
+            let mut sub = BorrowedSubstrate::new(&self.facade);
+            engine.run(&mut sub, &opts, now_ms()).map_err(err)
+        })?;
         serde_json::to_string(&res).map_err(err)
     }
 
     /// List recommendations. `filter` is optional JSON, e.g. `{"status":
     /// "pending"}`; omit or `{"status":"all"}` for every status. JSON list.
     #[pyo3(signature = (filter = None))]
-    fn recommendations(&self, filter: Option<String>) -> PyResult<String> {
+    fn recommendations(&self, py: Python<'_>, filter: Option<String>) -> PyResult<String> {
         let status = filter
             .and_then(|f| serde_json::from_str::<serde_json::Value>(&f).ok())
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
@@ -576,8 +783,12 @@ impl DejaDB {
             .and_then(|s| status_from_str(&s))
             .or(Some(RecStatus::Pending)); // default: pending
         // `{"status":"all"}` clears the filter; anything else defaults to pending.
-        let sub = BorrowedSubstrate::new(&self.facade);
-        let recs = Engine::with_builtins().recommendations(&sub, status).map_err(err)?;
+        let recs = py
+            .detach(|| {
+                let sub = BorrowedSubstrate::new(&self.facade);
+                Engine::with_builtins().recommendations(&sub, status)
+            })
+            .map_err(err)?;
         let rows: Vec<_> = recs
             .iter()
             .map(|r| {
@@ -599,47 +810,66 @@ impl DejaDB {
     /// `because` reason is mandatory. Non-rollbackable (destructive) payloads
     /// are rejected unless `allow_destructive=True`.
     #[pyo3(signature = (hash, because, allow_destructive = false))]
-    fn apply_recommendation(&self, hash: String, because: String, allow_destructive: bool) -> PyResult<String> {
-        let mut sub = BorrowedSubstrate::new(&self.facade);
-        let engine = Engine::with_builtins();
-        let now = now_ms();
-        let scopes = ScopeSet::all();
-        engine
-            .review(&mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human, &scopes, &because, now)
-            .map_err(err)?;
-        let applied = engine
-            .apply(&mut sub, &hash, &self.actor, ObserverType::Human, &scopes, &because, allow_destructive, now)
+    fn apply_recommendation(
+        &self,
+        py: Python<'_>,
+        hash: String,
+        because: String,
+        allow_destructive: bool,
+    ) -> PyResult<String> {
+        let applied = py
+            .detach(|| {
+                let mut sub = BorrowedSubstrate::new(&self.facade);
+                let engine = Engine::with_builtins();
+                let now = now_ms();
+                let scopes = ScopeSet::all();
+                engine.review(&mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human, &scopes, &because, now)?;
+                engine.apply(&mut sub, &hash, &self.actor, ObserverType::Human, &scopes, &because, allow_destructive, now)
+            })
             .map_err(err)?;
         Ok(json!({"hash": hash, "rollbackable": applied.rollbackable}).to_string())
     }
 
     /// Reject a recommendation with a reason (the library-friendly name for
     /// `deja waiser reject`).
-    fn dismiss_recommendation(&self, hash: String, why: String) -> PyResult<String> {
-        let mut sub = BorrowedSubstrate::new(&self.facade);
-        Engine::with_builtins()
-            .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
-            .map_err(err)?;
+    fn dismiss_recommendation(&self, py: Python<'_>, hash: String, why: String) -> PyResult<String> {
+        py.detach(|| {
+            let mut sub = BorrowedSubstrate::new(&self.facade);
+            Engine::with_builtins()
+                .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
+        })
+        .map_err(err)?;
         Ok(json!({"hash": hash, "status": "rejected"}).to_string())
     }
 
     /// Roll back an applied recommendation (retracts the grains it created).
     /// Mandatory reason; fails for non-rollbackable applies (FORGET has no
     /// inverse). Parity with `deja waiser rollback`.
-    fn rollback_recommendation(&self, hash: String, because: String) -> PyResult<String> {
-        let mut sub = BorrowedSubstrate::new(&self.facade);
-        Engine::with_builtins()
-            .rollback(&mut sub, &hash, &self.actor, ObserverType::Human, &ScopeSet::all(), &because, now_ms())
-            .map_err(err)?;
+    fn rollback_recommendation(
+        &self,
+        py: Python<'_>,
+        hash: String,
+        because: String,
+    ) -> PyResult<String> {
+        py.detach(|| {
+            let mut sub = BorrowedSubstrate::new(&self.facade);
+            Engine::with_builtins()
+                .rollback(&mut sub, &hash, &self.actor, ObserverType::Human, &ScopeSet::all(), &because, now_ms())
+        })
+        .map_err(err)?;
         Ok(json!({"hash": hash, "status": "rolled_back"}).to_string())
     }
 
     /// Measured outcomes of applied recommendations — the Verify gate's
     /// record (`held` / `regressed` per checkpoint). JSON list, parity with
     /// `deja waiser outcomes`.
-    fn waiser_outcomes(&self) -> PyResult<String> {
-        let sub = BorrowedSubstrate::new(&self.facade);
-        let outs = Engine::with_builtins().outcomes(&sub).map_err(err)?;
+    fn waiser_outcomes(&self, py: Python<'_>) -> PyResult<String> {
+        let outs = py
+            .detach(|| {
+                let sub = BorrowedSubstrate::new(&self.facade);
+                Engine::with_builtins().outcomes(&sub)
+            })
+            .map_err(err)?;
         serde_json::to_string(&outs).map_err(err)
     }
 }
