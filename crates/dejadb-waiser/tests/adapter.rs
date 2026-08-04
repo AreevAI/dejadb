@@ -153,11 +153,20 @@ fn tool_failure_clusters_from_tool_grains_and_applies() {
     let (_d, mut store) = open_temp();
     // Record tool calls as real Tool grains (what record_tool_call / the
     // tool-log importer produce). Content compacts to `cnt` → `tool_content`.
-    for _ in 0..4 {
+    //
+    // The four failures carry distinct payloads on purpose. Grains are
+    // content-addressed over the whole blob including `created_at`, so
+    // byte-identical calls recorded inside the same millisecond hash to the
+    // same address and the second one fails the UNIQUE constraint. This loop
+    // used to be four identical grains and passed only because writes were
+    // slow enough to straddle a millisecond — once the BM25 leg stopped
+    // costing ~1.6ms per write, they started landing together. Same reasoning
+    // and same fix as `crates/dejadb-js/__test__/smoke.mjs`.
+    for attempt in 0..4 {
         store
             .add(
                 &Tool::new("stripe_refund")
-                    .content("rate_limited 429")
+                    .content(&format!("rate_limited 429 (attempt {attempt})"))
                     .is_error(true)
                     .namespace("caller"),
             )
