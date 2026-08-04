@@ -95,10 +95,22 @@ def main():
     check("current session is NOT re-injected", "current reply" not in block, block)
     check("audit rows are NOT injected", "add user:" not in block, block)
 
+    print("\nsearch")
+    hits = json.loads(p.handle_tool_call("dejadb_memory", {"action": "search", "query": "window"}))
+    check("free text finds the mirrored profile entry by default",
+          any("window" in g["fields"].get("object", "") for g in hits), hits)
+
+    # With no lexical and no vector leg there is nothing to rank on. Saying so
+    # beats returning [], which reads as "no matching memories".
+    noleg_home = tempfile.mkdtemp()
+    with open(os.path.join(noleg_home, "dejadb.json"), "w") as fh:
+        json.dump({"index_text": False}, fh)
+    noleg = provider(noleg_home)
+    check("no-leg search explains itself rather than returning []",
+          "no free-text leg" in noleg.handle_tool_call("dejadb_memory",
+                                                       {"action": "search", "query": "seat"}))
+
     print("\nfailure modes")
-    check("search says why it cannot answer, rather than returning []",
-          "no free-text leg" in p.handle_tool_call("dejadb_memory",
-                                                   {"action": "search", "query": "seat"}))
     check("history needs both subject and relation",
           "needs both" in p.handle_tool_call("dejadb_memory",
                                              {"action": "history", "subject": "user:sam"}))

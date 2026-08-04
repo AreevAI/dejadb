@@ -461,6 +461,13 @@ const SCHEMA: &[&str] = &[
         blob BLOB NOT NULL)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_grains_hash ON grains(hash)",
     "CREATE TABLE IF NOT EXISTS embeddings(seq INTEGER PRIMARY KEY, vec BLOB)",
+    // BM25 leg — our own inverted index. See `search_text` for why this is not
+    // Turso's `USING fts`.
+    "CREATE TABLE IF NOT EXISTS fts_vocab(id INTEGER PRIMARY KEY, term TEXT UNIQUE)",
+    "CREATE TABLE IF NOT EXISTS fts_post(term INTEGER, seq INTEGER, ns INTEGER, tf INTEGER)",
+    "CREATE INDEX IF NOT EXISTS idx_fts_post ON fts_post(term, ns)",
+    "CREATE INDEX IF NOT EXISTS idx_fts_post_seq ON fts_post(seq)",
+    "CREATE TABLE IF NOT EXISTS fts_doc(seq INTEGER PRIMARY KEY, len INTEGER)",
     "CREATE TABLE IF NOT EXISTS triples(ns INTEGER, s INTEGER, p INTEGER, o INTEGER, seq INTEGER, cur INTEGER)",
     "CREATE INDEX IF NOT EXISTS idx_spo ON triples(ns,s,p,o,seq)",
     "CREATE INDEX IF NOT EXISTS idx_pos ON triples(ns,p,o,s,seq)",
@@ -696,6 +703,10 @@ struct GrainPrep {
     gtype: i64,
     text: Option<String>,
     embedding: Option<Vec<f32>>,
+    /// `(fts_vocab.id, term frequency)` for this grain's text, and the
+    /// document length in tokens. Empty when text indexing is off or deferred.
+    tokens: Vec<(i64, i64)>,
+    doc_len: i64,
 }
 
 /// Extracted index-relevant fields of a grain about to be stored.
@@ -731,6 +742,44 @@ fn extract_view(view: &DeserializedGrain) -> GrainView {
 /// "subject relation object" plus any top-level `content`. `None` = nothing
 /// to index. Used by the write path, the reranker's candidate text, and the
 /// `rebuild_text_index` backfill so all three stay in lockstep.
+/// BM25 tuning. Textbook defaults; the corpus here is short documents
+/// (a fact projects to "subject relation object"), so `b` matters more than
+/// `k1` and neither is worth exposing until someone can show a workload where
+/// tuning them helps.
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
+/// Longest token kept. Anything longer is a hash, a base64 blob or a URL —
+/// never a search term, and unbounded vocabulary growth if indexed.
+const MAX_TOKEN_LEN: usize = 64;
+
+/// Split text into index terms.
+///
+/// Deliberately plain: lowercase, split on anything not alphanumeric, drop
+/// what is too long. No stemming and no stopword list, because both make
+/// results depend on a language guess — and the same function runs at index
+/// time and query time, so whatever it does, the two agree. Grain text is
+/// already NFC-normalized by the canonical serializer, so `is_alphanumeric`
+/// is enough for non-ASCII scripts.
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && t.chars().count() <= MAX_TOKEN_LEN)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Tokens with their in-document frequency, plus the document's length in
+/// tokens (BM25 needs the length including repeats).
+fn token_freqs(text: &str) -> (Vec<(String, i64)>, i64) {
+    let tokens = tokenize(text);
+    let len = tokens.len() as i64;
+    let mut freqs: HashMap<String, i64> = HashMap::new();
+    for t in tokens {
+        *freqs.entry(t).or_insert(0) += 1;
+    }
+    (freqs.into_iter().collect(), len)
+}
+
 fn projected_text(view: &DeserializedGrain) -> Option<String> {
     if let Some(et) = view.get_str("embedding_text") {
         if !et.trim().is_empty() {
@@ -767,6 +816,19 @@ pub struct DejaDB {
     hlc_last: i64,
     entity_rels: HashSet<String>,
     index_text: bool,
+    /// Lazily-filled token -> `fts_vocab.id` cache. Not preloaded at open:
+    /// the text vocabulary is far larger than the triple dictionary and
+    /// reading it eagerly would put corpus-sized work back into every open.
+    fts_vocab: HashMap<String, i64>,
+    /// Live document count and total token length, for BM25's `N` and `avgdl`.
+    /// Kept in memory and adjusted on write for the same reason `next_seq` is:
+    /// an aggregate over the postings on every search would be O(corpus), the
+    /// exact thing this index exists to avoid.
+    fts_docs: i64,
+    fts_total_len: i64,
+    /// Set by [`defer_text_index`](Self::defer_text_index) — suppresses
+    /// posting writes during a bulk load until `rebuild_text_index` runs.
+    fts_deferred: bool,
     embedder: Option<Box<dyn EmbedBackend>>,
     /// Optional cross-encoder reranker (Tier-2). Host-supplied, off by default.
     reranker: Option<Box<dyn RerankBackend>>,
@@ -973,20 +1035,17 @@ impl DejaDB {
             )
             .await
             .map_err(db_err)?;
-            if opts.index_text {
-                // FTS index only when the BM25 leg is wanted: Turso's
-                // experimental tantivy index costs ~150ms per write txn in
-                // commit bookkeeping even for NULL text rows (measured in
-                // the voice-loop bench) — voice/edge profiles skip it.
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_fts ON grains USING fts (text)", ())
-                    .await
-                    .map_err(db_err)?;
-            }
+            // Files written before the BM25 leg moved off Turso's experimental
+            // FTS carry an `idx_fts` index that nothing reads any more, and
+            // that still taxes every write to this table. Drop it on sight.
+            // Absent (the normal case) it errors; that is not a problem.
+            let _ = conn.execute("DROP INDEX idx_fts", ()).await;
             Ok::<_, DejaDbError>(())
         })?;
 
         // Load dictionary + counters.
-        let (dict, next_term, next_seq, next_op, hlc_last) = rt.block_on(async {
+        let (dict, next_term, next_seq, next_op, hlc_last, fts_docs, fts_total_len, indexed_text) =
+            rt.block_on(async {
             let mut dict = HashMap::new();
             let mut next_term = 1i64;
             {
@@ -1013,7 +1072,12 @@ impl DejaDB {
             let next_seq = one("SELECT COALESCE(MAX(seq),0) FROM grains").await? + 1;
             let next_op = one("SELECT COALESCE(MAX(op_seq),0) FROM oplog").await? + 1;
             let hlc_last = one("SELECT COALESCE(MAX(hlc),0) FROM oplog").await?;
-            Ok::<_, DejaDbError>((dict, next_term, next_seq, next_op, hlc_last))
+            let fts_docs = one("SELECT COUNT(*) FROM fts_doc").await?;
+            let fts_total_len = one("SELECT COALESCE(SUM(len),0) FROM fts_doc").await?;
+            let indexed_text = one("SELECT COUNT(*) FROM grains WHERE text IS NOT NULL").await?;
+            Ok::<_, DejaDbError>((
+                dict, next_term, next_seq, next_op, hlc_last, fts_docs, fts_total_len, indexed_text,
+            ))
         })?;
 
         let blob_dir = std::path::PathBuf::from(format!("{}.blobs", path));
@@ -1031,7 +1095,7 @@ impl DejaDB {
             mode => Some(Telemetry::open(&rt, path, enc_key.as_deref(), mode)?),
         };
 
-        Ok(DejaDB {
+        let mut store = DejaDB {
             rt,
             _db: db,
             conn,
@@ -1042,6 +1106,10 @@ impl DejaDB {
             hlc_last,
             entity_rels: opts.entity_relations,
             index_text: opts.index_text,
+            fts_vocab: HashMap::new(),
+            fts_docs,
+            fts_total_len,
+            fts_deferred: false,
             embedder: None,
             reranker: None,
             expander: None,
@@ -1053,7 +1121,27 @@ impl DejaDB {
             st_probe_s: None,
             st_fetch_seq: None,
             st_latest: None,
-        })
+        };
+
+        // A file written by an older build has its text column populated but
+        // no postings, because the BM25 leg used to be Turso's `USING fts`
+        // index. Left alone, every free-text recall would answer "nothing
+        // found" — the worst failure available, since it is indistinguishable
+        // from an honest empty result. Rebuild once, here, and say so.
+        if store.index_text && indexed_text > 0 && store.fts_docs == 0 {
+            store.rebuild_text_index()?;
+            // Report documents indexed, not the rebuild's backfill count —
+            // that counts rows whose text column was NULL, which is zero on
+            // exactly the files this branch exists for.
+            let indexed = store.fts_docs;
+            store.warnings.push(format!(
+                "text index rebuilt on open ({indexed} grains): this file was written when the \
+                 BM25 leg used Turso's experimental FTS index, which is no longer used. \
+                 One-time; later opens skip it"
+            ));
+        }
+
+        Ok(store)
     }
 
     /// Install an embedding backend; subsequent adds embed their text
@@ -1120,6 +1208,16 @@ impl DejaDB {
     /// [`EnglishExpander`]. Install your own for other languages/domains.
     pub fn set_query_expander(&mut self, e: Box<dyn QueryExpander>) {
         self.expander = Some(e);
+    }
+
+    /// Documents currently carried by the BM25 index.
+    ///
+    /// [`rebuild_text_index`](Self::rebuild_text_index) returns how many rows
+    /// needed their *text column* backfilled, which is zero on a file that was
+    /// already populated — this is the number that answers "did the rebuild
+    /// actually index anything".
+    pub fn indexed_documents(&self) -> i64 {
+        self.fts_docs
     }
 
     /// Whether the BM25 text index is populated on writes (file-declared,
@@ -1197,37 +1295,27 @@ impl DejaDB {
         })
     }
 
-    /// Drop the FTS index ahead of a bulk load. Turso's experimental FTS
-    /// costs ~150ms of commit bookkeeping per write transaction while the
-    /// index exists — a tax bulk imports cannot amortize. With the index
-    /// dropped, the `text` column keeps populating at full write speed; call
-    /// [`Self::rebuild_text_index`] after the load to re-create the index
-    /// (Turso indexes all existing rows at CREATE INDEX time — milliseconds,
-    /// not per-row). Crash-safe: if the process dies in between, the next
-    /// open re-creates the index and backfills it.
+    /// Suspend BM25 posting writes ahead of a bulk load.
+    ///
+    /// Postings cost is per-token, so a bulk load no longer *needs* this the
+    /// way it did when the leg was Turso's FTS index — but writing postings
+    /// once at the end still beats writing them per row, and importers already
+    /// pair this with [`Self::rebuild_text_index`].
+    ///
+    /// The `text` column keeps populating throughout, so the rebuild has
+    /// everything it needs. Crash-safe: deferral is process state, not file
+    /// state, so a process that dies mid-load reopens with an incomplete index
+    /// and the open-time check rebuilds it.
     ///
     /// Index-layer only — stored blobs are never touched. Returns `false`
     /// when there was nothing to defer (text indexing off, or already
     /// deferred).
     pub fn defer_text_index(&mut self) -> Result<bool> {
-        if !self.index_text {
+        if !self.index_text || self.fts_deferred {
             return Ok(false);
         }
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            match conn.execute("DROP INDEX idx_fts", ()).await {
-                Ok(_) => Ok(true),
-                Err(e) => {
-                    // Already absent (e.g. defer called twice) is not an error.
-                    let s = e.to_string().to_ascii_lowercase();
-                    if s.contains("no such index") {
-                        Ok(false)
-                    } else {
-                        Err(db_err(e))
-                    }
-                }
-            }
-        })
+        self.fts_deferred = true;
+        Ok(true)
     }
 
     /// (Re)build the FTS index. Backfills the `text` column for rows written
@@ -1297,15 +1385,82 @@ impl DejaDB {
                 }
             }
         })?;
-        // 2) Re-create the index — Turso backfills all existing rows here.
-        self.rt.block_on(async {
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fts ON grains USING fts (text)",
-                (),
-            )
-            .await
-            .map_err(db_err)
+        // 2) Rebuild the postings from scratch. Cheaper than reconciling: the
+        //    text column is the source of truth and re-tokenizing it is linear
+        //    in total text, which is the same work an incremental fixup would
+        //    do anyway.
+        self.fts_deferred = false;
+        let texts: Vec<(i64, i64, String)> = self.rt.block_on(async {
+            conn.execute("DELETE FROM fts_post", ()).await.map_err(db_err)?;
+            conn.execute("DELETE FROM fts_doc", ()).await.map_err(db_err)?;
+            let mut out = Vec::new();
+            let mut rows = conn
+                .query("SELECT seq, ns, text FROM grains WHERE text IS NOT NULL", ())
+                .await
+                .map_err(db_err)?;
+            while let Some(row) = rows.next().await.map_err(db_err)? {
+                let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
+                let ns = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
+                if let Value::Text(t) = row.get_value(2).map_err(db_err)? {
+                    out.push((seq, ns, t));
+                }
+            }
+            Ok::<_, DejaDbError>(out)
         })?;
+
+        // Resolve every vocabulary id first (needs `&mut self`), then write the
+        // postings in one transaction.
+        //
+        // `(seq, ns, doc length, [(vocab id, term frequency)])`.
+        type PreparedDoc = (i64, i64, i64, Vec<(i64, i64)>);
+        let mut prepared: Vec<PreparedDoc> = Vec::with_capacity(texts.len());
+        let (mut docs, mut total_len) = (0i64, 0i64);
+        for (seq, ns, text) in &texts {
+            let (freqs, len) = token_freqs(text);
+            if freqs.is_empty() {
+                continue;
+            }
+            let mut ids = Vec::with_capacity(freqs.len());
+            for (term, tf) in freqs {
+                ids.push((self.fts_term_id(&term)?, tf));
+            }
+            docs += 1;
+            total_len += len;
+            prepared.push((*seq, *ns, len, ids));
+        }
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            conn.execute("BEGIN", ()).await.map_err(db_err)?;
+            let r = async {
+                for (seq, ns, len, ids) in &prepared {
+                    for (term, tf) in ids {
+                        conn.execute(
+                            "INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)",
+                            (pi(*term), pi(*seq), pi(*ns), pi(*tf)),
+                        )
+                        .await
+                        .map_err(db_err)?;
+                    }
+                    conn.execute(
+                        "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
+                        (pi(*seq), pi(*len)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
+                Ok::<_, DejaDbError>(())
+            }
+            .await;
+            match r {
+                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            }
+        })?;
+        self.fts_docs = docs;
+        self.fts_total_len = total_len;
         Ok(backfilled)
     }
 
@@ -1456,6 +1611,19 @@ impl DejaDB {
         };
         let projected = projected_text(&view);
         let text = if self.index_text { projected.clone() } else { None };
+        // Resolving vocabulary ids needs `&mut self`, so it happens here in
+        // prep rather than in the insert, which only has the connection.
+        let (tokens, doc_len) = match (&text, self.fts_deferred) {
+            (Some(t), false) => {
+                let (freqs, len) = token_freqs(t);
+                let mut ids = Vec::with_capacity(freqs.len());
+                for (term, tf) in freqs {
+                    ids.push((self.fts_term_id(&term)?, tf));
+                }
+                (ids, len)
+            }
+            _ => (Vec::new(), 0),
+        };
         let embed_text = projected;
         let embedding = match (&self.embedder, &embed_text) {
             (Some(e), Some(t)) => Some(e.embed(t)?),
@@ -1476,13 +1644,45 @@ impl DejaDB {
             gtype: gv.gtype as i64,
             text,
             embedding,
+            tokens,
+            doc_len,
         })
+    }
+
+    /// Resolve a token to its `fts_vocab` id, assigning one if new.
+    ///
+    /// Unlike the triple dictionary this is not preloaded at open, so a miss
+    /// costs a round trip. The cache makes that a once-per-token-per-process
+    /// cost, and real text reuses tokens heavily.
+    fn fts_term_id(&mut self, term: &str) -> Result<i64> {
+        if let Some(id) = self.fts_vocab.get(term) {
+            return Ok(*id);
+        }
+        let conn = &self.conn;
+        let id = self.rt.block_on(async {
+            conn.execute("INSERT OR IGNORE INTO fts_vocab(term) VALUES (?1)", (pt(term),))
+                .await
+                .map_err(db_err)?;
+            let mut rows = conn
+                .query("SELECT id FROM fts_vocab WHERE term = ?1", (pt(term),))
+                .await
+                .map_err(db_err)?;
+            match rows.next().await.map_err(db_err)? {
+                Some(row) => Ok::<i64, DejaDbError>(
+                    v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
+                ),
+                None => Err(DejaDbError::Storage("fts_vocab insert vanished".into())),
+            }
+        })?;
+        self.fts_vocab.insert(term.to_string(), id);
+        Ok(id)
     }
 
     fn add_batch_inner(&mut self, grains: &[&dyn AddableDyn]) -> Result<Vec<Hash>> {
         let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(grains)?;
         let conn = &self.conn;
         let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
+        let (d_docs, d_len) = fts_delta(&preps);
         self.rt.block_on(async {
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
             let r = insert_prepped(conn, &preps, first_seq, first_op, hlc0).await;
@@ -1494,6 +1694,8 @@ impl DejaDB {
                 }
             }
         })?;
+        self.fts_docs += d_docs;
+        self.fts_total_len += d_len;
         Ok(hashes)
     }
 
@@ -1869,6 +2071,7 @@ impl DejaDB {
         let op_seq = self.next_op;
         self.next_op += 1;
         let hlc = self.next_hlc();
+        let (d_docs, d_len) = fts_delta(&preps);
         let conn = &self.conn;
         self.rt.block_on(async {
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
@@ -1951,6 +2154,8 @@ impl DejaDB {
                 }
             }
         })?;
+        self.fts_docs += d_docs;
+        self.fts_total_len += d_len;
         Ok(new_hash)
     }
 
@@ -1980,6 +2185,19 @@ impl DejaDB {
             Some(x) => x,
             None => return Err(DejaDbError::NotFound(*hash)),
         };
+        // Read the document's length before the delete removes it, so the
+        // in-memory BM25 collection stats can be corrected afterwards.
+        let conn = &self.conn;
+        let doc_len = self.rt.block_on(async {
+            let mut rows = conn
+                .query("SELECT len FROM fts_doc WHERE seq = ?1", (pi(seq),))
+                .await
+                .map_err(db_err)?;
+            Ok::<Option<i64>, DejaDbError>(match rows.next().await.map_err(db_err)? {
+                Some(row) => v_i64(&row.get_value(0).map_err(db_err)?),
+                None => None,
+            })
+        })?;
         let op_seq = self.next_op;
         self.next_op += 1;
         let hlc = self.next_hlc();
@@ -1997,6 +2215,15 @@ impl DejaDB {
                     .await
                     .map_err(db_err)?;
                 conn.execute("DELETE FROM thread_idx WHERE seq=?1", (pi(seq),))
+                    .await
+                    .map_err(db_err)?;
+                // Postings too, or a forgotten grain's words keep answering
+                // free-text recall — a tombstone that leaves the text findable
+                // is not a tombstone.
+                conn.execute("DELETE FROM fts_post WHERE seq=?1", (pi(seq),))
+                    .await
+                    .map_err(db_err)?;
+                conn.execute("DELETE FROM fts_doc WHERE seq=?1", (pi(seq),))
                     .await
                     .map_err(db_err)?;
                 conn.execute("DELETE FROM grains WHERE seq=?1", (pi(seq),))
@@ -2063,6 +2290,10 @@ impl DejaDB {
                 }
             }
         })?;
+        if let Some(len) = doc_len {
+            self.fts_docs = (self.fts_docs - 1).max(0);
+            self.fts_total_len = (self.fts_total_len - len).max(0);
+        }
 
         // Scrub the telemetry sidecar so a forgotten grain never lingers there.
         // Best-effort: the main erasure already committed, and the sidecar is
@@ -2415,29 +2646,129 @@ impl DejaDB {
         self.has_grain(hash)
     }
 
-    /// BM25 leg: FTS `MATCH` over grain text (facts as "s r o", event
-    /// content). Returns current-grain seqs in match order.
+    /// BM25 leg over grain text (facts as "s r o", event content). Returns
+    /// live-grain seqs, best match first.
+    ///
+    /// This is our own inverted index rather than Turso's `USING fts`, and the
+    /// reason is measurable: with that index in place, a single-row `INSERT`
+    /// costs time proportional to the rows already stored — 1.6 ms at 500,
+    /// 64 ms at 4,000, still climbing — and a `MATCH` lookup costs the same
+    /// whether one row matches or every row does, which is what an index is
+    /// supposed to avoid. Batching does not amortize it. Reproduced against
+    /// bare `turso` with no DejaDB code involved, and identical on
+    /// `0.8.0-pre.2`, so it is not something a version bump fixes:
+    /// <https://github.com/tursodatabase/turso/issues/8170>.
+    ///
+    /// **When that issue is fixed**, this whole layer is deletable — see the
+    /// removal note in `docs/facts/bm25-index.md`. It is deliberately kept to
+    /// one table pair plus this function so that stays a small change.
+    ///
+    /// Postings are read per query term (`idx_fts_post` covers `(term, ns)`),
+    /// scored in memory, and only the top candidates are checked for
+    /// liveness — so cost tracks the number of documents containing the query
+    /// terms, not the size of the file.
     pub fn search_text(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
-        if !self.index_text {
+        if !self.index_text || k == 0 {
             return Ok(Vec::new()); // BM25 leg disabled (edge profile)
         }
         let ns_id = match self.term_lookup(ns) {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
+        let terms = tokenize(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `N` counts every indexed document, including ones later superseded.
+        // Their postings are still present and only filtered at the end, so
+        // using the live count here would make idf disagree with the postings
+        // actually being scored. The difference is immaterial to ranking.
+        let n_docs = self.fts_docs.max(1) as f64;
+        let avgdl = if self.fts_docs > 0 {
+            (self.fts_total_len as f64 / self.fts_docs as f64).max(1.0)
+        } else {
+            1.0
+        };
+
+        let conn = &self.conn;
+        let mut scores: HashMap<i64, f64> = HashMap::new();
+        for term in terms {
+            // Document length comes back with the posting, so scoring a term
+            // is one query regardless of how many documents contain it.
+            let postings: Vec<(i64, i64, i64)> = self.rt.block_on(async {
+                let mut out = Vec::new();
+                let mut rows = conn
+                    .query(
+                        "SELECT p.seq, p.tf, d.len FROM fts_post p
+                          JOIN fts_vocab v ON v.id = p.term
+                          JOIN fts_doc d ON d.seq = p.seq
+                         WHERE v.term = ?1 AND p.ns = ?2",
+                        (pt(&term), pi(ns_id)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                while let Some(row) = rows.next().await.map_err(db_err)? {
+                    let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
+                    let tf = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
+                    let len = v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(1).max(1);
+                    out.push((seq, tf, len));
+                }
+                Ok::<_, DejaDbError>(out)
+            })?;
+            if postings.is_empty() {
+                continue;
+            }
+            let df = postings.len() as f64;
+            // Robertson/Sparck-Jones idf, +1 inside the log so a term present
+            // in every document scores 0 rather than negative.
+            let idf = (1.0 + (n_docs - df + 0.5) / (df + 0.5)).ln();
+            for (seq, tf, dl) in postings {
+                let tf = tf as f64;
+                let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (dl as f64 / avgdl));
+                *scores.entry(seq).or_insert(0.0) += idf * (tf * (BM25_K1 + 1.0)) / (tf + norm);
+            }
+        }
+        if scores.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+        // Ties broken by seq descending, so equal-scoring matches come back
+        // newest-first and the order is stable across runs.
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.0.cmp(&a.0)));
+        // Over-fetch before the liveness filter: superseded grains keep their
+        // postings, so trimming to k first could return fewer than k live hits
+        // when a chain has been updated often.
+        ranked.truncate(k.saturating_mul(4).max(k));
+        let live = self.live_seqs(ranked.iter().map(|(s, _)| *s))?;
+        Ok(ranked
+            .into_iter()
+            .filter(|(s, _)| live.contains(s))
+            .map(|(s, _)| s)
+            .take(k)
+            .collect())
+    }
+
+    /// Which of `seqs` are still live (present and not superseded). One query
+    /// for the whole candidate set — the ids come from our own tables, so
+    /// inlining them carries no injection risk and avoids a bind per id.
+    fn live_seqs(&mut self, seqs: impl Iterator<Item = i64>) -> Result<HashSet<i64>> {
+        let list: Vec<String> = seqs.map(|s| s.to_string()).collect();
+        if list.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let sql = format!(
+            "SELECT seq FROM grains WHERE svt IS NULL AND seq IN ({})",
+            list.join(",")
+        );
         let conn = &self.conn;
         self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    "SELECT seq FROM grains WHERE text MATCH ?1 AND ns = ?2 AND svt IS NULL LIMIT ?3",
-                    (pt(query), pi(ns_id), pi(k as i64)),
-                )
-                .await
-                .map_err(db_err)?;
+            let mut out = HashSet::new();
+            let mut rows = conn.query(&sql, ()).await.map_err(db_err)?;
             while let Some(row) = rows.next().await.map_err(db_err)? {
                 if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                    out.push(s);
+                    out.insert(s);
                 }
             }
             Ok(out)
@@ -3190,6 +3521,7 @@ impl DejaDB {
         let op_seq = self.next_op;
         self.next_op += 1;
         let hlc = self.next_hlc();
+        let (d_docs, d_len) = fts_delta(&preps);
         let conn = &self.conn;
         self.rt.block_on(async {
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
@@ -3242,6 +3574,8 @@ impl DejaDB {
                 }
             }
         })?;
+        self.fts_docs += d_docs;
+        self.fts_total_len += d_len;
         Ok(merge_hash)
     }
 
@@ -3969,6 +4303,14 @@ pub use telemetry::{AccessStat, BudgetStat, QueryStat, RecallEvent, Telemetry, T
 /// grain durable and current while the old grain stayed un-superseded). The
 /// caller reserves `first_seq`/`first_op`/`hlc0` via [`DejaDB::prep_and_reserve`]
 /// and owns the surrounding transaction.
+/// `(documents, total token length)` a batch adds to the BM25 collection
+/// statistics. Applied by the caller after its transaction commits, so a
+/// rolled-back insert cannot leave the in-memory counters ahead of the file.
+fn fts_delta(preps: &[GrainPrep]) -> (i64, i64) {
+    let docs = preps.iter().filter(|p| !p.tokens.is_empty()).count() as i64;
+    (docs, preps.iter().map(|p| p.doc_len).sum())
+}
+
 async fn insert_prepped(
     conn: &Connection,
     preps: &[GrainPrep],
@@ -4003,6 +4345,14 @@ async fn insert_prepped(
         .prepare("INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)")
         .await
         .map_err(db_err)?;
+    let mut st_fp = conn
+        .prepare("INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)")
+        .await
+        .map_err(db_err)?;
+    let mut st_fd = conn
+        .prepare("INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)")
+        .await
+        .map_err(db_err)?;
     for (i, pr) in preps.iter().enumerate() {
         let seq = first_seq + i as i64;
         st_g.execute((
@@ -4022,6 +4372,16 @@ async fn insert_prepped(
         ))
         .await
         .map_err(db_err)?;
+        // BM25 postings: one row per distinct token. Cost is proportional to
+        // the grain's own length, not to how much is already stored.
+        if !pr.tokens.is_empty() {
+            for (term, tf) in &pr.tokens {
+                st_fp.execute((pi(*term), pi(seq), pi(pr.ns_id), pi(*tf)))
+                    .await
+                    .map_err(db_err)?;
+            }
+            st_fd.execute((pi(seq), pi(pr.doc_len))).await.map_err(db_err)?;
+        }
         if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
             st_t.execute((pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)))
                 .await

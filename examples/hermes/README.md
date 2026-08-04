@@ -55,7 +55,7 @@ Optional; every key has a default. `hermes memory setup` writes
 {
   "db_path": "",
   "namespace": "hermes",
-  "index_text": false,
+  "index_text": true,
   "embed_cmd": "",
   "budget_tokens": 800,
   "recent_turns": 8,
@@ -63,25 +63,26 @@ Optional; every key has a default. `hermes memory setup` writes
 }
 ```
 
-**`index_text` is off by default, which is not DejaDB's own default.** With the
-BM25 index on, every write costs time proportional to the file's size — ~1.6 ms
-at 500 grains, ~64 ms at 4,000, still climbing
-([tursodatabase/turso#8170](https://github.com/tursodatabase/turso/issues/8170)).
-A memory provider writes on every turn forever, which is exactly the shape that
-cannot absorb it. Off, writes stay flat at ~0.16 ms at any size.
+`index_text` enables the BM25 leg and is on by default. It was off in the first
+version of this provider, because the index was then Turso's experimental FTS
+and made every write cost time proportional to the file's size — the one thing
+a per-turn writer cannot absorb. DejaDB now uses its own inverted index
+(`docs/facts/bm25-index.md`), so writes stay flat at ~0.4 ms at 4k grains *and*
+free-text search works. Turn it off only for a write-heavy edge profile that
+never searches by text.
 
-The cost is that free-text search has no lexical leg. Set `embed_cmd` to get
-the vector leg instead — that is the recommended pairing:
+`embed_cmd` adds the vector leg alongside, which catches paraphrase that
+lexical matching misses:
 
 ```json
 { "embed_cmd": "python3 /path/to/embed.py" }
 ```
 
 Same contract as the CLI's `--embed-cmd`: text on stdin, JSON array of floats on
-stdout (see [`../llm/`](../llm/) for backend patterns). Without either leg,
-recall still works through the structural legs (profile by subject, prior turns
-by time); only `dejadb_memory action=search` is unavailable, and it says so
-rather than returning an empty list.
+stdout (see [`../llm/`](../llm/) for backend patterns). With neither leg, recall
+still works through the structural legs (profile by subject, prior turns by
+time); only `dejadb_memory action=search` is unavailable, and it says so rather
+than returning an empty list.
 
 ## How it maps
 

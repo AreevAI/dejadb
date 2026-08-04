@@ -895,7 +895,10 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         }
         "reindex" => {
             let n = m.rebuild_text_index().map_err(|e| e.to_string())?;
-            println!("text index rebuilt ({n} rows backfilled)");
+            println!(
+                "text index rebuilt: {} grains indexed ({n} needed their text backfilled)",
+                m.indexed_documents()
+            );
         }
         "verify" => {
             let rep = m.verify().map_err(|e| e.to_string())?;

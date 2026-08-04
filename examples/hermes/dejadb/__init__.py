@@ -49,20 +49,18 @@ DEFAULTS = {
     # One memory = one file. Left unset, it lands under $HERMES_HOME.
     "db_path": "",
     "namespace": "hermes",
-    # The BM25 text index is OFF by default, which is not DejaDB's own default.
-    # With it on, Turso's experimental FTS makes *every* write cost time
-    # proportional to the file's size — ~1.6 ms at 500 grains, ~64 ms at 4,000,
-    # and it keeps climbing (tursodatabase/turso#8170). A memory provider
-    # writes on every single turn, forever, so that is the one workload shape
-    # that cannot absorb it. Off, writes stay flat at ~0.16 ms no matter how
-    # large the file gets.
+    # The BM25 text index, on by default (matching DejaDB's own default).
     #
-    # The cost of off is that free-text search has no lexical leg. Set
-    # `embed_cmd` to get the vector leg instead, which is the recommended
-    # pairing; without either, recall still works but only through the
-    # structural legs (profile by subject, recent by time).
-    "index_text": False,
+    # This was off in the first version of this provider, because the index was
+    # Turso's experimental FTS and it made every write cost time proportional
+    # to the file's size — the one thing a per-turn writer cannot absorb.
+    # DejaDB now uses its own inverted index, so writes are flat (~0.4 ms at
+    # 4k grains) *and* free-text search works. Turn it off only for a
+    # write-heavy edge profile that never searches by text.
+    "index_text": True,
     # Same contract as the CLI's --embed-cmd: text on stdin, JSON array out.
+    # Optional now that BM25 is available by default — it adds the vector leg
+    # alongside, which catches paraphrase that lexical matching misses.
     "embed_cmd": "",
     "embed_model": "",
     # Token budget for the block injected each turn.
@@ -455,13 +453,13 @@ class DejaDbMemoryProvider(MemoryProvider):
                 "Memory file path (default: $HERMES_HOME/dejadb/<profile>.db)"},
             {"key": "namespace", "description": "Namespace prefix", "default": "hermes"},
             {"key": "index_text", "description":
-                "Enable the BM25 text index. Off by default: with it on, every write "
-                "costs time proportional to the file's size (turso#8170). Prefer "
-                "embed_cmd for free-text recall.",
-             "default": False, "choices": [True, False]},
+                "Enable the BM25 text index (recommended). Turn off only for a "
+                "write-heavy profile that never searches by text.",
+             "default": True, "choices": [True, False]},
             {"key": "embed_cmd", "description":
-                "Embedder command for the vector leg — text on stdin, JSON array of "
-                "floats on stdout. Recommended when index_text is off."},
+                "Optional embedder command for the vector leg — text on stdin, JSON "
+                "array of floats on stdout. Catches paraphrase that BM25 misses; "
+                "required for free-text search if index_text is off."},
             {"key": "budget_tokens", "description":
                 "Token budget for the block injected each turn", "default": 800},
             {"key": "waiser_on_session_end", "description":

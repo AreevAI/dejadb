@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The BM25 leg is now DejaDB's own inverted index, not Turso's `USING fts`.**
+  With that index in place a single-row `INSERT` cost time proportional to the
+  rows already stored (1.6 ms at 500 grains, 57.9 ms at 3,000, still climbing;
+  batching did not amortize it), and a `MATCH` lookup cost the same whether one
+  row matched or every row did. Reproduced against bare `turso` with no DejaDB
+  code involved, and identical on `0.8.0-pre.2`, so it was not a version bump
+  away: [tursodatabase/turso#8170](https://github.com/tursodatabase/turso/issues/8170).
+  After: writes are flat (~0.4 ms at 4k grains) and a rare-term lookup is flat
+  (~0.4 ms); a term matching *every* document costs more as the corpus grows,
+  which is correct — cost now tracks matches rather than file size.
+
+  Scoring is textbook BM25 (`k1=1.2`, `b=0.75`). Tokenizing is deliberately
+  plain — lowercase, split on non-alphanumeric — with no stemming and no
+  stopwords, so results never depend on a language guess. **Ranking will differ
+  from the old index**, which stemmed. Existing files self-heal: the first open
+  rebuilds the index and reports it in `open_warnings()`.
+
+  **This layer is meant to be deleted when the upstream issue is fixed.**
+  `docs/facts/bm25-index.md` is the removal instructions, and the acceptance
+  test for deciding the fix is real.
+- The Hermes memory provider now defaults `index_text` **on**, reversing the
+  default it shipped with hours earlier — that default only existed to dodge
+  the write cost above, and there is no longer anything to dodge.
+
 ### Added
 
 - **DejaDB as a Hermes Agent memory provider** (`examples/hermes/`), verified
