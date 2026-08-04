@@ -31,9 +31,8 @@ directory walk is CLI-only.
   whose content address is already present are counted as `skipped`, never
   duplicated, never an error. (Exact re-run dedup needs source timestamps —
   real exports have them.)
-- Bulk speed: the importer defers the FTS index for the duration and rebuilds
-  it once at the end, so a 10k-record import takes seconds, not the ~150
-  ms/write the live index would cost.
+- Bulk speed: the importer defers the BM25 index for the duration and rebuilds
+  it once at the end, so a 10k-record import takes seconds.
 
 The report is JSON: `{"added": n, "superseded": n, "forgotten": n,
 "skipped": n, "notes": [...]}` — per-record anomalies land in `notes` (on

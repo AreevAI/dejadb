@@ -22,6 +22,10 @@ lazily prepared and cached (`ensure_stmt`).
 - `entity_latest` PK(ns,s,p) — the µs point read. `heads` PK(ns,s,p,seq) —
   fork tips. `oplog(op_seq, hlc, op, hash)` — OP_ADD/OP_SUPERSEDE/OP_FORGET.
   `thread_idx` — session transcripts. `embeddings(seq, vec)`.
+- BM25 leg: `fts_vocab(id, term)` + `fts_post(term, seq, ns, tf)` +
+  `fts_doc(seq, len)` — our own inverted index. Written on add, dropped on
+  `forget`, rebuilt by `rebuild_text_index`. **Meant to be deleted** if
+  tursodatabase/turso#8170 is fixed — see `docs/facts/bm25-index.md`.
 - `meta(k, v)` — **file-carried declarations**:
   `text_index` ("1"/"0"), `entity_relations` (sorted JSON array),
   `embedding_model`/`embedding_dim` (provenance, stamped by the first
@@ -56,8 +60,10 @@ lazily prepared and cached (`ensure_stmt`).
 
 ## Hybrid recall
 
-`recall_hybrid` = structural (`recall_seqs`) + BM25 (`search_text`, Turso FTS,
-only when `index_text`) + vector (`search_vector`, brute-force
+`recall_hybrid` = structural (`recall_seqs`) + BM25 (`search_text`, our own
+inverted index over `fts_vocab`/`fts_post`/`fts_doc`, only when `index_text` —
+**not** Turso's `USING fts`, and `docs/facts/bm25-index.md` says why plus how to
+go back) + vector (`search_vector`, brute-force
 `vector_distance_cos`) fused with RRF (k0=60). **Deadline-bounded fail-open**:
 legs past the budget are skipped and partial results returned — never errors.
 Embeddings come from the host via the `EmbedBackend` trait (`dim`/`embed`,
@@ -72,11 +78,13 @@ it), else "s r o" + top-level `content`. The write path, the reranker's
 `candidate_text`, and the `rebuild_text_index` backfill all share it — keep
 them in lockstep.
 
-**Bulk loads**: `defer_text_index()` drops the FTS index (writes then skip the
-~150ms/txn FTS tax; the `text` column keeps populating), and
-`rebuild_text_index()` backfills NULL `text` from blobs and re-creates the
-index — Turso indexes all existing rows at CREATE INDEX time (ms, not
-per-row). Crash-safe: open's `CREATE INDEX IF NOT EXISTS` self-heals.
+**Bulk loads**: `defer_text_index()` suspends posting writes (the `text` column
+keeps populating), and `rebuild_text_index()` backfills NULL `text` from blobs
+and re-tokenizes the whole corpus into `fts_post`/`fts_doc`. Deferral is process
+state, not file state, so a process that dies mid-load reopens with an
+incomplete index and open's self-heal rebuilds it. Postings are per-token, so a
+bulk load no longer *needs* this the way it did when the leg was Turso's FTS —
+it is still cheaper than writing postings per row.
 `tests/text_index_tests.rs` pins the flow.
 
 `recall_hybrid` delegates to `recall_hybrid_tuned(.., RecallTuning)`, which
