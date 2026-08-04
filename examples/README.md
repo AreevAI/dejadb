@@ -13,6 +13,7 @@ installs). See [`docs/waiser.md`](../docs/waiser.md) for the full guide.
 | [`mcp/`](mcp/) | The multi-agent supervisor pattern (separation of duties over MCP) |
 | [`llm/`](llm/) | Ready-to-run `--llm-cmd` backends (`claude -p`, OpenAI, Ollama, a dependency-free mock) + the stdin/stdout protocol |
 | [`analyzers/`](analyzers/) | A bring-your-own command analyzer (`--analyzer-cmd`, advisory-only) with the probe/analyze protocol |
+| [`hermes/`](hermes/) | DejaDB as a [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory provider — budgeted per-turn assembly (p50 0.83 ms), `MEMORY.md`/`USER.md` edits mirrored as immutable grains, Waiser at session end |
 
 Every example models **judgment** — approve one recommendation, dismiss one
 with a reason. Never a rubber-stamp loop.

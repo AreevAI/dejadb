@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DejaDB as a Hermes Agent memory provider** (`examples/hermes/`), verified
+  against Hermes 0.16.0 through its real plugin loader, ABC and `MemoryManager`.
+  `prefetch()` is one budgeted CAL `ASSEMBLE` — **p50 0.83 ms at 2,080 grains**,
+  which matters because that hook sits on Hermes's synchronous turn path.
+  `MEMORY.md`/`USER.md` edits are mirrored as immutable grains, so wording an
+  agent consolidates away stays recallable. Ships with its limits written down:
+  Hermes never notifies providers of a `remove` (only `add`/`replace`), skills
+  are out of reach of a memory provider, and the plugin defaults `index_text`
+  **off** — the opposite of DejaDB's own default — because a per-turn writer
+  cannot absorb an index whose cost grows with the file.
+
 - **`DejaDB(..., index_text=True|False)` in the Python binding**, matching the
   CLI's `--index-text`. Left unset, the file's own declaration still wins;
   passed explicitly it is a deliberate re-stamp and the change is reported via
