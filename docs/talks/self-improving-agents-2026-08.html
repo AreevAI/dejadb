@@ -170,6 +170,27 @@ g.step{transform:none;transition:opacity .5s ease}
 .c-ro{color:var(--d-rose)}.c-vi{color:var(--d-violet)}.c-dm{color:var(--d-dim)}
 .prompt{color:var(--d-mint)}
 
+/* ── shareable links: one row per URL with a copy button ── */
+.links{display:flex;flex-direction:column;gap:12px;max-width:1180px}
+.linkrow{
+  display:flex;align-items:center;gap:18px;padding:15px 18px 15px 22px;
+  background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
+}
+.linkrow .what{flex:0 0 232px;font-size:17px;font-weight:640;color:var(--ink)}
+.linkrow .what small{display:block;font-weight:400;font-size:13.5px;color:var(--dimmer);margin-top:2px}
+.linkrow .url{
+  flex:1;min-width:0;font-family:var(--mono);font-size:15px;color:var(--cyan);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.copybtn{
+  flex:0 0 auto;font-family:var(--mono);font-size:13px;letter-spacing:.08em;
+  padding:8px 16px;border-radius:8px;border:1px solid var(--line-2);
+  background:var(--ground-2);color:var(--dim);cursor:pointer;transition:all .15s;
+}
+.copybtn:hover{border-color:var(--cyan);color:var(--cyan);background:var(--w-cyan)}
+.copybtn.done{border-color:var(--mint);color:var(--mint);background:var(--w-mint)}
+.copybtn:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+
 /* ── contents: built at runtime from the slides themselves, so it can
    never drift out of sync while the deck is being trimmed ── */
 /* Flowed columns, not a grid: grid rows align to the tallest cell and
@@ -1992,7 +2013,9 @@ Then open Q&A.">
 </section>
 
 <!-- ══════════ 43 · Q&A ══════════ -->
-<section class="slide divider" data-act="7" data-notes="10 minutes. Likely questions and short answers:
+<section class="slide" data-act="7" data-title="Q&amp;A — and everything, to take away" data-notes="10 minutes. Leave this up for the whole Q&A — every link has a copy button, so people can grab them while you talk.
+
+Likely questions and short answers:
 
 'Does this work with LangGraph / my stack?' — The engine is substrate-agnostic behind an OmsSubstrate trait; DejaDB is the shipped adapter. Adapters for other stores are the top roadmap item. deja migrate imports from 8 sources today.
 
@@ -2005,9 +2028,17 @@ Then open Q&A.">
 'Why not just a vector DB?' — Slide 3. Similarity has no time axis and no links.
 
 If you don't know: say so and offer to follow up. Consistent with the whole talk.">
-  <div class="act">Questions</div>
-  <h1>Q&amp;A</h1>
-  <p class="lede mono" style="font-size:21px;color:var(--cyan)">github.com/AreevAI/dejadb &nbsp;·&nbsp; examples/colab/</p>
+  <div class="eyebrow">Questions <span class="n">/ take these with you</span></div>
+  <div class="body">
+    <h1 class="step shown" data-s="0" style="font-size:70px;margin-bottom:30px">Q&amp;A</h1>
+    <div class="links">
+        <div class="linkrow"><div class="what">The code<small>open source · MIT / Apache</small></div><div class="url">github.com/AreevAI/dejadb</div><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb">copy</button></div>
+        <div class="linkrow"><div class="what">All 7 notebooks<small>run in Colab — no API key needed</small></div><div class="url">github.com/AreevAI/dejadb › examples/colab</div><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab">copy</button></div>
+        <div class="linkrow"><div class="what">Learns from conversation<small>notebook 06 · today’s demo 2</small></div><div class="url">colab.research.google.com › 06_agent_learns_from_conversation</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">The wrong lesson<small>notebook 02 · today’s demo 3</small></div><div class="url">colab.research.google.com › 02_the_wrong_lesson</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">Two loops, same experience<small>notebook 04 · today’s demo 1</small></div><div class="url">colab.research.google.com › 04_hermes_vs_governed</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb">copy</button></div>
+    </div>
+  </div>
 </section>
 
 </div></div>
@@ -2197,12 +2228,12 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
     function reset(){ if (active !== null){ active = null; paint(); } }
     document.addEventListener('keydown', reset);
     document.addEventListener('click', function(e){
-      if (!e.target.closest('.srcbtn, .pill, .tocrow')) reset();
+      if (!e.target.closest('.srcbtn, .pill, .tocrow, .copybtn')) reset();
     });
   })();
 
   stage.addEventListener('click', function(e){
-    if (e.target.closest('.srcbtn, .pill, .tocrow')) return;   // controls are not page turns
+    if (e.target.closest('.srcbtn, .pill, .tocrow, .copybtn')) return;   // controls are not page turns
     var r = stage.getBoundingClientRect();
     if (e.clientX < r.left + r.width * 0.22) prev(); else next();
   });
@@ -2357,6 +2388,38 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
 'paint();',
 '<\/script></body></html>'
   ].join('');
+
+  /* copy-to-clipboard. navigator.clipboard is undefined on file:// in some
+     browsers, so fall back to a hidden textarea + execCommand. */
+  function copyText(t){
+    if (navigator.clipboard && window.isSecureContext){
+      return navigator.clipboard.writeText(t);
+    }
+    return new Promise(function(res, rej){
+      var ta = document.createElement('textarea');
+      ta.value = t;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      ok ? res() : rej();
+    });
+  }
+  Array.prototype.slice.call(document.querySelectorAll('.copybtn')).forEach(function(b){
+    b.addEventListener('click', function(e){
+      e.stopPropagation();
+      var was = b.textContent;
+      copyText(b.getAttribute('data-copy')).then(function(){
+        b.textContent = 'copied';  b.classList.add('done');
+      }, function(){
+        b.textContent = 'press ⌘C';
+      });
+      setTimeout(function(){ b.textContent = was; b.classList.remove('done'); }, 1800);
+    });
+  });
 
   fit();
   go(0, false);
