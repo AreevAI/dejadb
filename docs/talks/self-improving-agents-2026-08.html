@@ -170,6 +170,22 @@ g.step{transform:none;transition:opacity .5s ease}
 .c-ro{color:var(--d-rose)}.c-vi{color:var(--d-violet)}.c-dm{color:var(--d-dim)}
 .prompt{color:var(--d-mint)}
 
+/* ── notebook links: real anchors, opened in a new tab so the deck keeps
+   its place. Every anchor is excluded from the click-to-advance handler. */
+.nblink{
+  display:inline-flex;align-items:center;gap:16px;text-decoration:none;
+  font-family:var(--mono);font-size:19px;color:var(--mint);
+  padding:7px 13px;margin:0 0 18px -13px;border-radius:9px;
+  transition:background .15s,color .15s;
+}
+.nblink:hover,.nblink:focus-visible{background:var(--w-mint);outline:none}
+.nblink .p{text-decoration:underline;text-decoration-color:rgba(12,138,94,.35);text-underline-offset:4px}
+.nblink:hover .p{text-decoration-color:var(--mint)}
+.nblink .ext{font-size:13px;letter-spacing:.1em;color:var(--dimmer);white-space:nowrap}
+.nblink:hover .ext{color:var(--mint)}
+.linkrow a.url{text-decoration:none;color:var(--cyan);border-radius:6px;transition:background .15s}
+.linkrow a.url:hover,.linkrow a.url:focus-visible{text-decoration:underline;text-underline-offset:4px;outline:none}
+
 /* ── shareable links: one row per URL with a copy button ── */
 .links{display:flex;flex-direction:column;gap:12px;max-width:1180px}
 .linkrow{
@@ -1311,8 +1327,7 @@ Outputs are pre-baked — if a cell fails, just scroll. Say so casually.">
       <div class="dhead"><span>Live notebook · Demo 1</span><span>~5 min</span></div>
       <div class="dbody">
         <h2 style="margin-bottom:8px">Two loops, same experience</h2>
-        <div class="path">examples/colab/04_hermes_vs_governed.ipynb</div>
-        <div class="url">colab.research.google.com/github/AreevAI/dejadb/blob/main/examples/colab/04_hermes_vs_governed.ipynb</div>
+        <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/04_hermes_vs_governed.ipynb</span><span class="ext">open in Colab ↗</span></a>
         <ol>
           <li>A refund agent during a flash sale — two failures.</li>
           <li><strong>Loop A</strong> — reflection with the gate off, in 12 lines: it learns <em>"avoid refund_processor while a flash sale is running."</em> Correlation, meet causation.</li>
@@ -1640,8 +1655,7 @@ Worth saying: the extraction schema is PINNED and enforced in code. Free-form ex
       <div class="dhead"><span>Live notebook · Demo 2</span><span>~6 min · the running example, for real</span></div>
       <div class="dbody">
         <h2 style="margin-bottom:8px">An agent that learns from conversation</h2>
-        <div class="path">examples/colab/06_agent_learns_from_conversation.ipynb</div>
-        <div class="url">colab.research.google.com/github/AreevAI/dejadb/blob/main/examples/colab/06_agent_learns_from_conversation.ipynb</div>
+        <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/06_agent_learns_from_conversation.ipynb</span><span class="ext">open in Colab ↗</span></a>
         <ol>
           <li>A <strong>real agent turn loop</strong> — assemble with CAL, a model extracts durable facts, captured back with provenance.</li>
           <li>March onboarding: it learns who owns billing. The customer's "where's my order?" teaches it <em>nothing durable</em> — by design.</li>
@@ -1731,8 +1745,7 @@ If you only show one notebook, show this one.">
       <div class="dhead" style="color:var(--mint);border-bottom-color:rgba(12,138,94,.24)"><span>Live notebook · Demo 3 — the anchor</span><span>~6–7 min · protect this time</span></div>
       <div class="dbody">
         <h2 style="margin-bottom:8px">The wrong lesson</h2>
-        <div class="path">examples/colab/02_the_wrong_lesson.ipynb</div>
-        <div class="url">colab.research.google.com/github/AreevAI/dejadb/blob/main/examples/colab/02_the_wrong_lesson.ipynb</div>
+        <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/02_the_wrong_lesson.ipynb</span><span class="ext">open in Colab ↗</span></a>
         <ol>
           <li>Month-end close. The payment gateway throws 401s. A reasonable lesson is proposed — <em>and you approve it.</em></li>
           <li>Six more rejections. Two days later, the Verify gate raises its hand: <strong>measured regression.</strong></li>
@@ -2032,11 +2045,11 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
   <div class="body">
     <h1 class="step shown" data-s="0" style="font-size:70px;margin-bottom:30px">Q&amp;A</h1>
     <div class="links">
-        <div class="linkrow"><div class="what">The code<small>open source · MIT / Apache</small></div><div class="url">github.com/AreevAI/dejadb</div><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb">copy</button></div>
-        <div class="linkrow"><div class="what">All 7 notebooks<small>run in Colab — no API key needed</small></div><div class="url">github.com/AreevAI/dejadb › examples/colab</div><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab">copy</button></div>
-        <div class="linkrow"><div class="what">Learns from conversation<small>notebook 06 · today’s demo 2</small></div><div class="url">colab.research.google.com › 06_agent_learns_from_conversation</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb">copy</button></div>
-        <div class="linkrow"><div class="what">The wrong lesson<small>notebook 02 · today’s demo 3</small></div><div class="url">colab.research.google.com › 02_the_wrong_lesson</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb">copy</button></div>
-        <div class="linkrow"><div class="what">Two loops, same experience<small>notebook 04 · today’s demo 1</small></div><div class="url">colab.research.google.com › 04_hermes_vs_governed</div><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">The code<small>open source · MIT / Apache</small></div><a class="url" href="https://github.com/AreevAI/dejadb" target="_blank" rel="noopener noreferrer">github.com/AreevAI/dejadb</a><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb">copy</button></div>
+        <div class="linkrow"><div class="what">All 7 notebooks<small>run in Colab — no API key needed</small></div><a class="url" href="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab" target="_blank" rel="noopener noreferrer">github.com/AreevAI/dejadb › examples/colab</a><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab">copy</button></div>
+        <div class="linkrow"><div class="what">Learns from conversation<small>notebook 06 · today’s demo 2</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 06_agent_learns_from_conversation</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">The wrong lesson<small>notebook 02 · today’s demo 3</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 02_the_wrong_lesson</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">Two loops, same experience<small>notebook 04 · today’s demo 1</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 04_hermes_vs_governed</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb">copy</button></div>
     </div>
   </div>
 </section>
@@ -2228,12 +2241,12 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
     function reset(){ if (active !== null){ active = null; paint(); } }
     document.addEventListener('keydown', reset);
     document.addEventListener('click', function(e){
-      if (!e.target.closest('.srcbtn, .pill, .tocrow, .copybtn')) reset();
+      if (!e.target.closest('a, .srcbtn, .pill, .tocrow, .copybtn')) reset();
     });
   })();
 
   stage.addEventListener('click', function(e){
-    if (e.target.closest('.srcbtn, .pill, .tocrow, .copybtn')) return;   // controls are not page turns
+    if (e.target.closest('a, .srcbtn, .pill, .tocrow, .copybtn')) return;   // links and controls are not page turns
     var r = stage.getBoundingClientRect();
     if (e.clientX < r.left + r.width * 0.22) prev(); else next();
   });
