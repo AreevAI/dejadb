@@ -1651,7 +1651,7 @@ Beat 2 — provenance. Every fact traces back to the turn that taught it.
 
 Beat 3 — July handover. Two live values. Waiser catches it with zero model calls. Resolve with a reason; history keeps John answerable.
 
-Beat 4, the payoff — three facts each individually fine: the API enforces 30 days for every tier, enterprise has a 45-day window, two enterprise refunds rejected at 35 and 38 days. No rule is violated. The combination is the bug. The LLM pass finds it, grounds it, verifies it — and it still queues for review.
+Beat 4, the payoff — three facts each individually fine: the API enforces 30 days for every tier, enterprise has a 45-day window, two enterprise refunds rejected at 35 and 38 days. No rule is violated. The combination is the bug. An open-weights model (Llama 3.3 70B) finds it, grounds it, verifies it — and it still queues for review.
 
 Worth saying: the extraction schema is PINNED and enforced in code. Free-form extraction inventing its own relation names each turn is exactly why other memory layers can't see their own contradictions.">
   <div class="body">
@@ -1739,7 +1739,7 @@ Month-end close. Payment gateway throws 401s. A reasonable lesson is proposed an
 
 Six more rejections. Two days later the Verify gate raises its hand: measured regression. The system files a revert. You roll it back with a reason, audited.
 
-Then the payoff — with a key, the LLM discovery pass connects three facts the agent had all along: credential_expiry 2026-07-30, close deadline 2026-08-02, gateway throwing 401s. The credential expired mid-close. No deterministic analyzer can see that; each fact is individually well-formed. And even that finding queues for review before it changes anything.
+Then the payoff — with a key, the LLM discovery pass — Llama 3.3 70B, open weights — connects three facts the agent had all along: credential_expiry 2026-07-30, close deadline 2026-08-02, gateway throwing 401s. The credential expired mid-close. No deterministic analyzer can see that; each fact is individually well-formed. And even that finding queues for review before it changes anything.
 
 Then supersede an outdated remittance inbox, forget a harmful workaround, print the full audit trail.
 
