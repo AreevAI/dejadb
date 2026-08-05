@@ -533,7 +533,6 @@ Everything shown today is open source and shipping. Three live Colab notebooks."
     <div><div class="role mono" style="color:var(--dimmer)">github.com/AreevAI/dejadb</div></div>
   </div>
 </section>
-
 <!-- ══════════ 2 · CONTENTS ══════════ -->
 <section class="slide" data-act="1" data-notes="Agenda — about 40 seconds. Do not read it out.
 
@@ -541,18 +540,17 @@ Say the shape instead: the first few minutes are the whole product end to end �
 
 Then point at the three green demo markers: those are live notebooks, not screenshots.
 
-Pacing at 47 minutes: Overview ~8, Definitions ~6, Hermes ~6 (incl. demo 1), Substrate ~5, Waiser ~13 (incl. demos 2 and 3), Proof ~6, Enterprise ~6.
+Pacing at 47 minutes: Overview ~8, Definitions ~6, Substrate ~5, Waiser ~13 (incl. demos 1 and 2), Hermes ~6 (incl. demo 3), Proof ~6, Enterprise ~6.
 
 Every line is clickable, so this doubles as your jump-to during Q&A — useful when someone asks about a slide you have already passed.
 
-If you need to lose five minutes: the landscape matrix, the speed slide, and demo 2.">
+If you need to lose five minutes: the landscape matrix, the speed slide, and demo 3.">
   <div class="eyebrow">Agenda <span class="n">/ what we'll cover</span></div>
   <div class="body top" style="padding-top:4px">
     <h2 class="step shown" data-s="0" style="font-size:40px;margin-bottom:4px">What we'll cover.</h2>
     <div id="toc"></div>
   </div>
 </section>
-
 <!-- ══════════ 2 · THE PROBLEM (conversation timeline) ══════════ -->
 <section class="slide" data-act="1" data-steps="4" data-notes="One slide for the problem — we come back to it in depth later.
 
@@ -591,7 +589,6 @@ Land the point under it: no system of record holds this. There is no billing_own
   </div>
   <div class="foot">No system of record holds this. The agent knows it <b>only because someone said it in a conversation.</b></div>
 </section>
-
 <!-- ══════════ 3 · ROOT CAUSE ══════════ -->
 <section class="slide" data-act="1" data-steps="2" data-notes="THE slide of the opening. Take your time.
 
@@ -621,7 +618,6 @@ Not a retrieval-quality problem. A better embedding model returns the same three
   </div>
   <div class="foot">Not a retrieval-quality problem. A better embedding model returns the same three chunks, <b>with the same confidence.</b></div>
 </section>
-
 <!-- ══════════ 4 · THE USUAL FIX: STACK STORES ══════════ -->
 <section class="slide" data-act="1" data-steps="3" data-notes="This is the slide that lands with architects, because most of them have built exactly this.
 
@@ -714,7 +710,6 @@ Do not oversell here. Say plainly: this is a reasonable architecture. It is just
   </div>
   <div class="foot">A reasonable architecture — and a lot of machinery. Three stores, three write paths, three ways to drift. <b>"Why does the agent believe this?" spans all of them, so nothing answers it.</b></div>
 </section>
-
 <!-- ══════════ 4 · THE SOLUTION ══════════ -->
 <section class="slide wide" data-act="1" data-steps="6" data-title="The solution — one memory engine, end to end" data-notes="The whole product on one slide. Walk it left to right, one reveal at a time — about 90 seconds.
 
@@ -861,7 +856,6 @@ Bottom strip: microsecond recall, zero-dollar writes, no server in the recall pa
     </div>
   </div>
 </section>
-
 <!-- ══════════ 5 · CAL ══════════ -->
 <section class="slide" data-act="1" data-steps="3" data-notes="CAL — the Context Assembly Language. 90 seconds, and this is where the opening problem gets solved.
 
@@ -924,7 +918,6 @@ IF ASKED about rerank: the cross-encoder is feature-gated in the stock build; th
   </div>
   <div class="foot">Assembly logic is <b>data, not code</b> — save the query into the memory file and re-tune what gets injected without redeploying the agent. <span style="color:var(--dimmer)">(Cross-encoder <span class="mono">rerank</span> is feature-gated; the lexical + vector legs are the stock path.)</span></div>
 </section>
-
 <!-- ══════════ 6 · WAISER OVERVIEW ══════════ -->
 <section class="slide wide" data-act="1" data-steps="6" data-notes="Waiser in 75 seconds — we come back and spend twelve minutes on it later.
 
@@ -1015,7 +1008,6 @@ Headline the badge: the whole detection loop closes with ZERO model calls. No ke
     </svg>
   </div>
 </section>
-
 <!-- ══════════ 7 · THE MAP ══════════ -->
 <section class="slide" data-act="1" data-steps="6" data-notes="Close the overview by handing them the map.
 
@@ -1035,14 +1027,12 @@ Each one is an act of the rest of the talk — point at the right-hand labels. T
   </div>
   <div class="foot">You answer all five for a code deploy. You answer <b>none</b> of them for what your agent learned last night.</div>
 </section>
-
 <!-- ══════════ 8 · DIVIDER ══════════ -->
 <section class="slide divider" data-act="2" data-notes="Act II — definitions. ~6 min. Mixed-background audience; this gives everyone shared vocabulary before Hermes.">
   <div class="act">Act II</div>
   <h1>What "self-improving"<br>actually means</h1>
   <p class="lede">A lifecycle you can point at — not a property you claim.</p>
 </section>
-
 <!-- ══════════ 9 ══════════ -->
 <section class="slide" data-act="2" data-steps="6" data-notes="Numbering is justified — this is genuinely a sequence and each rung depends on the previous.
 
@@ -1104,7 +1094,6 @@ Ask the room: where does your current agent stop?">
   </div>
   <div class="foot">Most "self-improving agent" demos stop at <b>03</b>. Rungs 04 and 05 are the difference between a demo and a system.</div>
 </section>
-
 <!-- ══════════ 10 ══════════ -->
 <section class="slide" data-act="2" data-steps="3" data-notes="The most commonly confused pair in the field, and this audience has people on both sides of it.
 
@@ -1129,7 +1118,6 @@ Good question to pose: how would you currently prove your agent got better last 
     <p class="kicker step" data-s="3" style="margin-top:24px;font-size:21px">Evidence links them. Metrics validate them. Rollback keeps them safe.</p>
   </div>
 </section>
-
 <!-- ══════════ 11 ══════════ -->
 <section class="slide" data-act="2" data-steps="3" data-notes="The turn that makes this a talk about self-improvement rather than about storage.
 
@@ -1144,7 +1132,6 @@ Tie back to the escalation: the agent doesn't just misroute once. It writes down
     <div class="step" data-s="3" style="margin-top:4px"><div class="stamp" style="font-size:23px">Confidently wrong — and compounding</div></div>
   </div>
 </section>
-
 <!-- ══════════ 12 ══════════ -->
 <section class="slide" data-act="2" data-steps="4" data-notes="The intellectual core. It's why the architecture looks the way it does, and it converts skeptical engineers.
 
@@ -1199,7 +1186,6 @@ The design rule falls straight out: whatever proposes a change must never be wha
       <strong>whatever proposes a change must never be what approves it.</strong></p>
   </div>
 </section>
-
 <!-- ══════════ 13 ══════════ -->
 <section class="slide" data-act="2" data-steps="4" data-notes="Why this is urgent now: field evidence, regulation, security.
 
@@ -1231,134 +1217,19 @@ Security: memory injection is a live attack class; published defenses ask for pr
   </div>
   <div class="foot">Field evidence, regulation, and security independently converge on one word: <b>governed.</b></div>
 </section>
-
-<!-- ══════════ 14 · DIVIDER ══════════ -->
-<section class="slide divider" data-act="3" data-notes="Act III — Hermes. ~6 min including demo 1. Be genuinely fair here; the credibility of the comparison depends on it.">
-  <div class="act">Act III</div>
-  <h1>Hermes: skills<br>from experience</h1>
-  <p class="lede">How an agent turns a workflow it just completed into one it can reuse.</p>
-</section>
-
-<!-- ══════════ 15 ══════════ -->
-<section class="slide" data-act="3" data-steps="4" data-notes="Be fair and accurate — this is a good system and people in the room may use it.
-
-Hermes Agent (Nous Research) is open source and self-hosted. Its pitch is a built-in learning loop over persistent memory: it creates skills from experience, edits procedural skill files, and consolidates episodic memory in a background post-turn review.
-
-Skills are procedural memory — on-demand documents loaded only when relevant rather than bloating every prompt. Genuinely good idea, right shape for reusable capability.
-
-Its built-in memory is deliberately small: two character-capped markdown files — MEMORY.md at 2,200 chars, USER.md at 1,375 — plus an FTS index over session history.">
-  <div class="eyebrow">Hermes <span class="n">/ 13</span></div>
-  <div class="body">
-    <h2 class="step" data-s="1">Hermes turns successful workflows<br>into reusable skills.</h2>
-    <p class="lede step" data-s="1" style="max-width:68ch">Skills are <em>procedural memory</em>: on-demand documents loaded only when relevant,
-      instead of bloating every prompt.</p>
-    <div class="grid g3" style="margin-top:6px">
-      <div class="card step" data-s="2"><div class="lbl">Create</div><p>After a complex task, an error recovery, or a user correction, the agent can write a skill.</p></div>
-      <div class="card step" data-s="3"><div class="lbl">Reuse</div><p>Installed skills are invoked directly and bundled into profiles for recurring work.</p></div>
-      <div class="card step" data-s="4"><div class="lbl">Consolidate</div><p>A background post-turn review compacts episodic memory into the two capped files.</p></div>
-    </div>
-  </div>
-  <div class="foot">Built-in memory is deliberately small: <b class="mono">MEMORY.md</b> (2,200 chars) + <b class="mono">USER.md</b> (1,375) + an FTS index over session history.</div>
-</section>
-
-<!-- ══════════ 16 ══════════ -->
-<section class="slide" data-act="3" data-steps="4" data-notes="The wedge — and it must come from their own documentation, not as a jab.
-
-Verified from Hermes's own docs: memory.write_approval and skills.write_approval BOTH default to false. Write freely; the gate is off. There's an open feature request — #19324 — asking for approval-before-write, which tells you users want the gate.
-
-And the subtle one: when a capped file approaches its limit, consolidation REPLACES entries. The previous wording is gone from disk. Not superseded — gone. So 'what did this agent believe last month' has no answer.
-
-Say explicitly: this is a design observation, not a comment on quality or popularity.">
-  <div class="eyebrow">Hermes <span class="n">/ 14 · where the gate is</span></div>
-  <div class="body">
-    <h2 class="step" data-s="1">The gate ships off.</h2>
-    <div class="term step" data-s="2" style="max-width:900px">
-      <div class="bar"><span class="dot"></span> hermes config — defaults</div>
-      <div class="body-t"><span class="c-dm">memory.write_approval</span>   <span class="c-ro">false</span>
-<span class="c-dm">skills.write_approval</span>   <span class="c-ro">false</span></div>
-    </div>
-    <p class="kicker step" data-s="3" style="margin-top:22px;max-width:74ch;font-size:20px">
-      Both default to <strong>false</strong> — write freely. An open feature request (<span class="mono">#19324</span>) asks for
-      approval-before-write, which tells you users want the gate.</p>
-    <p class="kicker step" data-s="4" style="margin-top:16px;max-width:74ch;font-size:20px">
-      And when a capped file fills, consolidation <strong>replaces</strong> entries — the previous wording is gone from disk.
-      <em>"What did this agent believe last month?"</em> has no answer.</p>
-  </div>
-  <div class="foot">Stated from its own documentation. An observation about <b>design</b> — not about quality or adoption.</div>
-</section>
-
-<!-- ══════════ 17 ══════════ -->
-<section class="slide" data-act="3" data-steps="3" data-notes="Make it concrete — this isn't theoretical. We ship a real memory provider for Hermes.
-
-Verified against Hermes 0.16.0, loaded through its real plugin loader, subclassing its real MemoryProvider ABC, driven through its real MemoryManager. Six hooks.
-
-The architecturally important number: prefetch() p50 is 0.83 ms at 2,080 grains, and prefetch sits on Hermes's SYNCHRONOUS turn path. A network-backed provider pays a round trip there on every single turn. That's the whole in-process argument in one measurement.
-
-State the honest limits: 'remove' is never mirrored, because Hermes's bridge only fires for add and replace. And skills are out of scope — a memory provider can't see or govern procedural memory.">
-  <div class="eyebrow">Hermes <span class="n">/ 15 · the integration</span></div>
-  <div class="body">
-    <h2 class="step" data-s="1">DejaDB runs as a Hermes memory provider.</h2>
-    <p class="lede step" data-s="1" style="max-width:70ch">Verified against <strong>Hermes 0.16.0</strong> — real plugin loader, real
-      <span class="mono">MemoryProvider</span> ABC, real <span class="mono">MemoryManager</span>.</p>
-    <div class="tblwrap step" data-s="2" style="max-width:1180px">
-      <table>
-        <tr><th style="width:260px">Hermes hook</th><th>What DejaDB does</th></tr>
-        <tr><td class="mono" style="color:var(--cyan)">prefetch(query)</td><td>One budgeted <span class="mono">ASSEMBLE</span> — profile facts + prior-session turns, token-capped</td></tr>
-        <tr><td class="mono" style="color:var(--cyan)">sync_turn(u, a)</td><td>One Event grain per side, tagged with the Hermes session id</td></tr>
-        <tr><td class="mono" style="color:var(--cyan)">on_memory_write(…)</td><td>Mirrors every <span class="mono">MEMORY.md</span>/<span class="mono">USER.md</span> edit as an audit Event <em>and</em> a profile Fact</td></tr>
-        <tr><td class="mono" style="color:var(--cyan)">on_pre_compress(…)</td><td>Persists what compression is about to discard</td></tr>
-        <tr><td class="mono" style="color:var(--cyan)">on_session_end(…)</td><td>Runs the deterministic analyzers — advisory only</td></tr>
-      </table>
-    </div>
-    <div class="grid g3 step" data-s="3" style="margin-top:20px">
-      <div class="card mint"><div class="metric"><div class="v" style="font-size:42px;color:var(--mint)">0.83<span style="font-size:22px"> ms</span></div><div class="k"><span class="mono">prefetch()</span> p50 at 2,080 grains</div></div></div>
-      <div class="card"><div class="metric"><div class="v" style="font-size:42px">0.47<span style="font-size:22px"> ms</span></div><div class="k"><span class="mono">sync_turn()</span></div></div></div>
-      <div class="card accent"><p style="color:var(--ink);font-size:18px"><strong>prefetch sits on Hermes's <em>synchronous</em> turn path.</strong> A network-backed provider pays a round trip there — every turn.</p></div>
-    </div>
-  </div>
-</section>
-
-<!-- ══════════ 18 · DEMO 1 ══════════ -->
-<section class="slide" data-act="3" data-steps="2" data-notes="DEMO 1 — notebook 04. Budget ~5 minutes.
-
-The 12-line simulation is the star: write_approval off means reflect() just appends a takeaway to skills.md. Two refund failures during a flash sale and the agent concludes 'avoid refund_processor while a flash sale is running'. Correlation, meet causation. Then 'fixing' it wipes the file — no record of what the agent believed during the sale.
-
-Loop B: same experience, governed. The model's hunch QUEUES instead of becoming behavior. You dismiss it with a reason. Only when a third failure clears the evidence bar does a real recommendation appear.
-
-Outputs are pre-baked — if a cell fails, just scroll. Say so casually.">
-  <div class="body">
-    <div class="demo step" data-s="1">
-      <div class="dhead"><span>Live notebook · Demo 1</span><span>~5 min</span></div>
-      <div class="dbody">
-        <h2 style="margin-bottom:8px">Two loops, same experience</h2>
-        <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/04_hermes_vs_governed.ipynb</span><span class="ext">open in Colab ↗</span></a>
-        <ol>
-          <li>A refund agent during a flash sale — two failures.</li>
-          <li><strong>Loop A</strong> — reflection with the gate off, in 12 lines: it learns <em>"avoid refund_processor while a flash sale is running."</em> Correlation, meet causation.</li>
-          <li>"Fixing" it wipes the file — no record of what the agent believed during the sale.</li>
-          <li><strong>Loop B</strong> — same experience, governed. The model's hunch <strong>queues</strong> instead of becoming behavior.</li>
-        </ol>
-      </div>
-    </div>
-    <p class="kicker step" data-s="2" style="margin-top:24px;font-size:21px">
-      Same experience. Same model. The only difference is <strong>where the write happens.</strong></p>
-  </div>
-</section>
-
 <!-- ══════════ 19 · DIVIDER ══════════ -->
-<section class="slide divider" data-act="4" data-notes="Act IV — the substrate, ~5 min. Keep it tight; this is the setup for Waiser's depth, not the destination.">
-  <div class="act">Act IV</div>
+<section class="slide divider" data-act="3" data-notes="Act III — the substrate, ~5 min. Keep it tight; this is the setup for Waiser's depth, not the destination.">
+  <div class="act">Act III</div>
   <h1>The substrate:<br>memory that can't rot</h1>
   <p class="lede">You cannot govern what you cannot reconstruct.</p>
 </section>
-
 <!-- ══════════ 20 ══════════ -->
-<section class="slide" data-act="4" data-steps="4" data-notes="Brisk — 90 seconds.
+<section class="slide" data-act="3" data-steps="4" data-notes="Brisk — 90 seconds.
 
 Facts become a knowledge graph: subject, relation, object. Real links, not loose blobs. Every record is immutable and content-addressed — SHA-256 over the whole record. Updates supersede; history stays. So you can ask what's true now, or what was true in March.
 
 One memory equals one file. That's the unit of erasure, sync, portability and write parallelism — and it's why 'delete this customer' is a real operation rather than a DELETE statement you hope covered everything.">
-  <div class="eyebrow">Substrate <span class="n">/ 16</span></div>
+  <div class="eyebrow">Substrate <span class="n">/ 13</span></div>
   <div class="body">
     <h2 class="step" data-s="1">An in-process memory engine.</h2>
     <div class="grid g4" style="margin-top:12px">
@@ -1372,16 +1243,15 @@ One memory equals one file. That's the unit of erasure, sync, portability and wr
       <strong>no server in the recall path.</strong></p>
   </div>
 </section>
-
 <!-- ══════════ 21 · THE SAME TIMELINE, RESOLVED ══════════ -->
-<section class="slide" data-act="4" data-steps="4" data-notes="Direct answer to the opening. Call back to it explicitly — 'this is the same conversation from slide two'.
+<section class="slide" data-act="3" data-steps="4" data-notes="Direct answer to the opening. Call back to it explicitly — 'this is the same conversation from slide two'.
 
 Same three turns. Now March is marked superseded — struck through, not deleted — July is LIVE, and August routes to Priya.
 
 Two things to point at. Each fact carries derived_from: a link back to the exact conversation turn that taught it. And the supersession carries a written reason.
 
 Then the structural point: because 'owner' is a functional relation — one live value by definition — two live values is a contradiction the store can DETECT. Not a ranking problem for similarity to guess at. That detection is what the whole next act is built on.">
-  <div class="eyebrow">Substrate <span class="n">/ 17</span></div>
+  <div class="eyebrow">Substrate <span class="n">/ 14</span></div>
   <div class="body">
     <h2 class="step" data-s="1" style="font-size:44px;margin-bottom:20px">The same conversation — with time and links.</h2>
     <div class="tl">
@@ -1413,12 +1283,11 @@ Then the structural point: because 'owner' is a functional relation — one live
   </div>
   <div class="foot">Because <b class="mono">owner</b> is a <b>functional</b> relation, two live values is a structural contradiction the store can <b>detect</b> — not a ranking problem for similarity to guess at.</div>
 </section>
-
 <!-- ══════════ 22 ══════════ -->
-<section class="slide" data-act="4" data-steps="4" data-notes="Scope, stated before the deep dive. With architects and researchers, scoped claims buy credibility — and this pre-empts two questions that would otherwise derail Q&A.
+<section class="slide" data-act="3" data-steps="4" data-notes="Scope, stated before the deep dive. With architects and researchers, scoped claims buy credibility — and this pre-empts two questions that would otherwise derail Q&A.
 
 We improve what the agent KNOWS. We do not claim to make your agent better at tasks — that's a capability claim needing a capability measurement we don't have. Clean, current, contradiction-free memory is the mechanism. We stop there deliberately.">
-  <div class="eyebrow">Substrate <span class="n">/ 18 · scope</span></div>
+  <div class="eyebrow">Substrate <span class="n">/ 15 · scope</span></div>
   <div class="body">
     <h2 class="step" data-s="1">What we're claiming — and what we're not.</h2>
     <div class="grid g2" style="margin-top:10px;gap:22px">
@@ -1435,23 +1304,21 @@ We improve what the agent KNOWS. We do not claim to make your agent better at ta
       Clean, current, contradiction-free memory is <em>the mechanism</em> — not the outcome. We stop where the measurement stops.</p>
   </div>
 </section>
-
 <!-- ══════════ 23 · DIVIDER ══════════ -->
-<section class="slide divider" data-act="5" data-notes="Act V — Waiser in depth. The heart of the talk, ~13 min including demos 2 and 3. Slow down.">
-  <div class="act">Act V</div>
+<section class="slide divider" data-act="4" data-notes="Act IV — Waiser in depth. The heart of the talk, ~13 min including demos 2 and 3. Slow down.">
+  <div class="act">Act IV</div>
   <h1>Waiser, in depth</h1>
   <p class="lede">Detection, the four gates, correction, and measurement.</p>
 </section>
-
 <!-- ══════════ 24 ══════════ -->
-<section class="slide" data-act="5" data-steps="3" data-notes="The claim that surprises people most. Make it explicit and let it sit.
+<section class="slide" data-act="4" data-steps="3" data-notes="The claim that surprises people most. Make it explicit and let it sit.
 
 Zero model calls to detect. No API key, no tokens, no dollars, no rate limits, no non-determinism, works air-gapped.
 
 Only possible because the substrate is typed and immutable — analyzers compute over declared semantics: error flags, supersession chains, valid_to windows. Never over raw prose.
 
 If your memory is a pile of text blobs, you have no choice but to send it to a model to find out what's in it. That's the architectural payoff of the previous act.">
-  <div class="eyebrow">Waiser <span class="n">/ 19</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 16</span></div>
   <div class="body">
     <h2 class="step" data-s="1">The loop closes with<br><em>zero</em> model calls.</h2>
     <div class="grid g4 step" data-s="2" style="margin-top:16px">
@@ -1466,9 +1333,8 @@ If your memory is a pile of text blobs, you have no choice but to send it to a m
       choice but to pay a model to tell you what's in it.</p>
   </div>
 </section>
-
 <!-- ══════════ 25 ══════════ -->
-<section class="slide" data-act="5" data-steps="3" data-notes="Eleven analyzers, ten on by default. The split is the differentiator.
+<section class="slide" data-act="4" data-steps="3" data-notes="Eleven analyzers, ten on by default. The split is the differentiator.
 
 Left, hygiene: is memory internally correct? Every memory product eventually builds some of these.
 
@@ -1477,7 +1343,7 @@ Right, utility: is memory USED, and does it help? Fed by a recall-telemetry side
 Telemetry is buffered and non-blocking — voice-loop recall stays ~82µs with it on. Encrypted under the file's key, never syncs.
 
 And you can add your own without recompiling: --analyzer-cmd runs your check in any language. Advisory only, can never mutate memory. That's the PII / house-style / compliance hook enterprises ask for.">
-  <div class="eyebrow">Waiser <span class="n">/ 20 · detection</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 17 · detection</span></div>
   <div class="body">
     <h2 class="step" data-s="1" style="margin-bottom:16px">Eleven analyzers. Ten on by default.</h2>
     <div class="split plain step" data-s="2">
@@ -1507,9 +1373,8 @@ And you can add your own without recompiling: --analyzer-cmd runs your check in 
       <span class="mono">--analyzer-cmd</span> — advisory only, it can never mutate memory.</p>
   </div>
 </section>
-
 <!-- ══════════ 26 ══════════ -->
-<section class="slide" data-act="5" data-steps="4" data-notes="Real output — run against the published 1.0.5 wheel, not a mockup.
+<section class="slide" data-act="4" data-steps="4" data-notes="Real output — run against the published 1.0.5 wheel, not a mockup.
 
 Three things to point at.
 
@@ -1518,7 +1383,7 @@ One: the failure signature is NORMALIZED. See the '#' where the call number was?
 Two: 71% of calls. It fires on rate, not just count, so a high-volume tool with a moderate failure rate isn't hidden.
 
 Three, the governance bit: apply returns rollbackable: true. The inverse was computed and stored at the moment of apply. Not 'we could probably reconstruct it' — stored.">
-  <div class="eyebrow">Waiser <span class="n">/ 21 · what it produces</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 18 · what it produces</span></div>
   <div class="body">
     <h2 class="step" data-s="1">Recommendations, not prose.</h2>
     <div class="term step" data-s="2" style="max-width:1230px">
@@ -1541,9 +1406,8 @@ Three, the governance bit: apply returns rollbackable: true. The inverse was com
       computed and stored <em>at apply time</em>.</p>
   </div>
 </section>
-
 <!-- ══════════ 27 ══════════ -->
-<section class="slide" data-act="5" data-steps="5" data-notes="Your change-management slide — the one engineering leaders will screenshot.
+<section class="slide" data-act="4" data-steps="5" data-notes="Your change-management slide — the one engineering leaders will screenshot.
 
 Propose: only structured objects enter the queue. Versioned analyzer id, template-rendered summary, evidence hashes, severity. Analyzers CANNOT emit free prose — deliberate, it's what makes the queue reviewable at a glance.
 
@@ -1554,7 +1418,7 @@ Apply: scope-checked. Destructive applies need admin plus an explicit allow flag
 Verify: the metric is re-measured after apply, and regression proposes a revert.
 
 Then the auto-apply question, because someone always asks: off by default. Granted only by a host policy file, only for built-in analyzers, only non-destructive supersede-shaped curation, never for LLM findings. Exactly ONE analyzer — duplicate_sweep — is even eligible. And the policy file is never stored inside the memory file, so a synced or stolen file can't arrive pre-armed.">
-  <div class="eyebrow">Waiser <span class="n">/ 22 · the four gates</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 19 · the four gates</span></div>
   <div class="body">
     <h2 class="step" data-s="1" style="margin-bottom:4px">Nothing changes behind your back.</h2>
     <svg class="neon" viewBox="0 0 1420 400" style="max-height:430px" role="img"
@@ -1639,9 +1503,8 @@ Then the auto-apply question, because someone always asks: off by default. Grant
   </div>
   <div class="foot">Auto-apply is <b>off by default</b> — granted only by a host policy file, only for built-in analyzers, only non-destructive curation, <b>never</b> for LLM findings. Exactly one analyzer is even eligible.</div>
 </section>
-
 <!-- ══════════ 28 · DEMO 2 ══════════ -->
-<section class="slide" data-act="5" data-steps="2" data-notes="DEMO 2 — notebook 06. Budget ~6 minutes. This is the SAME billing-escalation story from the opening, now running for real — say that out loud, it lands.
+<section class="slide" data-act="4" data-steps="2" data-notes="DEMO 1 — notebook 06. Budget ~6 minutes. This is the SAME billing-escalation story from the opening, now running for real — say that out loud, it lands.
 
 A real agent turn loop: assemble context with CAL, call a model to extract durable facts, capture them back with derived_from pointing at the conversation turn.
 
@@ -1656,7 +1519,7 @@ Beat 4, the payoff — three facts each individually fine: the API enforces 30 d
 Worth saying: the extraction schema is PINNED and enforced in code. Free-form extraction inventing its own relation names each turn is exactly why other memory layers can't see their own contradictions.">
   <div class="body">
     <div class="demo step" data-s="1">
-      <div class="dhead"><span>Live notebook · Demo 2</span><span>~6 min · the running example, for real</span></div>
+      <div class="dhead"><span>Live notebook · Demo 1</span><span>~6 min · the running example, for real</span></div>
       <div class="dbody">
         <h2 style="margin-bottom:8px">An agent that learns from conversation</h2>
         <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/06_agent_learns_from_conversation.ipynb</span><span class="ext">open in Colab ↗</span></a>
@@ -1673,16 +1536,15 @@ Worth saying: the extraction schema is PINNED and enforced in code. Free-form ex
       <span style="color:var(--dimmer)">(<span class="mono">03_detect_review_govern</span> covers the policy file if there's time.)</span></p>
   </div>
 </section>
-
 <!-- ══════════ 29 ══════════ -->
-<section class="slide" data-act="5" data-steps="4" data-notes="Correcting knowledge without erasing it. Contrast with last-writer-wins explicitly.
+<section class="slide" data-act="4" data-steps="4" data-notes="Correcting knowledge without erasing it. Contrast with last-writer-wins explicitly.
 
 In most stores, correcting a fact means overwriting it — the previous belief is gone. Here the correction is a supersession: new value live, old one retained and marked, and the link carries the reason and the actor.
 
 That's what makes 'what did the agent believe on 3 August, and why' answerable. Auditors don't want your current state. They want the chain.
 
 For content that genuinely must go: forget is a single-grain gated tombstone. And say the hard part out loud — logical deletion isn't byte erasure in ANY SQLite-lineage engine. The only honest erasure is per-file crypto-erasure: destroy the key. We measured this and published both results.">
-  <div class="eyebrow">Waiser <span class="n">/ 23 · correction</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 20 · correction</span></div>
   <div class="body">
     <h2 class="step" data-s="1">Correcting knowledge shouldn't erase it.</h2>
     <div class="grid g2 step" data-s="2" style="margin-top:8px;gap:22px">
@@ -1700,9 +1562,8 @@ For content that genuinely must go: forget is a single-grain gated tombstone. An
       <strong>crypto-erasure</strong>: destroy the key.</p>
   </div>
 </section>
-
 <!-- ══════════ 30 ══════════ -->
-<section class="slide" data-act="5" data-steps="5" data-notes="Measurement — the Verify gate. The rung almost nobody else has, so dwell here.
+<section class="slide" data-act="4" data-steps="5" data-notes="Measurement — the Verify gate. The rung almost nobody else has, so dwell here.
 
 'Did it make a change' is the wrong question. 'Did the change help' is the product.
 
@@ -1711,7 +1572,7 @@ Read the output: held at 1d, held at 7d, and at 30d baseline 0 becomes current 2
 The multi-horizon shape matters: a fix that looks fine early and rots later is exactly the one that hurts you, and a single post-apply check would have called this a success on day one.
 
 Re-measurement is a typed read over subsequent history. No LLM, no judge model, no guessing. Recorded as a file-truth that syncs.">
-  <div class="eyebrow">Waiser <span class="n">/ 24 · measurement</span></div>
+  <div class="eyebrow">Waiser <span class="n">/ 21 · measurement</span></div>
   <div class="body">
     <h2 class="step" data-s="1">"Did it change something" is the wrong question.</h2>
     <p class="lede step" data-s="1" style="margin-bottom:20px">"Did the change help?" is the product.</p>
@@ -1731,9 +1592,8 @@ Re-measurement is a typed read over subsequent history. No LLM, no judge model, 
       duplicate still exist. It does <em>not</em> score "was the blog post good."</p>
   </div>
 </section>
-
 <!-- ══════════ 31 · DEMO 3 ══════════ -->
-<section class="slide" data-act="5" data-steps="2" data-notes="DEMO 3 — notebook 02. The anchor demo of the whole talk. Budget 6-7 minutes and protect this time.
+<section class="slide" data-act="4" data-steps="2" data-notes="DEMO 2 — notebook 02. The anchor demo of the whole talk. Budget 6-7 minutes and protect this time.
 
 Month-end close. Payment gateway throws 401s. A reasonable lesson is proposed and you APPROVE it — 'gateway unstable during close, queue invoices for manual review'. Reasonable. Wrong.
 
@@ -1746,7 +1606,7 @@ Then supersede an outdated remittance inbox, forget a harmful workaround, print 
 If you only show one notebook, show this one.">
   <div class="body">
     <div class="demo step" data-s="1" style="border-color:rgba(12,138,94,.38);background:linear-gradient(180deg,var(--w-mint),#fff 55%)">
-      <div class="dhead" style="color:var(--mint);border-bottom-color:rgba(12,138,94,.24)"><span>Live notebook · Demo 3 — the anchor</span><span>~6–7 min · protect this time</span></div>
+      <div class="dhead" style="color:var(--mint);border-bottom-color:rgba(12,138,94,.24)"><span>Live notebook · Demo 2 — the anchor</span><span>~6–7 min · protect this time</span></div>
       <div class="dbody">
         <h2 style="margin-bottom:8px">The wrong lesson</h2>
         <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/02_the_wrong_lesson.ipynb</span><span class="ext">open in Colab ↗</span></a>
@@ -1764,14 +1624,120 @@ If you only show one notebook, show this one.">
       <strong>That's exactly where the model earns its place.</strong></p>
   </div>
 </section>
+<!-- ══════════ 14 · DIVIDER ══════════ -->
+<section class="slide divider" data-act="5" data-notes="Act V — Hermes, now that they know what governed looks like. ~6 min including demo 3. Be genuinely fair here; the credibility of the comparison depends on it.">
+  <div class="act">Act V</div>
+  <h1>Hermes: skills<br>from experience</h1>
+  <p class="lede">How an agent turns a workflow it just completed into one it can reuse.</p>
+</section>
+<!-- ══════════ 15 ══════════ -->
+<section class="slide" data-act="5" data-steps="4" data-notes="Be fair and accurate — this is a good system and people in the room may use it.
 
+Hermes Agent (Nous Research) is open source and self-hosted. Its pitch is a built-in learning loop over persistent memory: it creates skills from experience, edits procedural skill files, and consolidates episodic memory in a background post-turn review.
+
+Skills are procedural memory — on-demand documents loaded only when relevant rather than bloating every prompt. Genuinely good idea, right shape for reusable capability.
+
+Its built-in memory is deliberately small: two character-capped markdown files — MEMORY.md at 2,200 chars, USER.md at 1,375 — plus an FTS index over session history.">
+  <div class="eyebrow">Hermes <span class="n">/ 22</span></div>
+  <div class="body">
+    <h2 class="step" data-s="1">Hermes turns successful workflows<br>into reusable skills.</h2>
+    <p class="lede step" data-s="1" style="max-width:68ch">Skills are <em>procedural memory</em>: on-demand documents loaded only when relevant,
+      instead of bloating every prompt.</p>
+    <div class="grid g3" style="margin-top:6px">
+      <div class="card step" data-s="2"><div class="lbl">Create</div><p>After a complex task, an error recovery, or a user correction, the agent can write a skill.</p></div>
+      <div class="card step" data-s="3"><div class="lbl">Reuse</div><p>Installed skills are invoked directly and bundled into profiles for recurring work.</p></div>
+      <div class="card step" data-s="4"><div class="lbl">Consolidate</div><p>A background post-turn review compacts episodic memory into the two capped files.</p></div>
+    </div>
+  </div>
+  <div class="foot">Built-in memory is deliberately small: <b class="mono">MEMORY.md</b> (2,200 chars) + <b class="mono">USER.md</b> (1,375) + an FTS index over session history.</div>
+</section>
+<!-- ══════════ 16 ══════════ -->
+<section class="slide" data-act="5" data-steps="4" data-notes="The wedge — and it must come from their own documentation, not as a jab.
+
+Verified from Hermes's own docs: memory.write_approval and skills.write_approval BOTH default to false. Write freely; the gate is off. There's an open feature request — #19324 — asking for approval-before-write, which tells you users want the gate.
+
+And the subtle one: when a capped file approaches its limit, consolidation REPLACES entries. The previous wording is gone from disk. Not superseded — gone. So 'what did this agent believe last month' has no answer.
+
+Say explicitly: this is a design observation, not a comment on quality or popularity.">
+  <div class="eyebrow">Hermes <span class="n">/ 23 · where the gate is</span></div>
+  <div class="body">
+    <h2 class="step" data-s="1">The gate ships off.</h2>
+    <div class="term step" data-s="2" style="max-width:900px">
+      <div class="bar"><span class="dot"></span> hermes config — defaults</div>
+      <div class="body-t"><span class="c-dm">memory.write_approval</span>   <span class="c-ro">false</span>
+<span class="c-dm">skills.write_approval</span>   <span class="c-ro">false</span></div>
+    </div>
+    <p class="kicker step" data-s="3" style="margin-top:22px;max-width:74ch;font-size:20px">
+      Both default to <strong>false</strong> — write freely. An open feature request (<span class="mono">#19324</span>) asks for
+      approval-before-write, which tells you users want the gate.</p>
+    <p class="kicker step" data-s="4" style="margin-top:16px;max-width:74ch;font-size:20px">
+      And when a capped file fills, consolidation <strong>replaces</strong> entries — the previous wording is gone from disk.
+      <em>"What did this agent believe last month?"</em> has no answer.</p>
+  </div>
+  <div class="foot">Stated from its own documentation. An observation about <b>design</b> — not about quality or adoption.</div>
+</section>
+<!-- ══════════ 17 ══════════ -->
+<section class="slide" data-act="5" data-steps="3" data-notes="Make it concrete — this isn't theoretical. We ship a real memory provider for Hermes.
+
+Verified against Hermes 0.16.0, loaded through its real plugin loader, subclassing its real MemoryProvider ABC, driven through its real MemoryManager. Six hooks.
+
+The architecturally important number: prefetch() p50 is 0.83 ms at 2,080 grains, and prefetch sits on Hermes's SYNCHRONOUS turn path. A network-backed provider pays a round trip there on every single turn. That's the whole in-process argument in one measurement.
+
+State the honest limits: 'remove' is never mirrored, because Hermes's bridge only fires for add and replace. And skills are out of scope — a memory provider can't see or govern procedural memory.">
+  <div class="eyebrow">Hermes <span class="n">/ 24 · the integration</span></div>
+  <div class="body">
+    <h2 class="step" data-s="1">DejaDB runs as a Hermes memory provider.</h2>
+    <p class="lede step" data-s="1" style="max-width:70ch">Verified against <strong>Hermes 0.16.0</strong> — real plugin loader, real
+      <span class="mono">MemoryProvider</span> ABC, real <span class="mono">MemoryManager</span>.</p>
+    <div class="tblwrap step" data-s="2" style="max-width:1180px">
+      <table>
+        <tr><th style="width:260px">Hermes hook</th><th>What DejaDB does</th></tr>
+        <tr><td class="mono" style="color:var(--cyan)">prefetch(query)</td><td>One budgeted <span class="mono">ASSEMBLE</span> — profile facts + prior-session turns, token-capped</td></tr>
+        <tr><td class="mono" style="color:var(--cyan)">sync_turn(u, a)</td><td>One Event grain per side, tagged with the Hermes session id</td></tr>
+        <tr><td class="mono" style="color:var(--cyan)">on_memory_write(…)</td><td>Mirrors every <span class="mono">MEMORY.md</span>/<span class="mono">USER.md</span> edit as an audit Event <em>and</em> a profile Fact</td></tr>
+        <tr><td class="mono" style="color:var(--cyan)">on_pre_compress(…)</td><td>Persists what compression is about to discard</td></tr>
+        <tr><td class="mono" style="color:var(--cyan)">on_session_end(…)</td><td>Runs the deterministic analyzers — advisory only</td></tr>
+      </table>
+    </div>
+    <div class="grid g3 step" data-s="3" style="margin-top:20px">
+      <div class="card mint"><div class="metric"><div class="v" style="font-size:42px;color:var(--mint)">0.83<span style="font-size:22px"> ms</span></div><div class="k"><span class="mono">prefetch()</span> p50 at 2,080 grains</div></div></div>
+      <div class="card"><div class="metric"><div class="v" style="font-size:42px">0.47<span style="font-size:22px"> ms</span></div><div class="k"><span class="mono">sync_turn()</span></div></div></div>
+      <div class="card accent"><p style="color:var(--ink);font-size:18px"><strong>prefetch sits on Hermes's <em>synchronous</em> turn path.</strong> A network-backed provider pays a round trip there — every turn.</p></div>
+    </div>
+  </div>
+</section>
+<!-- ══════════ 18 · DEMO 1 ══════════ -->
+<section class="slide" data-act="5" data-steps="2" data-notes="DEMO 3 — notebook 04. Budget ~5 minutes.
+
+The 12-line simulation is the star: write_approval off means reflect() just appends a takeaway to skills.md. Two refund failures during a flash sale and the agent concludes 'avoid refund_processor while a flash sale is running'. Correlation, meet causation. Then 'fixing' it wipes the file — no record of what the agent believed during the sale.
+
+Loop B: same experience, governed. The model's hunch QUEUES instead of becoming behavior. You dismiss it with a reason. Only when a third failure clears the evidence bar does a real recommendation appear.
+
+Outputs are pre-baked — if a cell fails, just scroll. Say so casually.">
+  <div class="body">
+    <div class="demo step" data-s="1">
+      <div class="dhead"><span>Live notebook · Demo 3</span><span>~5 min</span></div>
+      <div class="dbody">
+        <h2 style="margin-bottom:8px">Two loops, same experience</h2>
+        <a class="nblink" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer"><span class="p">examples/colab/04_hermes_vs_governed.ipynb</span><span class="ext">open in Colab ↗</span></a>
+        <ol>
+          <li>A refund agent during a flash sale — two failures.</li>
+          <li><strong>Loop A</strong> — reflection with the gate off, in 12 lines: it learns <em>"avoid refund_processor while a flash sale is running."</em> Correlation, meet causation.</li>
+          <li>"Fixing" it wipes the file — no record of what the agent believed during the sale.</li>
+          <li><strong>Loop B</strong> — same experience, governed. The model's hunch <strong>queues</strong> instead of becoming behavior.</li>
+        </ol>
+      </div>
+    </div>
+    <p class="kicker step" data-s="2" style="margin-top:24px;font-size:21px">
+      Same experience. Same model. The only difference is <strong>where the write happens.</strong></p>
+  </div>
+</section>
 <!-- ══════════ 32 · DIVIDER ══════════ -->
 <section class="slide divider" data-act="6" data-notes="Act VI — proof. ~6 min. The audience includes people evaluating memory systems; they need something falsifiable to take away.">
   <div class="act">Act VI</div>
   <h1>Measured,<br>not asserted</h1>
   <p class="lede">Every quality claim in this talk has a harness you can run.</p>
 </section>
-
 <!-- ══════════ 33 ══════════ -->
 <section class="slide" data-act="6" data-steps="4" data-notes="Numbers with their caveats attached — the caveat is the credibility.
 
@@ -1800,7 +1766,6 @@ We never headline numbers we didn't measure and never inherit vendor benchmarks.
   </div>
   <div class="foot">We never headline numbers we didn't measure, and never inherit vendor benchmarks — one competing system has been publicly scored <b>58 / 66 / 75 / 84</b> on the same benchmark depending on who ran it.</div>
 </section>
-
 <!-- ══════════ 34 ══════════ -->
 <section class="slide" data-act="6" data-steps="5" data-notes="The LLM layer. Answers the question everyone is holding: 'so does a model decide what my agent learns?'
 
@@ -1843,7 +1808,6 @@ Floor is keyless: no backend configured, the stages are the identity function an
   </div>
   <div class="foot">No backend configured? The stages become the identity function and the deterministic loop is unchanged. <b>The floor is always keyless.</b></div>
 </section>
-
 <!-- ══════════ 35 ══════════ -->
 <section class="slide" data-act="6" data-steps="3" data-notes="Speed, framed as an architecture argument rather than a benchmark boast.
 
@@ -1866,7 +1830,6 @@ Reference point, vendor-stated not measured by us: a network memory service head
       "no server in the recall path" is an <strong>architectural</strong> claim, not a benchmark boast.</p>
   </div>
 </section>
-
 <!-- ══════════ 36 ══════════ -->
 <section class="slide" data-act="6" data-steps="2" data-notes="The landscape. For the people evaluating memory systems, this is what they came for.
 
@@ -1898,14 +1861,12 @@ Say the defensible sentence once. Don't oversell it.">
   </div>
   <div class="foot">Rated from each system's <b>own docs and papers</b> — by design, never by popularity. The nearest neighbours are cloud-only, grader-based, and don't cite evidence.</div>
 </section>
-
 <!-- ══════════ 37 · DIVIDER ══════════ -->
 <section class="slide divider" data-act="7" data-notes="Act VII — enterprise architecture. ~6 min. The CTO/architect act: slow, concrete, no hype.">
   <div class="act">Act VII</div>
   <h1>Architecture for<br>enterprise agents</h1>
   <p class="lede">Trust boundaries, failure modes, and operations — not just recall quality.</p>
 </section>
-
 <!-- ══════════ 38 ══════════ -->
 <section class="slide" data-act="7" data-steps="7" data-notes="The architect slide. Six considerations, one at a time.
 
@@ -1933,7 +1894,6 @@ And no daemon. It rides your hooks, cron, or CI.">
     </div>
   </div>
 </section>
-
 <!-- ══════════ 39 ══════════ -->
 <section class="slide" data-act="7" data-steps="3" data-notes="Where it actually plugs in — the practical adoption slide.
 
@@ -1959,7 +1919,6 @@ Surfaces: CLI, Python, Node, two MCP tools, HTTP API, and a web console with the
       a web console with the queue, sessions, and outcomes.</p>
   </div>
 </section>
-
 <!-- ══════════ 40 ══════════ -->
 <section class="slide" data-act="7" data-steps="5" data-notes="Non-goals at the end, where they function as integrity rather than hedging. Pre-empts most of Q&A.
 
@@ -1980,7 +1939,6 @@ Say the grounding one out loud — the checker is right about 3 in 4 on hard cas
   </div>
   <div class="foot">It's not "AI-powered" at the core. The deterministic layer is the floor; the model is an optional, bounded extension.</div>
 </section>
-
 <!-- ══════════ 41 ══════════ -->
 <section class="slide" data-act="7" data-steps="5" data-notes="The callback the whole deck was built for. Read them as answers, not features.
 
@@ -2004,7 +1962,6 @@ Then land the line: self-improvement you can put in front of a compliance team."
   </div>
   <div class="foot">Self-improvement you can put in front of a compliance team.</div>
 </section>
-
 <!-- ══════════ 42 · CTA ══════════ -->
 <section class="slide" data-act="7" data-steps="3" data-notes="Land it and stop. Don't add a summary after this.
 
@@ -2028,7 +1985,6 @@ Then open Q&A.">
     </div>
   </div>
 </section>
-
 <!-- ══════════ 43 · Q&A ══════════ -->
 <section class="slide" data-act="7" data-title="Q&amp;A — and everything, to take away" data-notes="10 minutes. Leave this up for the whole Q&A — every link has a copy button, so people can grab them while you talk.
 
@@ -2051,9 +2007,9 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
     <div class="links">
         <div class="linkrow"><div class="what">The code<small>open source · MIT / Apache</small></div><a class="url" href="https://github.com/AreevAI/dejadb" target="_blank" rel="noopener noreferrer">github.com/AreevAI/dejadb</a><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb">copy</button></div>
         <div class="linkrow"><div class="what">All 7 notebooks<small>run in Colab — no API key needed</small></div><a class="url" href="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab" target="_blank" rel="noopener noreferrer">github.com/AreevAI/dejadb › examples/colab</a><button class="copybtn" type="button" data-copy="https://github.com/AreevAI/dejadb/tree/talk/self-improving-agents/examples/colab">copy</button></div>
-        <div class="linkrow"><div class="what">Learns from conversation<small>notebook 06 · today’s demo 2</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 06_agent_learns_from_conversation</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb">copy</button></div>
-        <div class="linkrow"><div class="what">The wrong lesson<small>notebook 02 · today’s demo 3</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 02_the_wrong_lesson</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb">copy</button></div>
-        <div class="linkrow"><div class="what">Two loops, same experience<small>notebook 04 · today’s demo 1</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 04_hermes_vs_governed</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">Learns from conversation<small>notebook 06 · today’s demo 1</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 06_agent_learns_from_conversation</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/06_agent_learns_from_conversation.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">The wrong lesson<small>notebook 02 · today’s demo 2</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 02_the_wrong_lesson</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/02_the_wrong_lesson.ipynb">copy</button></div>
+        <div class="linkrow"><div class="what">Two loops, same experience<small>notebook 04 · today’s demo 3</small></div><a class="url" href="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb" target="_blank" rel="noopener noreferrer">colab.research.google.com › 04_hermes_vs_governed</a><button class="copybtn" type="button" data-copy="https://colab.research.google.com/github/AreevAI/dejadb/blob/talk/self-improving-agents/examples/colab/04_hermes_vs_governed.ipynb">copy</button></div>
     </div>
   </div>
 </section>
@@ -2267,7 +2223,7 @@ If you don't know: say so and offer to follow up. Consistent with the whole talk
       if (!byAct[a]) { byAct[a] = []; acts.push(a); }
       byAct[a].push(i);
     });
-    var names = {'1':'Overview','2':'Definitions','3':'Hermes','4':'Substrate','5':'Waiser','6':'Proof','7':'Enterprise'};
+    var names = {'1':'Overview','2':'Definitions','3':'Substrate','4':'Waiser','5':'Hermes','6':'Proof','7':'Enterprise'};
     acts.forEach(function(a){
       var box = document.createElement('div');
       box.className = 'tocact';
