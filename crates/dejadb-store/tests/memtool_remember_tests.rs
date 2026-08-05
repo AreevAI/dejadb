@@ -99,18 +99,180 @@ fn remember_extracts_facts_with_provenance() {
     let facts = m.recall("caller", "alice", None, 16).unwrap();
     assert_eq!(facts.len(), 2);
     for f in &facts {
-        assert_eq!(f.get_str("derived_from"), Some(res.observation.to_hex().as_str()));
+        assert_eq!(f.get_str("derived_from"), Some(res.event.to_hex().as_str()));
         assert_eq!(f.get_str("source_type"), Some("derived"));
     }
-    // observation grain holds the raw content
-    let obs = m.get(&res.observation).unwrap();
-    assert!(obs.fields["context"]["content"].as_str().unwrap().contains("morning calls"));
+    // the Event grain holds the raw content in its native `content` field,
+    // which is what the FTS/embedding projection indexes
+    let obs = m.get(&res.event).unwrap();
+    assert!(obs.fields["content"].as_str().unwrap().contains("morning calls"));
 }
 
 #[test]
-fn remember_without_extractor_stores_observation_only() {
+fn remember_without_extractor_stores_the_event_only() {
     let (mut m, _d) = open_mem();
     let res = m.remember("caller", "raw note", "cli", None).unwrap();
     assert!(res.facts.is_empty());
-    assert!(m.get(&res.observation).is_ok());
+    assert!(m.get(&res.event).is_ok());
+}
+
+// --- capture + attach_facts: the split seam for fallible extractors --------
+
+fn draft(subject: &str, relation: &str, object: &str) -> FactDraft {
+    FactDraft {
+        subject: subject.into(),
+        relation: relation.into(),
+        object: object.into(),
+        confidence: 0.9,
+    }
+}
+
+fn observer(id: &str) -> dejadb_store::Capture<'_> {
+    dejadb_store::Capture { observer: Some(id), ..Default::default() }
+}
+
+#[test]
+fn capture_stores_the_raw_text_before_any_extraction() {
+    let (mut m, _d) = open_mem();
+    let obs = m
+        .capture("caller", "Alice moved to Berlin", &observer("voice-agent"))
+        .unwrap();
+    let stored = m.get(&obs).unwrap();
+    assert_eq!(stored.fields["content"], "Alice moved to Berlin");
+    assert_eq!(stored.fields["observer"], "voice-agent");
+    // Nothing else was written — an extraction that never happens costs
+    // nothing but the facts.
+    assert_eq!(m.recall("caller", "alice", None, 16).unwrap().len(), 0);
+}
+
+#[test]
+fn captured_text_is_full_text_searchable() {
+    // The Observation shape this replaced buried the text in `context.content`,
+    // which `projected_text` does not index — remembered text was invisible to
+    // search. An Event's native `content` field is indexed.
+    let (mut m, _d) = open_mem();
+    m.capture("caller", "the marmalade incident happened in Lisbon", &observer("cli"))
+        .unwrap();
+    let hits = m.search_text("caller", "marmalade", 8).unwrap();
+    assert_eq!(hits.len(), 1, "remembered text must be searchable");
+}
+
+#[test]
+fn capture_threads_a_turn_by_session_and_role() {
+    let (mut m, _d) = open_mem();
+    let meta = dejadb_store::Capture {
+        observer: Some("voice-agent"),
+        session_id: Some("sess-1"),
+        role: Some("user"),
+    };
+    let h = m.capture("caller", "hello there", &meta).unwrap();
+    let g = m.get(&h).unwrap();
+    assert_eq!(g.fields["session_id"], "sess-1");
+    assert_eq!(g.fields["role"], "user");
+    // Reachable as part of its transcript, not just as a loose grain.
+    let tail = m.thread_tail("caller", "sess-1", 8).unwrap();
+    assert_eq!(tail.len(), 1);
+}
+
+#[test]
+fn capture_drops_an_unrecognized_role_rather_than_failing() {
+    let (mut m, _d) = open_mem();
+    let meta = dejadb_store::Capture { role: Some("wizard"), ..Default::default() };
+    let h = m.capture("caller", "abracadabra", &meta).unwrap();
+    let g = m.get(&h).unwrap();
+    assert!(g.fields.get("role").is_none_or(|v| v.is_null()));
+    assert_eq!(g.fields["content"], "abracadabra");
+}
+
+#[test]
+fn attach_facts_stamps_model_provenance_and_verification_status() {
+    let (mut m, _d) = open_mem();
+    let obs = m
+        .capture("caller", "Alice moved to Berlin", &observer("voice-agent"))
+        .unwrap();
+    let attr = dejadb_store::FactAttribution {
+        verification_status: Some("unverified"),
+        extractor_model: Some("openai:gpt-4o-mini"),
+    };
+    let facts = m
+        .attach_facts("caller", &obs, &[draft("alice", "lives_in", "Berlin")], &attr)
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+
+    let g = m.get(&facts[0]).unwrap();
+    assert_eq!(g.fields["derived_from"], obs.to_hex());
+    assert_eq!(g.fields["source_type"], "derived");
+    assert_eq!(g.fields["verification_status"], "unverified");
+    // An audit can answer "which model wrote this?" from the grain itself —
+    // and it survives the .mg round trip, which a provenance_chain entry
+    // would not (nothing in dejadb-core serializes that field).
+    assert_eq!(g.fields["extractor_model"], "openai:gpt-4o-mini");
+}
+
+#[test]
+fn attach_facts_with_no_attribution_matches_the_host_supplied_shape() {
+    let (mut m, _d) = open_mem();
+    let obs = m.capture("caller", "note", &observer("cli")).unwrap();
+    let facts = m
+        .attach_facts(
+            "caller",
+            &obs,
+            &[draft("alice", "prefers", "tea")],
+            &dejadb_store::FactAttribution::default(),
+        )
+        .unwrap();
+    let g = m.get(&facts[0]).unwrap();
+    // A host asserting its own facts is not relaying a model's claim: the
+    // provenance link is there, the model attribution is not.
+    assert_eq!(g.fields["derived_from"], obs.to_hex());
+    assert!(g.fields.get("verification_status").is_none_or(|v| v.is_null()));
+    assert!(g.fields.get("extractor_model").is_none_or(|v| v.is_null()));
+}
+
+// --- FactDraft::from_json_array — the shared CLI/py/js parse ----------------
+
+#[test]
+fn from_json_array_parses_and_defaults_confidence() {
+    let drafts = FactDraft::from_json_array(
+        r#"[{"subject":"john","relation":"prefers","object":"window seat","confidence":0.9},
+            {"subject":" john ","relation":"diet","object":"vegetarian"}]"#,
+    )
+    .unwrap();
+    assert_eq!(drafts.len(), 2);
+    assert_eq!(drafts[0].confidence, 0.9);
+    assert_eq!(drafts[1].confidence, dejadb_store::DRAFT_DEFAULT_CONFIDENCE);
+    assert_eq!(drafts[1].subject, "john", "fields are trimmed");
+}
+
+#[test]
+fn from_json_array_clamps_confidence() {
+    let drafts = FactDraft::from_json_array(
+        r#"[{"subject":"a","relation":"b","object":"c","confidence":7},
+            {"subject":"a","relation":"b","object":"d","confidence":-2}]"#,
+    )
+    .unwrap();
+    assert_eq!(drafts[0].confidence, 1.0);
+    assert_eq!(drafts[1].confidence, 0.0);
+}
+
+#[test]
+fn from_json_array_rejects_incomplete_triples() {
+    // An incomplete row used to become a Fact with empty subject/relation/
+    // object — a silently corrupt write. It is an error now.
+    for bad in [
+        r#"[{"subject":"john"}]"#,
+        r#"[{"subject":"john","relation":"prefers"}]"#,
+        r#"[{"subject":"","relation":"a","object":"b"}]"#,
+        r#"[{"subject":"a","relation":"a","object":"   "}]"#,
+    ] {
+        let e = FactDraft::from_json_array(bad).unwrap_err().to_string();
+        assert!(e.contains("facts[0]"), "{bad} → {e}");
+        assert!(e.starts_with("VAL-E001"), "carries its error code: {e}");
+    }
+}
+
+#[test]
+fn from_json_array_rejects_malformed_json() {
+    let e = FactDraft::from_json_array("not json").unwrap_err().to_string();
+    assert!(e.starts_with("VAL-E001"), "{e}");
 }

@@ -346,10 +346,101 @@ pub struct FactDraft {
     pub confidence: f64,
 }
 
+/// The confidence a draft gets when the source omits one.
+pub const DRAFT_DEFAULT_CONFIDENCE: f64 = 0.8;
+
+impl FactDraft {
+    /// Parse the `[{subject, relation, object, confidence}]` JSON that every
+    /// non-Rust surface uses to hand over pre-extracted facts (`--facts`,
+    /// `facts_json`) — a closure cannot cross FFI, so the drafts arrive as
+    /// text. Lives here, next to the type, because the CLI, Python, and Node
+    /// bindings all need exactly this parse.
+    ///
+    /// A row missing any of subject/relation/object is an error, not a silent
+    /// empty-string Fact. Confidence defaults to
+    /// [`DRAFT_DEFAULT_CONFIDENCE`] and is clamped into 0.0–1.0.
+    pub fn from_json_array(json: &str) -> Result<Vec<FactDraft>> {
+        let arr: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| {
+            DejaDbError::Validation(format!(
+                "facts must be a JSON array of {{subject, relation, object, confidence}}: {e}"
+            ))
+        })?;
+        arr.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let field = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let (subject, relation, object) = (field("subject"), field("relation"), field("object"));
+                if subject.is_empty() || relation.is_empty() || object.is_empty() {
+                    return Err(DejaDbError::Validation(format!(
+                        "facts[{i}] needs a non-empty subject, relation, and object"
+                    )));
+                }
+                Ok(FactDraft {
+                    subject,
+                    relation,
+                    object,
+                    confidence: v
+                        .get("confidence")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(DRAFT_DEFAULT_CONFIDENCE)
+                        .clamp(0.0, 1.0),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Provenance stamped on facts attached to their source grain by
+/// [`DejaDB::attach_facts`].
+///
+/// The default — used by `remember()`'s own extractor seam and by the
+/// host-supplied `--facts` path — adds nothing beyond the `derived_from` link:
+/// a host asserting its own facts is not relaying a model's claim, so it gets
+/// no model attribution and no verification status.
+#[derive(Debug, Clone, Default)]
+pub struct FactAttribution<'a> {
+    /// OMS `verification_status` (`"unverified"` / `"verified"` / …). Facts a
+    /// model extracted from free text are `"unverified"` until something
+    /// checks them; it is CAL-filterable, so the queue is queryable.
+    pub verification_status: Option<&'a str>,
+    /// Identifier of the model that produced these drafts, recorded so an
+    /// audit can answer "which model wrote this?" from the grain itself.
+    ///
+    /// It rides in `extra_fields` as `extractor_model` — the same mechanism
+    /// Waiser uses to carry structured data on a grain. `GrainCommon` has a
+    /// `provenance_chain` field that looks like the natural home, but nothing
+    /// in `dejadb-core` serializes it, so a value written there would be
+    /// silently dropped at the blob boundary.
+    pub extractor_model: Option<&'a str>,
+}
+
+/// Who captured a piece of raw content, and where it sits in a conversation.
+/// Every field is optional: `deja remember` names an observer, the MCP tool and
+/// `capture-stop` carry a session and a role, and a bare call needs none.
+#[derive(Debug, Clone, Default)]
+pub struct Capture<'a> {
+    /// The agent/process that captured the text. Kept in `extra_fields`
+    /// (an Event's `role` is the *author*, which is a different question).
+    pub observer: Option<&'a str>,
+    /// Session/thread id — what puts the Event in the thread index, so a
+    /// remembered turn is reachable as part of its transcript.
+    pub session_id: Option<&'a str>,
+    /// `user` | `assistant` | `system` | `tool`. Unrecognized values are
+    /// dropped rather than rejected.
+    pub role: Option<&'a str>,
+}
+
 /// Result of `DejaDB::remember`.
 #[derive(Debug, Clone)]
 pub struct RememberResult {
-    pub observation: Hash,
+    /// The Event grain holding the raw captured text.
+    pub event: Hash,
     pub facts: Vec<Hash>,
 }
 
@@ -3485,11 +3576,76 @@ impl DejaDB {
         Ok(subjects)
     }
 
+    /// Store raw content as an Event grain and return its hash. The first half
+    /// of `remember()`, split out so a caller whose extraction can *fail* (an
+    /// LLM call over the network) lands the raw text first and still has it
+    /// after a failed or garbage extraction. Losing the source text to a flaky
+    /// model call is the worst failure mode available to a memory engine.
+    ///
+    /// This is the one place raw remembered text is written, shared by
+    /// `deja remember`, both bindings, the MCP `dejadb_remember` tool, and
+    /// `capture-stop` — so the same input produces the same grain on every
+    /// surface.
+    pub fn capture(&mut self, ns: &str, content: &str, meta: &Capture<'_>) -> Result<Hash> {
+        use dejadb_core::types::{Event, Role};
+        let mut e = Event::new(content);
+        e.common.namespace = Some(ns.to_string());
+        e.session_id = meta.session_id.map(str::to_string);
+        e.role = meta.role.and_then(Role::from_str);
+        // Event has no observer field (it models a transcript turn, where
+        // `role` is the author). Who *captured* the turn is still worth
+        // keeping, so it rides in extra_fields, which round-trips through the
+        // blob.
+        if let Some(observer) = meta.observer.filter(|o| !o.is_empty()) {
+            e.common
+                .extra_fields
+                .insert("observer".to_string(), serde_json::json!(observer));
+        }
+        self.add(&e)
+    }
+
+    /// Store each draft as a Fact carrying `derived_from` provenance back to
+    /// `source`, plus whatever `attr` supplies. The second half of
+    /// `remember()`; call it after an out-of-band extraction (see
+    /// [`DejaDB::capture`]).
+    pub fn attach_facts(
+        &mut self,
+        ns: &str,
+        source: &Hash,
+        drafts: &[FactDraft],
+        attr: &FactAttribution<'_>,
+    ) -> Result<Vec<Hash>> {
+        let source_hex = source.to_hex();
+        let mut facts = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let mut fact = dejadb_core::types::Fact::new(&draft.subject, &draft.relation, &draft.object);
+            fact.common.confidence = draft.confidence.clamp(0.0, 1.0);
+            fact.common.namespace = Some(ns.to_string());
+            fact.common.derived_from = Some(source_hex.clone());
+            fact.common.source_type = Some("derived".to_string());
+            if let Some(status) = attr.verification_status {
+                fact.common.verification_status = Some(status.to_string());
+            }
+            if let Some(model) = attr.extractor_model {
+                fact.common
+                    .extra_fields
+                    .insert("extractor_model".to_string(), serde_json::json!(model));
+            }
+            facts.push(self.add(&fact)?);
+        }
+        Ok(facts)
+    }
+
     /// The `remember()` seam: store raw content as an
-    /// Observation grain, run the caller-supplied extraction function
+    /// Event grain, run the caller-supplied extraction function
     /// (typically an LLM callback — the host owns the model relationship),
     /// and store each returned draft as a Fact with `derived_from`
-    /// provenance back to the observation.
+    /// provenance back to that Event.
+    ///
+    /// This is the in-process shape, where the extractor cannot fail. A caller
+    /// with a *fallible* extractor composes [`DejaDB::capture`] and
+    /// [`DejaDB::attach_facts`] instead — what the CLI and the bindings do on
+    /// their `--model` / `--llm-cmd` path.
     #[allow(clippy::type_complexity)] // extractor is a plain callback; a type alias would not clarify
     pub fn remember(
         &mut self,
@@ -3498,24 +3654,10 @@ impl DejaDB {
         observer: &str,
         extractor: Option<&dyn Fn(&str) -> Vec<FactDraft>>,
     ) -> Result<RememberResult> {
-        use dejadb_core::types::Observation;
-        let mut obs = Observation::new(observer, "llm");
-        obs.common.namespace = Some(ns.to_string());
-        obs.common.context = Some(serde_json::json!({ "content": content }));
-        let observation = self.add(&obs)?;
-
-        let mut facts = Vec::new();
-        if let Some(f) = extractor {
-            for draft in f(content) {
-                let mut fact = dejadb_core::types::Fact::new(&draft.subject, &draft.relation, &draft.object);
-                fact.common.confidence = draft.confidence.clamp(0.0, 1.0);
-                fact.common.namespace = Some(ns.to_string());
-                fact.common.derived_from = Some(observation.to_hex());
-                fact.common.source_type = Some("derived".to_string());
-                facts.push(self.add(&fact)?);
-            }
-        }
-        Ok(RememberResult { observation, facts })
+        let event = self.capture(ns, content, &Capture { observer: Some(observer), ..Default::default() })?;
+        let drafts = extractor.map(|f| f(content)).unwrap_or_default();
+        let facts = self.attach_facts(ns, &event, &drafts, &FactAttribution::default())?;
+        Ok(RememberResult { event, facts })
     }
 
     /// Total number of grains in the hot store.

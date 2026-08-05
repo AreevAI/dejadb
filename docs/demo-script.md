@@ -71,7 +71,7 @@ reversible, (4) *model-native* — one line to give an agent memory.
   ```bash
   OBS=$(deja remember --db agent.db --ns agent --observer executor \
     --content "session 41: flaky test fixed by isolating the tempdir" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["observation"])')
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["event"])')
 
   deja cal "ADD fact SET subject = \"fix_flaky\" SET relation = \"lesson\" \
     SET object = \"Isolate the shared tempdir per test.\" SET derived_from = \"$OBS\" REASON \"distilled\"" \

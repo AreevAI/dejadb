@@ -12,6 +12,7 @@ observe finishes too quickly.
 """
 
 import json
+import sys
 import threading
 import time
 
@@ -171,12 +172,24 @@ def test_history_chain(tmp_path):
 # remember / stats / verify
 # --------------------------------------------------------------------------
 
-def test_remember_returns_observation(tmp_path):
+def test_remember_returns_event(tmp_path):
     m = make_db(tmp_path)
     res = json.loads(m.remember("John likes tea"))
-    assert "observation" in res
-    assert len(res["observation"]) == HEX64
+    assert "event" in res
+    assert len(res["event"]) == HEX64
     assert isinstance(res["facts"], list)
+    # The raw text is an Event grain — same as the MCP tool and capture-stop.
+    rows = json.loads(m.cal("RECALL events"))
+    assert rows["grains"][0]["fields"]["content"] == "John likes tea"
+
+
+def test_remember_threads_a_turn_by_session_and_role(tmp_path):
+    m = make_db(tmp_path)
+    m.remember("what's the refund policy?", session_id="call-1", role="user")
+    rows = json.loads(m.cal("RECALL events"))
+    fields = rows["grains"][0]["fields"]
+    assert fields["session_id"] == "call-1"
+    assert fields["role"] == "user"
 
 
 def test_remember_with_prelinked_facts(tmp_path):
@@ -187,6 +200,95 @@ def test_remember_with_prelinked_facts(tmp_path):
     res = json.loads(m.remember("John likes tea", facts_json=facts))
     assert len(res["facts"]) == 1
     assert all(len(h) == HEX64 for h in res["facts"])
+    # Host-supplied facts are the host's own assertion — no model attribution.
+    assert "model" not in res
+
+
+def test_remember_rejects_incomplete_facts(tmp_path):
+    m = make_db(tmp_path)
+    with pytest.raises(ValueError, match=r"facts\[0\]"):
+        m.remember("note", facts_json=json.dumps([{"subject": "john"}]))
+
+
+FAKE_LLM_PY = """
+import json, sys
+d = json.loads(sys.stdin.read())
+op = d.get("op", "")
+if op == "probe":
+    print(json.dumps({"model": "fake-extractor-1"}))
+elif op == "extract":
+    print(json.dumps({"facts": [
+        {"subject": "john", "relation": "prefers", "object": "window seat", "confidence": 0.9},
+        {"subject": "john", "relation": "guess", "object": "likes jazz", "confidence": 0.2},
+    ]}))
+elif op == "ground":
+    print(json.dumps({"results": [
+        {"id": c["id"], "supported": "guess" not in c["claim"], "reason": "checked"}
+        for c in d.get("claims", [])
+    ]}))
+else:
+    print(json.dumps({}))
+"""
+
+
+@pytest.fixture
+def fake_llm(tmp_path):
+    """A `llm_cmd` string driving a scripted fake — hermetic, no network."""
+    script = tmp_path / "fake_llm.py"
+    script.write_text(FAKE_LLM_PY)
+    return f"{sys.executable} {script}"
+
+
+def test_remember_extracts_with_a_model(tmp_path, fake_llm):
+    m = make_db(tmp_path)
+    res = json.loads(m.remember("I always want a window seat.", llm_cmd=fake_llm))
+    assert res["model"] == "fake-extractor-1"
+    assert res["proposed"] == 2
+    assert res["dropped"] == 0
+    assert res["verification_status"] == "unverified"
+    assert len(res["facts"]) == 2
+
+    # Provenance is on the grains, not just in the return value.
+    rows = json.loads(m.cal('RECALL facts WHERE verification_status = "unverified"'))
+    assert len(rows["grains"]) == 2
+    for g in rows["grains"]:
+        assert g["fields"]["derived_from"] == res["event"]
+        assert g["fields"]["extractor_model"] == "fake-extractor-1"
+
+
+def test_remember_grounding_drops_unsupported_facts(tmp_path, fake_llm):
+    m = make_db(tmp_path)
+    res = json.loads(
+        m.remember("I always want a window seat.", llm_cmd=fake_llm, ground_cmd=fake_llm)
+    )
+    assert res["proposed"] == 2
+    assert res["dropped"] == 1
+    assert res["verification_status"] == "verified"
+    assert len(res["facts"]) == 1
+
+
+def test_remember_confidence_floor(tmp_path, fake_llm):
+    m = make_db(tmp_path)
+    res = json.loads(
+        m.remember("I always want a window seat.", llm_cmd=fake_llm, min_confidence=0.5)
+    )
+    assert res["dropped"] == 1
+    assert len(res["facts"]) == 1
+
+
+def test_remember_keeps_the_source_text_when_extraction_fails(tmp_path):
+    m = make_db(tmp_path)
+    script = tmp_path / "dying_llm.py"
+    script.write_text(
+        "import json, sys\n"
+        "d = json.loads(sys.stdin.read())\n"
+        "print(json.dumps({'model': 'dying-1'})) if d.get('op') == 'probe' else sys.exit(3)\n"
+    )
+    with pytest.raises(ValueError, match="was stored"):
+        m.remember("some raw note", llm_cmd=f"{sys.executable} {script}")
+    # The raw text survived the failed extraction.
+    rows = json.loads(m.cal("RECALL events"))
+    assert len(rows["grains"]) == 1
 
 
 def test_stats_shape(tmp_path):

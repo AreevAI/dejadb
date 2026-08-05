@@ -209,8 +209,10 @@ Any MCP client can launch `deja serve --mcp --db <file>` and get 6 tools:
 
 Yes — DejaDB is the memory *substrate* for the loop, not the loop itself. A
 self-improvement loop is act → log experience → reflect → distill lessons →
-recall them next time; the reflection step is a model call your host makes
-(DejaDB runs no LLM). The store's job is making that loop safe to run
+recall them next time; the reflection step is a model call, and it is yours to
+own — DejaDB calls no model unless you point it at one (`deja remember --model`
+for extraction, `deja waiser run --model` for reflection; the key comes from
+the environment). The store's job is making that loop safe to run
 unattended, because in a learning loop memory rot **compounds** — an agent that
 re-learns duplicates or keeps stale lessons gets systematically worse:
 

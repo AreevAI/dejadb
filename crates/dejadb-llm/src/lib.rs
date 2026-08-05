@@ -22,6 +22,14 @@
 //! the remaining request JSON → the **user** message. Output is requested as
 //! JSON; Waiser's parsers tolerate anything malformed (dropping that stage's
 //! contribution), so a stray wrapper is safe.
+//!
+//! [`extract`] rides the same protocol for a second consumer: turning the free
+//! text passed to `remember()` into Fact drafts, so the extraction seam is
+//! reachable from the CLI and the bindings and not just from in-process Rust.
+
+pub mod extract;
+
+pub use extract::{extract_facts, extract_pipeline, ground_facts, ExtractedFact, Extraction};
 
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -132,6 +140,15 @@ fn op_schema(op: &str) -> Option<Value> {
         "enrich" => Some(obj(
             json!(["notes"]),
             json!({"notes": arr(obj(json!(["target","guidance"]), json!({"target":s,"guidance":s})))}),
+        )),
+        // The `remember()` extraction seam (`extract.rs`). GROUND for extracted
+        // facts reuses the "ground" arm above unchanged.
+        "extract" => Some(obj(
+            json!(["facts"]),
+            json!({"facts": arr(obj(
+                json!(["subject","relation","object","confidence"]),
+                json!({"subject":s,"relation":s,"object":s,"confidence":num}),
+            ))}),
         )),
         _ => None,
     }
@@ -436,7 +453,7 @@ mod tests {
 
     #[test]
     fn op_schemas_are_strict_and_flat() {
-        for op in ["discover", "ground", "verify", "enrich"] {
+        for op in ["discover", "ground", "verify", "enrich", "extract"] {
             let s = op_schema(op).unwrap_or_else(|| panic!("{op} has a schema"));
             assert_eq!(s["additionalProperties"], false, "{op}");
             assert!(!s["required"].as_array().unwrap().is_empty(), "{op}");

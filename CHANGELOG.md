@@ -6,7 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `remember()` stores an Event, not an Observation — every surface
+  now agrees.** `deja remember` and the bindings wrote an **Observation** while
+  the MCP `dejadb_remember` tool wrote an **Event**, for the same input. One
+  operation, two grain types, so a memory written over MCP and one written from
+  the CLI needed different queries to find. They now share a single write path
+  (`DejaDB::capture`), and it writes an Event — the grain that models a
+  transcript turn, which is what remembered content almost always is.
+
+  This also fixes a quiet data bug: an Observation carried the text in
+  `context.content`, which `projected_text` does **not** index, so remembered
+  text was invisible to `deja search` and to the BM25 leg of hybrid recall. An
+  Event's native `content` field is indexed, so remembered text is findable.
+
+  What this breaks:
+
+  - `RECALL observations` no longer finds newly remembered content — use
+    `RECALL events`. Observations already in a file are untouched (grains are
+    immutable), so an existing memory will hold both until you migrate it.
+  - The returned JSON key `observation` is now `event` on the CLI and both
+    bindings. MCP keeps `hash` and gains `event` alongside it.
+  - `RememberResult.observation` is now `RememberResult.event`.
+  - `DejaDB::observe()` (added earlier in this same unreleased cycle, never
+    shipped) is now `DejaDB::capture()`, taking a `Capture` struct.
+
+  `remember()`'s own signature is unchanged. `capture-stop`, which already
+  wrote Events by hand, now goes through the same path.
+
+- **`deja remember` gains `--session-id` and `--role`**, and the bindings gain
+  the matching `session_id` / `role` params — the fields MCP always had. A
+  remembered turn can now be recorded as part of its conversation from any
+  surface (`RECALL events WHERE session_id = "..."`). The MCP tool gains
+  `observer`, which the CLI always had. The two surfaces now take the same
+  inputs and produce the same grain.
+
+### Added
+
+- **`remember()` can extract facts with an LLM.** `remember` always took free
+  text, but distilling it into Facts was a Rust-only closure seam — the CLI and
+  both bindings could pass *pre-extracted* facts and nothing else (the CLI said
+  so in a comment: "the CLI can't run an LLM"). `deja remember --content "..."
+  --model openai:gpt-4o-mini` now does the extraction, as do `model=` /
+  `llm_cmd=` on the Python and Node bindings. Extraction rides the existing
+  Waiser wire protocol as a new `extract` op, so all three shipped providers
+  (OpenAI-compatible / Anthropic / Ollama) plus the `--llm-cmd` subprocess
+  escape hatch work with no new provider code, and no new dependency.
+
+  A model writing its own output into memory is exactly the failure mode this
+  engine exists to prevent, so the write is shaped around that:
+
+  - The raw text is stored **before** the model is called. A failed or
+    unreadable extraction costs the facts, never the source text — the hash is
+    still reported so the extraction can be retried against it.
+  - Extracted facts are stamped `verification_status="unverified"` and carry
+    `extractor_model` naming the model that wrote them, alongside the existing
+    `derived_from` / `source_type=derived`. `verification_status` is
+    CAL-filterable, so `RECALL facts WHERE verification_status = "unverified"`
+    is a review queue rather than a pile of new writes.
+  - `--ground-model` / `--ground-cmd` adds an opt-in entailment pass in a
+    *separate* call (proposer ≠ scorer, as in the Waiser verifier): unsupported
+    facts are dropped, survivors become `"verified"`.
+  - Drops are never silent — the output accounts for `proposed` vs `dropped`
+    across the `--min-confidence` floor and the grounder, and a response that
+    hits the per-call fact cap says so on stderr.
+
+  Also `--dry-run` (extract and print, store nothing) and `--extract-hint`
+  (steer extraction toward your domain). MCP's `dejadb_remember` is unchanged
+  and deliberately has no extraction — there the client is already a model.
+
+  New surface: `dejadb_llm::{extract_facts, ground_facts, extract_pipeline}`,
+  `DejaDB::{capture, attach_facts}` + `Capture` / `FactAttribution`, and
+  `FactDraft::from_json_array`. `remember()`'s signature is unchanged.
+
 ### Fixed
+
+- **`remember` no longer stores empty-field Facts from malformed input.** The
+  `--facts` / `facts_json` parse, duplicated across the CLI and both bindings,
+  read each field with `unwrap_or("")` — so a row missing `object` became a
+  Fact with an empty object rather than an error. The three copies are now one
+  `FactDraft::from_json_array`, and an incomplete triple is rejected with
+  `VAL-E001` naming the offending row.
 
 - **`WITH superseded` now works on anchored recalls, and labels what it
   returns.** The option only ever had an effect on the *unanchored* path

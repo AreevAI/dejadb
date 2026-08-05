@@ -13,7 +13,7 @@ use std::io::{BufRead, Write};
 use dejadb_cal::store_types::RecallParams;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::Hash;
-use dejadb_core::types::{Event, Role};
+use dejadb_store::Capture;
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
 use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
@@ -276,31 +276,30 @@ impl McpServer {
                 Ok(json!({"forgotten": h.to_hex()}).to_string())
             }
             "dejadb_remember" => {
-                // v1: store the raw content as an Event grain. Extraction into
-                // Facts is host-side (the `remember()` callback seam) — the
-                // MCP client (the model) can follow up with dejadb_add for the
-                // distilled facts it wants to keep.
+                // Stores the raw content as an Event through `DejaDB::capture`
+                // — the same write path as `deja remember`, the bindings, and
+                // `capture-stop`, so the same input yields the same grain on
+                // every surface.
+                //
+                // No LLM extraction knobs here, deliberately: over MCP the
+                // client *is* a model, so extraction would be a model calling
+                // a model. It follows up with dejadb_add for the facts it
+                // wants to keep.
                 let content = args
                     .get("content")
                     .and_then(|v| v.as_str())
                     .ok_or("dejadb_remember requires 'content'")?;
                 let ns = self.ns(args).to_string();
-                let session = args.get("session_id").and_then(|v| v.as_str()).map(String::from);
-                let role = args
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .and_then(Role::from_str);
+                let meta = Capture {
+                    observer: args.get("observer").and_then(|v| v.as_str()),
+                    session_id: args.get("session_id").and_then(|v| v.as_str()),
+                    role: args.get("role").and_then(|v| v.as_str()),
+                };
                 let h = self
                     .facade
-                    .with_store(|m| {
-                        let mut e = Event::new(content);
-                        e.common.namespace = Some(ns.clone());
-                        e.session_id = session.clone();
-                        e.role = role;
-                        m.add(&e)
-                    })
+                    .with_store(|m| m.capture(&ns, content, &meta))
                     .map_err(|e| e.to_string())?;
-                Ok(json!({"hash": h.to_hex(), "stored_as": "event",
+                Ok(json!({"hash": h.to_hex(), "event": h.to_hex(), "stored_as": "event",
                     "note": "distill durable facts with dejadb_add"}).to_string())
             }
             "dejadb_cal" => {
@@ -453,6 +452,7 @@ fn tool_defs() -> Vec<Value> {
                 "content": s("the utterance/observation text"),
                 "session_id": s("optional session/thread id"),
                 "role": s("optional: user|assistant|system|tool"),
+                "observer": s("optional id of the agent capturing this"),
                 "namespace": s("optional namespace")
             }, "required": ["content"]}
         }),

@@ -19,6 +19,52 @@ fn err<E: std::fmt::Display>(e: E) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
+/// Resolve an LLM backend the same two ways the CLI does: a subprocess
+/// (`llmCmd`, the zero-dependency escape hatch) or a built-in HTTP provider
+/// (`model`, key read from the environment). The subprocess wins when both are
+/// given. Both fail at construction, before anything is written.
+fn resolve_llm(
+    cmd: Option<String>,
+    spec: Option<String>,
+) -> napi::Result<Option<Box<dyn waiser::LlmBackend>>> {
+    if let Some(cmd) = cmd {
+        return Ok(Some(Box::new(waiser::CommandLlm::new(&cmd, None).map_err(err)?)));
+    }
+    if let Some(spec) = spec {
+        return Ok(Some(dejadb_llm::resolve(&spec, None, None).map_err(err)?));
+    }
+    Ok(None)
+}
+
+/// Run the shared extract → confidence floor → ground pipeline and convert the
+/// survivors to store drafts. An extraction that fails names the Event
+/// the raw text was already stored under, so the caller can retry against it
+/// instead of losing the content.
+fn extract_and_ground(
+    llm: &dyn waiser::LlmBackend,
+    grounder: Option<&dyn waiser::LlmBackend>,
+    source: &Hash,
+    content: &str,
+    hint: Option<&str>,
+    min_confidence: f64,
+) -> napi::Result<(usize, Vec<FactDraft>, Option<&'static str>)> {
+    let hex = source.to_hex();
+    let ex = dejadb_llm::extract_pipeline(llm, grounder, &hex, content, hint, min_confidence)
+        .map_err(|e| err(format!("{e} (event {hex} was stored)")))?;
+    let drafts = ex
+        .facts
+        .into_iter()
+        .map(|f| FactDraft {
+            subject: f.subject,
+            relation: f.relation,
+            object: f.object,
+            confidence: f.confidence,
+        })
+        .collect();
+    let status = if ex.grounded { "verified" } else { "unverified" };
+    Ok((ex.proposed, drafts, Some(status)))
+}
+
 /// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
 fn parse_duration_ms(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -410,44 +456,102 @@ impl DejaDb {
         })
     }
 
-    /// remember(): store content as an Observation; optional pre-extracted
-    /// facts (JSON list of {subject, relation, object, confidence}) become
-    /// provenance-linked Facts. Returns {"observation", "facts"} JSON.
+    /// remember(): store content as an Observation, then attach the facts
+    /// distilled from it. Three routes to those facts, in precedence order:
+    /// `factsJson` (pre-extracted by the host — a JSON list of
+    /// {subject, relation, object, confidence}), `llmCmd` (a subprocess
+    /// backend), or `model` ("openai:gpt-4o-mini", key from the env).
+    ///
+    /// The raw text is written before the model is called, so a failed
+    /// extraction never costs the raw text — the error names the hash it was
+    /// stored under. Model-extracted facts are stamped
+    /// `verification_status="unverified"` unless `groundModel`/`groundCmd`
+    /// runs a separate entailment pass (proposer ≠ scorer); facts it does not
+    /// support are dropped and survivors are stamped `"verified"`.
+    ///
+    /// The raw text is stored as an **Event** grain (a transcript turn) —
+    /// pass `sessionId`/`role` to place it in a conversation thread.
+    ///
+    /// Returns {"event", "facts"} JSON, plus {"model", "proposed",
+    /// "dropped", "verification_status"} when a model ran.
     #[napi(ts_return_type = "Promise<string>")]
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
     pub fn remember(
         &self,
         content: String,
         facts_json: Option<String>,
         observer: Option<String>,
         ns: Option<String>,
+        model: Option<String>,
+        llm_cmd: Option<String>,
+        ground_model: Option<String>,
+        ground_cmd: Option<String>,
+        extract_hint: Option<String>,
+        min_confidence: Option<f64>,
+        session_id: Option<String>,
+        role: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let facade = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let observer = observer.unwrap_or_else(|| "node".to_string());
+        // Runs on the worker pool: a model call is a network round trip, and
+        // blocking the event loop across it was the worst case of the old
+        // synchronous surface.
         StringJob::spawn(move || {
-            let drafts: Vec<FactDraft> = match facts_json {
-                Some(j) => {
-                    let arr: Vec<serde_json::Value> = serde_json::from_str(&j).map_err(err)?;
-                    arr.iter()
-                        .map(|v| FactDraft {
-                            subject: v["subject"].as_str().unwrap_or("").to_string(),
-                            relation: v["relation"].as_str().unwrap_or("").to_string(),
-                            object: v["object"].as_str().unwrap_or("").to_string(),
-                            confidence: v["confidence"].as_f64().unwrap_or(0.8),
-                        })
-                        .collect()
-                }
-                None => Vec::new(),
+            let explicit = match facts_json {
+                Some(j) => Some(FactDraft::from_json_array(&j).map_err(err)?),
+                None => None,
             };
-            let extractor = move |_c: &str| drafts.clone();
-            let res = facade
-                .with_store(|m| m.remember(&ns, &content, &observer, Some(&extractor)))
+            let llm = match explicit {
+                Some(_) => None,
+                None => resolve_llm(llm_cmd, model)?,
+            };
+            let grounder = match llm {
+                Some(_) => resolve_llm(ground_cmd, ground_model)?,
+                None => None,
+            };
+            let meta = dejadb_store::Capture {
+                observer: Some(observer.as_str()),
+                session_id: session_id.as_deref(),
+                role: role.as_deref(),
+            };
+            let event = facade
+                .with_store(|m| m.capture(&ns, &content, &meta))
                 .map_err(err)?;
-            Ok(json!({
-                "observation": res.observation.to_hex(),
-                "facts": res.facts.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
-            })
-            .to_string())
+
+            let (proposed, drafts, status) = match &llm {
+                None => {
+                    let d = explicit.unwrap_or_default();
+                    (d.len(), d, None)
+                }
+                Some(l) => extract_and_ground(
+                    l.as_ref(),
+                    grounder.as_deref(),
+                    &event,
+                    &content,
+                    extract_hint.as_deref(),
+                    min_confidence.unwrap_or(0.0),
+                )?,
+            };
+            let attribution = dejadb_store::FactAttribution {
+                verification_status: status,
+                extractor_model: llm.as_ref().map(|l| l.model()),
+            };
+            let facts = facade
+                .with_store(|m| m.attach_facts(&ns, &event, &drafts, &attribution))
+                .map_err(err)?;
+
+            let mut out = json!({
+                "event": event.to_hex(),
+                "facts": facts.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            });
+            if let (Some(obj), Some(l)) = (out.as_object_mut(), &llm) {
+                obj.insert("model".into(), json!(l.model()));
+                obj.insert("verification_status".into(), json!(status));
+                obj.insert("proposed".into(), json!(proposed));
+                obj.insert("dropped".into(), json!(proposed.saturating_sub(facts.len())));
+            }
+            Ok(out.to_string())
         })
     }
 
