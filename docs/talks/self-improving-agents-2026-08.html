@@ -405,7 +405,11 @@ g.step{transform:none;transition:opacity .5s ease}
 .split>div:last-child li::before{content:"✓";color:var(--mint)}
 .split.plain>div{background:#fff}
 .split.plain li{padding-left:0}
-.split.plain li::before{content:none}
+/* must out-specify `.split>div:first-child li::before` (0,2,3) — a bare
+   `.split.plain li::before` is (0,2,2) and silently loses, which left the
+   tick/cross marks overlapping the first character of every line. */
+.split.plain>div:first-child li::before,
+.split.plain>div:last-child li::before{content:none}
 
 /* ── table ───────────────────────────────────────────────── */
 .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:var(--shadow)}

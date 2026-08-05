@@ -5,8 +5,9 @@ against the `dejadb` wheel — no server, no Rust toolchain. Outputs are
 pre-baked from a validated end-to-end run, so every notebook reads well
 without executing.
 
-**Helpers ship inside the wheel.** The notebooks open with
-`from dejadb.helpers import *` (dejadb ≥ 1.0.4): `fresh` (clean re-runnable
+**Helpers ship inside the wheel.** Each notebook opens with one
+`%pip install` and `from dejadb.helpers import *` (dejadb ≥ 1.0.4, current
+release 1.0.5): `fresh` (clean re-runnable
 opens), `facts`/`show_recs`/`audit`/`outcomes` (plain-dict views over the
 JSON-string FFI), `days_later` (rehearse the 1d/7d/30d Verify checkpoints),
 `auto_model` (LLM auto-detection), and `bar` (labeled chart + PNG export).
@@ -18,7 +19,7 @@ Secrets panel) and the sweep adds an LLM discovery pass — drafts must survive
 GROUND→VERIFY and human review before anything changes. Without a key, the
 deterministic analyzers run everything; the floor is keyless.
 
-**Run locally** (from a repo checkout, before 1.0.4 is on PyPI):
+**Run locally** (any Jupyter, or from a repo checkout to test unreleased changes):
 
 ```bash
 python3 -m venv ~/.venvs/dejadb-demo
