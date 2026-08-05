@@ -13,11 +13,15 @@ JSON-string FFI), `days_later` (rehearse the 1d/7d/30d Verify checkpoints),
 `auto_model` (LLM auto-detection), and `bar` (labeled chart + PNG export).
 
 **LLM learning:** the learning notebooks call
-`waiser_run(model=auto_model())`. Provide an `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, or `OPENROUTER_API_KEY` (environment variable, or Colab's
-Secrets panel) and the sweep adds an LLM discovery pass — drafts must survive
-GROUND→VERIFY and human review before anything changes. Without a key, the
-deterministic analyzers run everything; the floor is keyless.
+`waiser_run(model=auto_model())`. Provide an `OPENROUTER_API_KEY` — as an
+environment variable, or in Colab's Secrets panel (the key icon in the left
+sidebar, switched on for the notebook) — and the sweep adds an LLM discovery
+pass: drafts must survive GROUND→VERIFY and human review before anything
+changes. Without a key, the deterministic analyzers run everything; the floor
+is keyless.
+
+(`auto_model()` also recognises `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` if you
+prefer another provider; the notebooks are written for OpenRouter.)
 
 **Run locally** (any Jupyter, or from a repo checkout to test unreleased changes):
 
