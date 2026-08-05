@@ -5,25 +5,24 @@ against the `dejadb` wheel — no server, no Rust toolchain. Outputs are
 pre-baked from a validated end-to-end run, so every notebook reads well
 without executing.
 
-**Helpers ship inside the wheel.** Each notebook opens with one
-`%pip install` and `from dejadb.helpers import *` (dejadb ≥ 1.0.4, current
-release 1.0.5): `fresh` (clean re-runnable
+**Helpers ship inside the wheel.** Each notebook opens with one `%pip install`
+and `from dejadb.helpers import *` (dejadb 1.0.5): `fresh` (clean re-runnable
 opens), `facts`/`show_recs`/`audit`/`outcomes` (plain-dict views over the
 JSON-string FFI), `days_later` (rehearse the 1d/7d/30d Verify checkpoints),
-`auto_model` (LLM auto-detection), and `bar` (labeled chart + PNG export).
+`auto_model` (finds a configured LLM key), and `bar` (labeled chart + PNG
+export).
 
-**LLM learning:** every model call in these notebooks goes to **Llama 3.3 70B
-Instruct** (open weights) through OpenRouter — nothing here needs a frontier
-model. Provide an `OPENROUTER_API_KEY` — as an
-environment variable, or in Colab's Secrets panel (the key icon in the left
-sidebar, switched on for the notebook) — and the sweep adds an LLM discovery
-pass: drafts must survive GROUND→VERIFY and human review before anything
-changes. Without a key, the deterministic analyzers run everything; the floor
-is keyless.
+**LLM learning:** every model call goes to **Llama 3.3 70B Instruct** — open
+weights, through OpenRouter. Nothing here needs a frontier model. Provide an
+`OPENROUTER_API_KEY`, as an environment variable or in Colab's Secrets panel
+(the key icon in the left sidebar, switched on for the notebook), and the sweep
+adds an LLM discovery pass: drafts must survive GROUND→VERIFY and human review
+before anything changes. Without a key the deterministic analyzers run
+everything — the floor is keyless.
 
-(`auto_model()` also recognises `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and
-the model is pinned in each notebook's setup cell — swap either if you prefer a
-different provider or a different open model.)
+`auto_model()` also recognises `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and the
+model itself is pinned in each notebook's setup cell, so swap either if you
+prefer a different provider or a different open model.
 
 **Run locally** (any Jupyter, or from a repo checkout to test unreleased changes):
 
