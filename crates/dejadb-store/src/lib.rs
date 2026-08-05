@@ -322,6 +322,19 @@ pub struct RecallTuning {
     /// relevance, 0.0 = maximum diversity. Requires an embedder + stored
     /// vectors; silently skipped otherwise.
     pub diversity_lambda: Option<f32>,
+    /// Widen every leg to the whole supersession chain instead of heads only.
+    ///
+    /// All three legs are heads-only by default — the structural probe filters
+    /// `cur=1`, BM25 drops non-live postings after scoring, and the vector leg
+    /// joins on `svt IS NULL`. That is the right default: stale values in a
+    /// model's context are the failure mode a memory engine exists to prevent.
+    /// This opts a caller that is asking *about the past* back into the rest of
+    /// the chain — CAL's `WITH superseded`, audit and drift reads.
+    ///
+    /// Forgotten grains stay gone: `forget` deletes the index rows outright
+    /// rather than flagging them, so nothing tombstoned or crypto-erased can
+    /// come back through this door.
+    pub include_superseded: bool,
 }
 
 /// One extracted fact from a `remember()` extraction callback.
@@ -849,8 +862,13 @@ pub struct DejaDB {
     // cached hot-path statements (lazily prepared)
     st_probe_sp: Option<turso::Statement>,
     st_probe_s: Option<turso::Statement>,
+    // same two probes without the `cur=1` predicate — the include-superseded
+    // scan, kept in their own slots so the heads-only path stays prepared
+    st_probe_sp_all: Option<turso::Statement>,
+    st_probe_s_all: Option<turso::Statement>,
     st_fetch_seq: Option<turso::Statement>,
     st_latest: Option<turso::Statement>,
+    st_superseder: Option<turso::Statement>,
 }
 
 async fn ensure_stmt<'a>(
@@ -1119,8 +1137,11 @@ impl DejaDB {
             telemetry,
             st_probe_sp: None,
             st_probe_s: None,
+            st_probe_sp_all: None,
+            st_probe_s_all: None,
             st_fetch_seq: None,
             st_latest: None,
+            st_superseder: None,
         };
 
         // A file written by an older build has its text column populated but
@@ -2668,6 +2689,24 @@ impl DejaDB {
     /// liveness — so cost tracks the number of documents containing the query
     /// terms, not the size of the file.
     pub fn search_text(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_text_inner(ns, query, k, false)
+    }
+
+    /// `search_text`, scoring the whole chain instead of the live heads.
+    /// Superseded grains keep their postings (supersede only flips index
+    /// state), so the historical text is still there to be found — the liveness
+    /// filter is the only thing hiding it.
+    pub fn search_text_all(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_text_inner(ns, query, k, true)
+    }
+
+    fn search_text_inner(
+        &mut self,
+        ns: &str,
+        query: &str,
+        k: usize,
+        include_superseded: bool,
+    ) -> Result<Vec<i64>> {
         if !self.index_text || k == 0 {
             return Ok(Vec::new()); // BM25 leg disabled (edge profile)
         }
@@ -2737,6 +2776,10 @@ impl DejaDB {
         // newest-first and the order is stable across runs.
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             .then(b.0.cmp(&a.0)));
+        if include_superseded {
+            ranked.truncate(k);
+            return Ok(ranked.into_iter().map(|(s, _)| s).collect());
+        }
         // Over-fetch before the liveness filter: superseded grains keep their
         // postings, so trimming to k first could return fewer than k live hits
         // when a chain has been updated often.
@@ -2769,6 +2812,49 @@ impl DejaDB {
             while let Some(row) = rows.next().await.map_err(db_err)? {
                 if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
                     out.insert(s);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Which of `hashes` have been superseded, and by what.
+    ///
+    /// Supersession is index-layer state — the blob is immutable and carries no
+    /// marker — so a caller holding recalled grains cannot tell a stale version
+    /// from the head that replaced it. A recall widened to the whole chain
+    /// (`RecallTuning::include_superseded`) needs that distinction to label what
+    /// it returns: handing a model an outdated value that *looks* current is a
+    /// worse answer than not returning the history at all.
+    ///
+    /// Indexed point reads on a cached statement, one per candidate. Only the
+    /// deliberately-widened path calls this; heads-only recall never pays for it.
+    pub fn supersession_map(&mut self, hashes: &[Hash]) -> Result<HashMap<Hash, Hash>> {
+        let mut out = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let conn = &self.conn;
+        let rt = &self.rt;
+        let slot = &mut self.st_superseder;
+        rt.block_on(async {
+            let st = ensure_stmt(
+                slot,
+                conn,
+                "SELECT superseded_by FROM grains WHERE hash = ?1",
+            )
+            .await?;
+            for h in hashes {
+                let mut rows = st
+                    .query((pb(h.as_bytes().to_vec()),))
+                    .await
+                    .map_err(db_err)?;
+                if let Some(row) = rows.next().await.map_err(db_err)? {
+                    if let Some(sup) = v_blob(&row.get_value(0).map_err(db_err)?)
+                        .and_then(|b| Hash::try_from_bytes(&b).ok())
+                    {
+                        out.insert(*h, sup);
+                    }
                 }
             }
             Ok(out)
@@ -2869,6 +2955,22 @@ impl DejaDB {
     }
 
     pub fn search_vector(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_vector_inner(ns, query, k, false)
+    }
+
+    /// `search_vector` over the whole chain rather than the live heads —
+    /// the vector half of `RecallTuning::include_superseded`.
+    pub fn search_vector_all(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_vector_inner(ns, query, k, true)
+    }
+
+    fn search_vector_inner(
+        &mut self,
+        ns: &str,
+        query: &str,
+        k: usize,
+        include_superseded: bool,
+    ) -> Result<Vec<i64>> {
         let (Some(embedder), Some(ns_id)) = (&self.embedder, self.term_lookup(ns)) else {
             return Ok(Vec::new());
         };
@@ -2879,9 +2981,15 @@ impl DejaDB {
             let mut out = Vec::new();
             let mut rows = conn
                 .query(
-                    "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
-                     WHERE g.ns = ?1 AND g.svt IS NULL
-                     ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3",
+                    if include_superseded {
+                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                         WHERE g.ns = ?1
+                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                    } else {
+                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                         WHERE g.ns = ?1 AND g.svt IS NULL
+                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                    },
                     (pi(ns_id), pt(&qjson), pi(k as i64)),
                 )
                 .await
@@ -2954,7 +3062,7 @@ impl DejaDB {
 
         // leg 1: structural (the voice hot path — always runs first)
         let structural: Vec<i64> = match subject {
-            Some(s) => self.recall_seqs(ns, s, relation, leg_k)?,
+            Some(s) => self.recall_seqs(ns, s, relation, leg_k, tuning.include_superseded)?,
             None => Vec::new(),
         };
         // leg 2: BM25 — plus Tier-1 query-expansion variant legs. Skipped when
@@ -2967,13 +3075,18 @@ impl DejaDB {
                 // in DIDs, namespaces, timestamps) degrades to an empty leg,
                 // exactly like a deadline-skipped one. recall_hybrid must never
                 // error — the structural/vector legs still answer.
-                fts_legs.push(self.search_text(ns, q, leg_k).unwrap_or_default());
+                fts_legs.push(
+                    self.search_text_inner(ns, q, leg_k, tuning.include_superseded)
+                        .unwrap_or_default(),
+                );
                 if tuning.query_expansion && self.index_text {
                     for variant in self.expand_query(q) {
                         if over(&start) {
                             break;
                         }
-                        let hits = self.search_text(ns, &variant, leg_k).unwrap_or_default();
+                        let hits = self
+                            .search_text_inner(ns, &variant, leg_k, tuning.include_superseded)
+                            .unwrap_or_default();
                         if !hits.is_empty() {
                             fts_legs.push(hits);
                         }
@@ -2989,7 +3102,8 @@ impl DejaDB {
                 // file's stored vectors errors inside vector_distance_cos (the
                 // store permits a mismatched embedder with only a warning) —
                 // degrade the vector leg rather than failing the whole recall.
-                self.search_vector(ns, q, leg_k).unwrap_or_default()
+                self.search_vector_inner(ns, q, leg_k, tuning.include_superseded)
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -3256,7 +3370,18 @@ impl DejaDB {
         })
     }
 
-    fn recall_seqs(&mut self, ns: &str, subject: &str, relation: Option<&str>, k: usize) -> Result<Vec<i64>> {
+    /// Structural leg. `all_versions` drops the `cur=1` predicate so the whole
+    /// supersession chain comes back instead of the heads — the widened scan
+    /// behind `RecallTuning::include_superseded`. It gets its own pair of cached
+    /// statements so the heads-only hot path keeps its prepared plans.
+    fn recall_seqs(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        relation: Option<&str>,
+        k: usize,
+        all_versions: bool,
+    ) -> Result<Vec<i64>> {
         let (ns_id, s_id) = match (self.term_lookup(ns), self.term_lookup(subject)) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
@@ -3270,8 +3395,11 @@ impl DejaDB {
         };
         let conn = &self.conn;
         let rt = &self.rt;
-        let slot_sp = &mut self.st_probe_sp;
-        let slot_s = &mut self.st_probe_s;
+        let (slot_sp, slot_s) = if all_versions {
+            (&mut self.st_probe_sp_all, &mut self.st_probe_s_all)
+        } else {
+            (&mut self.st_probe_sp, &mut self.st_probe_s)
+        };
         rt.block_on(async {
             let mut seqs = Vec::new();
             let mut rows = match p_id {
@@ -3279,7 +3407,11 @@ impl DejaDB {
                     let st = ensure_stmt(
                         slot_sp,
                         conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
+                        if all_versions {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 ORDER BY seq DESC LIMIT ?4"
+                        } else {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4"
+                        },
                     )
                     .await?;
                     st.query((pi(ns_id), pi(s_id), pi(p), pi(k as i64))).await.map_err(db_err)?
@@ -3288,7 +3420,11 @@ impl DejaDB {
                     let st = ensure_stmt(
                         slot_s,
                         conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
+                        if all_versions {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 ORDER BY seq DESC LIMIT ?3"
+                        } else {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3"
+                        },
                     )
                     .await?;
                     st.query((pi(ns_id), pi(s_id), pi(k as i64))).await.map_err(db_err)?

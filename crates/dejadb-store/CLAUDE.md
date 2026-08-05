@@ -99,11 +99,20 @@ pool-capped at `REFINE_POOL`=64):
 - **diversity** (Tier-1): greedy MMR (`lambda·rel − (1−lambda)·max_sim`) over
   embedded candidates, using `vector_distance_cos` for both query-relevance
   and pairwise similarity; needs an embedder, silently skipped otherwise.
+- **include_superseded**: widen *all three* legs from the heads to the whole
+  supersession chain — structural drops `cur=1` (its own cached statements,
+  `st_probe_*_all`), BM25 skips the `live_seqs` filter (`search_text_all`), the
+  vector leg drops `svt IS NULL` (`search_vector_all`). Heads-only is the right
+  default — stale values in a model's context are the failure mode — so this is
+  strictly opt-in, for callers asking *about the past*. Forgotten grains cannot
+  return: `forget` DELETEs the index rows, it does not flag them. Callers pair
+  it with `supersession_map(&[Hash])` to label which results are stale;
+  returning history unmarked is worse than not returning it.
 
 CAL reaches these via the already-ported `WITH diversity|rerank|
-query_expansion` options (executor → `RecallParams` → `DejaDbFacade` →
-`RecallTuning`). Covered by `tests/recall_tuning_tests.rs` (store) and
-dejadb-cal's `tests/recall_tuning_cal_tests.rs` (end-to-end).
+query_expansion|superseded` options (executor → `RecallParams` →
+`DejaDbFacade` → `RecallTuning`). Covered by `tests/recall_tuning_tests.rs`
+(store) and dejadb-cal's `tests/recall_tuning_cal_tests.rs` (end-to-end).
 
 ## Bundles / sync
 

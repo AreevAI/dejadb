@@ -127,9 +127,15 @@ un-ignore it as part of the fix:
    are silently dropped (EXPLAIN confirms they vanish from the plan).
 2. `BUDGET` written **after FORMAT** in ASSEMBLE is silently dropped
    (works in the documented BUDGET-then-FORMAT order).
-3. `WITH superseded` is a silent no-op on the structural recall path
-   (executor maps it to `exclude_superseded=false`; the store leg ignores it).
-4. `OR` across subject equalities silently returns only the first subject.
+3. `OR` across subject equalities silently returns only the first subject.
+
+Fixed, with the ignored test promoted to a permanent guard:
+
+- `WITH superseded` was a silent no-op on every anchored recall (all three legs
+  were hard-wired to heads). Now `golden_with_superseded_surfaces_the_chain`
+  pins the widened result *and* its `superseded_by` labels, and
+  `golden_without_superseded_stays_heads_only` pins the default — the more
+  load-bearing half, since it is what keeps stale values out of context.
 
 ## Changing a dataset
 

@@ -1567,3 +1567,53 @@ fn an_unanchored_where_applies_its_filters_and_serves_heads() {
     // The anchored leg is unchanged.
     assert_eq!(count(r#"RECALL facts WHERE subject = "john" AND relation = "plan""#), 1);
 }
+
+/// `WITH superseded` used to be a silent no-op on every *anchored* recall: the
+/// executor set the flag, but the structural leg filtered `cur=1`, BM25 dropped
+/// non-live postings after scoring, and the vector leg joined on `svt IS NULL`.
+/// So the same option meant two different things depending on whether the query
+/// happened to carry a subject — the least discoverable failure shape there is.
+#[test]
+fn with_superseded_widens_the_anchored_legs_and_labels_the_history() {
+    use dejadb_core::types::{Fact, Grain};
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+    let facade = facade_at(&path);
+
+    facade
+        .with_store(|m| {
+            let mut root = Fact::new("kim", "prefers", "tea leaves").confidence(0.9);
+            root.common.namespace = Some("caller".to_string());
+            let h1 = m.add(&root)?;
+            let mut v2 = Fact::new("kim", "prefers", "coffee beans").confidence(0.9);
+            v2.common.namespace = Some("caller".to_string());
+            m.supersede(&h1, &mut v2)?;
+            Ok::<_, dejadb_core::error::DejaDbError>(())
+        })
+        .unwrap();
+
+    let grains = |q: &str| match ex.execute(q, &facade).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => grains,
+        other => panic!("expected Grains, got: {other:?}"),
+    };
+
+    // Structural leg (WHERE subject).
+    assert_eq!(grains(r#"RECALL facts WHERE subject = "kim""#).len(), 1, "default is heads-only");
+    let widened = grains(r#"RECALL facts WHERE subject = "kim" WITH superseded"#);
+    assert_eq!(widened.len(), 2, "the anchored leg must widen to the chain");
+
+    // Every stale version comes back labeled. Handing a model an outdated value
+    // that reads as current would be a worse answer than omitting it.
+    let stale: Vec<_> = widened
+        .iter()
+        .filter(|g| g.fields.get("superseded_by").is_some_and(|v| v.is_string()))
+        .collect();
+    assert_eq!(stale.len(), 1, "exactly the superseded version carries a label");
+    assert_eq!(stale[0].fields["object"].as_str(), Some("tea leaves"));
+
+    // BM25 leg (ABOUT): "tea" survives only in history, so heads-only recall
+    // cannot find that word at all.
+    assert_eq!(grains(r#"RECALL facts ABOUT "tea""#).len(), 0);
+    assert_eq!(grains(r#"RECALL facts ABOUT "tea" WITH superseded"#).len(), 1);
+}

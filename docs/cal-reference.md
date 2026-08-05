@@ -417,7 +417,7 @@ representative selection:
 
 | Option | Effect |
 |---|---|
-| `WITH superseded` | Include historical (superseded) grains |
+| `WITH superseded` | Include historical (superseded) grains, each stamped with the `superseded_by` hash of the version that replaced it. Applies to every recall leg — structural, free-text and vector — so text that survives only in an old version becomes findable. Forgotten grains stay gone. |
 | `WITH provenance` | Include the provenance chain in results |
 | `WITH include_sources` | Include `derived_from` source grains |
 | `WITH score_breakdown` / `WITH explanation` | Return ranking detail |

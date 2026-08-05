@@ -620,14 +620,41 @@ fn known_bug_budget_after_format_is_dropped() {
 }
 
 #[test]
-#[ignore = "BUG: WITH superseded maps to exclude_superseded=false but the structural recall leg ignores it (returns head only)"]
-fn known_bug_with_superseded_structural_noop() {
+fn golden_with_superseded_surfaces_the_chain() {
+    // Was a known bug: the executor mapped `WITH superseded` to
+    // exclude_superseded=false, but every anchored leg was hard-wired to heads
+    // (structural `cur=1`, BM25's liveness filter, the vector leg's
+    // `svt IS NULL`), so the option was a silent no-op unless the recall
+    // happened to be unanchored. Now all three legs widen.
     let g = import_golden();
     let payload = g.cal("personal", r#"RECALL facts WHERE subject = "kim" WITH superseded"#);
     assert_eq!(
         grain_hashes(&payload).len(),
         3,
         "WITH superseded should surface the full kim chain"
+    );
+
+    // …and the two stale versions must come back *labeled*. Returning history
+    // unlabeled would hand a model outdated values that read as current.
+    let stale = payload["grains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["fields"]["superseded_by"].is_string())
+        .count();
+    assert_eq!(stale, 2, "history must be marked superseded, not just returned");
+}
+
+#[test]
+fn golden_without_superseded_stays_heads_only() {
+    // The default is the load-bearing half: stale values must not reach a
+    // model's context unless it explicitly asked for history.
+    let g = import_golden();
+    let payload = g.cal("personal", r#"RECALL facts WHERE subject = "kim""#);
+    assert_eq!(grain_hashes(&payload).len(), 1, "default recall must stay heads-only");
+    assert!(
+        payload["grains"][0]["fields"]["superseded_by"].is_null(),
+        "a head carries no supersession label"
     );
 }
 

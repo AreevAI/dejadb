@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`WITH superseded` now works on anchored recalls, and labels what it
+  returns.** The option only ever had an effect on the *unanchored* path
+  (`RECALL facts RECENT 20`); the moment a query carried a subject or an
+  `ABOUT` clause it became a silent no-op, because all three legs underneath
+  were hard-wired to the heads — the structural probe filtered `cur=1`, BM25
+  dropped non-live postings after scoring, and the vector leg joined on
+  `svt IS NULL`. So one option meant two different things depending on an
+  unrelated clause, and the documented behavior ("include historical grains")
+  was true only by accident. All three legs now widen.
+
+  The half that matters more: superseded grains come back **marked**.
+  Supersession is index-layer state and the blob carries no trace of it, so
+  history returned unlabeled would hand a model outdated values that read as
+  current — a worse answer than not returning them. Recall now stamps
+  `superseded_by` on each stale version, which surfaces in the JSON payload and
+  as `(superseded)` / `<superseded_by>` in the rendered formats.
+
+  This also closes a real gap rather than just a promise: text that survives
+  *only* in a superseded version was previously unfindable by search at any
+  limit — `RECALL facts ABOUT "tea" WITH superseded` now finds it.
+
+  Forgotten grains stay forgotten on the widened path: `forget` deletes index
+  rows outright rather than flagging them, and there is now a regression test
+  pinning that a tombstone survives the wider scan.
+
+  New store surface: `RecallTuning::include_superseded`, `search_text_all`,
+  `search_vector_all`, and `DejaDB::supersession_map`. Adding a public field to
+  `RecallTuning` breaks struct-literal construction — use `..Default::default()`.
+
 ## [1.0.5] - 2026-08-04
 
 > **Node users: this release breaks every call site.** `dejadb` on npm went
@@ -233,8 +264,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stale version came back next to the head that replaced it, both presented as
   current. `relation` is now applied on that path and the scan serves heads
   only; `WITH superseded` opts the full chain back in (on this leg — the
-  anchored leg's `WITH superseded` remains the known bug its ignored golden
-  test documents). New `DejaDB::recent_live`, so scans that legitimately want
+  anchored leg followed in the next release, see Unreleased).
+  New `DejaDB::recent_live`, so scans that legitimately want
   every version — Waiser's analyzers — keep `recent` unchanged.
 - **`CONTRADICTIONS` no longer answers "nothing is contested" about a memory
   that is.** The clause filters after recall, so the recall's `LIMIT` — 50 by

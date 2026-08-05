@@ -4326,13 +4326,25 @@ fn hits_to_grain_results(hits: &[crate::store_types::SearchHit]) -> Vec<CalGrain
             hash: hit.hash.to_hex(),
             grain_type: hit.grain.grain_type.as_str().to_string(),
             score: hit.score,
-            fields: serde_json::Value::Object(
-                hit.grain
+            fields: serde_json::Value::Object({
+                let mut map: serde_json::Map<String, serde_json::Value> = hit
+                    .grain
                     .fields
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+                    .collect();
+                // `superseded_by` is a common grain field, but nothing can fill
+                // it at write time — a grain cannot know its own successor — so
+                // it only ever arrives from the index, via a recall that asked
+                // for history. Project it here and every downstream consumer
+                // gets the label for free: the JSON payload, and the renderers'
+                // existing "(superseded)" note.
+                if let Some(sup) = hit.superseded_by_hash {
+                    map.entry("superseded_by".to_string())
+                        .or_insert_with(|| serde_json::Value::String(sup.to_hex()));
+                }
+                map
+            }),
             score_breakdown: hit
                 .score_breakdown
                 .as_ref()
