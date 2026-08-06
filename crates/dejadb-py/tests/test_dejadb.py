@@ -701,3 +701,63 @@ def test_step_actions_rejects_a_bad_hash(tmp_path):
     m = make_db(tmp_path, ns="org")
     with pytest.raises(ValueError):
         m.step_actions("not-a-hash")
+
+
+# --------------------------------------------------------------------------
+# the join: run history <-> semantic memory
+# --------------------------------------------------------------------------
+
+
+def test_run_trace_and_yield_cross_the_seam(tmp_path):
+    m = make_db(tmp_path, ns="ops")
+    ev = m.add("event", json.dumps({
+        "content": "caller asked about refunds",
+        "run_id": "run-a",
+    }))
+    m.add("fact", json.dumps({
+        "subject": "refunds", "relation": "window_days", "object": "30",
+        "derived_from": ev,
+    }))
+
+    out = json.loads(m.run_trace("run-a"))
+    assert out["run_id"] == "run-a"
+    assert len(out["trace"]) == 1
+    assert out["trace"][0]["fields"]["run_id"] == "run-a"
+    # `produced` is what the run yielded downstream and is not in the run.
+    assert len(out["produced"]) == 1
+    assert out["produced"][0]["fields"]["object"] == "30"
+
+
+def test_run_trace_can_skip_the_yield(tmp_path):
+    m = make_db(tmp_path, ns="ops")
+    m.add("event", json.dumps({"content": "x", "run_id": "run-a"}))
+    out = json.loads(m.run_trace("run-a", 64, False))
+    assert out["produced"] == []
+
+
+def test_runs_touching_walks_provenance_back_to_the_run(tmp_path):
+    m = make_db(tmp_path, ns="ops")
+    ev = m.add("event", json.dumps({
+        "content": "caller asked about refunds",
+        "run_id": "run-a",
+    }))
+    fact = m.add("fact", json.dumps({
+        "subject": "refunds", "relation": "window_days", "object": "30",
+        "derived_from": ev,
+    }))
+
+    out = json.loads(m.runs_touching(fact))
+    assert out["hash"] == fact
+    assert out["runs"] == ["run-a"]
+
+
+def test_unknown_run_answers_empty(tmp_path):
+    m = make_db(tmp_path, ns="ops")
+    out = json.loads(m.run_trace("no-such-run"))
+    assert out["trace"] == [] and out["produced"] == []
+
+
+def test_runs_touching_rejects_a_bad_hash(tmp_path):
+    m = make_db(tmp_path, ns="ops")
+    with pytest.raises(ValueError):
+        m.runs_touching("not-a-hash")

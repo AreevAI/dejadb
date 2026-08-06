@@ -4,7 +4,8 @@
 //! not SQL-over-MCP. Tool surface is a tag-grouped set:
 //! `dejadb_recall`, `dejadb_remember`, `dejadb_add`, `dejadb_supersede`,
 //! `dejadb_forget`, `dejadb_cal`, plus the graph/time tools
-//! `dejadb_related`, `dejadb_entity_at`, `dejadb_step_actions`.
+//! `dejadb_related`, `dejadb_entity_at`, `dejadb_step_actions`, and the
+//! run/memory join `dejadb_run_trace`, `dejadb_runs_touching`.
 //!
 //! Protocol errors are JSON-RPC errors; tool-execution failures are
 //! `isError: true` tool results, per the MCP spec.
@@ -346,6 +347,49 @@ impl McpServer {
                     .collect();
                 Ok(json!({"workflow": wf.to_hex(), "steps": steps}).to_string())
             }
+            "dejadb_run_trace" => {
+                let run = args
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_run_trace requires 'run_id'")?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+                let ns = self.ns(args).to_string();
+                let yield_too = args
+                    .get("include_yield")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let trace = self
+                    .facade
+                    .with_store(|m| m.run_trace(&ns, run, limit))
+                    .map_err(|e| e.to_string())?;
+                let produced = if yield_too {
+                    self.facade
+                        .with_store(|m| m.run_yield(&ns, run, limit))
+                        .map_err(|e| e.to_string())?
+                } else {
+                    Vec::new()
+                };
+                Ok(json!({
+                    "run_id": run,
+                    "trace": trace,
+                    "produced": produced,
+                })
+                .to_string())
+            }
+            "dejadb_runs_touching" => {
+                let h = args
+                    .get("hash")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_runs_touching requires 'hash'")?;
+                let h = Hash::from_hex(h).map_err(|e| e.to_string())?;
+                let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+                let ns = self.ns(args).to_string();
+                let runs = self
+                    .facade
+                    .with_store(|m| m.runs_touching(&ns, &h, depth))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"hash": h.to_hex(), "runs": runs}).to_string())
+            }
             "dejadb_remember" => {
                 // Stores the raw content as an Event through `DejaDB::capture`
                 // — the same write path as `deja remember`, the bindings, and
@@ -548,6 +592,25 @@ fn tool_defs() -> Vec<Value> {
                 "limit": {"type": "integer", "description": "max records returned (default 64)"},
                 "namespace": s("optional namespace")
             }, "required": ["workflow"]}
+        }),
+        json!({
+            "name": "dejadb_run_trace",
+            "description": "Everything recorded during a run, plus what the run produced downstream (facts/lessons derived from it). Crosses from execution history into semantic memory in one call.",
+            "inputSchema": {"type": "object", "properties": {
+                "run_id": s("the run identifier recorded on the run's grains"),
+                "include_yield": {"type": "boolean", "description": "also return grains derived from the run (default true)"},
+                "limit": {"type": "integer", "description": "max grains per section (default 64)"},
+                "namespace": s("optional namespace")
+            }, "required": ["run_id"]}
+        }),
+        json!({
+            "name": "dejadb_runs_touching",
+            "description": "Which runs produced or refined this grain — the reverse join, from a piece of memory back into execution history. Walks the provenance chain both ways. Runs that merely read the grain are not recorded: a read leaves no grain.",
+            "inputSchema": {"type": "object", "properties": {
+                "hash": s("content address (64-hex) of the grain"),
+                "depth": {"type": "integer", "description": "provenance hops to walk, max 8 (default 4)"},
+                "namespace": s("optional namespace")
+            }, "required": ["hash"]}
         }),
         json!({
             "name": "dejadb_remember",

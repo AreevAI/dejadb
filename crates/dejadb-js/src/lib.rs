@@ -776,6 +776,63 @@ impl DejaDb {
         })
     }
 
+    /// What a run recorded, and what it produced downstream.
+    ///
+    /// Returns `{run_id, trace, produced}` — `trace` is the run's own grains,
+    /// `produced` is what was derived from them and is not itself part of the
+    /// run. This is the query that crosses from execution history into
+    /// semantic memory.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn run_trace(
+        &self,
+        run_id: String,
+        limit: Option<u32>,
+        include_yield: Option<bool>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let limit = limit.unwrap_or(64) as usize;
+        let want_yield = include_yield.unwrap_or(true);
+        StringJob::spawn(move || {
+            let (trace, produced) = facade
+                .with_store(|m| {
+                    let t = m.run_trace(&ns, &run_id, limit)?;
+                    let p = if want_yield {
+                        m.run_yield(&ns, &run_id, limit)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, dejadb_core::error::DejaDbError>((t, p))
+                })
+                .map_err(err)?;
+            Ok(json!({"run_id": run_id, "trace": trace, "produced": produced}).to_string())
+        })
+    }
+
+    /// Which runs produced or refined this grain — the reverse join.
+    ///
+    /// Runs that merely *read* the grain are not recorded: a read leaves no
+    /// grain behind, so nothing in an append-only store can attest to it.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn runs_touching(
+        &self,
+        hash: String,
+        depth: Option<u32>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let depth = depth.unwrap_or(4) as usize;
+        StringJob::spawn(move || {
+            let h = parse_hash(&hash)?;
+            let runs = facade
+                .with_store(|m| m.runs_touching(&ns, &h, depth))
+                .map_err(err)?;
+            Ok(json!({"hash": h.to_hex(), "runs": runs}).to_string())
+        })
+    }
+
     /// Execution records for a workflow: which grains ran which of its nodes.
     ///
     /// A Workflow grain is immutable, so runs point at the plan rather than

@@ -44,6 +44,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The join: run history and semantic memory, queried together.** Every agent
+  stack keeps these apart — a checkpointer holds in-thread execution state, a
+  memory store holds cross-thread facts — and nothing can query across the
+  seam. Here they are one substrate, so two questions become one lookup each:
+
+  - `run_trace(ns, run_id, limit)` — what a run recorded, and (via
+    `run_yield`) what it **produced downstream**: the facts and lessons derived
+    from it that are not themselves part of the run. A transcript answers "what
+    happened"; this answers "what did we keep".
+  - `runs_touching(ns, hash, depth)` — the reverse: which runs produced or
+    refined a given grain, by walking its provenance chain both ways. Runs that
+    merely *read* it are not reported, and cannot be: a read leaves no grain
+    behind, so nothing in an append-only store can attest to it.
+
+  Shipped on the CLI (`deja run-trace` / `runs-touching`), MCP
+  (`dejadb_run_trace` / `dejadb_runs_touching`), Python and Node.
+
+  Two narrow index tables back it: `prov_idx` (parent address → derived grains)
+  and `run_idx` (run_id → grains). Deliberately not triple rows —
+  `derived_from` sits on *every* grain, so indexing it as triples would inflate
+  the index that recall scans. **Existing files need `deja reindex`**, which now
+  also backfills these and the `related_to` cross-links.
+
+- **`grains_derived_from` no longer reads the whole store.** It scanned and
+  deserialized **every grain** on each call, so one provenance question cost
+  the entire corpus. Now served by `prov_idx`.
+
 - **OMS 1.5: the Recommendation grain (`0x0C`).** A governed, auditable
   proposal to change memory or agent configuration — `target_ref`, the
   producing `analyzer`, a deterministic `summary` (`{template_id, args}`, never

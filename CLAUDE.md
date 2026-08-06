@@ -112,8 +112,9 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
 
 ## Smaller crates
 
-- **dejadb-mcp**: 9 tools (`dejadb_recall/add/supersede/forget/remember/cal`
-  plus the graph/time reads `dejadb_related/entity_at/step_actions`)
+- **dejadb-mcp**: 11 tools (`dejadb_recall/add/supersede/forget/remember/cal`,
+  the graph/time reads `dejadb_related/entity_at/step_actions`, and the
+  run<->memory join `dejadb_run_trace/runs_touching`)
   over newline-delimited JSON-RPC 2.0 on stdio, protocol rev `2025-06-18`.
   Convention: tool failures are `isError: true` *results*; only protocol
   errors are JSON-RPC errors. Notifications (no id) get no response. No
@@ -139,7 +140,8 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
   `tests/multichannel_tests.rs` is the §8 acceptance test (voice + WhatsApp +
   email sharing one memory via the hub).
 - **dejadb**: ~28 verbs (incl. `hub`, `migrate` from other memory systems,
-  `reindex`, and the graph/time reads `related`/`entity-at`/`step-actions`), hand-rolled `parse_args` → HashMap; global `--embed-cmd` installs
+  `reindex`, the graph/time reads `related`/`entity-at`/`step-actions`, and
+  the join `run-trace`/`runs-touching`), hand-rolled `parse_args` → HashMap; global `--embed-cmd` installs
   a `CommandEmbed` for vector recall on any verb. Opens honor
   the file's meta declarations; `--index-text true|false` explicitly
   re-stamps; open warnings print to stderr.

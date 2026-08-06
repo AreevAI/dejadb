@@ -38,10 +38,24 @@ lazily prepared and cached (`ensure_stmt`).
   `fts_doc(seq, len)` — our own inverted index. Written on add, dropped on
   `forget`, rebuilt by `rebuild_text_index`. **Meant to be deleted** if
   tursodatabase/turso#8170 is fixed — see `docs/facts/bm25-index.md`.
+- **The join** (`prov_idx`, `run_idx`): `prov_idx(ns, parent BLOB, seq)` is
+  reverse provenance — parent content address to the grains derived from it;
+  `run_idx(ns, run, seq)` maps `run_id` to the grains recorded during a run.
+  Deliberately narrow tables rather than triple rows: `derived_from` sits on
+  *every* grain, so indexing it as triples would inflate the index recall
+  scans. `run_trace`/`run_yield`/`runs_touching` are built on them —
+  `run_yield` crosses from execution history into semantic memory (what a run
+  *produced*, not what it recorded). `grains_derived_from` is served by
+  `prov_idx`; it used to scan and deserialize every grain in the store.
+  `rebuild_link_indexes()` backfills all three (plus `related_to` links) for
+  files written before they existed — wired into `deja reindex`.
 - `meta(k, v)` — **file-carried declarations**:
   `text_index` ("1"/"0"), `entity_relations` (sorted JSON array),
   `embedding_model`/`embedding_dim` (provenance, stamped by the first
-  `set_embedder`). Bare `open()` honors these; `open_with()` re-stamps and
+  `set_embedder`), `min_reader_version` (stamped when a grain newer than
+  `0x0B` is written — `deserialize_blob` errors on an unknown type byte rather
+  than skipping it, so such a file is unreadable, not partially readable, to an
+  older build). Bare `open()` honors these; `open_with()` re-stamps and
   records changes in `open_warnings()`; a different-dim embedder warns
   instead of mixing vector spaces. Host config is never persisted here —
   the file describes itself, the host supplies capabilities.

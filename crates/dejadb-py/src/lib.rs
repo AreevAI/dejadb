@@ -851,6 +851,59 @@ impl DejaDB {
         Ok(json!({"workflow": wf.to_hex(), "steps": steps}).to_string())
     }
 
+    /// What a run recorded, and what it produced downstream.
+    ///
+    /// Returns `{run_id, trace, produced}` — `trace` is the run's own grains,
+    /// `produced` is what was derived from them and is not itself part of the
+    /// run (extracted facts, distilled lessons). This is the query that crosses
+    /// from execution history into semantic memory.
+    #[pyo3(signature = (run_id, limit = 64, include_yield = true, ns = None))]
+    fn run_trace(
+        &self,
+        py: Python<'_>,
+        run_id: String,
+        limit: usize,
+        include_yield: bool,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let (trace, produced) = py
+            .detach(|| {
+                self.facade.with_store(|m| {
+                    let t = m.run_trace(&ns, &run_id, limit)?;
+                    let p = if include_yield {
+                        m.run_yield(&ns, &run_id, limit)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, DejaDbError>((t, p))
+                })
+            })
+            .map_err(err)?;
+        Ok(json!({"run_id": run_id, "trace": trace, "produced": produced}).to_string())
+    }
+
+    /// Which runs produced or refined this grain — the reverse join.
+    ///
+    /// Walks the provenance chain both ways from `hash`. Runs that merely
+    /// *read* the grain are not recorded: a read leaves no grain behind, so
+    /// nothing in an append-only store can attest to it.
+    #[pyo3(signature = (hash, depth = 4, ns = None))]
+    fn runs_touching(
+        &self,
+        py: Python<'_>,
+        hash: String,
+        depth: usize,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let h = Hash::from_hex(&hash).map_err(err)?;
+        let runs = py
+            .detach(|| self.facade.with_store(|m| m.runs_touching(&ns, &h, depth)))
+            .map_err(err)?;
+        Ok(json!({"hash": h.to_hex(), "runs": runs}).to_string())
+    }
+
     /// Incremental backup to a bundle file. Returns last_op_seq cursor.
     #[pyo3(signature = (path, since = 0))]
     fn bundle(&self, py: Python<'_>, path: String, since: i64) -> PyResult<i64> {

@@ -661,6 +661,18 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS oplog(op_seq INTEGER PRIMARY KEY, hlc INTEGER, op INTEGER, hash BLOB)",
     "CREATE TABLE IF NOT EXISTS thread_idx(ns INTEGER, session INTEGER, seq INTEGER)",
     "CREATE INDEX IF NOT EXISTS idx_thread ON thread_idx(ns, session, seq)",
+    // Reverse provenance: parent content address -> the grains derived from it.
+    // `derived_from` sits on *every* grain, so indexing it as triples would add
+    // a row for a large fraction of the store and inflate the index that recall
+    // scans. A narrow table keeps the cost proportional to the question.
+    // The parent is the raw 32-byte hash, not a dictionary term — interning one
+    // term per grain address would bloat `terms` for no lookup benefit.
+    "CREATE TABLE IF NOT EXISTS prov_idx(ns INTEGER, parent BLOB, seq INTEGER)",
+    "CREATE INDEX IF NOT EXISTS idx_prov ON prov_idx(ns, parent, seq)",
+    // Run correlation: `run_id` -> the grains recorded during that run. Run ids
+    // repeat across many grains, so this one *is* dictionary-encoded.
+    "CREATE TABLE IF NOT EXISTS run_idx(ns INTEGER, run INTEGER, seq INTEGER)",
+    "CREATE INDEX IF NOT EXISTS idx_run ON run_idx(ns, run, seq)",
 ];
 
 fn pi(x: i64) -> Value {
@@ -895,6 +907,10 @@ struct GrainPrep {
     /// link is an annotation and MUST NOT change the target's supersession
     /// state. Empty for the overwhelming majority of grains.
     links: Vec<(i64, i64, i64)>,
+    /// Dictionary id of `run_id`, for the run index.
+    run: Option<i64>,
+    /// Raw 32-byte `derived_from` parent address, for reverse provenance.
+    parent: Option<Vec<u8>>,
 }
 
 /// Extracted index-relevant fields of a grain about to be stored.
@@ -910,6 +926,10 @@ struct GrainView {
     gtype: u8,
     /// `(relation_type, target hash)` pairs from `related_to`.
     links: Vec<(String, String)>,
+    /// `run_id` — the only run-scoped correlation key in the grain model.
+    run: Option<String>,
+    /// `derived_from` — this grain's provenance parent, if any.
+    parent: Option<String>,
 }
 
 fn extract_view(view: &DeserializedGrain) -> GrainView {
@@ -923,6 +943,8 @@ fn extract_view(view: &DeserializedGrain) -> GrainView {
         vt: view.get_i64("valid_to"),
         created_at: view.get_i64("created_at").unwrap_or_else(now_ms),
         gtype: view.grain_type as u8,
+        run: view.get_str("run_id").map(str::to_string),
+        parent: view.get_str("derived_from").map(str::to_string),
         links: view
             .fields
             .get("related_to")
@@ -1888,6 +1910,18 @@ impl DejaDB {
                 links.push((self_id, self.term_id(rel)?, self.term_id(target)?));
             }
         }
+        let run = match &gv.run {
+            Some(r) => Some(self.term_id(r)?),
+            None => None,
+        };
+        // A malformed parent address is dropped rather than failing the write:
+        // provenance is an index, and an unindexable link must not cost the
+        // grain itself.
+        let parent = gv
+            .parent
+            .as_deref()
+            .and_then(|p| Hash::from_hex(p).ok())
+            .map(|h| h.as_bytes().to_vec());
         Ok(GrainPrep {
             blob,
             hash,
@@ -1906,6 +1940,8 @@ impl DejaDB {
             tokens,
             doc_len,
             links,
+            run,
+            parent,
         })
     }
 
@@ -1998,19 +2034,147 @@ impl DejaDB {
 
     // ----- read path -----
 
+    /// Backfill the secondary indexes that were added after this file may have
+    /// been written: reverse provenance (`prov_idx`), run correlation
+    /// (`run_idx`), and the `related_to` cross-link triples.
+    ///
+    /// Returns the number of index rows written. Idempotent — the tables are
+    /// cleared first, so running it twice is not double-counting. Reads every
+    /// blob once, so it is a maintenance operation, not a hot path.
+    pub fn rebuild_link_indexes(&mut self) -> Result<usize> {
+        let conn = &self.conn;
+        let rows: Vec<(i64, i64, Vec<u8>)> = self.rt.block_on(async {
+            conn.execute("DELETE FROM prov_idx", ()).await.map_err(db_err)?;
+            conn.execute("DELETE FROM run_idx", ()).await.map_err(db_err)?;
+            let mut r = conn
+                .query("SELECT seq, ns, blob FROM grains ORDER BY seq", ())
+                .await
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = r.next().await.map_err(db_err)? {
+                let (Some(seq), Some(ns), Some(blob)) = (
+                    v_i64(&row.get_value(0).map_err(db_err)?),
+                    v_i64(&row.get_value(1).map_err(db_err)?),
+                    v_blob(&row.get_value(2).map_err(db_err)?),
+                ) else {
+                    continue;
+                };
+                out.push((seq, ns, blob));
+            }
+            Ok::<_, DejaDbError>(out)
+        })?;
+
+        // Resolve dictionary ids first: term interning needs `&mut self`, and
+        // the write loop below only has the connection.
+        struct Row {
+            seq: i64,
+            ns: i64,
+            run: Option<i64>,
+            parent: Option<Vec<u8>>,
+            links: Vec<(i64, i64, i64)>,
+        }
+        let mut plan: Vec<Row> = Vec::with_capacity(rows.len());
+        for (seq, ns, blob) in &rows {
+            let view = deserialize_blob(blob)?;
+            let gv = extract_view(&view);
+            let run = match &gv.run {
+                Some(r) => Some(self.term_id(r)?),
+                None => None,
+            };
+            let parent = gv
+                .parent
+                .as_deref()
+                .and_then(|p| Hash::from_hex(p).ok())
+                .map(|h| h.as_bytes().to_vec());
+            let mut links = Vec::with_capacity(gv.links.len());
+            if !gv.links.is_empty() {
+                let self_id = self.term_id(&view.hash.to_hex())?;
+                for (rel, target) in &gv.links {
+                    links.push((self_id, self.term_id(rel)?, self.term_id(target)?));
+                }
+            }
+            plan.push(Row { seq: *seq, ns: *ns, run, parent, links });
+        }
+
+        let conn = &self.conn;
+        let written = self.rt.block_on(async {
+            let mut n = 0usize;
+            conn.execute("BEGIN", ()).await.map_err(db_err)?;
+            for r in &plan {
+                if let Some(run) = r.run {
+                    conn.execute(
+                        "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
+                        (pi(r.ns), pi(run), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    n += 1;
+                }
+                if let Some(ref p) = r.parent {
+                    conn.execute(
+                        "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
+                        (pi(r.ns), pb(p.clone()), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    n += 1;
+                }
+                for (ls, lp, lo) in &r.links {
+                    // Replayed rather than appended: a re-run must not stack
+                    // duplicate edges onto the traversal index.
+                    conn.execute(
+                        "DELETE FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND o=?4 AND seq=?5",
+                        (pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    conn.execute(
+                        "DELETE FROM osp WHERE ns=?1 AND o=?2 AND s=?3 AND p=?4 AND seq=?5",
+                        (pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    conn.execute(
+                        "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                        (pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    conn.execute(
+                        "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                        (pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    n += 1;
+                }
+            }
+            conn.execute("COMMIT", ()).await.map_err(db_err)?;
+            Ok::<_, DejaDbError>(n)
+        })?;
+        Ok(written)
+    }
+
     /// Reverse provenance: every grain whose `derived_from` is exactly
     /// `parent`, newest first. This is the credit-assignment / episode-unlearn
     /// query — "which lessons were distilled from this observation?" or "what
     /// did the agent learn from this bad session?". Superseded versions are
     /// included so the full derived lineage is visible; the caller can revise
-    /// or `forget` each hash. Provenance is not a hot path, so this scans
-    /// stored grains rather than maintaining a dedicated index.
+    /// or `forget` each hash.
+    ///
+    /// Served by `prov_idx`. It used to read and deserialize **every grain in
+    /// the store** on each call, which made a provenance question cost the
+    /// whole corpus. Files written before that index existed need `reindex`.
     pub fn grains_derived_from(&mut self, parent: &Hash) -> Result<Vec<DeserializedGrain>> {
-        let parent_hex = parent.to_hex();
         let conn = &self.conn;
+        let key = parent.as_bytes().to_vec();
         let blobs = self.rt.block_on(async {
             let mut rows = conn
-                .query("SELECT blob FROM grains ORDER BY seq DESC", ())
+                .query(
+                    "SELECT g.blob FROM prov_idx p JOIN grains g ON g.seq = p.seq
+                     WHERE p.parent = ?1 ORDER BY p.seq DESC",
+                    (pb(key),),
+                )
                 .await
                 .map_err(db_err)?;
             let mut out = Vec::new();
@@ -2021,14 +2185,113 @@ impl DejaDB {
             }
             Ok::<_, DejaDbError>(out)
         })?;
-        let mut result = Vec::new();
-        for b in &blobs {
-            let g = deserialize_blob(b)?;
-            if g.get_str("derived_from") == Some(parent_hex.as_str()) {
-                result.push(g);
+        blobs.iter().map(|b| deserialize_blob(b)).collect()
+    }
+
+    /// Every grain recorded during `run_id`, newest first — the run's own
+    /// transcript.
+    ///
+    /// `run_id` is the only run-scoped correlation key in the grain model
+    /// (OMS §8.2, Event). Pair with [`Self::run_yield`] for what the run
+    /// *produced* downstream.
+    pub fn run_trace(&mut self, ns: &str, run_id: &str, limit: usize) -> Result<Vec<DeserializedGrain>> {
+        let (Some(ns_id), Some(run)) = (self.term_lookup(ns), self.term_lookup(run_id)) else {
+            return Ok(Vec::new());
+        };
+        let conn = &self.conn;
+        let limit = limit.min(1024) as i64;
+        let blobs = self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT g.blob FROM run_idx r JOIN grains g ON g.seq = r.seq
+                     WHERE r.ns = ?1 AND r.run = ?2 ORDER BY r.seq DESC LIMIT ?3",
+                    (pi(ns_id), pi(run), pi(limit)),
+                )
+                .await
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.map_err(db_err)? {
+                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
+                    out.push(b);
+                }
+            }
+            Ok::<_, DejaDbError>(out)
+        })?;
+        blobs.iter().map(|b| deserialize_blob(b)).collect()
+    }
+
+    /// What a run produced downstream: the grains derived from the run's own
+    /// grains — extracted facts, distilled lessons — that are not themselves
+    /// part of the run.
+    ///
+    /// This is the join the two indexes exist for: it crosses from execution
+    /// history into semantic memory in one call. A transcript answers "what
+    /// happened"; this answers "what did we keep".
+    pub fn run_yield(&mut self, ns: &str, run_id: &str, limit: usize) -> Result<Vec<DeserializedGrain>> {
+        let trace = self.run_trace(ns, run_id, limit)?;
+        let in_run: HashSet<Hash> = trace.iter().map(|g| g.hash).collect();
+        let mut seen: HashSet<Hash> = in_run.clone();
+        let mut out = Vec::new();
+        for g in &trace {
+            for child in self.grains_derived_from(&g.hash)? {
+                if !in_run.contains(&child.hash) && seen.insert(child.hash) {
+                    out.push(child);
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
             }
         }
-        Ok(result)
+        Ok(out)
+    }
+
+    /// Which runs touched this grain — the reverse join, from a piece of
+    /// semantic memory back into execution history.
+    ///
+    /// Walks the provenance chain in both directions from `hash` (ancestors via
+    /// `derived_from`, descendants via the reverse index) and collects the
+    /// `run_id` of everything reachable, including the grain itself. Bounded by
+    /// `depth` hops, because a long-lived memory's lineage is unbounded.
+    ///
+    /// Note this records runs that *produced or refined* the grain, not runs
+    /// that merely read it — a read leaves no grain, so nothing in an
+    /// append-only store can attest to it.
+    pub fn runs_touching(&mut self, ns: &str, hash: &Hash, depth: usize) -> Result<Vec<String>> {
+        let depth = depth.min(8);
+        let mut runs: Vec<String> = Vec::new();
+        let mut seen_run: HashSet<String> = HashSet::new();
+        let mut visited: HashSet<Hash> = HashSet::new();
+        let mut frontier = vec![*hash];
+        visited.insert(*hash);
+
+        for _ in 0..=depth {
+            let mut next: Vec<Hash> = Vec::new();
+            for h in std::mem::take(&mut frontier) {
+                let Ok(g) = self.get(&h) else { continue };
+                if let Some(r) = g.get_str("run_id") {
+                    if seen_run.insert(r.to_string()) {
+                        runs.push(r.to_string());
+                    }
+                }
+                // Up: the grain this one was derived from.
+                if let Some(p) = g.get_str("derived_from").and_then(|p| Hash::from_hex(p).ok()) {
+                    if visited.insert(p) {
+                        next.push(p);
+                    }
+                }
+                // Down: grains derived from this one.
+                for child in self.grains_derived_from(&h)? {
+                    if child.get_str("namespace") == Some(ns) && visited.insert(child.hash) {
+                        next.push(child.hash);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(runs)
     }
 
     /// Recent grains in a namespace, newest first, bounded by `limit`. With
@@ -4558,6 +4821,22 @@ impl DejaDB {
                     .await
                     .map_err(db_err)?;
                 }
+                if let Some(run) = pr.run {
+                    conn.execute(
+                        "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
+                        (pi(pr.ns_id), pi(run), pi(seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
+                if let Some(ref parent) = pr.parent {
+                    conn.execute(
+                        "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
+                        (pi(pr.ns_id), pb(parent.clone()), pi(seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
                 if let Some(ref emb) = pr.embedding {
                     conn.execute(
                         "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
@@ -4983,6 +5262,25 @@ async fn insert_prepped(
                 .execute((pi(pr.ns_id), pi(sess), pi(seq)))
                 .await
                 .map_err(db_err)?;
+        }
+        // Run correlation + reverse provenance. Both are plain index rows: they
+        // record where a grain came from and which run recorded it, and neither
+        // participates in supersession.
+        if let Some(run) = pr.run {
+            conn.execute(
+                "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
+                (pi(pr.ns_id), pi(run), pi(seq)),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        if let Some(ref parent) = pr.parent {
+            conn.execute(
+                "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
+                (pi(pr.ns_id), pb(parent.clone()), pi(seq)),
+            )
+            .await
+            .map_err(db_err)?;
         }
         if let Some(ref emb) = pr.embedding {
             conn.execute(

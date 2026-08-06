@@ -390,3 +390,39 @@ test('graph traversal, as-of reads, and workflow execution records', async (t) =
 
   await assert.rejects(() => m.stepActions('not-a-hash'))
 })
+
+test('the join: run history and semantic memory queried together', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-join-'))
+  const m = new DejaDb(join(dir, 'm.db'), 'ops')
+
+  const ev = await m.add('event', JSON.stringify({
+    content: 'caller asked about refunds',
+    run_id: 'run-a',
+  }))
+  assert.equal(ev.length, HEX64)
+
+  const fact = await m.add('fact', JSON.stringify({
+    subject: 'refunds', relation: 'window_days', object: '30',
+    derived_from: ev,
+  }))
+
+  // Forward: what the run recorded, and what it produced downstream.
+  const trace = JSON.parse(await m.runTrace('run-a'))
+  assert.equal(trace.run_id, 'run-a')
+  assert.equal(trace.trace.length, 1)
+  assert.equal(trace.trace[0].fields.run_id, 'run-a')
+  assert.equal(trace.produced.length, 1, 'the distilled fact is not in the run')
+  assert.equal(trace.produced[0].fields.object, '30')
+
+  // The yield can be skipped when only the transcript is wanted.
+  assert.deepEqual(JSON.parse(await m.runTrace('run-a', 64, false)).produced, [])
+
+  // Reverse: from a fact back to the runs that produced it.
+  const back = JSON.parse(await m.runsTouching(fact))
+  assert.equal(back.hash, fact)
+  assert.deepEqual(back.runs, ['run-a'])
+
+  // Unknown runs answer, they do not throw.
+  assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
+  await assert.rejects(() => m.runsTouching('not-a-hash'))
+})

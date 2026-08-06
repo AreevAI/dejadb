@@ -127,6 +127,22 @@ export declare class DejaDb {
    */
   entityAt(subject: string, relation: string, at: number, axis?: string | undefined | null, ns?: string | undefined | null): Promise<string>
   /**
+   * What a run recorded, and what it produced downstream.
+   *
+   * Returns `{run_id, trace, produced}` — `trace` is the run's own grains,
+   * `produced` is what was derived from them and is not itself part of the
+   * run. This is the query that crosses from execution history into
+   * semantic memory.
+   */
+  runTrace(runId: string, limit?: number | undefined | null, includeYield?: boolean | undefined | null, ns?: string | undefined | null): Promise<string>
+  /**
+   * Which runs produced or refined this grain — the reverse join.
+   *
+   * Runs that merely *read* the grain are not recorded: a read leaves no
+   * grain behind, so nothing in an append-only store can attest to it.
+   */
+  runsTouching(hash: string, depth?: number | undefined | null, ns?: string | undefined | null): Promise<string>
+  /**
    * Execution records for a workflow: which grains ran which of its nodes.
    *
    * A Workflow grain is immutable, so runs point at the plan rather than

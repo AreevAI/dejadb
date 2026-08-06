@@ -77,6 +77,10 @@ COMMANDS:
   step-actions --workflow HASH [--node ID] [--limit N]
                                       execution records for a workflow —
                                       which grains ran which of its nodes
+  run-trace --run-id ID [--limit N]   what a run recorded, and what it
+                                      produced downstream (facts/lessons)
+  runs-touching --hash H [--depth N]  which runs produced or refined a grain
+                                      (walks provenance both ways)
   verify                              integrity + content-address recheck
   stats                               store counters
   serve    --mcp [--ns NS] [--mount alias=path,...] [--no-destructive-ops] [--lock-ns NS]  MCP server on stdio
@@ -920,6 +924,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 "text index rebuilt: {} grains indexed ({n} needed their text backfilled)",
                 m.indexed_documents()
             );
+            // Secondary indexes added after 1.0: reverse provenance, run
+            // correlation, and related_to cross-links. A file written before
+            // they existed answers provenance and run questions with nothing
+            // until this runs.
+            let links = m.rebuild_link_indexes().map_err(|e| e.to_string())?;
+            println!("link indexes rebuilt: {links} rows (provenance, runs, cross-links)");
         }
         "related" => {
             let start = flag(&flags, "start").ok_or("related requires --start")?;
@@ -980,6 +990,39 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             }
             for (n, h) in rows {
                 println!("{n}\t{}", h.to_hex());
+            }
+        }
+        "run-trace" => {
+            let run = flag(&flags, "run-id").ok_or("run-trace requires --run-id")?;
+            let limit: usize = flag(&flags, "limit")
+                .map_or(Ok(64), |l| l.parse())
+                .map_err(|_| "--limit must be a number")?;
+            let trace = m.run_trace(&ns, &run, limit).map_err(|e| e.to_string())?;
+            let produced = m.run_yield(&ns, &run, limit).map_err(|e| e.to_string())?;
+            if trace.is_empty() {
+                println!("(no grains recorded for run {run})");
+            }
+            println!("recorded during {run}: {} grain(s)", trace.len());
+            for g in &trace {
+                println!("  {} {:?}", g.hash.to_hex(), g.grain_type);
+            }
+            println!("produced by {run}: {} grain(s)", produced.len());
+            for g in &produced {
+                println!("  {} {:?}", g.hash.to_hex(), g.grain_type);
+            }
+        }
+        "runs-touching" => {
+            let h = flag(&flags, "hash").ok_or("runs-touching requires --hash")?;
+            let h = Hash::from_hex(&h).map_err(|e| e.to_string())?;
+            let depth: usize = flag(&flags, "depth")
+                .map_or(Ok(4), |d| d.parse())
+                .map_err(|_| "--depth must be a number")?;
+            let runs = m.runs_touching(&ns, &h, depth).map_err(|e| e.to_string())?;
+            if runs.is_empty() {
+                println!("(no run produced or refined {})", h.to_hex());
+            }
+            for r in runs {
+                println!("{r}");
             }
         }
         "verify" => {

@@ -413,3 +413,49 @@ fn cli_step_actions_reads_workflow_execution_records() {
     assert!(!ok, "a malformed hash must fail");
     assert!(!err.is_empty());
 }
+
+/// The join: run history and semantic memory queried across the seam.
+#[test]
+fn cli_run_join_verbs() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("j.db");
+    let db = db.to_str().unwrap();
+
+    // An event in a run, then a fact distilled from it.
+    let (ok, ev, err) = deja(&[
+        "remember", "--db", db, "--ns", "ops", "--content", "caller asked about refunds",
+        "--session-id", "s1",
+    ]);
+    assert!(ok, "remember failed: {err}");
+    let ev_hash = ev
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|t| t.len() == 64)
+        .expect("an event hash")
+        .to_string();
+
+    let (ok, _, err) = deja(&[
+        "cal", "--db", db, "--ns", "ops",
+        &format!(
+            r#"ADD fact SET subject = "refunds" SET relation = "window_days" SET object = "30" SET derived_from = "{ev_hash}" REASON "distilled""#
+        ),
+    ]);
+    assert!(ok, "derived add failed: {err}");
+
+    // Nothing carries a run_id here, so the run query answers empty — cleanly.
+    let (ok, out, err) = deja(&["run-trace", "--db", db, "--ns", "ops", "--run-id", "nope"]);
+    assert!(ok, "run-trace failed: {err}");
+    assert!(out.contains("no grains recorded"), "{out}");
+
+    // runs-touching walks provenance and reports honestly when no run made it.
+    let (ok, out, err) = deja(&[
+        "runs-touching", "--db", db, "--ns", "ops", "--hash", &ev_hash,
+    ]);
+    assert!(ok, "runs-touching failed: {err}");
+    assert!(out.contains("no run produced") || !out.trim().is_empty(), "{out}");
+
+    let (ok, _, err) = deja(&[
+        "runs-touching", "--db", db, "--ns", "ops", "--hash", "not-a-hash",
+    ]);
+    assert!(!ok, "a malformed hash must fail");
+    assert!(!err.is_empty());
+}

@@ -63,7 +63,7 @@ fn mcp_round_trip() {
 
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "dejadb");
     let tools = by_id(2)["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 13);
 
     // add returned a hash
     let add_text = by_id(3)["result"]["content"][0]["text"].as_str().unwrap();
