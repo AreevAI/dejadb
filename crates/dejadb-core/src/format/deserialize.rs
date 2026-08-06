@@ -647,6 +647,32 @@ impl DeserializedGrain {
                 c.is_withdrawal = self.get_bool("is_withdrawal");
                 Box::new(c)
             }
+            GrainType::Recommendation => {
+                let sm = self.fields.get("summary");
+                let summary = Summary {
+                    template_id: sm
+                        .and_then(|v| v.get("template_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    args: sm
+                        .and_then(|v| v.get("args"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                };
+                Box::new(Recommendation::new(
+                    self.get_str("target_ref").unwrap_or(""),
+                    Analyzer::new(
+                        self.fields
+                            .get("analyzer")
+                            .and_then(|v| v.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    ),
+                    summary,
+                    Proposal::Cal(self.get_str("proposal_cal").unwrap_or("").to_string()),
+                ))
+            }
             GrainType::Skill => {
                 let mut sk = Skill::new(&s("name"), &s("description"));
                 if let Some(w) = self.get_str("when_to_use") {
@@ -1071,6 +1097,75 @@ impl DeserializedGrain {
         }
 
         Ok(s)
+    }
+
+    /// Reconstruct a [`Recommendation`] (OMS 1.5 §8.12).
+    ///
+    /// `rec_status` is never restored: it is index-layer state rebuilt from the
+    /// audit chain, and a blob that carried one would be a forged status.
+    pub fn to_recommendation(&self) -> Result<Recommendation> {
+        if self.grain_type != GrainType::Recommendation {
+            return Err(DejaDbError::Validation("not a Recommendation grain".into()));
+        }
+        let target_ref = self
+            .get_str("target_ref")
+            .ok_or_else(|| DejaDbError::Validation("missing target_ref".into()))?
+            .to_string();
+
+        let am = self.fields.get("analyzer");
+        let analyzer = Analyzer {
+            id: am
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| DejaDbError::Validation("missing analyzer.id".into()))?
+                .to_string(),
+            params: am.and_then(|v| v.get("params")).cloned(),
+        };
+
+        let sm = self.fields.get("summary");
+        let summary = Summary {
+            template_id: sm
+                .and_then(|v| v.get("template_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| DejaDbError::Validation("missing summary.template_id".into()))?
+                .to_string(),
+            args: sm
+                .and_then(|v| v.get("args"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        };
+
+        // Rule 1: exactly one proposal. Zero is malformed; more than one is
+        // ambiguous about which change was actually approved, so both are
+        // rejected rather than resolved by precedence.
+        let cal = self.get_str("proposal_cal").map(str::to_string);
+        let edit = self.fields.get("proposal_edit").cloned();
+        let data = self.fields.get("proposal_data").cloned();
+        let present = cal.is_some() as u8 + edit.is_some() as u8 + data.is_some() as u8;
+        if present != 1 {
+            return Err(DejaDbError::Validation(format!(
+                "a recommendation must carry exactly one proposal, found {present}"
+            )));
+        }
+        let proposal = match (cal, edit, data) {
+            (Some(c), _, _) => Proposal::Cal(c),
+            (_, Some(e), _) => Proposal::Edit(e),
+            (_, _, Some(d)) => Proposal::Data(d),
+            _ => unreachable!("count checked above"),
+        };
+
+        let mut rec = Recommendation::new(&target_ref, analyzer, summary, proposal);
+        // The stored key is authoritative — recomputing would silently rewrite
+        // a key a peer derived under a different (possibly newer) rule.
+        if let Some(k) = self.get_str("dedup_key") {
+            rec.dedup_key = k.to_string();
+        }
+        rec.severity = self.get_str("severity").and_then(Severity::parse);
+        rec.metric_snapshot = self.fields.get("metric_snapshot").cloned();
+        rec.evidence_query = self.get_str("evidence_query").map(str::to_string);
+
+        self.fill_common_scalars(&mut rec.common);
+        Ok(rec)
     }
 
     /// Fill the common fields every typed reconstructor restores.

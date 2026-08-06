@@ -47,7 +47,7 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
 
 | Crate | What | CLAUDE.md |
 |---|---|---|
-| `dejadb-core` | `.mg` format, canonical serialization, content addressing, 11 grain types, tool-schema rendering | yes |
+| `dejadb-core` | `.mg` format, canonical serialization, content addressing, 12 grain types, tool-schema rendering | yes |
 | `dejadb-store` | Turso store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs, memory-tool adapter, migration importers | yes |
 | `dejadb-cal` | CAL lexer/parser/executor, ASSEMBLE, `DejaDbFacade` + mounts | yes |
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |

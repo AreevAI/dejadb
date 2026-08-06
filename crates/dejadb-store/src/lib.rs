@@ -543,6 +543,42 @@ pub const RRF_K0: f64 = 60.0;
 /// widens the pool to at least `k`.
 const REFINE_POOL: usize = 64;
 
+/// Semver-ish `a < b` over dotted numeric versions. Non-numeric components
+/// (a `-rc1` suffix) compare as 0, which errs toward *not* warning — a false
+/// alarm on every open would train people to ignore the one that matters.
+fn version_lt(a: &str, b: &str) -> bool {
+    let parts = |v: &str| -> Vec<u32> {
+        v.split(['.', '-', '+'])
+            .map(|p| p.parse::<u32>().unwrap_or(0))
+            .collect()
+    };
+    let (pa, pb) = (parts(a), parts(b));
+    for i in 0..pa.len().max(pb.len()) {
+        let (x, y) = (pa.get(i).copied().unwrap_or(0), pb.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x < y;
+        }
+    }
+    false
+}
+
+/// The highest `.mg` grain type byte a DejaDB build before OMS 1.5 could
+/// decode. `deserialize_blob` **errors** on an unknown type byte rather than
+/// skipping it, so a file carrying a newer grain is not merely partially
+/// readable to an older build — the read fails.
+const LEGACY_MAX_GRAIN_BYTE: u8 = 0x0B;
+
+/// Reader version stamped into `meta` the first time a grain newer than
+/// [`LEGACY_MAX_GRAIN_BYTE`] is written to a file.
+///
+/// OMS §4.5 guarantees an additive type byte leaves existing *content
+/// addresses* valid; it says nothing about older *readers*. This turns the
+/// resulting failure from a mid-recall decode error into a statement the file
+/// makes about itself, which `open_warnings()` surfaces. It cannot help builds
+/// that shipped before the check existed — for those the only safe posture is
+/// not to sync a file containing new grain types.
+const MIN_READER_VERSION_KEY: &str = "min_reader_version";
+
 /// Open options.
 pub struct DejaDbOptions {
     /// Relations whose objects are entities (get OSP reverse-index rows).
@@ -1011,6 +1047,9 @@ pub struct DejaDB {
     /// Reconciliation notes from open / set_embedder (file declarations vs
     /// what this session supplied). Never fatal; surfaced by hosts.
     warnings: Vec<String>,
+    /// False once the file carries a `min_reader_version` stamp, so the check
+    /// on the write path costs one bool after the first newer-than-1.4 grain.
+    needs_min_reader_stamp: bool,
     blob_dir: std::path::PathBuf,
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
@@ -1289,6 +1328,7 @@ impl DejaDB {
             expander: None,
             meta_embed,
             warnings,
+            needs_min_reader_stamp: !meta.contains_key(MIN_READER_VERSION_KEY),
             blob_dir,
             telemetry,
             st_probe_sp: None,
@@ -1299,6 +1339,20 @@ impl DejaDB {
             st_latest: None,
             st_superseder: None,
         };
+
+        // The file may declare that it needs a newer reader than this build (a
+        // grain type added after this binary was compiled). Say so at open
+        // rather than letting a recall fail to decode a blob halfway through.
+        if let Some(req) = meta.get(MIN_READER_VERSION_KEY) {
+            if version_lt(env!("CARGO_PKG_VERSION"), req) {
+                store.warnings.push(format!(
+                    "this memory declares min_reader_version {req} but this build is {} — it \
+                     contains grain types this version cannot decode, and reads that touch them \
+                     will fail. Upgrade dejadb to {req} or later",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+        }
 
         // A file written by an older build has its text column populated but
         // no postings, because the BM25 leg used to be Turso's `USING fts`
@@ -1448,6 +1502,25 @@ impl DejaDB {
     }
 
     /// Upsert a single `meta` row.
+    /// Read one `meta` row. `None` for a missing key — a file that has never
+    /// declared something is not an error.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query("SELECT v FROM meta WHERE k = ?1", (pt(key),))
+                .await
+                .map_err(db_err)?;
+            match rows.next().await.map_err(db_err)? {
+                Some(row) => Ok(match row.get_value(0).map_err(db_err)? {
+                    Value::Text(v) => Some(v),
+                    _ => None,
+                }),
+                None => Ok(None),
+            }
+        })
+    }
+
     pub fn meta_put(&self, key: &str, value: &str) -> Result<()> {
         let conn = &self.conn;
         self.rt.block_on(async {
@@ -1867,6 +1940,19 @@ impl DejaDB {
 
     fn add_batch_inner(&mut self, grains: &[&dyn AddableDyn]) -> Result<Vec<Hash>> {
         let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(grains)?;
+        // A grain type newer than any pre-1.5 build could decode makes this file
+        // unreadable to those builds — `deserialize_blob` errors on an unknown
+        // type byte rather than skipping it. Record that requirement in the file
+        // so it is a statement the memory makes about itself (byte 2 of the .mg
+        // header is the type byte).
+        if self.needs_min_reader_stamp
+            && preps
+                .iter()
+                .any(|p| p.blob.get(2).is_some_and(|b| *b > LEGACY_MAX_GRAIN_BYTE))
+        {
+            self.meta_put(MIN_READER_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
+            self.needs_min_reader_stamp = false;
+        }
         let conn = &self.conn;
         let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         let (d_docs, d_len) = fts_delta(&preps);

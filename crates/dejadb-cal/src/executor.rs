@@ -2698,7 +2698,7 @@ impl CalExecutor {
         let info = match &describe.target {
             DescribeTarget::Schema => serde_json::json!({
                 "grain_types": [
-                    "fact", "event", "state", "workflow", "tool",
+                    "fact", "event", "state", "workflow", "tool", "recommendation",
                     "observation", "goal", "reasoning", "consensus", "consent", "skill"
                 ],
                 "common_fields": [
@@ -2738,6 +2738,15 @@ impl CalExecutor {
                     ],
                     // OMS §8.3. `checkpoint_data` never existed as a field, and
                     // `session_id` is Event-only.
+                    // OMS 1.5 §8.12. `rec_status` is index-layer — filterable,
+                    // never author-written.
+                    GrainTypePlural::Recommendations => &[
+                        "target_ref",
+                        "analyzer",
+                        "severity",
+                        "dedup_key",
+                        "rec_status",
+                    ],
                     GrainTypePlural::States => &["context", "plan", "history"],
                     GrainTypePlural::Workflows => &[
                         "name",
@@ -5719,6 +5728,36 @@ fn toon_row_from_fields(grain_type: &str, fields: &serde_json::Value) -> String 
                 toon_escape_simple(&name),
                 toon_escape_simple(&domain),
                 toon_escape_simple(&proficiency),
+            ]
+        }
+        "recommendation" => {
+            // Columns: target_ref, severity, content (matches the registry).
+            let target = get_str("target_ref");
+            let severity = if get_str("severity").is_empty() {
+                "info".to_string()
+            } else {
+                get_str("severity")
+            };
+            let summary = fields
+                .get("summary")
+                .and_then(|s| s.get("args"))
+                .and_then(|a| a.as_object())
+                .map(|o| {
+                    let mut vs: Vec<String> = o
+                        .iter()
+                        .map(|(k, v)| match v {
+                            serde_json::Value::String(t) => format!("{k}={t}"),
+                            other => format!("{k}={other}"),
+                        })
+                        .collect();
+                    vs.sort();
+                    vs.join("; ")
+                })
+                .unwrap_or_default();
+            vec![
+                toon_escape_simple(&target),
+                toon_escape_simple(&severity),
+                toon_escape_simple(&summary),
             ]
         }
         _ => {

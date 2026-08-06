@@ -44,6 +44,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **OMS 1.5: the Recommendation grain (`0x0C`).** A governed, auditable
+  proposal to change memory or agent configuration — `target_ref`, the
+  producing `analyzer`, a deterministic `summary` (`{template_id, args}`, never
+  analyzer prose), a computed `dedup_key`, and exactly one proposal
+  (`proposal_cal` / `proposal_edit` / `proposal_data`, modeled as an enum so
+  §8.12 rule 1 is unrepresentable-if-broken). Byte values `0x01`–`0x0B` are
+  unchanged, so every existing content address remains valid.
+
+  Two details carry the design:
+
+  - **`rec_status` is index-layer and never enters the blob.** That is what
+    makes a recommendation's content address stable across its whole review
+    lifecycle — propose, approve, apply and roll back never re-address the
+    grain — while a change in *content* is a supersession. The identity durable
+    across a supersession chain is `dedup_key`, not the content address.
+  - **`dedup_key` is computed, never author-chosen**, by the normative §8.12
+    rule 5 recipe (SHA-256 over NUL-separated analyzer-family, `target_ref`,
+    action-kind; NFC after case-folding, and `target_ref` deliberately *not*
+    folded). Two implementations must derive the same key or dedup fails on any
+    imported, federated or forked store, so there is exactly one place that
+    computes it.
+
+  Query-only per CAL 1.2: `RECALL recommendations` works with its type-specific
+  field set, but there is no `ADD recommendation` and lifecycle transitions
+  never occur through `ADD`/`SUPERSEDE SET` — the type is engine-emitted and
+  lifecycle-gated. SML 1.1's `<recommendation>` element renders it.
+
+  Waiser has **not** been migrated onto the type — its recommendations still
+  ride as Facts. Landing the format and rewriting a live queue are different
+  risks, and they are sequenced separately.
+
+- **Files carrying a post-1.4 grain declare `min_reader_version`.** OMS §4.5
+  guarantees an additive type byte leaves existing content addresses valid; it
+  says nothing about older *readers*, and `deserialize_blob` errors on an
+  unknown type byte rather than skipping it — so such a file is not partially
+  readable to a pre-1.5 build, it fails. The stamp turns that into a statement
+  the file makes about itself, surfaced by `open_warnings()`. It cannot help
+  builds that shipped before the check existed: for those the only safe posture
+  is not to sync a file containing new grain types. New: `DejaDB::meta_get`.
+
 - **The graph and as-of reads are reachable outside Rust.** `related`
   (bounded k-hop entity walk), `entity_at` (two-axis as-of read) and
   `step_actions` (workflow execution records) existed only as store methods —

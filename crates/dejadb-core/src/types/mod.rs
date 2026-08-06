@@ -9,6 +9,7 @@ pub mod json_schema_subset;
 mod observation;
 mod reasoning;
 pub mod registry;
+mod recommendation;
 mod skill;
 mod state;
 mod tool;
@@ -26,6 +27,9 @@ pub use json_schema_subset::{
 };
 pub use observation::*;
 pub use reasoning::*;
+pub use recommendation::{
+    compute_dedup_key, Analyzer, Proposal, RecStatus, Recommendation, Severity, Summary,
+};
 pub use skill::{Skill, SkillStrategy};
 pub use state::*;
 pub use tool::*;

@@ -175,6 +175,21 @@ static FIELD_MAP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
     m.insert("evidence_required", "evreq");
     m.insert("rollback_on_failure", "rof");
     m.insert("allowed_transitions", "atr");
+    // OMS 1.5 §6.13 — Recommendation-specific fields.
+    m.insert("target_ref", "tref");
+    m.insert("analyzer", "anlz");
+    m.insert("summary", "summ");
+    m.insert("dedup_key", "ddk");
+    m.insert("proposal_cal", "pcal");
+    m.insert("proposal_edit", "pedit");
+    m.insert("proposal_data", "pdata");
+    m.insert("severity", "sev");
+    m.insert("metric_snapshot", "msnap");
+    m.insert("evidence_query", "evq");
+    // §6.1 — index-layer, never written into a blob (§8.12 rule 3). The key
+    // exists so the name round-trips wherever the index layer surfaces it.
+    m.insert("rec_status", "rstat");
+
     // OMS 1.2 new Goal fields
     m.insert("depends_on", "depg");
     m.insert("assigned_agent", "asgn");

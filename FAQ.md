@@ -53,8 +53,8 @@ specification it implements is CC0 (public domain). See
 A grain is the atomic unit of memory — one immutable, content-addressed record.
 Its address is the SHA-256 hash of its entire serialized `.mg` blob, so
 identical content always yields the same address, and any change produces a new
-grain. There are 11 grain types: **Fact, Event, State, Workflow, Tool,
-Observation, Goal, Reasoning, Consensus, Consent, Skill**. A `Fact` is a
+grain. There are 12 grain types: **Fact, Event, State, Workflow, Tool,
+Observation, Goal, Reasoning, Consensus, Consent, Skill, Recommendation**. A `Fact` is a
 subject–relation–object triple (e.g. `john · prefers · "window seat"`); an
 `Event` is raw conversational content; and so on.
 

@@ -351,6 +351,23 @@ fn all_grain_types_round_trip_is_deterministic() {
         GrainType::Workflow,
     );
 
+    // 0x0C Recommendation (OMS 1.5)
+    assert_grain_round_trip(
+        &Recommendation::new(
+            "entity:conformance/alice",
+            Analyzer::new("waiser.duplicate_sweep/1"),
+            Summary {
+                template_id: "dup.consolidate".into(),
+                args: serde_json::json!({ "count": 3, "subject": "alice" }),
+            },
+            Proposal::Cal("SUPERSEDE sha256:aa BECAUSE \"duplicate\"".into()),
+        )
+        .severity(Severity::Medium)
+        .created_at(CREATED_AT)
+        .namespace(NS),
+        GrainType::Recommendation,
+    );
+
     // 0x05 Tool
     assert_grain_round_trip(
         &Tool::new("calculator")

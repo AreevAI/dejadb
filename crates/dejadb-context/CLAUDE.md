@@ -18,8 +18,8 @@ text in SML / TOON / Markdown / PlainText / JSON.
   fill remainder). Progressive disclosure: Full up to ~70% of budget, then
   Summary, then Omit at ~95%.
 - `render.rs` — `GrainRenderer` trait (`render`, `render_summary`,
-  `token_estimate`, `context_priority`) + `RendererRegistry` with 12 per-type
-  renderers (11 grain types + default). `toon_columns()` defines the TOON
+  `token_estimate`, `context_priority`) + `RendererRegistry` with 13 per-type
+  renderers (12 grain types + default). `toon_columns()` defines the TOON
   tabular columns per grain type.
 - `assembly.rs` — `ContextAssembler` (`format()`, `format_with_hints()`),
   `RenderingHints`, `FormattedContext{text, estimated_tokens, included_count,

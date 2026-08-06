@@ -1667,6 +1667,7 @@ fn default_type_order() -> Vec<GrainType> {
         GrainType::Consensus,
         GrainType::Consent,
         GrainType::Skill,
+        GrainType::Recommendation,
     ]
 }
 
@@ -1697,6 +1698,7 @@ fn section_tag(gt: &GrainType) -> &'static str {
         GrainType::Consensus => "consensus",
         GrainType::Consent => "consents",
         GrainType::Skill => "skills",
+        GrainType::Recommendation => "recommendations",
     }
 }
 

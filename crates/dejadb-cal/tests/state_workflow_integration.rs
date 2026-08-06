@@ -552,3 +552,122 @@ fn multi_hop_respects_the_limit() {
     );
     assert!(hits.len() <= 2, "LIMIT 2 must cap the result: {hits:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Recommendation (0x0C) — OMS 1.5 / CAL 1.2
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recommendations_are_recallable_but_never_addable() {
+    // OMS 1.5 makes Recommendation query-only: it is engine-emitted and
+    // lifecycle-gated, so CAL deliberately has no `ADD recommendation` and
+    // lifecycle transitions never happen through ADD/SUPERSEDE SET.
+    let (ex, facade, _d) = setup();
+    use dejadb_cal::facade::CalStoreFacade;
+
+    // The generic ADD form refuses it.
+    let out = ex
+        .execute(
+            r#"ADD recommendation SET target_ref = "entity:caller/alice" REASON "x""#,
+            &facade,
+        )
+        .unwrap();
+    match out.result {
+        CalResultPayload::Unsupported { message, .. } => {
+            assert!(message.contains("recommendation"), "{message}");
+        }
+        other => panic!("ADD recommendation must be refused, got {other:?}"),
+    }
+
+    // And so does the JSON write path every binding reaches.
+    let fields = serde_json::json!({ "target_ref": "entity:caller/alice" });
+    assert!(
+        facade
+            .cal_add("recommendation", fields.as_object().unwrap())
+            .is_err(),
+        "cal_add must not mint recommendations either"
+    );
+
+    // But the type is a first-class query target.
+    let recalled = ex.execute("RECALL recommendations RECENT 10", &facade).unwrap();
+    match recalled.result {
+        CalResultPayload::Grains { grains, .. } => assert!(grains.is_empty()),
+        other => panic!("expected Grains, got {other:?}"),
+    }
+}
+
+#[test]
+fn recommendation_round_trips_through_the_store_and_renders() {
+    // Written through the store (the engine path), read back through CAL.
+    let (ex, facade, _d) = setup();
+    use dejadb_core::types::*;
+
+    let rec = Recommendation::new(
+        "entity:caller/alice",
+        Analyzer::new("waiser.duplicate_sweep/1"),
+        Summary {
+            template_id: "dup.consolidate".into(),
+            args: serde_json::json!({ "subject": "alice", "count": 3 }),
+        },
+        Proposal::Cal("SUPERSEDE sha256:aa BECAUSE \"duplicate\"".into()),
+    )
+    .severity(Severity::Medium)
+    .namespace("caller");
+    facade.with_store(|m| m.add(&rec)).unwrap();
+
+    let g = recall_one(&ex, &facade, "recommendations");
+    let f = &g["fields"];
+    assert_eq!(f["target_ref"], "entity:caller/alice");
+    assert_eq!(f["analyzer"]["id"], "waiser.duplicate_sweep/1");
+    assert_eq!(f["summary"]["template_id"], "dup.consolidate");
+    assert_eq!(f["summary"]["args"]["count"], 3);
+    assert_eq!(f["severity"], "medium");
+    assert_eq!(f["proposal_cal"], "SUPERSEDE sha256:aa BECAUSE \"duplicate\"");
+    assert_eq!(f["dedup_key"].as_str().unwrap().len(), 64);
+
+    // rec_status is index-layer: it must never appear in the blob, which is
+    // what keeps the content address stable across the review lifecycle.
+    assert!(
+        f.get("rec_status").is_none(),
+        "rec_status must not be serialized: {f}"
+    );
+}
+
+#[test]
+fn recommendations_are_filterable_by_their_type_specific_fields() {
+    let (ex, facade, _d) = setup();
+    use dejadb_core::types::*;
+
+    for (target, sev) in [
+        ("entity:caller/alice", Severity::High),
+        ("entity:caller/bob", Severity::Low),
+    ] {
+        let rec = Recommendation::new(
+            target,
+            Analyzer::new("waiser.staleness/1"),
+            Summary {
+                template_id: "stale".into(),
+                args: serde_json::json!({}),
+            },
+            Proposal::Cal("x".into()),
+        )
+        .severity(sev)
+        .namespace("caller");
+        facade.with_store(|m| m.add(&rec)).unwrap();
+    }
+
+    let out = ex
+        .execute(
+            r#"RECALL recommendations WHERE severity = "high" RECENT 10"#,
+            &facade,
+        )
+        .unwrap();
+    match out.result {
+        CalResultPayload::Grains { grains, .. } => {
+            assert_eq!(grains.len(), 1, "severity must filter");
+            let v = serde_json::to_value(&grains[0]).unwrap();
+            assert_eq!(v["fields"]["target_ref"], "entity:caller/alice");
+        }
+        other => panic!("expected Grains, got {other:?}"),
+    }
+}

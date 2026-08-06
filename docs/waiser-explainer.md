@@ -479,8 +479,8 @@ MCP / HTTP parity on the full lifecycle incl. rollback + outcomes · precision
 6. **Provenance / poisoning analyzers** — injection-pattern and trust-score
    sweeps; the audit substrate is already in place.
 7. **Fleet rollups** — cross-file/cross-agent aggregation in the console.
-8. **OMS `0x0C` recommendation grain** — native grain type (today recs ride
-   as Facts); deliberately a spec-level decision (frozen serialization).
+8. **Migrate onto the OMS `0x0C` recommendation grain** — the native type now
+   exists (OMS 1.5); moving the live queue onto it is a data migration.
 
 *Visual: two-lane timeline, "shipped" lane visibly heavier; next lane
 numbered.*

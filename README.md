@@ -453,7 +453,7 @@ local machine, and report vulnerabilities per our [security policy](SECURITY.md)
 
 | Crate | What |
 |---|---|
-| `dejadb-core` | `.mg` format, canonical serialization, content addressing, 11 grain types, tool-schema rendering |
+| `dejadb-core` | `.mg` format, canonical serialization, content addressing, 12 grain types, tool-schema rendering |
 | `dejadb-store` | Turso-backed store: dictionary-encoded triples, hybrid recall, heads/forks, blobs (CAS), bundles/streaming, memory-tool adapter |
 | `dejadb-cal` | CAL lexer/parser/executor, multi-source ASSEMBLE, saved queries, `DejaDbFacade` (+ read-only mounts) |
 | `dejadb-context` | Budget-aware provider-optimal rendering (SML/TOON/Markdown/JSON) |

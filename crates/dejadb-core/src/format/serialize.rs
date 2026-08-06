@@ -716,6 +716,78 @@ fn add_type_specific_fields<G: Grain + 'static>(grain: &G, map: &mut BTreeMap<St
             let arr: Vec<Value> = consent.witness_dids.iter().map(|s| nfc_string(s)).collect();
             map.insert(compact_field("witness_dids").to_string(), Value::Array(arr));
         }
+    } else if let Some(rec) = any.downcast_ref::<Recommendation>() {
+        // OMS 1.5 §8.12 / §6.13. Note `rec_status` is deliberately absent: it is
+        // index-layer state rebuilt from the audit chain, and keeping it out of
+        // the blob is what makes a recommendation's content address stable
+        // across its whole review lifecycle.
+        map.insert(
+            compact_field("target_ref").to_string(),
+            nfc_string(&rec.target_ref),
+        );
+        {
+            let mut a = BTreeMap::new();
+            a.insert("id".to_string(), nfc_string(&rec.analyzer.id));
+            if let Some(ref p) = rec.analyzer.params {
+                a.insert("params".to_string(), json_to_msgpack(p));
+            }
+            map.insert(
+                compact_field("analyzer").to_string(),
+                btree_to_msgpack_map(a),
+            );
+        }
+        {
+            // A deterministic template id + its args — never analyzer prose
+            // (rule 4), so a summary stays reproducible and translatable.
+            let mut sm = BTreeMap::new();
+            sm.insert(
+                "template_id".to_string(),
+                nfc_string(&rec.summary.template_id),
+            );
+            sm.insert("args".to_string(), json_to_msgpack(&rec.summary.args));
+            map.insert(
+                compact_field("summary").to_string(),
+                btree_to_msgpack_map(sm),
+            );
+        }
+        map.insert(
+            compact_field("dedup_key").to_string(),
+            nfc_string(&rec.dedup_key),
+        );
+        // Exactly one proposal (rule 1) — an enum here, so the invariant cannot
+        // be violated by construction.
+        match &rec.proposal {
+            Proposal::Cal(cal) => {
+                map.insert(compact_field("proposal_cal").to_string(), nfc_string(cal));
+            }
+            Proposal::Edit(e) => {
+                map.insert(
+                    compact_field("proposal_edit").to_string(),
+                    json_to_msgpack(e),
+                );
+            }
+            Proposal::Data(d) => {
+                map.insert(
+                    compact_field("proposal_data").to_string(),
+                    json_to_msgpack(d),
+                );
+            }
+        }
+        if let Some(sev) = rec.severity {
+            map.insert(
+                compact_field("severity").to_string(),
+                nfc_string(sev.as_str()),
+            );
+        }
+        if let Some(ref ms) = rec.metric_snapshot {
+            map.insert(
+                compact_field("metric_snapshot").to_string(),
+                json_to_msgpack(ms),
+            );
+        }
+        if let Some(ref eq) = rec.evidence_query {
+            map.insert(compact_field("evidence_query").to_string(), nfc_string(eq));
+        }
     } else if let Some(skill) = any.downcast_ref::<Skill>() {
         // OMS 1.4 Skill (0x0B). Required name + description; optional
         // definition + learned-competence fields. Empty vecs and None

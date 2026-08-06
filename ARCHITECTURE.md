@@ -41,7 +41,7 @@ then governs, verifies, and improves.
    │ FACTS   EVENTS   │      per-source  BUDGET + PRIORITY · dedup             ▼ calls
    │ SKILLS  TOOLS    │      FORMAT sml│toon│markdown│json                ╔═══════════╗
    │ WORKFLOWS STATE  │◀── results · events · facts captured (ADD) ────────╢  ACTIONS  ║
-   │ GOALS   …   (11) │    immutable · content-addressed grains            ║ host runs ║
+   │ GOALS   …   (12) │    immutable · content-addressed grains            ║ host runs ║
    └──┬────────────▲──┘                                                    ╚═══════════╝
       │            │
    op-log +   governed writes back — SUPERSEDE · ADD · FORGET
@@ -67,7 +67,7 @@ then governs, verifies, and improves.
 
 1. **Storage (left).** The memory itself — immutable, content-addressed grains
    in per-file Turso DBs (§2–§3). The labeled streams are the grain types that
-   actually reach a model; `(11)` marks the rest.
+   actually reach a model; `(12)` marks the rest.
 2. **Recall (`CAL · ASSEMBLE`, §5–§7).** Reads storage and joins the streams
    under per-source token budgets and priorities, in-process — no server, no
    network. What travels the arrow is not "a prompt string" but one
@@ -133,7 +133,7 @@ The 9-byte header is fixed-width and self-describing:
 |---|---|---|
 | 0 | `version` | Format version (currently `0x01`) |
 | 1 | `flags` | Bit flags (see below) |
-| 2 | `grain_type` | The grain type byte (`0x01`–`0x0B`) |
+| 2 | `grain_type` | The grain type byte (`0x01`–`0x0C`) |
 | 3–4 | `ns_hash` | First 2 bytes of SHA-256(namespace), big-endian |
 | 5–8 | `created_at_sec` | Creation time, epoch **seconds**, big-endian u32 |
 
@@ -162,9 +162,9 @@ These rules are a conformance contract: changing any of them would silently
 change the content address of every grain ever written and break OMS test-vector
 conformance. They are treated as frozen unless the spec itself moves.
 
-### 2.3 The 11 grain types
+### 2.3 The 12 grain types
 
-OMS defines 11 grain types, each with a stable header byte. The type byte, the
+OMS 1.5 defines 12 grain types, each with a stable header byte. The type byte, the
 canonical name, and the fields are part of the format contract.
 
 | Byte | Type | Purpose | Key fields |
@@ -180,8 +180,9 @@ canonical name, and the fields are part of the format contract.
 | `0x09` | **Consensus** | An agreement across multiple observers | `threshold`, `agreement_count`, `participating_observers` |
 | `0x0A` | **Consent** | A consent / authorization record (DID-scoped) | `consent_action`, `purpose`, `grantor_did`, `grantee_did` |
 | `0x0B` | **Skill** | A packaged, reusable agent capability with learned proficiency | `name`, `domain`, `proficiency`, `transferable` |
+| `0x0C` | **Recommendation** | A governed, auditable proposal to change memory or agent config | `target_ref`, `analyzer`, `summary`, `dedup_key`, one `proposal_*` |
 
-All 11 types share a common envelope (`namespace`, timestamps, provenance,
+All 12 types share a common envelope (`namespace`, timestamps, provenance,
 supersession links, optional content/embedding references). The type-specific
 fields above are what each type adds on top.
 
@@ -607,10 +608,12 @@ depends on no DejaDB crate and runs against any OMS-shaped store through the
 implements the `LlmBackend` trait with out-of-box providers. The whole user
 surface — the `deja waiser` verb family and `deja init`, two MCP tools, the
 `/api/waiser/*` routes, the Waiser console tab, and the Python/Node bindings —
-reduces to that engine. Recommendation and audit grains are modeled as a
-forthcoming OMS `0x0C` type; until it is realized in `dejadb-core` they ride as
-content-addressed Fact grains in a `waiser` namespace (an additive, address-safe
-interim, per OMS §4.5). Full design: [`waiser.md`](docs/waiser.md) and
+reduces to that engine. The OMS `0x0C` **Recommendation** type is now realized
+in `dejadb-core` (§2.3), but Waiser still writes its recommendation and audit
+grains as content-addressed Fact grains in a `waiser` namespace: migrating the
+existing queue to the native type is a data decision, not a format one, and is
+deliberately separate from landing the type. Full design:
+[`waiser.md`](docs/waiser.md) and
 [`waiser-reflection.md`](docs/waiser-reflection.md).
 
 ---
@@ -635,7 +638,7 @@ crates — the memory stack, and the Waiser self-improvement engine:
 
 | Crate | Depends on | What it does |
 |---|---|---|
-| **dejadb-core** | — | The `.mg` format, canonical serialization, content addressing, the 11 grain types, and tool-schema rendering. Storage-agnostic; everything depends on it. |
+| **dejadb-core** | — | The `.mg` format, canonical serialization, content addressing, the 12 grain types, and tool-schema rendering. Storage-agnostic; everything depends on it. |
 | **dejadb-store** | core | The Turso store: dictionary-encoded triple indexes, `entity_latest` heads/forks, hybrid recall + RRF, bounded graph ops, the op-log + HLC + tombstones, the CAS blob sidecar, bundles/streaming, and the memory-tool adapter. |
 | **dejadb-cal** | core, store | CAL lexer, parser, AST, executor, multi-source ASSEMBLE, templates, saved queries, and the `DejaDbFacade` (with read-only mounts) that binds CAL to the store. |
 | **dejadb-context** | cal, core | Budget-aware rendering (SML/TOON/Markdown/JSON), progressive disclosure, provider presets, and tool-schema formats. |

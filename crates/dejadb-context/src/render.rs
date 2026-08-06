@@ -94,6 +94,7 @@ impl RendererRegistry {
         registry.register(Box::new(ConsensusRenderer));
         registry.register(Box::new(ConsentRenderer));
         registry.register(Box::new(SkillRenderer));
+        registry.register(Box::new(RecommendationRenderer));
         registry
     }
 
@@ -1565,6 +1566,130 @@ impl GrainRenderer for ConsentRenderer {
 // domain + proficiency). `instructions`/`when_to_use` are deliberately NOT
 // rendered raw (design §13 non-blocking note).
 // ---------------------------------------------------------------------------
+
+/// SML 1.1 `<recommendation>` — renders the proposal summary with `target` and
+/// `severity` attributes.
+struct RecommendationRenderer;
+
+/// A recommendation's `summary` is a template id plus args, never prose
+/// (OMS §8.12 rule 4). Without the template registry to render it here, show
+/// the argument values — what a reviewer actually needs to see — rather than
+/// the template id, which means nothing on its own.
+fn recommendation_summary(grain: &DeserializedGrain) -> String {
+    let args = grain.fields.get("summary").and_then(|s| s.get("args"));
+    let Some(obj) = args.and_then(|a| a.as_object()) else {
+        return grain
+            .get_str("target_ref")
+            .unwrap_or("recommendation")
+            .to_string();
+    };
+    let mut parts: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| match v {
+            serde_json::Value::String(s) => format!("{k}={s}"),
+            other => format!("{k}={other}"),
+        })
+        .collect();
+    parts.sort(); // deterministic: the arg map has no inherent order
+    if parts.is_empty() {
+        grain
+            .get_str("target_ref")
+            .unwrap_or("recommendation")
+            .to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+impl GrainRenderer for RecommendationRenderer {
+    fn grain_type(&self) -> GrainType {
+        GrainType::Recommendation
+    }
+
+    fn render(&self, grain: &DeserializedGrain, policy: &FormatPolicy) -> String {
+        let target = grain.get_str("target_ref").unwrap_or("");
+        let severity = grain.get_str("severity").unwrap_or("info");
+        let summary = recommendation_summary(grain);
+        let meta = extract_metadata(grain, policy.metadata);
+
+        match &policy.format {
+            OutputFormat::Sml => {
+                let attrs = meta
+                    .as_ref()
+                    .map(|m| format_meta_sml_attrs(m, policy.metadata))
+                    .unwrap_or_default();
+                format!(
+                    "<recommendation target=\"{}\" severity=\"{}\"{attrs}>{}</recommendation>",
+                    sml_escape(target),
+                    sml_escape(severity),
+                    sml_escape(&summary)
+                )
+            }
+            OutputFormat::Markdown => {
+                let suffix = meta
+                    .as_ref()
+                    .map(|m| format_meta_markdown(m, policy.metadata))
+                    .unwrap_or_default();
+                format!("[{severity}] {summary} → `{target}`{suffix}")
+            }
+            OutputFormat::PlainText => {
+                let suffix = meta
+                    .as_ref()
+                    .map(|m| format_meta_plain(m, policy.metadata))
+                    .unwrap_or_default();
+                format!("[{severity}] {summary} -> {target}{suffix}")
+            }
+            OutputFormat::Json => {
+                let mut obj = serde_json::json!({
+                    "type": "recommendation",
+                    "target_ref": target,
+                    "severity": severity,
+                    "summary": summary,
+                });
+                // The reviewable substance: who proposed it, the dedup identity,
+                // the change itself, and the status the index layer resolved.
+                for key in [
+                    "analyzer",
+                    "dedup_key",
+                    "proposal_cal",
+                    "proposal_edit",
+                    "proposal_data",
+                    "metric_snapshot",
+                    "evidence_query",
+                    "rec_status",
+                ] {
+                    if let Some(v) = grain.fields.get(key) {
+                        obj[key] = v.clone();
+                    }
+                }
+                if let Some(ref m) = meta {
+                    add_json_metadata(&mut obj, m, policy.metadata);
+                }
+                obj.to_string()
+            }
+            OutputFormat::Toon => format!(
+                "{},{},{}",
+                toon_escape(target),
+                toon_escape(severity),
+                toon_escape(&summary)
+            ),
+        }
+    }
+
+    fn render_summary(&self, grain: &DeserializedGrain, _policy: &FormatPolicy) -> String {
+        format!(
+            "[{}] {}",
+            grain.get_str("severity").unwrap_or("info"),
+            recommendation_summary(grain)
+        )
+    }
+
+    fn context_priority(&self, grain: &DeserializedGrain, hit: &SearchHit) -> f32 {
+        // A pending proposal is something a reviewer must act on, so it ranks
+        // above passive records but below the facts it is reasoning about.
+        adjusted_priority(0.7, grain, hit)
+    }
+}
 
 struct SkillRenderer;
 

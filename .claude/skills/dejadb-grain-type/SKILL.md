@@ -5,14 +5,14 @@ description: Checklist for adding a new grain type or changing an existing one's
 
 # Adding or changing a grain type
 
-There are **11 grain types** (Fact 0x01 … Skill 0x0B). Serialization dispatches
+There are **12 grain types** (Fact 0x01 … Recommendation 0x0C). Serialization dispatches
 on `downcast_ref` chains, so a `registry.rs` row is **necessary but not
 sufficient** — miss an arm and the type serializes to garbage or fails to
 reconstruct, with tests catching only some of it.
 
 ## First: which case are you in?
 
-- **Adding a new type** (new type byte, e.g. 0x0C) is **additive** — it does not
+- **Adding a new type** (new type byte, e.g. 0x0D) is **additive** — it does not
   change any existing grain's content address. Safe to do without a spec gate,
   but coordinate with OMS: the type byte and name are conformance surface.
 - **Adding/renaming a field on an existing type**, or changing its default/omit

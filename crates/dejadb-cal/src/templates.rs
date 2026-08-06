@@ -1390,7 +1390,26 @@ fn project_content(grain: &CalGrainResult) -> ResolvedValue {
         },
         "consent" => get("purpose").unwrap_or_default(),
         "skill" => get("description").unwrap_or_default(),
-        "recommendation" => get("summary").unwrap_or_default(),
+        // OMS §8.12: `summary` is `{template_id, args}`, not prose — reading it
+        // as a string yielded nothing. Project the argument values, which is
+        // what a reviewer needs; the template id alone means nothing.
+        "recommendation" => f
+            .get("summary")
+            .and_then(|s| s.get("args"))
+            .and_then(|a| a.as_object())
+            .map(|o| {
+                let mut vs: Vec<String> = o
+                    .iter()
+                    .map(|(k, v)| match v {
+                        serde_json::Value::String(t) => format!("{k}={t}"),
+                        other => format!("{k}={other}"),
+                    })
+                    .collect();
+                vs.sort();
+                vs.join(", ")
+            })
+            .or_else(|| get("target_ref"))
+            .unwrap_or_default(),
         _ => get("content").or_else(|| get("object")).unwrap_or_default(),
     };
     if text.is_empty() { ResolvedValue::Null } else { ResolvedValue::Str(text) }
@@ -2255,6 +2274,14 @@ pub fn default_grain_render(grain: &CalGrainResult, ctx: &RenderContext) -> Stri
             truncate_str(&field_str(grain, "description"), 60),
             field_str_or(grain, "domain", "general"),
             format_confidence(field_f64(grain, "proficiency")),
+        ),
+        // Recommendation — the reviewable line: severity, target, and the
+        // change kind, so a queue reads at a glance.
+        "recommendation" => format!(
+            "[{}] {} -> {}",
+            field_str_or(grain, "severity", "info"),
+            truncate_str(&field_str(grain, "dedup_key"), 12),
+            field_str(grain, "target_ref"),
         ),
         _ => format!("{}: {}", grain.grain_type, grain.hash),
     }

@@ -190,3 +190,70 @@ fn step_action_relation_parses_round_trip() {
     // No node named — an execution record must say which step it ran.
     assert_eq!(step_action_node("mg:step_action:"), None);
 }
+
+// ---------------------------------------------------------------------------
+// OMS 1.5 forward-compatibility posture
+// ---------------------------------------------------------------------------
+
+/// `deserialize_blob` errors on an unknown grain type byte rather than skipping
+/// it, so a file carrying a post-1.4 grain is unreadable to an older build —
+/// not merely partially readable. The file records that requirement itself.
+#[test]
+fn a_new_grain_type_stamps_min_reader_version() {
+    let d = TempDir::new().unwrap();
+    let path = d.path().join("m.db");
+    {
+        let mut m = DejaDB::open(path.to_str().unwrap()).unwrap();
+        // A file of only pre-1.5 grains makes no such claim.
+        m.add(
+            &dejadb_core::types::Fact::new("a", "b", "c")
+                .created_at(1_700_000_000_000)
+                .namespace("ns"),
+        )
+        .unwrap();
+        assert_eq!(m.meta_get("min_reader_version").unwrap(), None);
+
+        let rec = Recommendation::new(
+            "entity:ns/a",
+            Analyzer::new("waiser.dup/1"),
+            Summary {
+                template_id: "t".into(),
+                args: serde_json::json!({}),
+            },
+            Proposal::Cal("x".into()),
+        )
+        .created_at(1_700_000_001_000)
+        .namespace("ns");
+        m.add(&rec).unwrap();
+        assert!(
+            m.meta_get("min_reader_version").unwrap().is_some(),
+            "a 0x0C grain must stamp the requirement"
+        );
+    }
+    // Reopening with a build that satisfies it is silent.
+    let m = DejaDB::open(path.to_str().unwrap()).unwrap();
+    assert!(
+        !m.open_warnings()
+            .iter()
+            .any(|w| w.contains("min_reader_version")),
+        "this build satisfies its own stamp: {:?}",
+        m.open_warnings()
+    );
+}
+
+#[test]
+fn a_file_needing_a_newer_reader_warns_at_open() {
+    let d = TempDir::new().unwrap();
+    let path = d.path().join("m.db");
+    {
+        let m = DejaDB::open(path.to_str().unwrap()).unwrap();
+        // Simulate a file written by a future build.
+        m.meta_put("min_reader_version", "99.0.0").unwrap();
+    }
+    let m = DejaDB::open(path.to_str().unwrap()).unwrap();
+    let w = m.open_warnings();
+    assert!(
+        w.iter().any(|x| x.contains("99.0.0")),
+        "open must say the file needs a newer reader, got {w:?}"
+    );
+}

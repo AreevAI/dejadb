@@ -1400,6 +1400,9 @@ pub enum GrainTypePlural {
     Consensuses,
     Consents,
     Skills,
+    /// OMS 1.5 / CAL 1.2. Query-only: engine-emitted and lifecycle-gated, so
+    /// deliberately absent from the addable set (no `ADD recommendation`).
+    Recommendations,
     /// Wildcard — `RECALL *` or `RECALL grains` — matches all types.
     All,
 }
@@ -1419,6 +1422,7 @@ impl GrainTypePlural {
             "consensuses" | "consensus" => Some(Self::Consensuses),
             "consents" | "consent" => Some(Self::Consents),
             "skills" | "skill" => Some(Self::Skills),
+            "recommendations" | "recommendation" => Some(Self::Recommendations),
             "*" | "grains" | "all" => Some(Self::All),
             _ => None,
         }
@@ -1438,6 +1442,7 @@ impl GrainTypePlural {
             Self::Consensuses => "consensuses",
             Self::Consents => "consents",
             Self::Skills => "skills",
+            Self::Recommendations => "recommendations",
             Self::All => "*",
         }
     }
@@ -1456,6 +1461,7 @@ impl GrainTypePlural {
             Self::Consensuses => Some(dejadb_core::types::GrainType::Consensus),
             Self::Consents => Some(dejadb_core::types::GrainType::Consent),
             Self::Skills => Some(dejadb_core::types::GrainType::Skill),
+            Self::Recommendations => Some(dejadb_core::types::GrainType::Recommendation),
             Self::All => None,
         }
     }
@@ -1482,6 +1488,8 @@ pub enum GrainTypeSingular {
     Consensus,
     Consent,
     Skill,
+    /// OMS 1.5. Query-only — see `GrainTypePlural::Recommendations`.
+    Recommendation,
 }
 
 impl GrainTypeSingular {
@@ -1499,6 +1507,7 @@ impl GrainTypeSingular {
             "consensus" => Some(Self::Consensus),
             "consent" => Some(Self::Consent),
             "skill" => Some(Self::Skill),
+            "recommendation" => Some(Self::Recommendation),
             _ => None,
         }
     }
@@ -1517,6 +1526,7 @@ impl GrainTypeSingular {
             Self::Consensus => "consensus",
             Self::Consent => "consent",
             Self::Skill => "skill",
+            Self::Recommendation => "recommendation",
         }
     }
 
@@ -1534,6 +1544,7 @@ impl GrainTypeSingular {
             Self::Consensus => dejadb_core::types::GrainType::Consensus,
             Self::Consent => dejadb_core::types::GrainType::Consent,
             Self::Skill => dejadb_core::types::GrainType::Skill,
+            Self::Recommendation => dejadb_core::types::GrainType::Recommendation,
         }
     }
 
@@ -1551,6 +1562,7 @@ impl GrainTypeSingular {
             Self::Consensus => GrainTypePlural::Consensuses,
             Self::Consent => GrainTypePlural::Consents,
             Self::Skill => GrainTypePlural::Skills,
+            Self::Recommendation => GrainTypePlural::Recommendations,
         }
     }
 }

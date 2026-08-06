@@ -21,6 +21,11 @@ pub enum GrainType {
     Consensus,
     Consent,
     Skill,
+    /// OMS 1.5 §8.12. Appended last on purpose: `dejadb-store` indexes the
+    /// `gtype` column as this enum's ordinal rather than the .mg header byte,
+    /// so inserting a variant mid-enum would silently renumber every stored
+    /// row and break type-filtered recall in every existing file.
+    Recommendation,
 }
 
 impl GrainType {

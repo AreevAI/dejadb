@@ -57,7 +57,7 @@ pub struct GrainTypeMeta {
     pub toon_columns: &'static [&'static str],
 }
 
-/// The 11 OMS grain types (OMS 1.4), one metadata row each. The byte values
+/// The 12 OMS grain types (OMS 1.5), one metadata row each. The byte values
 /// match the `.mg` header spec and are immutable.
 pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
     GrainTypeMeta {
@@ -220,6 +220,31 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
             "last_practiced_at",
         ],
         toon_columns: &["name", "domain", "proficiency"],
+    },
+    // OMS 1.5 — Recommendation (0x0C). A governed, auditable proposal to change
+    // memory or agent configuration.
+    GrainTypeMeta {
+        ty: GrainType::Recommendation,
+        byte: 0x0C,
+        name: "recommendation",
+        plural: "recommendations",
+        // Query-only by design (OMS 1.5 / CAL 1.2): a recommendation is
+        // engine-emitted and lifecycle-gated, so there is no `ADD
+        // recommendation` and lifecycle transitions never occur through
+        // `ADD`/`SUPERSEDE SET`. They are emitted by an analyzer layer and
+        // moved through review by the audit path.
+        add_via_set: false,
+        required_add_fields: &["target_ref", "analyzer", "summary", "dedup_key"],
+        // `rec_status` is index-layer (§5.6/§6.1) — filterable, never written
+        // by an author.
+        queryable_fields: &[
+            "target_ref",
+            "analyzer",
+            "severity",
+            "dedup_key",
+            "rec_status",
+        ],
+        toon_columns: &["target_ref", "severity", "content"],
     },
 ];
 

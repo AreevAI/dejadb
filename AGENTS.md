@@ -49,7 +49,7 @@ dejadb-core ← dejadb-store ← dejadb-cal ← dejadb-context
 
 | Crate | What it does |
 |---|---|
-| `dejadb-core` | The `.mg` binary format, canonical serialization, SHA-256 content addressing, the 11 grain types, and tool-schema rendering. Depends on no other workspace crate. |
+| `dejadb-core` | The `.mg` binary format, canonical serialization, SHA-256 content addressing, the 12 grain types, and tool-schema rendering. Depends on no other workspace crate. |
 | `dejadb-store` | Turso-backed store: dictionary-encoded triple indexes, hybrid recall, heads/forks/merge, CAS blob sidecar, bundles & streaming, the Anthropic memory-tool adapter. |
 | `dejadb-cal` | CAL lexer / parser / executor, multi-source `ASSEMBLE`, saved queries, and `DejaDbFacade` (with read-only mounts) that binds CAL to the store. |
 | `dejadb-context` | Budget-aware rendering of recall results into model-ready context (SML / TOON / Markdown / JSON / plain text). |
@@ -102,7 +102,7 @@ that break them will not be merged without a design discussion first.
 
 - **Grain types & the `.mg` format** — `crates/dejadb-core/src/format/` and
   `crates/dejadb-core/src/types/`. The registry
-  (`types/registry.rs`) is the source of truth for the 11 grain types.
+  (`types/registry.rs`) is the source of truth for the 12 grain types.
 - **Store schema, recall, forks/merge, bundles** — `crates/dejadb-store/src/lib.rs`.
 - **CAL grammar & executor** — `crates/dejadb-cal/src/{lexer,parser,executor}.rs`.
   These are large; navigate with grep and offset reads, not full reads.

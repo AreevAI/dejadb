@@ -371,12 +371,17 @@ Existing write callers add `--token-env`; a token unlocks review + apply.
 
 ## Compatibility notes
 
-- **Interim grain mapping.** The OMS 0x0C recommendation type is not yet
-  realized in dejadb-core, so recommendation and audit grains currently ride
-  as Facts in the `waiser` namespace with the field-map carried as JSON.
-  They are real, content-addressed, syncable grains; when 0x0C lands this
-  becomes a native mapping and existing content addresses stay valid
-  (additive, per OMS §4.5).
+- **Interim grain mapping.** The OMS 1.5 `0x0C` Recommendation type **is** now
+  realized in dejadb-core, but Waiser has not migrated to it: recommendation
+  and audit grains still ride as Facts in the `waiser` namespace with the
+  field-map carried as JSON. They are real, content-addressed, syncable
+  grains. Moving the queue to the native type is a data migration, not a
+  format change — existing content addresses stay valid either way (additive,
+  per OMS §4.5) — and it is sequenced separately so landing the type does not
+  rewrite anyone's live queue. Note that a file containing `0x0C` grains
+  stamps `min_reader_version`: `deserialize_blob` errors on an unknown type
+  byte rather than skipping it, so such a file is unreadable to a pre-1.5
+  build.
 - **Tool grains.** The flagship analyzer reads Tool grains (0x05), which
   carry `tool_name`/`is_error`/`content` natively. `record_tool_call` and
   `deja migrate --from tool-log` both produce them.
@@ -430,10 +435,11 @@ guidance; stamped external-analyzer findings `origin = command` (they were
 mislabeled `builtin` — the `[external]` badge could never render); and added
 the trust class to `waiser analyzers`.
 
-Remaining follow-ups (documented, not blockers): the **native OMS `0x0C`
-Recommendation grain** in `dejadb-core` — deliberately deferred, because it
-changes the frozen canonical serialization / grain-type registry and is an
-OMS-spec-level decision; until then recommendations ride as Facts with a
-distinguishing relation (`waiser_recommendation`). And a labeled non-parasitic
+Remaining follow-ups (documented, not blockers): **migrating Waiser onto the
+native OMS `0x0C` Recommendation grain**, which now exists in `dejadb-core`
+(OMS 1.5 landed it, resolving the spec-level decision that had deferred it).
+Recommendations still ride as Facts with a distinguishing relation
+(`waiser_recommendation`) until that migration is sequenced. And a labeled
+non-parasitic
 corpus for a published Effective-Reliability number. See `waiser-proposal.md`
 for the full plan.
