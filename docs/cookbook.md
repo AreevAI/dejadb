@@ -300,9 +300,16 @@ hardening checklist.
 
 ## 9. Ingest raw conversation, then distill facts
 
-`remember` stores raw content as an Observation grain (it prints the hash).
-DejaDB runs no LLM itself, so fact extraction is host-supplied — pass your
-extractor's output as JSON:
+`remember` stores raw content as an **Event** grain (it prints the hash) and
+attaches the facts distilled from it. You supply those facts, or you let a model
+extract them.
+
+Every surface that captures raw text writes the same grain through the same
+path — `deja remember`, the Python and Node bindings, the MCP `dejadb_remember`
+tool, and the `capture-stop` hook. Pass `--session-id` and `--role` to record a
+turn as part of its conversation (`RECALL events WHERE session_id = "..."`).
+
+**Host-supplied** — you already ran your own extractor, so no model is called:
 
 ```bash
 deja remember --db john.db --ns caller \
@@ -311,6 +318,57 @@ deja remember --db john.db --ns caller \
   --facts '[{"subject":"john","relation":"prefers","object":"window seat","confidence":0.9},
             {"subject":"john","relation":"diet","object":"vegetarian","confidence":0.95}]'
 ```
+
+**Model-extracted** — `--model provider:name` uses a built-in backend (key read
+from the environment: `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `ollama:` for
+a local model, never on the command line). `--llm-cmd 'CMD'` is the
+zero-dependency escape hatch: your command gets the request JSON on stdin and
+prints the response.
+
+```bash
+deja remember --db john.db --ns caller \
+  --content "I always want a window seat, and I'm vegetarian." \
+  --observer voice-agent \
+  --model openai:gpt-4o-mini
+```
+
+```json
+{"observation":"a1b2…","facts":["c3d4…","e5f6…"],"model":"gpt-4o-mini",
+ "verification_status":"unverified","proposed":2,"dropped":0}
+```
+
+Extraction is the point where a model can write its own hallucinations into
+memory, so the write is shaped to stay honest about that:
+
+- **The raw text lands first.** The Observation is written *before* the model is
+  called. A failed or garbage extraction costs you the facts, never the source —
+  the hash is still printed, and you can retry the extraction against it.
+- **Extracted facts are marked, not trusted.** Each one carries `derived_from`
+  (the observation), `source_type=derived`, `extractor_model` (which model wrote
+  it), and `verification_status="unverified"`. That last one is CAL-filterable,
+  so the extraction queue is reviewable:
+
+  ```bash
+  deja cal 'RECALL facts WHERE verification_status = "unverified"' --db john.db --ns caller
+  ```
+
+- **Grounding is opt-in.** `--ground-model` / `--ground-cmd` runs a *separate*
+  call that checks each proposed fact against the source text — proposer ≠
+  scorer, the same rule the Waiser verifier follows. Facts the grounder does not
+  support are dropped; survivors are stamped `"verified"`.
+- **Nothing is dropped silently.** `proposed` vs `dropped` in the output account
+  for everything the confidence floor (`--min-confidence`) and the grounder
+  removed.
+
+Use `--dry-run` to see what a model would extract without writing anything —
+useful for iterating on `--extract-hint`, which steers extraction toward your
+domain ("only travel preferences; ignore scheduling chatter").
+
+The same knobs exist on the bindings (`model=`, `llm_cmd=`, `ground_cmd=`,
+`extract_hint=`, `min_confidence=` in Python; the camelCase equivalents in
+Node). MCP's `dejadb_remember` deliberately has none of this — there the client
+*is* a model, so it stores the exchange as an Event and distills with
+`dejadb_add`.
 
 The Anthropic memory-tool backend maps a `/memories/...` file space onto
 supersession chains of Fact grains (full wiring guide:
@@ -346,9 +404,9 @@ harness looks up the nearest existing lesson before writing and supersedes it
 instead of adding a paraphrase. In a learning loop these properties are not
 hygiene: rot compounds, because the agent keeps learning from its own mistakes.
 
-Log experience as it happens — `remember` stores each entry as an Observation
-grain and prints its hash (keep it: the lesson below links back to it). Writes
-never call an LLM, so log everything:
+Log experience as it happens — `remember` stores each entry as an Event grain
+and prints its hash (keep it: the lesson below links back to it). Without
+`--model` no model is called, so this stays a pure write — log everything:
 
 ```bash
 deja remember --db agent.db --ns agent --observer executor \
@@ -475,8 +533,12 @@ there is no prompt or no match, so it never adds noise.
 
 ### The reflection harness (your model call)
 
-DejaDB runs no LLM, so the *reflect* step — turning captured experience into
-lessons — is a host job. The shape of a nightly (or on-`SessionEnd`) harness:
+The *reflect* step — turning captured experience into lessons — is a model
+call. DejaDB will make it for you if you point it at a model (`deja remember
+--model` for extraction, §9; `deja waiser run --model` for governed
+reflection), but nothing runs one by default, and the harness below keeps the
+call entirely in your hands. The shape of a nightly (or on-`SessionEnd`)
+harness:
 
 ```bash
 # 1. Pull recent experience (now that the experience log is recallable):

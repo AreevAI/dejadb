@@ -6,7 +6,7 @@
 //!                          current value (0 stale), full history retained.
 //! M3  write-cost         → structural writes cost 0 LLM calls / 0 tokens / $0.
 //! M4  provenance         → every grain traces to when + how it entered, and
-//!                          derived facts to their source Observation.
+//!                          derived facts to the Event they came from.
 //!
 //! All four are structural and deterministic: no LLM, no network, no
 //! competitor hosting. That is the whole point — these are cheap to reproduce
@@ -199,13 +199,13 @@ fn main() {
     let rr = m
         .remember("main", "carol was promoted to admin", "agent:hr", Some(&extract as &dyn Fn(&str) -> Vec<FactDraft>))
         .unwrap();
-    let obs_hex = rr.observation.to_hex();
-    stored_hashes.insert(obs_hex.clone());
+    let event_hex = rr.event.to_hex();
+    stored_hashes.insert(event_hex.clone());
     let (mut derived_ok, derived_total) = (0usize, rr.facts.len());
     for h in &rr.facts {
         stored_hashes.insert(h.to_hex());
         let g = m.get(h).unwrap();
-        if g.get_str("derived_from") == Some(obs_hex.as_str()) && g.get_str("source_type") == Some("derived") {
+        if g.get_str("derived_from") == Some(event_hex.as_str()) && g.get_str("source_type") == Some("derived") {
             derived_ok += 1;
         }
     }

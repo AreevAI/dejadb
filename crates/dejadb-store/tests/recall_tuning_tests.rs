@@ -267,3 +267,123 @@ fn rerank_requested_without_backend_keeps_fusion_order() {
         .unwrap();
     assert_eq!(got.len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// include_superseded: widen every leg from the heads to the whole chain
+// ---------------------------------------------------------------------------
+
+/// tea → coffee → matcha, one (subject, relation) cell, two supersessions.
+fn chain(m: &mut DejaDB) -> Result<()> {
+    let h1 = m.add(&fact("caller", "kim", "prefers", "tea leaves"))?;
+    let mut g2 = fact("caller", "kim", "prefers", "coffee beans");
+    let h2 = m.supersede(&h1, &mut g2)?;
+    let mut g3 = fact("caller", "kim", "prefers", "matcha powder");
+    m.supersede(&h2, &mut g3)?;
+    Ok(())
+}
+
+#[test]
+fn structural_leg_widens_to_the_whole_chain() {
+    let d = TempDir::new().unwrap();
+    let mut m = DejaDB::open(d.path().join("m.db").to_str().unwrap()).unwrap();
+    chain(&mut m).unwrap();
+
+    // Default: the head only. Stale values must not reach a model's context
+    // unless the caller asked for history.
+    let heads = m
+        .recall_hybrid_tuned("caller", Some("kim"), Some("prefers"), None, 8, None, RecallTuning::default())
+        .unwrap();
+    assert_eq!(objects(&heads), vec!["matcha powder"]);
+
+    let all = m
+        .recall_hybrid_tuned(
+            "caller",
+            Some("kim"),
+            Some("prefers"),
+            None,
+            8,
+            None,
+            RecallTuning { include_superseded: true, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!(all.len(), 3, "the whole chain: {:?}", objects(&all));
+    assert!(pos(&all, "tea").is_some(), "the oldest version must be reachable");
+}
+
+#[test]
+fn bm25_leg_finds_text_that_only_exists_in_history() {
+    let d = TempDir::new().unwrap();
+    let mut m = DejaDB::open(d.path().join("m.db").to_str().unwrap()).unwrap();
+    chain(&mut m).unwrap();
+
+    // "tea" survives only in a superseded version. Heads-only recall cannot see
+    // it at all — that word is unfindable, which is the gap this flag closes.
+    assert!(m.search_text("caller", "tea", 8).unwrap().is_empty());
+    assert_eq!(m.search_text_all("caller", "tea", 8).unwrap().len(), 1);
+
+    let all = m
+        .recall_hybrid_tuned(
+            "caller",
+            None,
+            None,
+            Some("tea"),
+            8,
+            None,
+            RecallTuning { include_superseded: true, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!(objects(&all), vec!["tea leaves"]);
+}
+
+#[test]
+fn forgotten_grains_do_not_come_back_through_the_widened_scan() {
+    // The safety property behind relaxing `cur=1`: supersede only flips index
+    // state, but forget DELETEs the rows outright. A tombstone must stay a
+    // tombstone on every path, including the one that asks for history.
+    let d = TempDir::new().unwrap();
+    let mut m = DejaDB::open(d.path().join("m.db").to_str().unwrap()).unwrap();
+    let h1 = m.add(&fact("caller", "kim", "prefers", "tea leaves")).unwrap();
+    let mut g2 = fact("caller", "kim", "prefers", "coffee beans");
+    m.supersede(&h1, &mut g2).unwrap();
+    m.forget(&h1).unwrap();
+
+    let widened = RecallTuning { include_superseded: true, ..Default::default() };
+    let structural = m
+        .recall_hybrid_tuned("caller", Some("kim"), Some("prefers"), None, 8, None, widened)
+        .unwrap();
+    assert_eq!(objects(&structural), vec!["coffee beans"], "forgotten grain resurfaced");
+    let text = m
+        .recall_hybrid_tuned("caller", None, None, Some("tea"), 8, None, widened)
+        .unwrap();
+    assert!(text.is_empty(), "forgotten text stayed findable: {:?}", objects(&text));
+}
+
+#[test]
+fn supersession_map_labels_only_the_stale_versions() {
+    let d = TempDir::new().unwrap();
+    let mut m = DejaDB::open(d.path().join("m.db").to_str().unwrap()).unwrap();
+    chain(&mut m).unwrap();
+
+    let all = m
+        .recall_hybrid_tuned(
+            "caller",
+            Some("kim"),
+            Some("prefers"),
+            None,
+            8,
+            None,
+            RecallTuning { include_superseded: true, ..Default::default() },
+        )
+        .unwrap();
+    let hashes: Vec<_> = all.iter().map(|g| g.hash).collect();
+    let map = m.supersession_map(&hashes).unwrap();
+    assert_eq!(map.len(), 2, "both stale versions carry a superseder");
+
+    // The head is absent from the map, and every superseder is itself a grain
+    // in the chain — the labels reconstruct the lineage, not just a flag.
+    let head = all.iter().find(|g| g.get_str("object") == Some("matcha powder")).unwrap();
+    assert!(!map.contains_key(&head.hash));
+    for sup in map.values() {
+        assert!(hashes.contains(sup), "superseder must be a real grain");
+    }
+}

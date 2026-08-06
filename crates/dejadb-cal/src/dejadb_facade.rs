@@ -18,7 +18,9 @@ use crate::errors::CalError;
 use crate::facade::{CalStoreFacade, TemplateInfo};
 use crate::json_build::{build_grain_from_json, GrainSink};
 use crate::queries::{PersistedQuery, QueryEntry, QueryListEntry, QueryRegistry};
-use crate::store_types::{DiversityMethod, ForkGroupInfo, RecallParams, SearchHit, VersionEntry};
+use crate::store_types::{
+    DiversityMethod, ForkGroupInfo, RecallParams, SearchHit, SupersessionStatus, VersionEntry,
+};
 use crate::templates::{PersistedTemplate, TemplateRegistry};
 
 /// `meta` key prefixes for CAL host metadata. One row per entry, so recording
@@ -613,6 +615,9 @@ impl CalStoreFacade for DejaDbFacade {
         // and does not know about supersession, so this path has to reapply
         // both itself.
         let unanchored = params.subject.is_none() && params.query.is_none();
+        // `WITH superseded` — the caller is asking about the past, so every leg
+        // widens from the heads to the whole supersession chain.
+        let include_superseded = params.exclude_superseded == Some(false);
         let raw = if unanchored {
             match params.grain_type {
                 // Heads only, unless `WITH superseded` asked otherwise. The
@@ -621,7 +626,7 @@ impl CalStoreFacade for DejaDbFacade {
                 // alongside the head that replaced it and recall reported both
                 // as current. Supersession is index-layer state, so the
                 // distinction has to be made in the query, not after it.
-                Some(_) if params.exclude_superseded != Some(false) => m.recent_live(
+                Some(_) if !include_superseded => m.recent_live(
                     ns,
                     params.grain_type,
                     k.saturating_mul(Self::RECALL_OVERFETCH),
@@ -651,6 +656,7 @@ impl CalStoreFacade for DejaDbFacade {
                     DiversityMethod::Mmr { lambda } => Some(lambda),
                     DiversityMethod::Threshold(_) => None,
                 }),
+                include_superseded,
             };
             m.recall_hybrid_tuned(
                 ns,
@@ -664,7 +670,7 @@ impl CalStoreFacade for DejaDbFacade {
         };
         drop(m);
 
-        let hits = raw
+        let mut hits: Vec<SearchHit> = raw
             .into_iter()
             // `relation` reaches the anchored leg as a store-side predicate,
             // but `recent` takes no predicates at all — so on that path the
@@ -698,6 +704,32 @@ impl CalStoreFacade for DejaDbFacade {
             .take(k)
             .map(Self::hit)
             .collect();
+
+        // Label the history. A widened recall returns stale versions next to the
+        // heads that replaced them, and nothing in an immutable blob says which
+        // is which — unlabeled, `WITH superseded` would quietly feed a model
+        // outdated values that read as current. Renderers and the RF-2
+        // context rule key off these two fields, so stamping them is what makes
+        // the widened result honest rather than merely bigger.
+        if include_superseded && !hits.is_empty() {
+            let hashes: Vec<Hash> = hits.iter().map(|h| h.hash).collect();
+            let mut m = match &mount_alias {
+                Some(a) => self.mounts.get(a).unwrap().lock().unwrap(),
+                None => self.store.lock().unwrap(),
+            };
+            // Fail-open, like every other recall refinement: an unlabeled result
+            // is worse than a labeled one but far better than a failed query.
+            if let Ok(map) = m.supersession_map(&hashes) {
+                drop(m);
+                for hit in &mut hits {
+                    hit.supersession_status = Some(match map.get(&hit.hash) {
+                        Some(_) => SupersessionStatus::Superseded,
+                        None => SupersessionStatus::Current,
+                    });
+                    hit.superseded_by_hash = map.get(&hit.hash).copied();
+                }
+            }
+        }
         Ok(hits)
     }
 

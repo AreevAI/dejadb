@@ -189,9 +189,16 @@ deja cal 'HISTORY WHERE subject = "fix_flaky_tests" AND relation = "proficiency"
 deja restore --db rewound.db --from ./checkpoints --until-hlc <T>  # roll back a bad learning episode
 ```
 
-Reflection (deriving the lessons) is your model call — DejaDB never runs an
-LLM. What it guarantees: revised lessons replace instead of co-ranking, every
-lesson links back to the experience that taught it (`derived_from`),
+Distilling the lessons is a model call, and it is yours to own: no model runs
+unless you point DejaDB at one (`--model provider:name` or `--llm-cmd`, key
+from the environment). Point `remember` at one and it extracts the facts for
+you — stamped `verification_status="unverified"` with the model named on the
+grain, after the raw text is already stored, so a hallucinated extraction is
+reviewable and never costs you the source
+([cookbook §9](docs/cookbook.md#9-ingest-raw-conversation-then-distill-facts)).
+What the write path guarantees either way: revised lessons replace instead of
+co-ranking, every lesson links back to the experience that taught it
+(`derived_from`),
 synced/replayed writes can't double-store, and a bad episode rewinds with
 point-in-time restore (checkpoint first — the recipe shows the flow). Even a
 *paraphrased* re-learning is caught: `deja novelty` reports the nearest existing

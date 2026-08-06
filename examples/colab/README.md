@@ -5,20 +5,26 @@ against the `dejadb` wheel — no server, no Rust toolchain. Outputs are
 pre-baked from a validated end-to-end run, so every notebook reads well
 without executing.
 
-**Helpers ship inside the wheel.** The notebooks open with
-`from dejadb.helpers import *` (dejadb ≥ 1.0.4): `fresh` (clean re-runnable
+**Helpers ship inside the wheel.** Each notebook opens with one `%pip install`
+and `from dejadb.helpers import *` (dejadb 1.0.5): `fresh` (clean re-runnable
 opens), `facts`/`show_recs`/`audit`/`outcomes` (plain-dict views over the
 JSON-string FFI), `days_later` (rehearse the 1d/7d/30d Verify checkpoints),
-`auto_model` (LLM auto-detection), and `bar` (labeled chart + PNG export).
+`auto_model` (finds a configured LLM key), and `bar` (labeled chart + PNG
+export).
 
-**LLM learning:** the learning notebooks call
-`waiser_run(model=auto_model())`. Provide an `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, or `OPENROUTER_API_KEY` (environment variable, or Colab's
-Secrets panel) and the sweep adds an LLM discovery pass — drafts must survive
-GROUND→VERIFY and human review before anything changes. Without a key, the
-deterministic analyzers run everything; the floor is keyless.
+**LLM learning:** every model call goes to **Llama 3.3 70B Instruct** — open
+weights, through OpenRouter. Nothing here needs a frontier model. Provide an
+`OPENROUTER_API_KEY`, as an environment variable or in Colab's Secrets panel
+(the key icon in the left sidebar, switched on for the notebook), and the sweep
+adds an LLM discovery pass: drafts must survive GROUND→VERIFY and human review
+before anything changes. Without a key the deterministic analyzers run
+everything — the floor is keyless.
 
-**Run locally** (from a repo checkout, before 1.0.4 is on PyPI):
+`auto_model()` also recognises `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and the
+model itself is pinned in each notebook's setup cell, so swap either if you
+prefer a different provider or a different open model.
+
+**Run locally** (any Jupyter, or from a repo checkout to test unreleased changes):
 
 ```bash
 python3 -m venv ~/.venvs/dejadb-demo
@@ -34,6 +40,7 @@ cd examples/colab && ~/.venvs/dejadb-demo/bin/jupyter lab
 | [`03_detect_review_govern.ipynb`](03_detect_review_govern.ipynb) | A customer-success desk: flaky CRM export flagged, ordinary flakiness correctly ignored, a contract-status contradiction resolved by supersession, autonomy granted only via policy file | Detecting tool failures & contradictions; reviewing/approving; four gates | 7–9 min |
 | [`04_hermes_vs_governed.ipynb`](04_hermes_vs_governed.ipynb) | A refund agent during a flash sale: the write-approval-off reflection loop simulated in 12 lines (wrong skill, no evidence, no history) vs the same experience governed — where even the LLM's hunch queues for review | What Hermes is / skills from experience; the Hermes–DejaDB comparison | 6–8 min |
 | [`05_enterprise_architecture.ipynb`](05_enterprise_architecture.ipynb) | File-per-tenant, encryption at rest with live wrong-key rejection, forget/crypto-erasure, bundle sync, mem0 migration with provenance, policy-as-code, reference deployment | Architectural considerations for enterprise agent systems | 7–9 min |
+| [`06_agent_learns_from_conversation.ipynb`](06_agent_learns_from_conversation.ipynb) | A support desk runs a **real agent turn loop** — assemble → LLM extraction → capture back with provenance — then a handover call contradicts what it learned in March; deterministic detection resolves it, and an LLM pass finds a three-fact policy inconsistency no rule can reach | An agent learning from conversation; provenance; contradiction & correction; where the model earns its place | 8–10 min |
 | [`self_improving_agents.ipynb`](self_improving_agents.ipynb) | **The full tour** — one arc end to end, plus the memory graph, vector recall, and the console launcher | All of it | 15–20 min |
 
 Suggested pairings for a single session: **02 + 04** (the "wrong lesson"

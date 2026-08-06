@@ -74,6 +74,17 @@ COMMANDS:
                                        cross-file ASSEMBLE; ns \"alias.inner\")
   repl     [--ns NS]                  interactive CAL console in the terminal
   remember --content TEXT [--facts JSON] [--observer ID]
+           [--session-id ID] [--role user|assistant|system|tool]
+           [--model SPEC | --llm-cmd CMD] [--extract-hint TEXT]
+           [--ground-model SPEC | --ground-cmd CMD]
+           [--min-confidence F] [--dry-run]
+                                      store free text as an Event, then
+                                      attach the facts distilled from it.
+                                      --facts is host-supplied and skips the
+                                      model; --model/--llm-cmd extract with an
+                                      LLM (stamped verification_status
+                                      \"unverified\" unless --ground-* checks
+                                      them). --dry-run prints, stores nothing.
   hook     claude-code               print settings.json hook snippet
                                       (auto recall-before-prompt + capture-on-stop)
   memtool  '<COMMAND-JSON>'           Anthropic memory-tool ops on grains
@@ -991,11 +1002,14 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let mut stored = 0;
             for role in ["user", "assistant"] {
                 if let Some(text) = last.get(role) {
-                    let mut e = dejadb_core::types::Event::new(text);
-                    e.common.namespace = Some(ns.clone());
-                    e.session_id = Some(session.clone());
-                    e.role = dejadb_core::types::Role::from_str(role);
-                    m.add(&e).map_err(|e| e.to_string())?;
+                    // Same write path as `deja remember` and the MCP tool, so
+                    // a captured turn is the same grain however it arrived.
+                    let meta = dejadb_store::Capture {
+                        observer: None,
+                        session_id: Some(session.as_str()),
+                        role: Some(role),
+                    };
+                    m.capture(&ns, text, &meta).map_err(|e| e.to_string())?;
                     stored += 1;
                 }
             }
@@ -1090,38 +1104,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 }
             }
         }
-        "remember" => {
-            let content = need(&flags, "content")?;
-            let observer = flag(&flags, "observer").unwrap_or_else(|| "cli".to_string());
-            // Pre-extracted facts as JSON (the CLI can't run an LLM; hosts
-            // pass their extractor's output here).
-            let drafts: Vec<dejadb_store::FactDraft> = match flag(&flags, "facts") {
-                Some(j) => {
-                    let arr: Vec<serde_json::Value> =
-                        serde_json::from_str(&j).map_err(|e| format!("bad --facts: {e}"))?;
-                    arr.iter()
-                        .map(|v| dejadb_store::FactDraft {
-                            subject: v["subject"].as_str().unwrap_or("").to_string(),
-                            relation: v["relation"].as_str().unwrap_or("").to_string(),
-                            object: v["object"].as_str().unwrap_or("").to_string(),
-                            confidence: v["confidence"].as_f64().unwrap_or(0.8),
-                        })
-                        .collect()
-                }
-                None => Vec::new(),
-            };
-            let extractor = move |_c: &str| drafts.clone();
-            let res = m
-                .remember(&ns, &content, &observer, Some(&extractor))
-                .map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "observation": res.observation.to_hex(),
-                    "facts": res.facts.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
-                })
-            );
-        }
+        "remember" => run_remember(m, &ns, &flags)?,
         "memtool" => {
             let cmd = positional
                 .first()
@@ -1489,6 +1472,228 @@ fn resolve_hash(engine: &Engine, sub: &DejaDbSubstrate, prefix: &str) -> Result<
         1 => Ok(matches[0].to_string()),
         n => Err(format!("'{prefix}' is ambiguous ({n} matches) — use more characters")),
     }
+}
+
+/// Resolve an LLM backend from a `--<prefix>cmd` / `--<prefix>model` flag pair,
+/// the same two ways `deja waiser run` attaches one: a subprocess (the
+/// zero-dependency escape hatch) or a built-in HTTP provider whose key is read
+/// from the environment, never from the command line. The subprocess wins when
+/// both are given. Both fail at construction, before anything is written.
+fn resolve_llm(
+    flags: &HashMap<String, String>,
+    cmd_flag: &str,
+    model_flag: &str,
+) -> Result<Option<Box<dyn waiser::LlmBackend>>, String> {
+    if let Some(cmd) = flag(flags, cmd_flag) {
+        let label = flag(flags, "llm-model");
+        let llm = waiser::CommandLlm::new(&cmd, label.as_deref()).map_err(|e| e.to_string())?;
+        return Ok(Some(Box::new(llm)));
+    }
+    if let Some(spec) = flag(flags, model_flag) {
+        let base = flag(flags, "llm-base-url");
+        let key_env = flag(flags, "llm-api-key-env");
+        let llm = dejadb_llm::resolve(&spec, base.as_deref(), key_env.as_deref())
+            .map_err(|e| e.to_string())?;
+        return Ok(Some(llm));
+    }
+    Ok(None)
+}
+
+/// `deja remember` — store free text as an Observation, then attach the facts
+/// distilled from it.
+///
+/// Three routes to those facts, in precedence order:
+///
+/// - `--facts JSON` — the host already extracted them; no model is called and
+///   the facts carry no model attribution (the host is asserting them).
+/// - `--llm-cmd CMD` — a subprocess backend.
+/// - `--model provider:name` — a built-in HTTP backend, key from the env.
+///
+/// The raw text is written **before** the model is called, so a failed or
+/// garbage extraction never costs the raw text. Model-extracted facts are
+/// stamped `verification_status = "unverified"` (CAL-filterable, so they can be
+/// reviewed) unless `--ground-model`/`--ground-cmd` runs a separate entailment
+/// pass over them — a different call from the one that proposed them, the same
+/// proposer ≠ scorer rule the Waiser verifier follows. Facts the grounder does
+/// not support are dropped; survivors are stamped `"verified"`.
+fn run_remember(mut m: DejaDB, ns: &str, flags: &HashMap<String, String>) -> Result<(), String> {
+    let content = need(flags, "content")?;
+    let observer = flag(flags, "observer").unwrap_or_else(|| "cli".to_string());
+    let dry_run = flag(flags, "dry-run").is_some();
+    let hint = flag(flags, "extract-hint");
+    let min_confidence = match flag(flags, "min-confidence") {
+        Some(s) => s
+            .parse::<f64>()
+            .map_err(|e| format!("bad --min-confidence: {e}"))?,
+        None => 0.0,
+    };
+    // The store drops an unrecognized role (forward-compatible, which MCP
+    // clients rely on), but a typo'd flag silently losing data is a bad trade
+    // for a human at a terminal — reject it before anything runs.
+    let role = flags.get("role").map(String::as_str);
+    if let Some(r) = role.filter(|r| dejadb_core::types::Role::from_str(r).is_none()) {
+        return Err(format!("--role {r:?}: expected user|assistant|system|tool"));
+    }
+
+    // Host-supplied drafts short-circuit the model entirely.
+    let explicit = match flag(flags, "facts") {
+        Some(j) => Some(dejadb_store::FactDraft::from_json_array(&j).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let llm = match explicit {
+        Some(_) => None,
+        None => resolve_llm(flags, "llm-cmd", "model")?,
+    };
+    let grounder = match llm {
+        Some(_) => resolve_llm(flags, "ground-cmd", "ground-model")?,
+        None => None,
+    };
+    let model = llm.as_ref().map(|l| l.model().to_string());
+
+    // --dry-run: extract and print, write nothing. For iterating on
+    // --extract-hint without leaving drafts behind in the memory.
+    if dry_run {
+        let (proposed, facts) = match &llm {
+            Some(l) => {
+                let (proposed, facts, _) = extract_drafts(
+                    l.as_ref(),
+                    grounder.as_deref(),
+                    "dry-run",
+                    &content,
+                    hint.as_deref(),
+                    min_confidence,
+                )?;
+                (proposed, facts)
+            }
+            None => {
+                let f = explicit.unwrap_or_default();
+                (f.len(), f)
+            }
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": true,
+                "model": model,
+                "proposed": proposed,
+                "facts": facts.iter().map(draft_json).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    // The raw text lands first and unconditionally: whatever the model does
+    // next, the source of the extraction is already durable.
+    let capture = dejadb_store::Capture {
+        observer: Some(observer.as_str()),
+        session_id: flags.get("session-id").map(String::as_str),
+        role,
+    };
+    let event = m
+        .capture(ns, &content, &capture)
+        .map_err(|e| e.to_string())?;
+    let report = |facts: &[Hash], extra: serde_json::Value| {
+        let mut out = serde_json::json!({
+            "event": event.to_hex(),
+            "facts": facts.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+        });
+        if let (Some(obj), Some(extra)) = (out.as_object_mut(), extra.as_object()) {
+            obj.extend(extra.clone());
+        }
+        println!("{out}");
+    };
+    // A model call that fails still leaves the raw text stored — print the
+    // hash so the caller can retry the extraction against it, then exit
+    // non-zero so the missing facts are not mistaken for "nothing to extract".
+    let failed = |e: String| -> String {
+        report(&[], serde_json::json!({ "error": e }));
+        e
+    };
+
+    let (proposed, drafts, status) = match &llm {
+        None => {
+            let d = explicit.unwrap_or_default();
+            (d.len(), d, None)
+        }
+        Some(l) => match extract_drafts(
+            l.as_ref(),
+            grounder.as_deref(),
+            &event.to_hex(),
+            &content,
+            hint.as_deref(),
+            min_confidence,
+        ) {
+            Ok((proposed, drafts, grounded)) => (
+                proposed,
+                drafts,
+                Some(if grounded { "verified" } else { "unverified" }),
+            ),
+            Err(e) => return Err(failed(e)),
+        },
+    };
+
+    let attribution = dejadb_store::FactAttribution {
+        verification_status: status,
+        extractor_model: model.as_deref(),
+    };
+    let facts = m
+        .attach_facts(ns, &event, &drafts, &attribution)
+        .map_err(|e| e.to_string())?;
+    let extra = match &model {
+        // What the model proposed vs what survived the confidence floor and
+        // the grounder — a silent drop would read as "the model found less".
+        Some(model) => serde_json::json!({
+            "model": model,
+            "verification_status": status,
+            "proposed": proposed,
+            "dropped": proposed.saturating_sub(facts.len()),
+        }),
+        None => serde_json::json!({}),
+    };
+    report(&facts, extra);
+    Ok(())
+}
+
+/// Run the shared extract → confidence floor → ground pipeline and convert the
+/// survivors to store drafts. Warns on stderr when a response hit the per-call
+/// cap, so a truncated extraction is never silent.
+fn extract_drafts(
+    llm: &dyn waiser::LlmBackend,
+    grounder: Option<&dyn waiser::LlmBackend>,
+    source: &str,
+    content: &str,
+    hint: Option<&str>,
+    min_confidence: f64,
+) -> Result<(usize, Vec<dejadb_store::FactDraft>, bool), String> {
+    let ex =
+        dejadb_llm::extract_pipeline(llm, grounder, source, content, hint, min_confidence)
+            .map_err(|e| e.to_string())?;
+    if ex.proposed >= dejadb_llm::extract::MAX_FACTS {
+        eprintln!(
+            "note: extraction hit the {}-fact cap; some facts may have been dropped",
+            dejadb_llm::extract::MAX_FACTS
+        );
+    }
+    let drafts = ex
+        .facts
+        .into_iter()
+        .map(|f| dejadb_store::FactDraft {
+            subject: f.subject,
+            relation: f.relation,
+            object: f.object,
+            confidence: f.confidence,
+        })
+        .collect();
+    Ok((ex.proposed, drafts, ex.grounded))
+}
+
+fn draft_json(d: &dejadb_store::FactDraft) -> serde_json::Value {
+    serde_json::json!({
+        "subject": d.subject,
+        "relation": d.relation,
+        "object": d.object,
+        "confidence": d.confidence,
+    })
 }
 
 /// Load the host policy from `--policy FILE` or `$WAISER_POLICY` (§6.2).

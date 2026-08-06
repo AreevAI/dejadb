@@ -384,16 +384,21 @@
 
   /* ── graph ── */
   #gwrap { background:var(--well); border:1px solid var(--line); border-radius:16px; overflow:hidden; }
-  #gstage { position:relative; }
+  /* The query workbench draws its own result graph (#qstage/#qcanvas/#qzoom);
+     it shares this chrome so the two graphs read — and handle — the same. */
+  #gstage, #qstage { position:relative; }
   #gcanvas { display:block; width:100%; height:560px; cursor:grab; }
-  #gcanvas.grabbing { cursor:grabbing; }
+  #qcanvas { display:block; width:100%; height:460px; cursor:grab;
+             background:var(--well); border:1px solid var(--line); border-radius:14px; }
+  #gcanvas.grabbing, #qcanvas.grabbing { cursor:grabbing; }
   .float { position:absolute; background:var(--surface); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }
   #gtools { top:16px; left:16px; display:flex; align-items:center; gap:10px; background:none; border:0; box-shadow:none; }
   #glegend { bottom:16px; left:16px; display:flex; align-items:center; gap:14px; height:34px; padding:0 14px; border-radius:17px; }
   #glegend span { display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--text); white-space:nowrap; }
   #gzoom { bottom:16px; right:16px; display:flex; align-items:center; height:34px; padding:0 4px; border-radius:17px; }
-  #gzoom button { width:30px; height:28px; border:0; background:none; color:var(--text); font-size:16px; border-radius:14px; }
-  #gzoom button.lbl { width:auto; padding:0 10px; font-size:12px; font-weight:600; color:var(--accent); }
+  #qzoom { bottom:14px; right:14px; display:flex; align-items:center; height:34px; padding:0 4px; border-radius:17px; }
+  #gzoom button, #qzoom button { width:30px; height:28px; border:0; background:none; color:var(--text); font-size:16px; border-radius:14px; }
+  #gzoom button.lbl, #qzoom button.lbl { width:auto; padding:0 10px; font-size:12px; font-weight:600; color:var(--accent); }
   #ginspect { top:16px; right:16px; width:288px; padding:18px; display:flex; flex-direction:column; gap:14px; }
   #gscrub { display:flex; flex-direction:column; gap:11px; padding:16px 20px 18px; background:var(--surface); border-top:1px solid var(--line); }
   #gscrub input[type=range] { width:100%; accent-color:var(--accent); }
@@ -2174,11 +2179,21 @@ function renderConnectSettings(host) {
     const list = (r && r.ok && r.analyzers) || [];
     if (!list.length) { alist.appendChild(el('div', 'empty', 'No analyzers reported.')); return; }
     for (const a of list) {
-      const row = el('div', 'srow'); row.style.cursor = 'default';
-      const d = el('span'); d.style.cssText = 'width:6px;height:6px;border-radius:3px;flex-shrink:0;background:'
+      const row = el('div', 'srow'); row.style.cursor = 'default'; row.style.alignItems = 'flex-start';
+      const d = el('span'); d.style.cssText = 'width:6px;height:6px;border-radius:3px;flex-shrink:0;margin-top:8px;background:'
         + (a.enabled ? 'var(--ok)' : 'var(--ghost)');
       row.appendChild(d);
-      row.appendChild(el('span', 't', a.title || analyzerName(a.id)));
+      /* Name over the analyzer's own one-line description: a toggle you cannot
+         read is a toggle nobody touches. */
+      const body = el('div', 't');
+      body.style.cssText = 'display:flex;flex-direction:column;gap:2px;min-width:0';
+      body.appendChild(el('span', null, a.title || analyzerName(a.id)));
+      if (a.description) {
+        const sub = el('span', 'tiny', a.description);
+        sub.style.lineHeight = '18px';
+        body.appendChild(sub);
+      }
+      row.appendChild(body);
       const sw = el('button', 'btn ghost sm', a.enabled ? 'On' : 'Off');
       sw.onclick = async () => {
         sw.disabled = true;
@@ -3197,13 +3212,20 @@ function qHistory(r) {
 }
 function qGraphNote(gs) {
   const wrap = el('div'); wrap.style.paddingTop = '14px';
-  wrap.appendChild(el('div', 'meta', 'Showing these ' + gs.length + ' results as a graph.'));
+  wrap.appendChild(el('div', 'meta', 'Showing these ' + gs.length + ' results as a graph — '
+    + 'scroll to zoom, drag the background to pan, drag a node to move it, click one to explore it.'));
+  const stage = el('div'); stage.id = 'qstage'; stage.style.marginTop = '10px';
   const cv = document.createElement('canvas');
   cv.id = 'qcanvas';
-  cv.style.cssText = 'display:block;width:100%;height:460px;background:var(--well);'
-    + 'border:1px solid var(--line);border-radius:14px;margin-top:10px';
-  wrap.appendChild(cv);
-  requestAnimationFrame(() => drawResultGraph(cv, gs));
+  stage.appendChild(cv);
+  const zoom = el('div', 'float'); zoom.id = 'qzoom';
+  const btn = (txt, title, cls) => { const b = el('button', cls, txt); b.title = title; return b; };
+  const bOut = btn('−', 'zoom out'), bIn = btn('+', 'zoom in'), bFit = btn('Fit', 'fit to view', 'lbl');
+  zoom.append(bOut, bIn, bFit);
+  stage.appendChild(zoom);
+  wrap.appendChild(stage);
+  /* The canvas has no layout size until it is in the document. */
+  requestAnimationFrame(() => drawResultGraph(cv, gs, { zin: bIn, zout: bOut, fit: bFit }));
   return wrap;
 }
 /* Assembly is DejaDB's differentiator — show where the budget went. */
@@ -3231,7 +3253,7 @@ function assembledSources(r) {
 /* A compact, self-contained layout for result graphs. Deliberately separate
    from the memory graph: that one owns rewind, depth and focus state, and
    entangling the two would make both harder to reason about. */
-function drawResultGraph(cv, gs) {
+function drawResultGraph(cv, gs, ctrls) {
   const ctx = cv.getContext('2d');
   const nodes = new Map(), links = [];
   const add = n => { if (!nodes.has(n)) nodes.set(n, { id: n, x: (Math.random() - .5) * 260,
@@ -3245,6 +3267,10 @@ function drawResultGraph(cv, gs) {
   }
   const list = [...nodes.values()];
   if (!list.length) { ctx.clearRect(0, 0, cv.width, cv.height); return; }
+  /* Settle once, up front: the layout is the answer's shape, and a graph that
+     keeps drifting under the cursor is harder to read than one that holds
+     still. Everything after this is view state — the node positions only move
+     when a person drags them. */
   for (let step = 0; step < 320; step++) {
     const k = Math.max(0.05, 1 - step / 320);
     for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) {
@@ -3264,55 +3290,136 @@ function drawResultGraph(cv, gs) {
     for (const n of list) { n.vx += -n.x * 0.005 * k; n.vy += -n.y * 0.005 * k;
       n.x += (n.vx *= 0.82); n.y += (n.vy *= 0.82); }
   }
-  const dpr = window.devicePixelRatio || 1;
-  const W = cv.clientWidth, H = cv.clientHeight;
-  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  for (const n of list) { const r = 12 + Math.min(16, n.deg * 3);
-    x0 = Math.min(x0, n.x - r - 50); x1 = Math.max(x1, n.x + r + 50);
-    y0 = Math.min(y0, n.y - r - 26); y1 = Math.max(y1, n.y + r + 26); }
-  const scale = Math.max(0.25, Math.min(1.3, Math.min(W / (x1 - x0), H / (y1 - y0))));
-  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-  const ink = cssVar('--ink'), line = cssVar('--line2'), accent = cssVar('--accent'),
-        well = cssVar('--well'), dim = cssVar('--dim');
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, W, H);
-  ctx.save();
-  ctx.translate(W / 2, H / 2); ctx.scale(scale, scale); ctx.translate(-cx, -cy);
-  ctx.strokeStyle = line; ctx.lineWidth = 1.5;
-  for (const l of links) { const a = nodes.get(l.a), b = nodes.get(l.b);
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
-  const halo = (t, x, y, font, fill) => { ctx.font = font; ctx.textAlign = 'center';
-    ctx.lineWidth = 3.5; ctx.lineJoin = 'round'; ctx.strokeStyle = well; ctx.strokeText(t, x, y);
-    ctx.fillStyle = fill; ctx.fillText(t, x, y); };
-  if (scale > 0.5) for (const l of links) {
-    const a = nodes.get(l.a), b = nodes.get(l.b);
-    const len = Math.hypot(b.x - a.x, b.y - a.y);
-    if (!l.label || len < 130) continue;
-    const nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len;
-    halo(l.label, (a.x + b.x) / 2 + nx * 11, (a.y + b.y) / 2 + ny * 11 + 4, '12px ' + cssVar('--sans'), dim);
+  /* ── view state: one pan/zoom transform over settled world coordinates ── */
+  let scale = 1, tx = 0, ty = 0, W = 0, H = 0, hover = null, touched = false;
+  const radius = n => 12 + Math.min(16, n.deg * 3);
+  const MIN_SCALE = 0.2, MAX_SCALE = 4;
+  function fit() {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of list) { const r = radius(n);
+      x0 = Math.min(x0, n.x - r - 50); x1 = Math.max(x1, n.x + r + 50);
+      y0 = Math.min(y0, n.y - r - 26); y1 = Math.max(y1, n.y + r + 26); }
+    scale = Math.max(0.25, Math.min(1.3, Math.min(W / (x1 - x0), H / (y1 - y0))));
+    tx = W / 2 - (x0 + x1) / 2 * scale;
+    ty = H / 2 - (y0 + y1) / 2 * scale;
   }
-  for (const n of list) {
-    const r = 12 + Math.min(16, n.deg * 3);
-    ctx.fillStyle = accent; ctx.globalAlpha = 0.9;
-    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill();
-    ctx.globalAlpha = 1;
-    halo(n.id.length > 22 ? n.id.slice(0, 21) + '…' : n.id, n.x, n.y + r + 16,
-      '600 13px ' + cssVar('--sans'), ink);
+  const toWorld = e => { const r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left - tx) / scale, y: (e.clientY - r.top - ty) / scale }; };
+  /* Topmost first, so the node you see on top is the one you grab. */
+  const hit = p => { for (let i = list.length - 1; i >= 0; i--) { const n = list[i];
+    if (Math.hypot(n.x - p.x, n.y - p.y) <= radius(n) + 4) return n; } return null; };
+  function resize() {
+    W = cv.clientWidth; H = cv.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
   }
-  ctx.restore();
-  cv.onclick = e => {
-    const rect = cv.getBoundingClientRect();
-    const wx = (e.clientX - rect.left - W / 2) / scale + cx, wy = (e.clientY - rect.top - H / 2) / scale + cy;
-    for (const n of list) {
-      const r = 12 + Math.min(16, n.deg * 3);
-      if (Math.hypot(n.x - wx, n.y - wy) <= r + 4) {
-        runQuery('RECALL facts WHERE subject = "' + n.id.replace(/"/g, '') + '" LIMIT 50');
-        return;
-      }
+  /* Coalesce to one paint per frame — a trackpad emits wheel events far faster
+     than the display refreshes. */
+  let queued = false;
+  const redraw = () => { if (queued) return; queued = true;
+    requestAnimationFrame(() => { queued = false; draw(); }); };
+  /* Zoom about a point in canvas space, so the thing under the cursor (or the
+     middle, for the buttons) stays put. */
+  function zoomAt(px, py, factor) {
+    const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * factor));
+    if (next === scale) return;
+    tx = px - (px - tx) * (next / scale);
+    ty = py - (py - ty) * (next / scale);
+    scale = next; touched = true; redraw();
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const ink = cssVar('--ink'), line = cssVar('--line2'), accent = cssVar('--accent'),
+          well = cssVar('--well'), dim = cssVar('--dim');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(tx, ty); ctx.scale(scale, scale);
+    ctx.strokeStyle = line; ctx.lineWidth = 1.5;
+    for (const l of links) { const a = nodes.get(l.a), b = nodes.get(l.b);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
+    const halo = (t, x, y, font, fill) => { ctx.font = font; ctx.textAlign = 'center';
+      ctx.lineWidth = 3.5; ctx.lineJoin = 'round'; ctx.strokeStyle = well; ctx.strokeText(t, x, y);
+      ctx.fillStyle = fill; ctx.fillText(t, x, y); };
+    if (scale > 0.5) for (const l of links) {
+      const a = nodes.get(l.a), b = nodes.get(l.b);
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (!l.label || len < 130) continue;
+      const nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len;
+      halo(l.label, (a.x + b.x) / 2 + nx * 11, (a.y + b.y) / 2 + ny * 11 + 4, '12px ' + cssVar('--sans'), dim);
     }
-  };
-  cv.style.cursor = 'pointer';
+    for (const n of list) {
+      const r = radius(n);
+      if (n.id === hover) { ctx.strokeStyle = accent; ctx.lineWidth = 2 / scale;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 4, 0, 7); ctx.stroke(); }
+      ctx.fillStyle = accent; ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill();
+      ctx.globalAlpha = 1;
+      halo(n.id.length > 22 ? n.id.slice(0, 21) + '…' : n.id, n.x, n.y + r + 16,
+        '600 13px ' + cssVar('--sans'), ink);
+    }
+    ctx.restore();
+  }
+
+  /* ── interaction ──
+     Drag listeners live on the window only while a gesture is running, so a
+     result graph that gets replaced (every re-render builds a new canvas)
+     leaves nothing behind. */
+  cv.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const p = toWorld(e), n = hit(p);
+    let moved = false;
+    const drag = n ? { id: n.id, dx: n.x - p.x, dy: n.y - p.y } : null;
+    const pan = n ? null : { x: e.clientX - tx, y: e.clientY - ty };
+    if (pan) cv.classList.add('grabbing');
+    const move = ev => {
+      moved = moved || Math.abs(ev.clientX - e.clientX) + Math.abs(ev.clientY - e.clientY) > 3;
+      if (drag) { const q = toWorld(ev); const t = nodes.get(drag.id);
+        if (t) { t.x = q.x + drag.dx; t.y = q.y + drag.dy; } }
+      else { tx = ev.clientX - pan.x; ty = ev.clientY - pan.y; }
+      touched = true; redraw();
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+      cv.classList.remove('grabbing');
+      /* A click that never moved is a click, not a gesture. */
+      if (n && !moved) runQuery('RECALL facts WHERE subject = "' + n.id.replace(/"/g, '') + '" LIMIT 50');
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  });
+  cv.addEventListener('mousemove', e => {
+    const n = hit(toWorld(e));
+    const id = n ? n.id : null;
+    cv.style.cursor = n ? 'pointer' : 'grab';
+    if (id !== hover) { hover = id; redraw(); }
+  });
+  cv.addEventListener('mouseleave', () => { if (hover) { hover = null; redraw(); } });
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = cv.getBoundingClientRect();
+    /* macOS trackpad pinch arrives as ctrl+wheel — finer steps, or it snaps. */
+    const f = e.ctrlKey ? Math.exp(-e.deltaY * 0.01) : (e.deltaY < 0 ? 1.12 : 0.89);
+    zoomAt(e.clientX - r.left, e.clientY - r.top, f);
+  }, { passive: false });
+  cv.addEventListener('dblclick', () => { touched = false; fit(); redraw(); });
+  if (ctrls) {
+    ctrls.zin.onclick = () => zoomAt(W / 2, H / 2, 1.2);
+    ctrls.zout.onclick = () => zoomAt(W / 2, H / 2, 1 / 1.2);
+    ctrls.fit.onclick = () => { touched = false; fit(); redraw(); };
+  }
+  /* Re-fit on resize only while the view is untouched: once someone has zoomed
+     somewhere deliberately, yanking them back to the whole graph is worse. */
+  const ro = new ResizeObserver(() => {
+    if (!cv.isConnected) { ro.disconnect(); return; }
+    if (!cv.clientWidth) return;
+    resize(); if (!touched) fit(); redraw();
+  });
+  ro.observe(cv);
+
+  resize(); fit(); draw();
 }
 
 /* ── menus: saved queries, templates, history, formats ── */

@@ -322,6 +322,19 @@ pub struct RecallTuning {
     /// relevance, 0.0 = maximum diversity. Requires an embedder + stored
     /// vectors; silently skipped otherwise.
     pub diversity_lambda: Option<f32>,
+    /// Widen every leg to the whole supersession chain instead of heads only.
+    ///
+    /// All three legs are heads-only by default — the structural probe filters
+    /// `cur=1`, BM25 drops non-live postings after scoring, and the vector leg
+    /// joins on `svt IS NULL`. That is the right default: stale values in a
+    /// model's context are the failure mode a memory engine exists to prevent.
+    /// This opts a caller that is asking *about the past* back into the rest of
+    /// the chain — CAL's `WITH superseded`, audit and drift reads.
+    ///
+    /// Forgotten grains stay gone: `forget` deletes the index rows outright
+    /// rather than flagging them, so nothing tombstoned or crypto-erased can
+    /// come back through this door.
+    pub include_superseded: bool,
 }
 
 /// One extracted fact from a `remember()` extraction callback.
@@ -333,10 +346,101 @@ pub struct FactDraft {
     pub confidence: f64,
 }
 
+/// The confidence a draft gets when the source omits one.
+pub const DRAFT_DEFAULT_CONFIDENCE: f64 = 0.8;
+
+impl FactDraft {
+    /// Parse the `[{subject, relation, object, confidence}]` JSON that every
+    /// non-Rust surface uses to hand over pre-extracted facts (`--facts`,
+    /// `facts_json`) — a closure cannot cross FFI, so the drafts arrive as
+    /// text. Lives here, next to the type, because the CLI, Python, and Node
+    /// bindings all need exactly this parse.
+    ///
+    /// A row missing any of subject/relation/object is an error, not a silent
+    /// empty-string Fact. Confidence defaults to
+    /// [`DRAFT_DEFAULT_CONFIDENCE`] and is clamped into 0.0–1.0.
+    pub fn from_json_array(json: &str) -> Result<Vec<FactDraft>> {
+        let arr: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| {
+            DejaDbError::Validation(format!(
+                "facts must be a JSON array of {{subject, relation, object, confidence}}: {e}"
+            ))
+        })?;
+        arr.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let field = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let (subject, relation, object) = (field("subject"), field("relation"), field("object"));
+                if subject.is_empty() || relation.is_empty() || object.is_empty() {
+                    return Err(DejaDbError::Validation(format!(
+                        "facts[{i}] needs a non-empty subject, relation, and object"
+                    )));
+                }
+                Ok(FactDraft {
+                    subject,
+                    relation,
+                    object,
+                    confidence: v
+                        .get("confidence")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(DRAFT_DEFAULT_CONFIDENCE)
+                        .clamp(0.0, 1.0),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Provenance stamped on facts attached to their source grain by
+/// [`DejaDB::attach_facts`].
+///
+/// The default — used by `remember()`'s own extractor seam and by the
+/// host-supplied `--facts` path — adds nothing beyond the `derived_from` link:
+/// a host asserting its own facts is not relaying a model's claim, so it gets
+/// no model attribution and no verification status.
+#[derive(Debug, Clone, Default)]
+pub struct FactAttribution<'a> {
+    /// OMS `verification_status` (`"unverified"` / `"verified"` / …). Facts a
+    /// model extracted from free text are `"unverified"` until something
+    /// checks them; it is CAL-filterable, so the queue is queryable.
+    pub verification_status: Option<&'a str>,
+    /// Identifier of the model that produced these drafts, recorded so an
+    /// audit can answer "which model wrote this?" from the grain itself.
+    ///
+    /// It rides in `extra_fields` as `extractor_model` — the same mechanism
+    /// Waiser uses to carry structured data on a grain. `GrainCommon` has a
+    /// `provenance_chain` field that looks like the natural home, but nothing
+    /// in `dejadb-core` serializes it, so a value written there would be
+    /// silently dropped at the blob boundary.
+    pub extractor_model: Option<&'a str>,
+}
+
+/// Who captured a piece of raw content, and where it sits in a conversation.
+/// Every field is optional: `deja remember` names an observer, the MCP tool and
+/// `capture-stop` carry a session and a role, and a bare call needs none.
+#[derive(Debug, Clone, Default)]
+pub struct Capture<'a> {
+    /// The agent/process that captured the text. Kept in `extra_fields`
+    /// (an Event's `role` is the *author*, which is a different question).
+    pub observer: Option<&'a str>,
+    /// Session/thread id — what puts the Event in the thread index, so a
+    /// remembered turn is reachable as part of its transcript.
+    pub session_id: Option<&'a str>,
+    /// `user` | `assistant` | `system` | `tool`. Unrecognized values are
+    /// dropped rather than rejected.
+    pub role: Option<&'a str>,
+}
+
 /// Result of `DejaDB::remember`.
 #[derive(Debug, Clone)]
 pub struct RememberResult {
-    pub observation: Hash,
+    /// The Event grain holding the raw captured text.
+    pub event: Hash,
     pub facts: Vec<Hash>,
 }
 
@@ -849,8 +953,13 @@ pub struct DejaDB {
     // cached hot-path statements (lazily prepared)
     st_probe_sp: Option<turso::Statement>,
     st_probe_s: Option<turso::Statement>,
+    // same two probes without the `cur=1` predicate — the include-superseded
+    // scan, kept in their own slots so the heads-only path stays prepared
+    st_probe_sp_all: Option<turso::Statement>,
+    st_probe_s_all: Option<turso::Statement>,
     st_fetch_seq: Option<turso::Statement>,
     st_latest: Option<turso::Statement>,
+    st_superseder: Option<turso::Statement>,
 }
 
 async fn ensure_stmt<'a>(
@@ -1119,8 +1228,11 @@ impl DejaDB {
             telemetry,
             st_probe_sp: None,
             st_probe_s: None,
+            st_probe_sp_all: None,
+            st_probe_s_all: None,
             st_fetch_seq: None,
             st_latest: None,
+            st_superseder: None,
         };
 
         // A file written by an older build has its text column populated but
@@ -2668,6 +2780,24 @@ impl DejaDB {
     /// liveness — so cost tracks the number of documents containing the query
     /// terms, not the size of the file.
     pub fn search_text(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_text_inner(ns, query, k, false)
+    }
+
+    /// `search_text`, scoring the whole chain instead of the live heads.
+    /// Superseded grains keep their postings (supersede only flips index
+    /// state), so the historical text is still there to be found — the liveness
+    /// filter is the only thing hiding it.
+    pub fn search_text_all(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_text_inner(ns, query, k, true)
+    }
+
+    fn search_text_inner(
+        &mut self,
+        ns: &str,
+        query: &str,
+        k: usize,
+        include_superseded: bool,
+    ) -> Result<Vec<i64>> {
         if !self.index_text || k == 0 {
             return Ok(Vec::new()); // BM25 leg disabled (edge profile)
         }
@@ -2737,6 +2867,10 @@ impl DejaDB {
         // newest-first and the order is stable across runs.
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             .then(b.0.cmp(&a.0)));
+        if include_superseded {
+            ranked.truncate(k);
+            return Ok(ranked.into_iter().map(|(s, _)| s).collect());
+        }
         // Over-fetch before the liveness filter: superseded grains keep their
         // postings, so trimming to k first could return fewer than k live hits
         // when a chain has been updated often.
@@ -2769,6 +2903,49 @@ impl DejaDB {
             while let Some(row) = rows.next().await.map_err(db_err)? {
                 if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
                     out.insert(s);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Which of `hashes` have been superseded, and by what.
+    ///
+    /// Supersession is index-layer state — the blob is immutable and carries no
+    /// marker — so a caller holding recalled grains cannot tell a stale version
+    /// from the head that replaced it. A recall widened to the whole chain
+    /// (`RecallTuning::include_superseded`) needs that distinction to label what
+    /// it returns: handing a model an outdated value that *looks* current is a
+    /// worse answer than not returning the history at all.
+    ///
+    /// Indexed point reads on a cached statement, one per candidate. Only the
+    /// deliberately-widened path calls this; heads-only recall never pays for it.
+    pub fn supersession_map(&mut self, hashes: &[Hash]) -> Result<HashMap<Hash, Hash>> {
+        let mut out = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let conn = &self.conn;
+        let rt = &self.rt;
+        let slot = &mut self.st_superseder;
+        rt.block_on(async {
+            let st = ensure_stmt(
+                slot,
+                conn,
+                "SELECT superseded_by FROM grains WHERE hash = ?1",
+            )
+            .await?;
+            for h in hashes {
+                let mut rows = st
+                    .query((pb(h.as_bytes().to_vec()),))
+                    .await
+                    .map_err(db_err)?;
+                if let Some(row) = rows.next().await.map_err(db_err)? {
+                    if let Some(sup) = v_blob(&row.get_value(0).map_err(db_err)?)
+                        .and_then(|b| Hash::try_from_bytes(&b).ok())
+                    {
+                        out.insert(*h, sup);
+                    }
                 }
             }
             Ok(out)
@@ -2869,6 +3046,22 @@ impl DejaDB {
     }
 
     pub fn search_vector(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_vector_inner(ns, query, k, false)
+    }
+
+    /// `search_vector` over the whole chain rather than the live heads —
+    /// the vector half of `RecallTuning::include_superseded`.
+    pub fn search_vector_all(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
+        self.search_vector_inner(ns, query, k, true)
+    }
+
+    fn search_vector_inner(
+        &mut self,
+        ns: &str,
+        query: &str,
+        k: usize,
+        include_superseded: bool,
+    ) -> Result<Vec<i64>> {
         let (Some(embedder), Some(ns_id)) = (&self.embedder, self.term_lookup(ns)) else {
             return Ok(Vec::new());
         };
@@ -2879,9 +3072,15 @@ impl DejaDB {
             let mut out = Vec::new();
             let mut rows = conn
                 .query(
-                    "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
-                     WHERE g.ns = ?1 AND g.svt IS NULL
-                     ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3",
+                    if include_superseded {
+                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                         WHERE g.ns = ?1
+                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                    } else {
+                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                         WHERE g.ns = ?1 AND g.svt IS NULL
+                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                    },
                     (pi(ns_id), pt(&qjson), pi(k as i64)),
                 )
                 .await
@@ -2954,7 +3153,7 @@ impl DejaDB {
 
         // leg 1: structural (the voice hot path — always runs first)
         let structural: Vec<i64> = match subject {
-            Some(s) => self.recall_seqs(ns, s, relation, leg_k)?,
+            Some(s) => self.recall_seqs(ns, s, relation, leg_k, tuning.include_superseded)?,
             None => Vec::new(),
         };
         // leg 2: BM25 — plus Tier-1 query-expansion variant legs. Skipped when
@@ -2967,13 +3166,18 @@ impl DejaDB {
                 // in DIDs, namespaces, timestamps) degrades to an empty leg,
                 // exactly like a deadline-skipped one. recall_hybrid must never
                 // error — the structural/vector legs still answer.
-                fts_legs.push(self.search_text(ns, q, leg_k).unwrap_or_default());
+                fts_legs.push(
+                    self.search_text_inner(ns, q, leg_k, tuning.include_superseded)
+                        .unwrap_or_default(),
+                );
                 if tuning.query_expansion && self.index_text {
                     for variant in self.expand_query(q) {
                         if over(&start) {
                             break;
                         }
-                        let hits = self.search_text(ns, &variant, leg_k).unwrap_or_default();
+                        let hits = self
+                            .search_text_inner(ns, &variant, leg_k, tuning.include_superseded)
+                            .unwrap_or_default();
                         if !hits.is_empty() {
                             fts_legs.push(hits);
                         }
@@ -2989,7 +3193,8 @@ impl DejaDB {
                 // file's stored vectors errors inside vector_distance_cos (the
                 // store permits a mismatched embedder with only a warning) —
                 // degrade the vector leg rather than failing the whole recall.
-                self.search_vector(ns, q, leg_k).unwrap_or_default()
+                self.search_vector_inner(ns, q, leg_k, tuning.include_superseded)
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -3256,7 +3461,18 @@ impl DejaDB {
         })
     }
 
-    fn recall_seqs(&mut self, ns: &str, subject: &str, relation: Option<&str>, k: usize) -> Result<Vec<i64>> {
+    /// Structural leg. `all_versions` drops the `cur=1` predicate so the whole
+    /// supersession chain comes back instead of the heads — the widened scan
+    /// behind `RecallTuning::include_superseded`. It gets its own pair of cached
+    /// statements so the heads-only hot path keeps its prepared plans.
+    fn recall_seqs(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        relation: Option<&str>,
+        k: usize,
+        all_versions: bool,
+    ) -> Result<Vec<i64>> {
         let (ns_id, s_id) = match (self.term_lookup(ns), self.term_lookup(subject)) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
@@ -3270,8 +3486,11 @@ impl DejaDB {
         };
         let conn = &self.conn;
         let rt = &self.rt;
-        let slot_sp = &mut self.st_probe_sp;
-        let slot_s = &mut self.st_probe_s;
+        let (slot_sp, slot_s) = if all_versions {
+            (&mut self.st_probe_sp_all, &mut self.st_probe_s_all)
+        } else {
+            (&mut self.st_probe_sp, &mut self.st_probe_s)
+        };
         rt.block_on(async {
             let mut seqs = Vec::new();
             let mut rows = match p_id {
@@ -3279,7 +3498,11 @@ impl DejaDB {
                     let st = ensure_stmt(
                         slot_sp,
                         conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
+                        if all_versions {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 ORDER BY seq DESC LIMIT ?4"
+                        } else {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4"
+                        },
                     )
                     .await?;
                     st.query((pi(ns_id), pi(s_id), pi(p), pi(k as i64))).await.map_err(db_err)?
@@ -3288,7 +3511,11 @@ impl DejaDB {
                     let st = ensure_stmt(
                         slot_s,
                         conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
+                        if all_versions {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 ORDER BY seq DESC LIMIT ?3"
+                        } else {
+                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3"
+                        },
                     )
                     .await?;
                     st.query((pi(ns_id), pi(s_id), pi(k as i64))).await.map_err(db_err)?
@@ -3349,11 +3576,76 @@ impl DejaDB {
         Ok(subjects)
     }
 
+    /// Store raw content as an Event grain and return its hash. The first half
+    /// of `remember()`, split out so a caller whose extraction can *fail* (an
+    /// LLM call over the network) lands the raw text first and still has it
+    /// after a failed or garbage extraction. Losing the source text to a flaky
+    /// model call is the worst failure mode available to a memory engine.
+    ///
+    /// This is the one place raw remembered text is written, shared by
+    /// `deja remember`, both bindings, the MCP `dejadb_remember` tool, and
+    /// `capture-stop` — so the same input produces the same grain on every
+    /// surface.
+    pub fn capture(&mut self, ns: &str, content: &str, meta: &Capture<'_>) -> Result<Hash> {
+        use dejadb_core::types::{Event, Role};
+        let mut e = Event::new(content);
+        e.common.namespace = Some(ns.to_string());
+        e.session_id = meta.session_id.map(str::to_string);
+        e.role = meta.role.and_then(Role::from_str);
+        // Event has no observer field (it models a transcript turn, where
+        // `role` is the author). Who *captured* the turn is still worth
+        // keeping, so it rides in extra_fields, which round-trips through the
+        // blob.
+        if let Some(observer) = meta.observer.filter(|o| !o.is_empty()) {
+            e.common
+                .extra_fields
+                .insert("observer".to_string(), serde_json::json!(observer));
+        }
+        self.add(&e)
+    }
+
+    /// Store each draft as a Fact carrying `derived_from` provenance back to
+    /// `source`, plus whatever `attr` supplies. The second half of
+    /// `remember()`; call it after an out-of-band extraction (see
+    /// [`DejaDB::capture`]).
+    pub fn attach_facts(
+        &mut self,
+        ns: &str,
+        source: &Hash,
+        drafts: &[FactDraft],
+        attr: &FactAttribution<'_>,
+    ) -> Result<Vec<Hash>> {
+        let source_hex = source.to_hex();
+        let mut facts = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let mut fact = dejadb_core::types::Fact::new(&draft.subject, &draft.relation, &draft.object);
+            fact.common.confidence = draft.confidence.clamp(0.0, 1.0);
+            fact.common.namespace = Some(ns.to_string());
+            fact.common.derived_from = Some(source_hex.clone());
+            fact.common.source_type = Some("derived".to_string());
+            if let Some(status) = attr.verification_status {
+                fact.common.verification_status = Some(status.to_string());
+            }
+            if let Some(model) = attr.extractor_model {
+                fact.common
+                    .extra_fields
+                    .insert("extractor_model".to_string(), serde_json::json!(model));
+            }
+            facts.push(self.add(&fact)?);
+        }
+        Ok(facts)
+    }
+
     /// The `remember()` seam: store raw content as an
-    /// Observation grain, run the caller-supplied extraction function
+    /// Event grain, run the caller-supplied extraction function
     /// (typically an LLM callback — the host owns the model relationship),
     /// and store each returned draft as a Fact with `derived_from`
-    /// provenance back to the observation.
+    /// provenance back to that Event.
+    ///
+    /// This is the in-process shape, where the extractor cannot fail. A caller
+    /// with a *fallible* extractor composes [`DejaDB::capture`] and
+    /// [`DejaDB::attach_facts`] instead — what the CLI and the bindings do on
+    /// their `--model` / `--llm-cmd` path.
     #[allow(clippy::type_complexity)] // extractor is a plain callback; a type alias would not clarify
     pub fn remember(
         &mut self,
@@ -3362,24 +3654,10 @@ impl DejaDB {
         observer: &str,
         extractor: Option<&dyn Fn(&str) -> Vec<FactDraft>>,
     ) -> Result<RememberResult> {
-        use dejadb_core::types::Observation;
-        let mut obs = Observation::new(observer, "llm");
-        obs.common.namespace = Some(ns.to_string());
-        obs.common.context = Some(serde_json::json!({ "content": content }));
-        let observation = self.add(&obs)?;
-
-        let mut facts = Vec::new();
-        if let Some(f) = extractor {
-            for draft in f(content) {
-                let mut fact = dejadb_core::types::Fact::new(&draft.subject, &draft.relation, &draft.object);
-                fact.common.confidence = draft.confidence.clamp(0.0, 1.0);
-                fact.common.namespace = Some(ns.to_string());
-                fact.common.derived_from = Some(observation.to_hex());
-                fact.common.source_type = Some("derived".to_string());
-                facts.push(self.add(&fact)?);
-            }
-        }
-        Ok(RememberResult { observation, facts })
+        let event = self.capture(ns, content, &Capture { observer: Some(observer), ..Default::default() })?;
+        let drafts = extractor.map(|f| f(content)).unwrap_or_default();
+        let facts = self.attach_facts(ns, &event, &drafts, &FactAttribution::default())?;
+        Ok(RememberResult { event, facts })
     }
 
     /// Total number of grains in the hot store.

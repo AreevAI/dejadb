@@ -53,7 +53,7 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |
 | `waiser` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/waiser.md` | — |
 | `dejadb-waiser` | DejaDB substrate adapter for Waiser (`waiser::OmsSubstrate` over `DejaDbFacade`) + recall-telemetry sidecar | — |
-| `dejadb-llm` | Out-of-box LLM backends for Waiser (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) | — |
+| `dejadb-llm` | Out-of-box LLM backends (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) for Waiser + the `remember()` free-text→Fact extraction (`extract.rs`) | — |
 | `dejadb-mcp` | Stdio MCP server (see below) | — |
 | `dejadb-server` | Web console + dejad hub (see below) | — |
 | `dejadb` | The `deja` binary (see below) | — |

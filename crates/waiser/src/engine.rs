@@ -1087,6 +1087,7 @@ impl Engine {
                 crate::config::AnalyzerSetting {
                     id: m.id.clone(),
                     title: m.title.clone(),
+                    description: m.description.clone(),
                     tier: format!("{:?}", m.tier),
                     trust_class: format!("{:?}", m.trust_class).to_lowercase(),
                     default_on: m.default_on,

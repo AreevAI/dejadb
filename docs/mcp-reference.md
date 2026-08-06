@@ -176,9 +176,20 @@ Distill durable knowledge from it afterwards with `dejadb_add`.
 | `content` | string | **yes** | The utterance/observation text |
 | `session_id` | string | no | Session/thread id |
 | `role` | string | no | `user` \| `assistant` \| `system` \| `tool` |
+| `observer` | string | no | Id of the agent capturing this |
 | `namespace` | string | no | Optional namespace |
 
-Returns `{ "hash": "<hash>", "stored_as": "event", "note": "distill durable facts with dejadb_add" }`.
+Returns `{ "hash": "<hash>", "event": "<hash>", "stored_as": "event", "note": "distill durable facts with dejadb_add" }`
+(`event` and `hash` are the same value; `event` matches the key the CLI and
+bindings return, `hash` is kept for compatibility).
+
+This is the **same write path** as `deja remember`, the Python/Node bindings,
+and `capture-stop` — the same input produces the same grain on every surface.
+
+What this tool deliberately does *not* have is the LLM extraction knobs
+(`--model` / `--llm-cmd`): over MCP the client already *is* a model, so
+extraction here would be a model calling a model. Distill with `dejadb_add`
+instead.
 
 ### `dejadb_cal`
 

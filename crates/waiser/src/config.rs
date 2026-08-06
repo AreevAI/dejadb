@@ -137,6 +137,9 @@ pub struct AnalyzerConfigUpdate {
 pub struct AnalyzerSetting {
     pub id: String,
     pub title: String,
+    /// The manifest's one-line "what it does", so the Setup view can say what
+    /// a toggle turns off without the reader having to know the analyzer.
+    pub description: String,
     pub tier: String,
     pub trust_class: String,
     pub default_on: bool,

@@ -65,11 +65,26 @@ export declare class DejaDb {
   /** Erase a grain from the hot store (tombstoned). Host-level op. */
   forget(hash: string): Promise<void>
   /**
-   * remember(): store content as an Observation; optional pre-extracted
-   * facts (JSON list of {subject, relation, object, confidence}) become
-   * provenance-linked Facts. Returns {"observation", "facts"} JSON.
+   * remember(): store content as an Observation, then attach the facts
+   * distilled from it. Three routes to those facts, in precedence order:
+   * `factsJson` (pre-extracted by the host — a JSON list of
+   * {subject, relation, object, confidence}), `llmCmd` (a subprocess
+   * backend), or `model` ("openai:gpt-4o-mini", key from the env).
+   *
+   * The raw text is written before the model is called, so a failed
+   * extraction never costs the raw text — the error names the hash it was
+   * stored under. Model-extracted facts are stamped
+   * `verification_status="unverified"` unless `groundModel`/`groundCmd`
+   * runs a separate entailment pass (proposer ≠ scorer); facts it does not
+   * support are dropped and survivors are stamped `"verified"`.
+   *
+   * The raw text is stored as an **Event** grain (a transcript turn) —
+   * pass `sessionId`/`role` to place it in a conversation thread.
+   *
+   * Returns {"event", "facts"} JSON, plus {"model", "proposed",
+   * "dropped", "verification_status"} when a model ran.
    */
-  remember(content: string, factsJson?: string | undefined | null, observer?: string | undefined | null, ns?: string | undefined | null): Promise<string>
+  remember(content: string, factsJson?: string | undefined | null, observer?: string | undefined | null, ns?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, extractHint?: string | undefined | null, minConfidence?: number | undefined | null, sessionId?: string | undefined | null, role?: string | undefined | null): Promise<string>
   /** Execute CAL. Returns the wire-format payload as a JSON string. */
   cal(query: string): Promise<string>
   /** Supersession-chain history for (subject, relation), newest first. */

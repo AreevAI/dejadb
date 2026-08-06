@@ -14,7 +14,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 
 import { DejaDb } from '../index.js'
 
@@ -148,6 +149,104 @@ test('bad input rejects with a JS Error', async () => {
   await assert.rejects(() => m.add('fact', 'not-json'), Error)
   // Invalid content address for forget() -> Error.
   await assert.rejects(() => m.forget('nothex'), Error)
+})
+
+// A scripted fake speaking the Waiser wire protocol — hermetic, no network
+// and no key, the same shape crates/dejadb-cli/tests/remember_llm_tests.rs uses.
+const FAKE_LLM_PY = `
+import json, sys
+d = json.loads(sys.stdin.read())
+op = d.get("op", "")
+if op == "probe":
+    print(json.dumps({"model": "fake-extractor-1"}))
+elif op == "extract":
+    print(json.dumps({"facts": [
+        {"subject": "john", "relation": "prefers", "object": "window seat", "confidence": 0.9},
+        {"subject": "john", "relation": "guess", "object": "likes jazz", "confidence": 0.2},
+    ]}))
+elif op == "ground":
+    print(json.dumps({"results": [
+        {"id": c["id"], "supported": "guess" not in c["claim"], "reason": "checked"}
+        for c in d.get("claims", [])
+    ]}))
+else:
+    print(json.dumps({}))
+`
+
+/// Write the fake to a temp file and return its `llmCmd` string, or null when
+/// there is no python to run it with (skip rather than fail).
+function fakeLlm() {
+  for (const py of ['python3', 'python']) {
+    const probe = spawnSync(py, ['--version'])
+    if (probe.status === 0) {
+      const dir = mkdtempSync(join(tmpdir(), 'dejadb-fake-llm-'))
+      const script = join(dir, 'fake_llm.py')
+      writeFileSync(script, FAKE_LLM_PY)
+      return `${py} ${script}`
+    }
+  }
+  return null
+}
+
+test('remember with prelinked facts carries no model attribution', async () => {
+  const m = makeDb()
+  const facts = JSON.stringify([
+    { subject: 'john', relation: 'likes', object: 'tea', confidence: 0.9 },
+  ])
+  const res = JSON.parse(await m.remember('John likes tea', facts))
+  assert.equal(res.facts.length, 1)
+  assert.equal(res.event.length, HEX64)
+  assert.equal(res.model, undefined, 'no model ran')
+  // The raw text is an Event grain — same as the MCP tool and capture-stop.
+  const rows = JSON.parse(await m.cal('RECALL events'))
+  assert.equal(rows.grains[0].fields.content, 'John likes tea')
+  // An incomplete triple is rejected rather than stored with empty fields.
+  await assert.rejects(() => m.remember('note', JSON.stringify([{ subject: 'john' }])), Error)
+})
+
+test('remember threads a turn by session and role', async () => {
+  const m = makeDb()
+  // (content, factsJson, observer, ns, model, llmCmd, groundModel, groundCmd,
+  //  extractHint, minConfidence, sessionId, role)
+  await m.remember("what's the refund policy?", null, null, null, null, null, null, null, null, null, 'call-1', 'user')
+  const rows = JSON.parse(await m.cal('RECALL events'))
+  assert.equal(rows.grains[0].fields.session_id, 'call-1')
+  assert.equal(rows.grains[0].fields.role, 'user')
+})
+
+test('remember extracts facts with a model', async (t) => {
+  const llmCmd = fakeLlm()
+  if (!llmCmd) return t.skip('no python on PATH')
+  const m = makeDb()
+  const res = JSON.parse(
+    await m.remember('I always want a window seat.', null, null, null, null, llmCmd),
+  )
+  assert.equal(res.model, 'fake-extractor-1')
+  assert.equal(res.proposed, 2)
+  assert.equal(res.dropped, 0)
+  assert.equal(res.verificationStatus ?? res.verification_status, 'unverified')
+  assert.equal(res.facts.length, 2)
+
+  const rows = JSON.parse(await m.cal('RECALL facts WHERE verification_status = "unverified"'))
+  assert.equal(rows.grains.length, 2)
+  for (const g of rows.grains) {
+    assert.equal(g.fields.derived_from, res.event)
+    assert.equal(g.fields.extractor_model, 'fake-extractor-1')
+  }
+})
+
+test('remember grounding drops unsupported facts', async (t) => {
+  const llmCmd = fakeLlm()
+  if (!llmCmd) return t.skip('no python on PATH')
+  const m = makeDb()
+  // (content, factsJson, observer, ns, model, llmCmd, groundModel, groundCmd)
+  const res = JSON.parse(
+    await m.remember('I always want a window seat.', null, null, null, null, llmCmd, null, llmCmd),
+  )
+  assert.equal(res.proposed, 2)
+  assert.equal(res.dropped, 1)
+  assert.equal(res.facts.length, 1)
+  assert.equal(res.verificationStatus ?? res.verification_status, 'verified')
 })
 
 test('memoryTool create/view over /memories', async () => {
