@@ -833,7 +833,7 @@ impl CalExecutor {
                 }
                 self.inject_write_namespace(&mut fields, store);
                 // Build AddOptions from WITH clause.
-                let options = build_add_options(&add.with_options);
+                let options = build_add_options(&add.with_options, exec_warnings);
                 match store.cal_add_with_options(add.grain_type.as_str(), &fields, options) {
                     Ok(result) => Ok(CalResultPayload::Added {
                         hash: hex::encode(result.hash.as_bytes()),
@@ -979,7 +979,7 @@ impl CalExecutor {
                     fields.insert("retries".into(), serde_json::Value::Object(retries_map));
                 }
                 self.inject_write_namespace(&mut fields, store);
-                let options = build_add_options(&wf.with_options);
+                let options = build_add_options(&wf.with_options, exec_warnings);
                 match store.cal_add_with_options("workflow", &fields, options) {
                     Ok(result) => Ok(CalResultPayload::Added {
                         hash: hex::encode(result.hash.as_bytes()),
@@ -4165,7 +4165,7 @@ pub(super) fn map_store_err(e: DejaDbError, span: Option<super::errors::Span>) -
 }
 
 /// Build `AddOptions` from CAL `AddWithOption` list.
-fn build_add_options(opts: &[AddWithOption]) -> AddOptions {
+fn build_add_options(opts: &[AddWithOption], warnings: &mut Vec<String>) -> AddOptions {
     let mut options = AddOptions::default();
     for opt in opts {
         match opt {
@@ -4173,6 +4173,15 @@ fn build_add_options(opts: &[AddWithOption]) -> AddOptions {
                 options.extract_event_date = Some(true);
             }
             AddWithOption::AutoRelate => {
+                // Parsed and accepted since 1.0, but no store path has ever read
+                // `AddOptions::auto_relate` — the option silently did nothing.
+                // It stays in the grammar (it is documented, and removing it
+                // would turn working queries into parse errors) but now says so
+                // instead of pretending.
+                warnings.push(
+                    "CAL-W004: WITH auto_relate is accepted but not implemented —                      no relations are inferred. Link grains explicitly with                      related_to, or use WITH multi_hop(n) on recall to widen                      through the entity graph."
+                        .to_string(),
+                );
                 options.auto_relate = Some(true);
             }
             AddWithOption::ExtractMemories => {

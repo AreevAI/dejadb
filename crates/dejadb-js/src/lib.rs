@@ -9,7 +9,9 @@
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_store::memory_tool::MemoryTool;
-use dejadb_store::{CommandEmbed, DejaDB as RustDejaDB, FactDraft, TelemetryMode};
+use dejadb_store::{
+    parse_relations, Axis, CommandEmbed, DejaDB as RustDejaDB, Direction, FactDraft, TelemetryMode,
+};
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use napi_derive::napi;
 use serde_json::json;
@@ -703,6 +705,102 @@ impl DejaDb {
                 ))));
             }
             Ok(json!({"integrity": r.integrity, "grains": r.grains}).to_string())
+        })
+    }
+
+    /// Bounded k-hop walk over the entity graph.
+    ///
+    /// `relations` is comma-separated. `direction` is out|in|both — in/both use
+    /// the reverse index, which only covers relations the file declares
+    /// entity-valued, so they find nothing for relations outside that set.
+    ///
+    /// Argument validation happens inside the task so a bad `direction` or an
+    /// empty relation list *rejects* the promise, matching every other method
+    /// here — throwing synchronously would contradict the `Promise<string>`
+    /// signature napi generates.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn related(
+        &self,
+        start: String,
+        relations: String,
+        direction: Option<String>,
+        depth: Option<u32>,
+        limit: Option<u32>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let depth = depth.unwrap_or(2) as usize;
+        let limit = limit.unwrap_or(64) as usize;
+        StringJob::spawn(move || {
+            let rels = parse_relations(&relations);
+            if rels.is_empty() {
+                return Err(napi::Error::from_reason(
+                    "relations must name at least one relation",
+                ));
+            }
+            let dir = Direction::parse(direction.as_deref().unwrap_or("out")).ok_or_else(|| {
+                napi::Error::from_reason("direction must be one of: out, in, both")
+            })?;
+            let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+            let reached = facade
+                .with_store(|m| m.related(&ns, &start, &refs, dir, depth, limit))
+                .map_err(err)?;
+            Ok(json!({"start": start, "reached": reached}).to_string())
+        })
+    }
+
+    /// As-of read on two axes: `world` = what was true at `at`,
+    /// `knowledge` = what the agent knew at `at`. `at` is epoch milliseconds.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn entity_at(
+        &self,
+        subject: String,
+        relation: String,
+        at: i64,
+        axis: Option<String>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        StringJob::spawn(move || {
+            let ax = Axis::parse(axis.as_deref().unwrap_or("world"))
+                .ok_or_else(|| napi::Error::from_reason("axis must be one of: world, knowledge"))?;
+            let found = facade
+                .with_store(|m| m.entity_at(&ns, &subject, &relation, at, ax))
+                .map_err(err)?;
+            Ok(match found {
+                Some(g) => json!({"found": true, "grain": g}).to_string(),
+                None => json!({"found": false}).to_string(),
+            })
+        })
+    }
+
+    /// Execution records for a workflow: which grains ran which of its nodes.
+    ///
+    /// A Workflow grain is immutable, so runs point at the plan rather than
+    /// mutating it — retries show up as several records for one node.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn step_actions(
+        &self,
+        workflow: String,
+        node: Option<String>,
+        limit: Option<u32>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let limit = limit.unwrap_or(64) as usize;
+        StringJob::spawn(move || {
+            let wf = parse_hash(&workflow)?;
+            let rows = facade
+                .with_store(|m| m.step_actions(&ns, &wf, node.as_deref(), limit))
+                .map_err(err)?;
+            let steps: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(n, h)| json!({"node": n, "hash": h.to_hex()}))
+                .collect();
+            Ok(json!({"workflow": wf.to_hex(), "steps": steps}).to_string())
         })
     }
 

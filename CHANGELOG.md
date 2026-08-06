@@ -44,6 +44,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The graph and as-of reads are reachable outside Rust.** `related`
+  (bounded k-hop entity walk), `entity_at` (two-axis as-of read) and
+  `step_actions` (workflow execution records) existed only as store methods —
+  no CLI verb, no MCP tool, no binding — so the bounded traversal and the
+  bitemporal read, arguably the two strongest capabilities in the engine, were
+  invisible to every user who wasn't linking the crate. All three now ship on
+  MCP (`dejadb_related` / `dejadb_entity_at` / `dejadb_step_actions`), the CLI
+  (`deja related` / `entity-at` / `step-actions`), Python and Node, with the
+  same scalars-in/JSON-out shape and the same `out|in|both` and
+  `world|knowledge` vocabulary everywhere. No new CAL syntax: that is an OMS
+  conformance decision, not a wiring task.
+
 - **Workflow execution records — OMS §8.4 `mg:step_action:<node_id>`.** A
   Workflow grain is immutable and content-addressed, so it can never accumulate
   run state; the spec's answer is to point the execution records at the plan
@@ -112,6 +124,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FactDraft::from_json_array`. `remember()`'s signature is unchanged.
 
 ### Fixed
+
+- **Dead code removed.** Deleted `GoalTree`, `GoalNode`, `StateDiff` and the `AutoRelated` engine
+  event — declarations with no constructor, caller, test or doc reference
+  anywhere in the tree.
+
+- **`WITH multi_hop(n)` now does something.** It was lexed, parsed, clamped to
+  1–3 and written to `RecallParams` — and never read by any recall path, so the
+  option documented as "entity-graph multi-hop retrieval" was a no-op. It now
+  takes the entities named by the first-pass results, anchors a fresh recall on
+  each, and adds what comes back to the candidate pool, repeating per hop.
+  Expansion runs *before* post-filtering and `LIMIT`, so hops compete for the
+  slots the caller asked for instead of extending past them, and a direct match
+  always outranks something reached by association. Fail-open, like every other
+  recall refinement.
+
+- **`provenance_chain` was silently dropped on every write.** OMS §6.1 defines
+  it (`pc`, the derivation trail) and `GrainCommon` declares it with a compact
+  key, but nothing serialized it — anything a caller recorded there vanished at
+  the blob boundary. Now written, uncompacted per §6.2. Optional, so existing
+  blobs stay byte-identical.
+
+- **`WITH auto_relate` says it is not implemented.** Parsed and accepted since
+  1.0, never consumed by any store path. It stays in the grammar — it is
+  documented, and removing it would turn working queries into parse errors —
+  but now emits CAL-W004 instead of silently doing nothing.
 
 - **`GrainTypeMeta::addable` renamed to `add_via_set`, and its doc corrected.**
   The field claimed to gate "creation via `ADD` / the `add` HTTP+SDK path", but

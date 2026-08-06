@@ -329,3 +329,87 @@ fn hub_requires_a_key_and_guards_the_bind_address() {
         "bind guard message is unclear: {err}"
     );
 }
+
+/// The graph and as-of reads used to be reachable only by linking the crate.
+#[test]
+fn cli_graph_and_temporal_verbs() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("g.db");
+    let db = db.to_str().unwrap();
+
+    for (s, o) in [("alice", "bob"), ("bob", "carol")] {
+        let (ok, _, err) = deja(&[
+            "add", "--db", db, "--ns", "org", "--subject", s, "--relation", "reports_to",
+            "--object", o,
+        ]);
+        assert!(ok, "add failed: {err}");
+    }
+
+    // Forward walk, two hops.
+    let (ok, out, err) = deja(&[
+        "related", "--db", db, "--ns", "org", "--start", "alice", "--relations", "reports_to",
+    ]);
+    assert!(ok, "related failed: {err}");
+    assert!(out.contains("bob") && out.contains("carol"), "{out}");
+
+    // Reverse walk uses the OSP index; `reports_to` is entity-valued by default.
+    let (ok, out, err) = deja(&[
+        "related", "--db", db, "--ns", "org", "--start", "carol", "--relations", "reports_to",
+        "--direction", "in",
+    ]);
+    assert!(ok, "reverse related failed: {err}");
+    assert!(out.contains("alice"), "{out}");
+
+    // A bad direction is refused rather than silently defaulting.
+    let (ok, _, err) = deja(&[
+        "related", "--db", db, "--ns", "org", "--start", "alice", "--relations", "reports_to",
+        "--direction", "sideways",
+    ]);
+    assert!(!ok, "bad direction must fail");
+    assert!(err.contains("out, in, both"), "{err}");
+
+    // As-of read on the knowledge axis.
+    let (ok, out, err) = deja(&[
+        "entity-at", "--db", db, "--ns", "org", "--subject", "alice", "--relation", "reports_to",
+        "--at", "4102444800000", "--axis", "knowledge",
+    ]);
+    assert!(ok, "entity-at failed: {err}");
+    assert!(out.contains("bob"), "{out}");
+
+    // An unknown entity answers, it does not error.
+    let (ok, out, err) = deja(&[
+        "entity-at", "--db", db, "--ns", "org", "--subject", "nobody", "--relation", "reports_to",
+        "--at", "4102444800000",
+    ]);
+    assert!(ok, "entity-at on unknown subject failed: {err}");
+    assert!(out.contains("nothing known"), "{out}");
+}
+
+#[test]
+fn cli_step_actions_reads_workflow_execution_records() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("w.db");
+    let db = db.to_str().unwrap();
+
+    let (ok, out, err) = deja(&[
+        "cal", "--db", db, "--ns", "ci",
+        r#"ADD workflow "pipeline" build -> test REASON "smoke""#,
+    ]);
+    assert!(ok, "add workflow failed: {err}");
+    let wf = out
+        .split('"')
+        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("a workflow hash in the CAL output")
+        .to_string();
+
+    // The plan exists and nothing has run against it yet.
+    let (ok, out, err) = deja(&["step-actions", "--db", db, "--ns", "ci", "--workflow", &wf]);
+    assert!(ok, "step-actions failed: {err}");
+    assert!(out.contains("no execution records"), "{out}");
+
+    let (ok, _, err) = deja(&[
+        "step-actions", "--db", db, "--ns", "ci", "--workflow", "not-a-hash",
+    ]);
+    assert!(!ok, "a malformed hash must fail");
+    assert!(!err.is_empty());
+}

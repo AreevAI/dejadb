@@ -63,7 +63,7 @@ fn mcp_round_trip() {
 
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "dejadb");
     let tools = by_id(2)["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 11);
 
     // add returned a hash
     let add_text = by_id(3)["result"]["content"][0]["text"].as_str().unwrap();
@@ -310,4 +310,79 @@ fn serve_requires_explicit_db() {
         err.contains("explicit memory file"),
         "expected an explicit-db error, got: {err}"
     );
+}
+
+/// The graph walk, the as-of read and workflow execution records over MCP —
+/// three store capabilities that were previously reachable only from Rust.
+#[test]
+fn mcp_exposes_graph_and_temporal_tools() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("g.db");
+    let db = db.to_str().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+        .args(["serve", "--mcp", "--db", db, "--ns", "org"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let add = |id: u64, s: &str, o: &str| {
+        rpc(id, "tools/call", serde_json::json!({"name": "dejadb_add", "arguments": {
+            "fields": {"subject": s, "relation": "reports_to", "object": o}}}))
+    };
+    let script = [
+        rpc(1, "initialize", serde_json::json!({"protocolVersion": "2025-06-18",
+            "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}})),
+        add(2, "alice", "bob"),
+        add(3, "bob", "carol"),
+        rpc(4, "tools/call", serde_json::json!({"name": "dejadb_related", "arguments": {
+            "start": "alice", "relations": "reports_to", "depth": 2}})),
+        rpc(5, "tools/call", serde_json::json!({"name": "dejadb_related", "arguments": {
+            "start": "carol", "relations": "reports_to", "direction": "in"}})),
+        rpc(6, "tools/call", serde_json::json!({"name": "dejadb_related", "arguments": {
+            "start": "alice", "relations": "reports_to", "direction": "sideways"}})),
+        rpc(7, "tools/call", serde_json::json!({"name": "dejadb_entity_at", "arguments": {
+            "subject": "alice", "relation": "reports_to", "at": 4102444800000i64,
+            "axis": "knowledge"}})),
+        rpc(8, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
+            "query": "ADD workflow \"ci\" build -> test REASON \"smoke\""}})),
+        rpc(9, "tools/call", serde_json::json!({"name": "dejadb_step_actions", "arguments": {
+            "workflow": "not-a-hash"}})),
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for line in &script {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let by_id = |id: u64| lines.iter().find(|v| v["id"] == id).unwrap();
+    let text = |id: u64| -> serde_json::Value {
+        serde_json::from_str(by_id(id)["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    // Forward walk, then the reverse walk that needs the OSP index.
+    assert_eq!(by_id(4)["result"]["isError"], false);
+    assert_eq!(text(4)["reached"], serde_json::json!(["bob", "carol"]));
+    assert_eq!(text(5)["reached"], serde_json::json!(["bob", "alice"]));
+
+    // A bad direction is a tool error, not a protocol error or a crash.
+    assert_eq!(by_id(6)["result"]["isError"], true);
+
+    // As-of read on the knowledge axis finds the value that was current.
+    assert_eq!(by_id(7)["result"]["isError"], false);
+    assert_eq!(text(7)["found"], true);
+    assert_eq!(text(7)["grain"]["fields"]["object"], "bob");
+
+    // A workflow exists; a malformed hash is refused as a tool error.
+    assert_eq!(by_id(8)["result"]["isError"], false);
+    assert_eq!(by_id(9)["result"]["isError"], true);
 }

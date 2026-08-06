@@ -4,7 +4,6 @@
 //! - Query parameter types (`RecallParams`, `DiversityConfig`, `DiversityMethod`)
 //! - Result/response types (`SearchHit`, `ScoreBreakdown`, `DetailedStats`, etc.)
 //! - Session types (`SessionBootstrap`, `ToolSummary`, `ToolStats`)
-//! - Goal and state types (`GoalNode`, `GoalTree`, `StateDiff`)
 //! - Intelligence types (`ConsolidationResult`, `ConsolidationGroupInfo`, `CompiledContext`)
 //! - Engine events (`EngineEvent`)
 //! - Internal cache alias (`GrainCache`)
@@ -270,42 +269,6 @@ pub struct ToolStats {
 // H2: Goal Orchestration types
 // ---------------------------------------------------------------------------
 
-/// A node in a goal tree, representing a Goal grain and its sub-goals.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GoalNode {
-    /// The Goal grain itself.
-    pub grain: DeserializedGrain,
-    /// Content-address hash of this goal.
-    pub hash: Hash,
-    /// Sub-goals (children) of this goal.
-    pub children: Vec<GoalNode>,
-}
-
-/// A complete goal tree for a session.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GoalTree {
-    /// Root goals (goals with no parent).
-    pub roots: Vec<GoalNode>,
-    /// Total number of goals in the tree.
-    pub total_goals: usize,
-}
-
-/// A diff between two State grains, showing added, removed, and changed keys.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct StateDiff {
-    /// Hash of the old State grain.
-    pub old_hash: Hash,
-    /// Hash of the new State grain.
-    pub new_hash: Hash,
-    /// Keys present in new but not in old.
-    pub added: Vec<String>,
-    /// Keys present in old but not in new.
-    pub removed: Vec<String>,
-    /// Keys present in both but with different values: (key, old_value, new_value).
-    pub changed: Vec<(String, serde_json::Value, serde_json::Value)>,
-    /// Keys present in both with identical values.
-    pub unchanged: Vec<String>,
-}
 
 // ---------------------------------------------------------------------------
 // H3: Multi-Agent + Intelligence types
@@ -388,12 +351,6 @@ pub enum EngineEvent {
     Forgotten { hash: Hash },
     /// A grain was superseded.
     Superseded { old_hash: Hash, new_hash: Hash },
-    /// Auto-relate detected a relationship between grains.
-    AutoRelated {
-        new_hash: Hash,
-        related_hash: Hash,
-        relation_type: String,
-    },
     /// Memories were extracted from a source grain via the add-intelligence pipeline.
     MemoriesExtracted {
         source_hash: Hash,
@@ -1041,9 +998,12 @@ pub struct RecallParams {
     pub subject_affinity_boost: Option<f64>,
     /// Entity-graph multi-hop: follow entity links from top-K results.
     /// Value is the number of hops (1-3). None = disabled.
-    /// After first-pass recall, extracts entities from top-K results' subject/object
-    /// fields, queries hexastore for grains mentioning those entities, scores them
-    /// against the original query, and merges via RRF.
+    /// After first-pass recall, takes the entities named by the top results'
+    /// subject/object fields, anchors a fresh recall on each, and adds what
+    /// comes back to the candidate pool — repeating for each hop. Expansion
+    /// happens before post-filtering and LIMIT, so hops compete for the slots
+    /// the caller asked for rather than extending past them, and a direct match
+    /// always outranks something reached by association.
     pub multi_hop: Option<u8>,
     /// Target date (epoch ms) for proximity-based scoring.
     /// When set with target_date_weight, boosts grains near this specific date.

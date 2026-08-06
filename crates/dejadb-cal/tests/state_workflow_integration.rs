@@ -448,3 +448,107 @@ fn facade_add(facade: &DejaDbFacade, grain_type: &str, fields: &serde_json::Valu
     let hash = facade.cal_add(grain_type, &map).unwrap();
     hex::encode(hash.as_bytes())
 }
+
+// ---------------------------------------------------------------------------
+// WITH multi_hop(n) — entity-graph expansion
+// ---------------------------------------------------------------------------
+
+/// A chain the first pass cannot reach in one step: the query matches only
+/// `alice`, but `carol`'s fact is two entity hops away.
+fn hop_chain(ex: &CalExecutor, facade: &DejaDbFacade) {
+    for (s, r, o) in [
+        ("alice", "reports_to", "bob"),
+        ("bob", "reports_to", "carol"),
+        ("carol", "owns", "the-deploy-key"),
+    ] {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "{s}" SET relation = "{r}" SET object = "{o}"
+                   SET namespace = "caller" REASON "hop""#
+            ),
+            facade,
+        )
+        .unwrap();
+    }
+}
+
+fn objects(payload: CalResultPayload) -> Vec<String> {
+    match payload {
+        CalResultPayload::Grains { grains, .. } => grains
+            .iter()
+            .filter_map(|g| {
+                serde_json::to_value(g).ok()?["fields"]["object"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect(),
+        other => panic!("expected Grains, got {other:?}"),
+    }
+}
+
+#[test]
+fn multi_hop_reaches_facts_the_first_pass_cannot() {
+    // `WITH multi_hop(n)` was parsed, clamped and stored on RecallParams — and
+    // never read by any recall path, so the documented option did nothing.
+    let (ex, facade, _d) = setup();
+    hop_chain(&ex, &facade);
+
+    let plain = objects(
+        ex.execute(r#"RECALL facts WHERE subject = "alice""#, &facade)
+            .unwrap()
+            .result,
+    );
+    assert_eq!(plain, vec!["bob"], "one anchored match without expansion");
+
+    let hopped = objects(
+        ex.execute(
+            r#"RECALL facts WHERE subject = "alice" LIMIT 10 WITH multi_hop(2)"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(
+        hopped.contains(&"the-deploy-key".to_string()),
+        "two hops must reach carol's fact, got {hopped:?}"
+    );
+    assert_eq!(hopped[0], "bob", "the direct match still ranks first");
+}
+
+#[test]
+fn multi_hop_depth_bounds_how_far_it_reaches() {
+    let (ex, facade, _d) = setup();
+    hop_chain(&ex, &facade);
+
+    let one = objects(
+        ex.execute(
+            r#"RECALL facts WHERE subject = "alice" LIMIT 10 WITH multi_hop(1)"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(one.contains(&"carol".to_string()), "one hop reaches bob's fact");
+    assert!(
+        !one.contains(&"the-deploy-key".to_string()),
+        "one hop must not reach two hops out: {one:?}"
+    );
+}
+
+#[test]
+fn multi_hop_respects_the_limit() {
+    // Expansion competes for the k slots the caller asked for; it must not
+    // silently return more rows than LIMIT.
+    let (ex, facade, _d) = setup();
+    hop_chain(&ex, &facade);
+
+    let hits = objects(
+        ex.execute(
+            r#"RECALL facts WHERE subject = "alice" LIMIT 2 WITH multi_hop(3)"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert!(hits.len() <= 2, "LIMIT 2 must cap the result: {hits:?}");
+}

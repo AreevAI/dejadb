@@ -3,7 +3,8 @@
 //! Memory-semantic tools over newline-delimited JSON-RPC 2.0 on stdio —
 //! not SQL-over-MCP. Tool surface is a tag-grouped set:
 //! `dejadb_recall`, `dejadb_remember`, `dejadb_add`, `dejadb_supersede`,
-//! `dejadb_forget`, `dejadb_cal`.
+//! `dejadb_forget`, `dejadb_cal`, plus the graph/time tools
+//! `dejadb_related`, `dejadb_entity_at`, `dejadb_step_actions`.
 //!
 //! Protocol errors are JSON-RPC errors; tool-execution failures are
 //! `isError: true` tool results, per the MCP spec.
@@ -13,7 +14,7 @@ use std::io::{BufRead, Write};
 use dejadb_cal::store_types::RecallParams;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::Hash;
-use dejadb_store::Capture;
+use dejadb_store::{Axis, Capture, Direction};
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
 use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
@@ -275,6 +276,76 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"forgotten": h.to_hex()}).to_string())
             }
+            "dejadb_related" => {
+                let start = args
+                    .get("start")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_related requires 'start'")?;
+                let rels = dejadb_store::parse_relations(
+                    args.get("relations").and_then(|v| v.as_str()).unwrap_or(""),
+                );
+                if rels.is_empty() {
+                    return Err("dejadb_related requires 'relations' (comma-separated)".into());
+                }
+                let dir = Direction::parse(
+                    args.get("direction").and_then(|v| v.as_str()).unwrap_or("out"),
+                )
+                .ok_or("direction must be one of: out, in, both")?;
+                let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                let cap = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+                let ns = self.ns(args).to_string();
+                let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+                let reached = self
+                    .facade
+                    .with_store(|m| m.related(&ns, start, &refs, dir, depth, cap))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"start": start, "reached": reached}).to_string())
+            }
+            "dejadb_entity_at" => {
+                let subject = args
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_entity_at requires 'subject'")?;
+                let relation = args
+                    .get("relation")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_entity_at requires 'relation'")?;
+                let at = args
+                    .get("at")
+                    .and_then(|v| v.as_i64())
+                    .ok_or("dejadb_entity_at requires 'at' (epoch ms)")?;
+                let axis =
+                    Axis::parse(args.get("axis").and_then(|v| v.as_str()).unwrap_or("world"))
+                        .ok_or("axis must be one of: world, knowledge")?;
+                let ns = self.ns(args).to_string();
+                let found = self
+                    .facade
+                    .with_store(|m| m.entity_at(&ns, subject, relation, at, axis))
+                    .map_err(|e| e.to_string())?;
+                Ok(match found {
+                    Some(g) => json!({"found": true, "grain": g}).to_string(),
+                    None => json!({"found": false}).to_string(),
+                })
+            }
+            "dejadb_step_actions" => {
+                let wf = args
+                    .get("workflow")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_step_actions requires 'workflow'")?;
+                let wf = Hash::from_hex(wf).map_err(|e| e.to_string())?;
+                let node = args.get("node").and_then(|v| v.as_str());
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+                let ns = self.ns(args).to_string();
+                let rows = self
+                    .facade
+                    .with_store(|m| m.step_actions(&ns, &wf, node, limit))
+                    .map_err(|e| e.to_string())?;
+                let steps: Vec<_> = rows
+                    .into_iter()
+                    .map(|(n, h)| json!({"node": n, "hash": h.to_hex()}))
+                    .collect();
+                Ok(json!({"workflow": wf.to_hex(), "steps": steps}).to_string())
+            }
             "dejadb_remember" => {
                 // Stores the raw content as an Event through `DejaDB::capture`
                 // — the same write path as `deja remember`, the bindings, and
@@ -444,6 +515,39 @@ fn tool_defs() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "hash": s("content address (64-hex) to forget")
             }, "required": ["hash"]}
+        }),
+        json!({
+            "name": "dejadb_related",
+            "description": "Walk the entity graph from a starting term over the given relations (bounded k-hop, breadth-first). Reverse/both directions only see relations the file declares as entity-valued.",
+            "inputSchema": {"type": "object", "properties": {
+                "start": s("entity term to start from, e.g. \"alice\""),
+                "relations": s("comma-separated relations, e.g. \"reports_to,mg:knows\""),
+                "direction": s("out (default) | in | both"),
+                "depth": {"type": "integer", "description": "hops to walk, 1-4 (default 2)"},
+                "limit": {"type": "integer", "description": "max entities returned (default 64)"},
+                "namespace": s("optional namespace")
+            }, "required": ["start", "relations"]}
+        }),
+        json!({
+            "name": "dejadb_entity_at",
+            "description": "As-of read on two axes: what was true in the world at T (world), or what the agent knew at T (knowledge). Use to answer questions about the past rather than the current head.",
+            "inputSchema": {"type": "object", "properties": {
+                "subject": s("entity, e.g. \"alice\""),
+                "relation": s("relation, e.g. \"employer\""),
+                "at": {"type": "integer", "description": "point in time, epoch milliseconds"},
+                "axis": s("world (default) | knowledge"),
+                "namespace": s("optional namespace")
+            }, "required": ["subject", "relation", "at"]}
+        }),
+        json!({
+            "name": "dejadb_step_actions",
+            "description": "Execution records for a workflow: which grains ran which of its nodes (OMS mg:step_action). A workflow grain is immutable, so runs point at the plan rather than mutating it; retries appear as several records for one node.",
+            "inputSchema": {"type": "object", "properties": {
+                "workflow": s("content address (64-hex) of the Workflow grain"),
+                "node": s("optional node id, to narrow to one step"),
+                "limit": {"type": "integer", "description": "max records returned (default 64)"},
+                "namespace": s("optional namespace")
+            }, "required": ["workflow"]}
         }),
         json!({
             "name": "dejadb_remember",

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
 use dejadb_core::types::{Fact, Grain, Tool};
-use dejadb_store::DejaDB;
+use dejadb_store::{Axis, DejaDB, Direction};
 use dejadb_waiser::{now_ms, DejaDbSubstrate};
 use waiser::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
 
@@ -67,6 +67,16 @@ COMMANDS:
   restore  --from DIR [--until-hlc T]            rebuild from stream dir (PITR)
   follow   --from DIR [--interval-ms N] [--once]  subscribe: apply new segments
                                                   (org/category distribution)
+  related  --start TERM --relations R1,R2 [--direction out|in|both]
+           [--depth N] [--limit N]    walk the entity graph (bounded k-hop).
+                                      in/both only see relations the file
+                                      declares entity-valued
+  entity-at --subject S --relation R --at MS [--axis world|knowledge]
+                                      as-of read: what was true at T (world)
+                                      or what was known at T (knowledge)
+  step-actions --workflow HASH [--node ID] [--limit N]
+                                      execution records for a workflow —
+                                      which grains ran which of its nodes
   verify                              integrity + content-address recheck
   stats                               store counters
   serve    --mcp [--ns NS] [--mount alias=path,...] [--no-destructive-ops] [--lock-ns NS]  MCP server on stdio
@@ -910,6 +920,67 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 "text index rebuilt: {} grains indexed ({n} needed their text backfilled)",
                 m.indexed_documents()
             );
+        }
+        "related" => {
+            let start = flag(&flags, "start").ok_or("related requires --start")?;
+            let rels = dejadb_store::parse_relations(
+                &flag(&flags, "relations").ok_or("related requires --relations")?,
+            );
+            if rels.is_empty() {
+                return Err("--relations must name at least one relation".to_string());
+            }
+            let dir = Direction::parse(&flag(&flags, "direction").unwrap_or_default())
+                .ok_or("--direction must be one of: out, in, both")?;
+            let depth: usize = flag(&flags, "depth")
+                .map_or(Ok(2), |d| d.parse())
+                .map_err(|_| "--depth must be a number")?;
+            let cap: usize = flag(&flags, "limit")
+                .map_or(Ok(64), |l| l.parse())
+                .map_err(|_| "--limit must be a number")?;
+            let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+            let reached = m
+                .related(&ns, &start, &refs, dir, depth, cap)
+                .map_err(|e| e.to_string())?;
+            if reached.is_empty() {
+                println!("(nothing reachable from {start})");
+            }
+            for r in reached {
+                println!("{r}");
+            }
+        }
+        "entity-at" => {
+            let subject = flag(&flags, "subject").ok_or("entity-at requires --subject")?;
+            let relation = flag(&flags, "relation").ok_or("entity-at requires --relation")?;
+            let at: i64 = flag(&flags, "at")
+                .ok_or("entity-at requires --at (epoch ms)")?
+                .parse()
+                .map_err(|_| "--at must be epoch milliseconds")?;
+            let axis = Axis::parse(&flag(&flags, "axis").unwrap_or_default())
+                .ok_or("--axis must be one of: world, knowledge")?;
+            match m
+                .entity_at(&ns, &subject, &relation, at, axis)
+                .map_err(|e| e.to_string())?
+            {
+                Some(g) => println!("{}", serde_json::to_string_pretty(&g).unwrap_or_default()),
+                None => println!("(nothing known for {subject} {relation} at {at})"),
+            }
+        }
+        "step-actions" => {
+            let wf = flag(&flags, "workflow").ok_or("step-actions requires --workflow")?;
+            let wf = Hash::from_hex(&wf).map_err(|e| e.to_string())?;
+            let node = flag(&flags, "node");
+            let limit: usize = flag(&flags, "limit")
+                .map_or(Ok(64), |l| l.parse())
+                .map_err(|_| "--limit must be a number")?;
+            let rows = m
+                .step_actions(&ns, &wf, node.as_deref(), limit)
+                .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("(no execution records for {})", wf.to_hex());
+            }
+            for (n, h) in rows {
+                println!("{n}\t{}", h.to_hex());
+            }
         }
         "verify" => {
             let rep = m.verify().map_err(|e| e.to_string())?;

@@ -7,7 +7,10 @@
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{Hash, DejaDbError};
 use dejadb_store::memory_tool::MemoryTool;
-use dejadb_store::{CommandEmbed, EmbedBackend, FactDraft, TelemetryMode, DejaDB as RustDejaDB};
+use dejadb_store::{
+    parse_relations, Axis, CommandEmbed, DejaDB as RustDejaDB, Direction, EmbedBackend, FactDraft,
+    TelemetryMode,
+};
 use dejadb_waiser::{now_ms, BorrowedSubstrate};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -755,6 +758,97 @@ impl DejaDB {
             "terms": s.terms, "ops": s.ops, "events_indexed": s.events_indexed,
         })
         .to_string())
+    }
+
+    /// Bounded k-hop walk over the entity graph.
+    ///
+    /// `relations` is comma-separated. `direction` is out|in|both — in/both use
+    /// the reverse index, which only covers relations the file declares
+    /// entity-valued, so they find nothing for relations outside that set.
+    #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
+    #[pyo3(signature = (start, relations, direction = "out".to_string(), depth = 2, limit = 64, ns = None))]
+    fn related(
+        &self,
+        py: Python<'_>,
+        start: String,
+        relations: String,
+        direction: String,
+        depth: usize,
+        limit: usize,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let rels = parse_relations(&relations);
+        if rels.is_empty() {
+            return Err(PyValueError::new_err(
+                "relations must name at least one relation",
+            ));
+        }
+        let dir = Direction::parse(&direction)
+            .ok_or_else(|| PyValueError::new_err("direction must be one of: out, in, both"))?;
+        let reached = py
+            .detach(|| {
+                let refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+                self.facade
+                    .with_store(|m| m.related(&ns, &start, &refs, dir, depth, limit))
+            })
+            .map_err(err)?;
+        Ok(json!({"start": start, "reached": reached}).to_string())
+    }
+
+    /// As-of read on two axes: `world` = what was true at `at`,
+    /// `knowledge` = what the agent knew at `at`. `at` is epoch milliseconds.
+    #[pyo3(signature = (subject, relation, at, axis = "world".to_string(), ns = None))]
+    fn entity_at(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        relation: String,
+        at: i64,
+        axis: String,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let ax = Axis::parse(&axis)
+            .ok_or_else(|| PyValueError::new_err("axis must be one of: world, knowledge"))?;
+        let found = py
+            .detach(|| {
+                self.facade
+                    .with_store(|m| m.entity_at(&ns, &subject, &relation, at, ax))
+            })
+            .map_err(err)?;
+        Ok(match found {
+            Some(g) => json!({"found": true, "grain": g}).to_string(),
+            None => json!({"found": false}).to_string(),
+        })
+    }
+
+    /// Execution records for a workflow: which grains ran which of its nodes.
+    ///
+    /// A Workflow grain is immutable, so runs point at the plan rather than
+    /// mutating it — retries show up as several records for one node.
+    #[pyo3(signature = (workflow, node = None, limit = 64, ns = None))]
+    fn step_actions(
+        &self,
+        py: Python<'_>,
+        workflow: String,
+        node: Option<String>,
+        limit: usize,
+        ns: Option<String>,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let wf = Hash::from_hex(&workflow).map_err(err)?;
+        let rows = py
+            .detach(|| {
+                self.facade
+                    .with_store(|m| m.step_actions(&ns, &wf, node.as_deref(), limit))
+            })
+            .map_err(err)?;
+        let steps: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(n, h)| json!({"node": n, "hash": h.to_hex()}))
+            .collect();
+        Ok(json!({"workflow": wf.to_hex(), "steps": steps}).to_string())
     }
 
     /// Incremental backup to a bundle file. Returns last_op_seq cursor.

@@ -6,6 +6,7 @@
 //! M2 scope: structural recall only. Semantic (`query`) recall returns a
 //! clear error until the FTS/vector legs land (M4).
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use dejadb_core::error::{Hash, DejaDbError, Result};
@@ -97,6 +98,15 @@ impl DejaDbFacade {
     /// Recall over-fetch multiplier: `recall_hybrid` is asked for
     /// `limit × RECALL_OVERFETCH` candidates before post-filtering.
     pub const RECALL_OVERFETCH: usize = 4;
+
+    /// How many first-pass results seed `WITH multi_hop`. The top few name the
+    /// entities worth following; taking every result would fan out over the
+    /// long tail of a weak match.
+    pub const MULTI_HOP_SEED: usize = 8;
+
+    /// Candidates pulled per entity per hop. Small on purpose — a hop is a
+    /// widening heuristic, and the candidate pool is capped anyway.
+    pub const MULTI_HOP_FANOUT: usize = 8;
 
     /// Aliases of read-only mounted stores (ASSEMBLE cross-file sources).
     pub fn mount_aliases(&self) -> Vec<String> {
@@ -668,6 +678,70 @@ impl CalStoreFacade for DejaDbFacade {
                 tuning,
             )?
         };
+
+        // `WITH multi_hop(n)` — entity-graph expansion.
+        //
+        // Take the entities the first pass surfaced (its results' subject and
+        // object terms), anchor a fresh recall on each, and add what comes back
+        // to the candidate pool. Repeat `n` times, following the graph outward.
+        //
+        // Expansion happens here, before the post-filters and the `LIMIT` below,
+        // so hops *compete* for the k slots the caller asked for rather than
+        // extending past them. Appended after the first pass, so a direct match
+        // always outranks something reached by association.
+        //
+        // Fail-open, like every other recall refinement: a hop that errors is
+        // skipped rather than failing the query.
+        let mut raw = raw;
+        if let Some(hops) = params.multi_hop.filter(|h| *h > 0) {
+            let mut seen: HashSet<Hash> = raw.iter().map(|g| g.hash).collect();
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut frontier: Vec<String> = Vec::new();
+            let push_entities = |g: &DeserializedGrain,
+                                     visited: &mut HashSet<String>,
+                                     out: &mut Vec<String>| {
+                for field in ["subject", "object"] {
+                    if let Some(v) = g.get_str(field) {
+                        if !v.is_empty() && visited.insert(v.to_string()) {
+                            out.push(v.to_string());
+                        }
+                    }
+                }
+            };
+            for g in raw.iter().take(Self::MULTI_HOP_SEED) {
+                push_entities(g, &mut visited, &mut frontier);
+            }
+
+            let budget = k.saturating_mul(Self::RECALL_OVERFETCH);
+            'hops: for _ in 0..hops {
+                let mut next: Vec<String> = Vec::new();
+                for entity in std::mem::take(&mut frontier) {
+                    if raw.len() >= budget {
+                        break 'hops;
+                    }
+                    let Ok(found) = m.recall_hybrid(
+                        ns,
+                        Some(&entity),
+                        None,
+                        params.query.as_deref(),
+                        Self::MULTI_HOP_FANOUT,
+                        None,
+                    ) else {
+                        continue;
+                    };
+                    for g in found {
+                        if seen.insert(g.hash) {
+                            push_entities(&g, &mut visited, &mut next);
+                            raw.push(g);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+        }
         drop(m);
 
         let mut hits: Vec<SearchHit> = raw

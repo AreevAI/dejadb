@@ -625,3 +625,79 @@ def test_add_batch_rejects_the_whole_call_and_writes_nothing(tmp_path):
             {"grain_type": "fact"},  # no fields -> the batch is refused
         ]))
     assert json.loads(m.stats())["grains"] == before
+
+
+# --------------------------------------------------------------------------
+# graph traversal, as-of reads, workflow execution records
+# --------------------------------------------------------------------------
+
+
+def org_graph(tmp_path):
+    """alice -> bob -> carol over `reports_to`, a default entity-valued relation."""
+    m = make_db(tmp_path, ns="org")
+    m.add("fact", json.dumps({"subject": "alice", "relation": "reports_to", "object": "bob"}))
+    m.add("fact", json.dumps({"subject": "bob", "relation": "reports_to", "object": "carol"}))
+    return m
+
+
+def test_related_walks_forward_and_backward(tmp_path):
+    m = org_graph(tmp_path)
+    assert json.loads(m.related("alice", "reports_to"))["reached"] == ["bob", "carol"]
+    # Reverse traversal needs the OSP index, which only covers entity-valued
+    # relations — `reports_to` is one of the defaults.
+    assert json.loads(m.related("carol", "reports_to", "in"))["reached"] == ["bob", "alice"]
+
+
+def test_related_accepts_a_comma_separated_relation_list(tmp_path):
+    m = org_graph(tmp_path)
+    out = json.loads(m.related("alice", "reports_to, mg:knows"))
+    assert out["start"] == "alice"
+    assert "bob" in out["reached"]
+
+
+def test_related_rejects_a_bad_direction_and_an_empty_relation_list(tmp_path):
+    m = org_graph(tmp_path)
+    with pytest.raises(ValueError):
+        m.related("alice", "reports_to", "sideways")
+    with pytest.raises(ValueError):
+        m.related("alice", "   ")
+
+
+def test_related_depth_bounds_the_walk(tmp_path):
+    m = org_graph(tmp_path)
+    assert json.loads(m.related("alice", "reports_to", "out", 1))["reached"] == ["bob"]
+
+
+def test_entity_at_reads_the_knowledge_axis(tmp_path):
+    m = org_graph(tmp_path)
+    now = json.loads(m.stats())  # any call; we just need a plausible clock below
+    assert now is not None
+    at = json.loads(m.entity_at("alice", "reports_to", 4102444800000, "knowledge"))
+    assert at["found"] is True
+    assert at["grain"]["fields"]["object"] == "bob"
+
+
+def test_entity_at_reports_nothing_rather_than_raising(tmp_path):
+    m = org_graph(tmp_path)
+    assert json.loads(m.entity_at("nobody", "reports_to", 4102444800000))["found"] is False
+
+
+def test_entity_at_rejects_a_bad_axis(tmp_path):
+    m = org_graph(tmp_path)
+    with pytest.raises(ValueError):
+        m.entity_at("alice", "reports_to", 1, "sometime")
+
+
+def test_step_actions_reads_execution_records(tmp_path):
+    m = make_db(tmp_path, ns="org")
+    wf = json.loads(m.cal('ADD workflow "ci" build -> test REASON "test"'))["hash"]
+    assert len(wf) == HEX64
+    out = json.loads(m.step_actions(wf))
+    assert out["workflow"] == wf
+    assert out["steps"] == []  # the plan exists; nothing has run against it
+
+
+def test_step_actions_rejects_a_bad_hash(tmp_path):
+    m = make_db(tmp_path, ns="org")
+    with pytest.raises(ValueError):
+        m.step_actions("not-a-hash")

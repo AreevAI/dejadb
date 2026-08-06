@@ -108,6 +108,31 @@ export declare class DejaDb {
   importBundle(path: string): Promise<number>
   /** Integrity + content-address verification. Throws on failure. */
   verify(): Promise<string>
+  /**
+   * Bounded k-hop walk over the entity graph.
+   *
+   * `relations` is comma-separated. `direction` is out|in|both — in/both use
+   * the reverse index, which only covers relations the file declares
+   * entity-valued, so they find nothing for relations outside that set.
+   *
+   * Argument validation happens inside the task so a bad `direction` or an
+   * empty relation list *rejects* the promise, matching every other method
+   * here — throwing synchronously would contradict the `Promise<string>`
+   * signature napi generates.
+   */
+  related(start: string, relations: string, direction?: string | undefined | null, depth?: number | undefined | null, limit?: number | undefined | null, ns?: string | undefined | null): Promise<string>
+  /**
+   * As-of read on two axes: `world` = what was true at `at`,
+   * `knowledge` = what the agent knew at `at`. `at` is epoch milliseconds.
+   */
+  entityAt(subject: string, relation: string, at: number, axis?: string | undefined | null, ns?: string | undefined | null): Promise<string>
+  /**
+   * Execution records for a workflow: which grains ran which of its nodes.
+   *
+   * A Workflow grain is immutable, so runs point at the plan rather than
+   * mutating it — retries show up as several records for one node.
+   */
+  stepActions(workflow: string, node?: string | undefined | null, limit?: number | undefined | null, ns?: string | undefined | null): Promise<string>
   /** Record a tool call as a Tool grain — the flagship analyzer's food. */
   recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null): Promise<string>
   /**

@@ -349,3 +349,44 @@ test('waiser: record tool calls, run, review, apply', async () => {
   const sweep = await m.waiserRun(null, null, null, null, null, null, null, null, true)
   assert.equal(JSON.parse(sweep).outcome, 'ran')
 })
+
+test('graph traversal, as-of reads, and workflow execution records', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-graph-'))
+  const m = new DejaDb(join(dir, 'm.db'), 'org')
+
+  // A small org graph. `reports_to` is one of the default entity-valued
+  // relations, so reverse traversal has an index to walk.
+  await m.add('fact', JSON.stringify({ subject: 'alice', relation: 'reports_to', object: 'bob' }))
+  await m.add('fact', JSON.stringify({ subject: 'bob', relation: 'reports_to', object: 'carol' }))
+
+  const out = JSON.parse(await m.related('alice', 'reports_to', 'out', 2, 10))
+  assert.deepEqual(out.reached, ['bob', 'carol'], 'two hops up the chain')
+
+  const back = JSON.parse(await m.related('carol', 'reports_to', 'in', 2, 10))
+  assert.deepEqual(back.reached, ['bob', 'alice'], 'reverse traversal via the OSP index')
+
+  // Comma-separated relation lists, and a rejected direction.
+  assert.ok(JSON.parse(await m.related('alice', 'reports_to, mg:knows')).reached.length >= 1)
+  await assert.rejects(() => m.related('alice', 'reports_to', 'sideways'))
+  await assert.rejects(() => m.related('alice', '  '))
+
+  // As-of read. Nothing was recorded with explicit validity, so the world axis
+  // finds nothing — but it must answer, not throw.
+  const at = JSON.parse(await m.entityAt('alice', 'reports_to', Date.now(), 'knowledge'))
+  assert.equal(at.found, true)
+  assert.equal(at.grain.fields.object, 'bob')
+  await assert.rejects(() => m.entityAt('alice', 'reports_to', Date.now(), 'sometime'))
+
+  // Workflow execution records: the plan is immutable, so runs point at it.
+  const wf = JSON.parse(
+    await m.cal('ADD workflow "ci" build -> test REASON "smoke"'),
+  )
+  const wfHash = wf.hash
+  assert.equal(wfHash.length, HEX64)
+
+  const empty = JSON.parse(await m.stepActions(wfHash))
+  assert.deepEqual(empty.steps, [], 'no runs recorded yet')
+  assert.equal(empty.workflow, wfHash)
+
+  await assert.rejects(() => m.stepActions('not-a-hash'))
+})

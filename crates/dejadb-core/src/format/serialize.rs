@@ -1053,6 +1053,22 @@ fn add_common_fields(common: &GrainCommon, created_at: i64, map: &mut BTreeMap<S
         );
     }
 
+    // provenance_chain — OMS §6.1 `pc`, the derivation trail. Declared on
+    // GrainCommon and given a compact key, but never serialized: anything a
+    // caller put here was silently dropped at the blob boundary. Entries are
+    // free-form maps and, per §6.2, are NOT compacted recursively.
+    if !common.provenance_chain.is_empty() {
+        let arr: Vec<Value> = common
+            .provenance_chain
+            .iter()
+            .map(|p| json_to_msgpack(&p.data))
+            .collect();
+        map.insert(
+            compact_field("provenance_chain").to_string(),
+            Value::Array(arr),
+        );
+    }
+
     // related_to
     if !common.related_to.is_empty() {
         let arr: Vec<Value> = common

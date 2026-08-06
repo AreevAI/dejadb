@@ -268,7 +268,10 @@ ADD goal SET description = "confirm flight" SET goal_state = "open"
 Omitting `SET namespace = ...` stores the grain in the session namespace.
 
 `ADD` intelligence options: `WITH extract_memories` (decompose content into
-atomic facts), `WITH auto_relate`, `WITH extract_event_date`, `WITH sync`.
+atomic facts), `WITH extract_event_date`, `WITH sync`. `WITH auto_relate`
+parses but is **not implemented** — it infers no relations and emits CAL-W004.
+Link grains explicitly via `related_to`, or widen at read time with
+`WITH multi_hop(n)`.
 There is also an `ADD workflow "name" ... graph ... BIND ... REASON "..."`
 form for DAG-shaped Workflow grains.
 
@@ -425,7 +428,7 @@ representative selection:
 | `WITH dedup(object)` | Deduplicate, optionally by a field |
 | `WITH rerank` / `WITH rerank("model")` | Cross-encoder reranking (feature-gated) |
 | `WITH query_expansion` / `WITH query_decompose` / `WITH hyde` | Query rewriting strategies |
-| `WITH multi_hop(2)` | Entity-graph multi-hop retrieval (1–3 hops) |
+| `WITH multi_hop(2)` | Entity-graph expansion (1–3 hops): follows the entities named by the first-pass results and adds what they anchor to the candidate pool, competing within `LIMIT` |
 | `WITH recency_weight(0.3)` / `WITH min_score(0.6)` | Scoring controls |
 | `WITH conflict_resolution` | Keep only the newest grain per `(subject, relation)` |
 | `WITH contradiction_detection` | Keep everything, but stamp `contested_by` on grains that are live tips of an open fork |

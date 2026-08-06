@@ -52,6 +52,46 @@ pub enum Direction {
     Both,
 }
 
+impl Direction {
+    /// Parse the wire spelling used by every binding (`out`/`in`/`both`).
+    /// Defaults to `Out` so a caller that omits it walks the graph forwards.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "out" | "" => Some(Self::Out),
+            "in" => Some(Self::In),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+impl Axis {
+    /// Parse the wire spelling used by every binding.
+    ///
+    /// `world` = what was true at T (`valid_from`/`valid_to`);
+    /// `knowledge` = what the agent knew at T (walks the supersession chain).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "world" | "" => Some(Self::World),
+            "knowledge" => Some(Self::Knowledge),
+            _ => None,
+        }
+    }
+}
+
+/// Split the comma-separated relation list the bindings take.
+///
+/// Relations arrive as one scalar string (the FFI convention is scalars in,
+/// JSON out), so `"mg:knows, reports_to"` becomes two relations. Empty entries
+/// are dropped — a trailing comma is not an anonymous relation.
+pub fn parse_relations(csv: &str) -> Vec<String> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Result of `bundle_since` — the git-shaped incremental backup (§5.10).
 #[derive(Debug, Clone)]
 pub struct BundleStats {
