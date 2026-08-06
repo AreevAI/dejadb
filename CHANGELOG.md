@@ -44,6 +44,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CAL 1.2 (OMS 1.5) conformance verified, and `recommendations` documented.**
+  Both template features CAL 1.2 adds — the `ELEMENT` shorthand
+  (`DEFINE TEMPLATE x AS "<text>"`) and the inline `FORMAT TEMPLATE "<text>"`
+  — were already implemented here, and already desugar to an `ELEMENT` section
+  as §10.6.1 requires. DejaDB had built what the spec's *examples* showed
+  before the spec's grammar admitted them; CAL 1.2 fixed the grammar to match.
+  Tests now pin the behaviour rather than the comments: the shorthand renders
+  once per grain (not once per result), a named shorthand is byte-identical to
+  its section form, combining the two forms is refused, and an inline shorthand
+  can be aliased alongside another format. `docs/cal-reference.md` gains the
+  `recommendations` row, marked read-only with its queryable fields.
+
 - **The join: run history and semantic memory, queried together.** Every agent
   stack keeps these apart — a checkpointer holds in-thread execution state, a
   memory store holds cross-thread facts — and nothing can query across the

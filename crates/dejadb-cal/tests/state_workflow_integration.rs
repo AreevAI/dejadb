@@ -671,3 +671,120 @@ fn recommendations_are_filterable_by_their_type_specific_fields() {
         other => panic!("expected Grains, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// CAL 1.2 — the ELEMENT shorthand (§10.6.1)
+// ---------------------------------------------------------------------------
+
+fn rendered(payload: CalResultPayload) -> String {
+    match payload {
+        CalResultPayload::Formatted { text, .. } => text,
+        other => panic!("expected Formatted, got {other:?}"),
+    }
+}
+
+fn three_facts(ex: &CalExecutor, facade: &DejaDbFacade) {
+    for (s, o) in [("alice", "tea"), ("bob", "coffee"), ("cara", "water")] {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "{s}" SET relation = "prefers" SET object = "{o}"
+                   SET namespace = "caller" REASON "seed""#
+            ),
+            facade,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn element_shorthand_renders_once_per_grain_not_once_per_result() {
+    // §10.6.1: `TEMPLATE "<text>"` is exactly `TEMPLATE { ELEMENT { <text> } }`
+    // — the string renders ONE grain and the engine iterates. Rendering it
+    // whole-result would be a different model entirely.
+    let (ex, facade, _d) = setup();
+    three_facts(&ex, &facade);
+
+    let out = rendered(
+        ex.execute(
+            r#"RECALL facts WHERE relation = "prefers" RECENT 10
+               FORMAT TEMPLATE "{{grain.subject}} likes {{grain.object}}""#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    for (s, o) in [("alice", "tea"), ("bob", "coffee"), ("cara", "water")] {
+        assert!(out.contains(&format!("{s} likes {o}")), "missing {s}: {out}");
+    }
+}
+
+#[test]
+fn a_named_shorthand_template_is_indistinguishable_from_its_section_form() {
+    // The spec defines the shorthand by equivalence, so both spellings must
+    // produce byte-identical output.
+    let (ex, facade, _d) = setup();
+    three_facts(&ex, &facade);
+
+    ex.execute(
+        r#"DEFINE TEMPLATE short AS "{{grain.subject}}={{grain.object}}""#,
+        &facade,
+    )
+    .unwrap();
+    ex.execute(
+        "DEFINE TEMPLATE long ELEMENT {\n{{grain.subject}}={{grain.object}}\n}",
+        &facade,
+    )
+    .unwrap();
+
+    let a = rendered(
+        ex.execute(
+            r#"RECALL facts WHERE relation = "prefers" RECENT 10 FORMAT TEMPLATE short"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    let b = rendered(
+        ex.execute(
+            r#"RECALL facts WHERE relation = "prefers" RECENT 10 FORMAT TEMPLATE long"#,
+            &facade,
+        )
+        .unwrap()
+        .result,
+    );
+    assert_eq!(a.trim(), b.trim(), "shorthand must equal its section form");
+}
+
+#[test]
+fn a_definition_may_not_combine_the_shorthand_and_a_section_list() {
+    // §10.6.1: "A definition MUST NOT combine the two forms."
+    let (ex, facade, _d) = setup();
+    assert!(
+        ex.execute(
+            r#"DEFINE TEMPLATE bad AS "{{grain.subject}}" ELEMENT { x }"#,
+            &facade,
+        )
+        .is_err(),
+        "combining the shorthand with a section list must be refused"
+    );
+}
+
+#[test]
+fn an_inline_shorthand_can_be_aliased_alongside_another_format() {
+    // The §10.1.1 example the spec's own grammar used to reject.
+    let (ex, facade, _d) = setup();
+    three_facts(&ex, &facade);
+
+    let out = ex
+        .execute(
+            r#"RECALL facts WHERE relation = "prefers" RECENT 10
+               FORMAT [json AS structured, TEMPLATE "{{grain.subject}}: {{grain.object}}" AS oneliner]"#,
+            &facade,
+        )
+        .unwrap();
+    // Multi-format results carry both renderings.
+    let v = serde_json::to_value(&out.result).unwrap();
+    let s = v.to_string();
+    assert!(s.contains("structured"), "{s}");
+    assert!(s.contains("oneliner"), "{s}");
+}

@@ -64,7 +64,14 @@ form for writes. The names are case-insensitive.
 | `consensuses` | `consensus` |
 | `consents` | `consent` |
 | `skills` | `skill` |
+| `recommendations` | — (query-only) |
 | `*` / `grains` / `all` | — (wildcard: matches every type) |
+
+`recommendations` (OMS 1.5 `0x0C`) is **read-only**: a recommendation is
+engine-emitted and lifecycle-gated, so there is no `ADD recommendation`, and
+`ADD`/`SUPERSEDE SET` never create or transition one. Queryable fields:
+`target_ref`, `analyzer`, `severity`, `dedup_key`, `rec_status` — the last is
+index-layer state rebuilt from the audit chain, never author-written.
 
 ---
 
