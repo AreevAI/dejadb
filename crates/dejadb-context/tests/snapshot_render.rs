@@ -75,8 +75,12 @@ fn fixture_hits() -> Vec<SearchHit> {
         hit(grain(
             GrainType::State,
             0x11,
+            // `context` is what the `ctx` wire key expands to (OMS §8.3). The
+            // fixture previously used `context_data` — the Rust field name, which
+            // never appears in a deserialized grain — so these goldens locked in
+            // a State that rendered as the literal "state".
             vec![(
-                "context_data",
+                "context",
                 serde_json::json!({ "label": "planning_phase" }),
             )],
         )),

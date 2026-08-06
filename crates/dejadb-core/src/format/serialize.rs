@@ -291,10 +291,26 @@ fn add_type_specific_fields<G: Grain + 'static>(grain: &G, map: &mut BTreeMap<St
             map.insert(compact_field("run_id").to_string(), nfc_string(rid));
         }
     } else if let Some(st) = any.downcast_ref::<State>() {
+        // OMS §8.3: `context` is State's required field and shares the `ctx` wire
+        // key with the common context (§6.1). Written here, so add_common_fields
+        // must not clobber it. Inner keys stay verbatim — no key compaction.
         map.insert(
             compact_field("context").to_string(),
             json_to_msgpack(&st.context_data),
         );
+        // `plan` and `history` stay uncompacted per OMS §6.3.
+        if let Some(ref plan) = st.plan {
+            if !plan.is_empty() {
+                let arr: Vec<Value> = plan.iter().map(|s| nfc_string(s)).collect();
+                map.insert("plan".to_string(), Value::Array(arr));
+            }
+        }
+        if let Some(ref history) = st.history {
+            if !history.is_empty() {
+                let arr: Vec<Value> = history.iter().map(json_to_msgpack).collect();
+                map.insert("history".to_string(), Value::Array(arr));
+            }
+        }
     } else if let Some(wf) = any.downcast_ref::<Workflow>() {
         // nodes: Vec<String>
         let nodes: Vec<Value> = wf.nodes.iter().map(|s| nfc_string(s)).collect();
@@ -563,6 +579,40 @@ fn add_type_specific_fields<G: Grain + 'static>(grain: &G, map: &mut BTreeMap<St
         }
         if let Some(ref dfo) = goal.delegate_from {
             map.insert(compact_field("delegate_from").to_string(), nfc_string(dfo));
+        }
+        // OMS §6.7 Goal fields that had struct fields and compact keys but no arm
+        // here — every write silently dropped them. All are Option, so omitting
+        // when unset keeps existing blobs byte-identical.
+        if let Some(ref crs) = goal.criteria_structured {
+            map.insert(
+                compact_field("criteria_structured").to_string(),
+                json_to_msgpack(crs),
+            );
+        }
+        if let Some(ref ep) = goal.expiry_policy {
+            map.insert(compact_field("expiry_policy").to_string(), json_to_msgpack(ep));
+        }
+        if let Some(ref rec) = goal.recurrence {
+            map.insert(compact_field("recurrence").to_string(), json_to_msgpack(rec));
+        }
+        if let Some(evreq) = goal.evidence_required {
+            map.insert(
+                compact_field("evidence_required").to_string(),
+                Value::Boolean(evreq),
+            );
+        }
+        if let Some(rof) = goal.rollback_on_failure {
+            map.insert(
+                compact_field("rollback_on_failure").to_string(),
+                Value::Boolean(rof),
+            );
+        }
+        if let Some(ref atr) = goal.allowed_transitions {
+            let arr: Vec<Value> = atr.iter().map(|s| nfc_string(s)).collect();
+            map.insert(
+                compact_field("allowed_transitions").to_string(),
+                Value::Array(arr),
+            );
         }
     } else if let Some(reasoning) = any.downcast_ref::<Reasoning>() {
         if !reasoning.premises.is_empty() {
@@ -868,12 +918,16 @@ fn add_common_fields(common: &GrainCommon, created_at: i64, map: &mut BTreeMap<S
         map.insert(compact_field("embedding_text").to_string(), nfc_string(et));
     }
 
-    // Context map — compact string keys using FIELD_MAP (supports int:* profile keys)
+    // Context map — compact string keys using FIELD_MAP (supports int:* profile keys).
+    //
+    // Type-specific fields win on key collision: OMS gives State (§8.3) a required
+    // `context` field that shares this wire key, and `add_type_specific_fields` runs
+    // first. Inserting unconditionally here silently replaced a State's whole
+    // snapshot with the common metadata map. No other grain type writes `ctx`, so
+    // this is a no-op everywhere else.
     if let Some(ref ctx) = common.context {
-        map.insert(
-            compact_field("context").to_string(),
-            json_to_msgpack_with_key_compaction(ctx),
-        );
+        map.entry(compact_field("context").to_string())
+            .or_insert_with(|| json_to_msgpack_with_key_compaction(ctx));
     }
 
     // Invalidation policy

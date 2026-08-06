@@ -26,7 +26,7 @@ reconstruct, with tests catching only some of it.
 1. **`types/<name>.rs`** — the grain struct (+ `types/mod.rs` module decl).
    Follow an existing type; implement the `Grain` trait / `GrainCommon`.
 2. **`types/registry.rs`** — the `GRAIN_TYPES` metadata row (byte, name,
-   plural, addable, queryable). A test forces coverage of every type here.
+   plural, add_via_set, queryable). A test forces coverage of every type here.
 3. **`format/serialize.rs`** — the `add_type_specific_fields` downcast arm.
 4. **`format/deserialize.rs`** — the reconstruction arm + the typed
    reconstructor (`to_<type>()`), and update `embedding_text()` / `base_text()`

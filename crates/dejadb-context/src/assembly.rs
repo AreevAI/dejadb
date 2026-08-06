@@ -161,13 +161,15 @@ fn extract_supersession_chains(hits: &[SearchHit]) -> Vec<SupersessionChain> {
             let subject = field_str(&hits[i].grain.fields, "subject")
                 .or_else(|| field_str(&hits[i].grain.fields, "description"))
                 .unwrap_or_default();
+            // State's snapshot lands under `context` (the `ctx` wire key, OMS §8.3);
+            // `context_data` is the Rust field name and never appears in `fields`.
             let old_value = field_str(&hits[i].grain.fields, "object")
                 .or_else(|| field_str(&hits[i].grain.fields, "content"))
-                .or_else(|| field_str(&hits[i].grain.fields, "context_data"))
+                .or_else(|| field_str(&hits[i].grain.fields, "context"))
                 .unwrap_or_default();
             let new_value = field_str(&hits[new_idx].grain.fields, "object")
                 .or_else(|| field_str(&hits[new_idx].grain.fields, "content"))
-                .or_else(|| field_str(&hits[new_idx].grain.fields, "context_data"))
+                .or_else(|| field_str(&hits[new_idx].grain.fields, "context"))
                 .unwrap_or_default();
 
             let old_date = format_timestamp(hits[i].grain.header.created_at_sec);
@@ -1994,7 +1996,7 @@ mod tests {
         let hits = vec![
             make_hit(
                 GrainType::State,
-                vec![("context_data", "session running")],
+                vec![("context", "session running")],
                 0.9,
             ),
             make_hit(

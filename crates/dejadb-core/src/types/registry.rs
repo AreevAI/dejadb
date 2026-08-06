@@ -31,9 +31,25 @@ pub struct GrainTypeMeta {
     pub name: &'static str,
     /// Canonical plural name used by CAL `RECALL <plural>` (e.g. `"skills"`).
     pub plural: &'static str,
-    /// Whether this type may be created via `ADD` / the `add` HTTP+SDK path.
-    pub addable: bool,
-    /// Required `SET` fields for an `ADD` of this type.
+    /// Whether this type can be built from the **generic** CAL form
+    /// `ADD <type> SET k = v …`.
+    ///
+    /// This is a *shape* fact, not a permission. `false` means a flat list of
+    /// `SET` pairs cannot express the type — a Workflow is a graph, a Tool has a
+    /// call/result lifecycle, an Event carries structured content blocks — so
+    /// those types are created through purpose-built paths instead: a dedicated
+    /// CAL statement (`ADD workflow … build -> test`), the per-type JSON
+    /// builders behind `cal_add` (which MCP, Python and Node all reach), or a
+    /// host API such as `capture()`. **Those paths are deliberately not gated by
+    /// this flag** — they validate structure themselves, which is the point.
+    ///
+    /// Enforced in exactly one place: the `CalStatement::Add` arm of the CAL
+    /// executor, which returns `Unsupported` (never a permission denial). Access
+    /// control lives in scopes and `allow_destructive_ops`, not here.
+    pub add_via_set: bool,
+    /// Required fields for an `ADD` of this type. Consumed by the per-type JSON
+    /// builders regardless of [`Self::add_via_set`] — a type that cannot be
+    /// built from flat `SET` pairs still has required fields.
     pub required_add_fields: &'static [&'static str],
     /// Type-specific fields surfaced by `RECALL <type> WHERE <field> …`.
     pub queryable_fields: &'static [&'static str],
@@ -49,7 +65,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x01,
         name: "fact",
         plural: "facts",
-        addable: true,
+        add_via_set: true,
         required_add_fields: &["subject", "relation", "object"],
         queryable_fields: &["subject", "relation", "object", "confidence"],
         toon_columns: &["subject", "content", "confidence"],
@@ -59,7 +75,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x02,
         name: "event",
         plural: "events",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &["content"],
         queryable_fields: &[
             "role",
@@ -69,6 +85,10 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
             "content",
             "created_at",
             "stop_reason",
+            // OMS §8.2 `run_id` — serialized since 1.0 but absent from this list,
+            // so it was write-only: unfilterable and undiscoverable via DESCRIBE.
+            // It is the only run-scoped correlation key in the grain model.
+            "run_id",
         ],
         toon_columns: &["role", "time", "content"],
     },
@@ -77,9 +97,12 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x03,
         name: "state",
         plural: "states",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &[],
-        queryable_fields: &["context", "plan", "checkpoint_data"],
+        // OMS §8.3: `context` (required) + `plan`/`history` (optional). There is no
+        // `checkpoint_data` field in the spec or the struct — it was advertised here
+        // but had no serializer, deserializer, or storage.
+        queryable_fields: &["context", "plan", "history"],
         toon_columns: &["context", "content"],
     },
     GrainTypeMeta {
@@ -87,7 +110,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x04,
         name: "workflow",
         plural: "workflows",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &["nodes"],
         queryable_fields: &[
             "trigger", "node", "binding", "nodes", "edges", "bindings", "name", "retries",
@@ -99,7 +122,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x05,
         name: "tool",
         plural: "tools",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &["tool_name"],
         queryable_fields: &[
             "tool_name",
@@ -117,7 +140,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x06,
         name: "observation",
         plural: "observations",
-        addable: true,
+        add_via_set: true,
         required_add_fields: &["observer_id", "observer_type"],
         queryable_fields: &["observer_id", "observer_type", "sensor", "value", "unit"],
         toon_columns: &["observer", "content"],
@@ -127,7 +150,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x07,
         name: "goal",
         plural: "goals",
-        addable: true,
+        add_via_set: true,
         required_add_fields: &["description"],
         queryable_fields: &[
             "goal_state",
@@ -145,7 +168,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x08,
         name: "reasoning",
         plural: "reasonings",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &[],
         queryable_fields: &["reasoning_type", "premises", "conclusion"],
         toon_columns: &["type", "content"],
@@ -155,7 +178,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x09,
         name: "consensus",
         plural: "consensuses",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &[],
         queryable_fields: &["threshold", "agreement_count", "participating_observers"],
         toon_columns: &["threshold", "count", "content"],
@@ -165,7 +188,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x0A,
         name: "consent",
         plural: "consents",
-        addable: false,
+        add_via_set: false,
         required_add_fields: &["subject_did"],
         queryable_fields: &[
             "consent_action",
@@ -184,7 +207,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         byte: 0x0B,
         name: "skill",
         plural: "skills",
-        addable: true,
+        add_via_set: true,
         required_add_fields: &["name", "description"],
         queryable_fields: &[
             "name",
@@ -221,10 +244,11 @@ pub fn from_str(s: &str) -> Option<GrainType> {
     GRAIN_TYPES.iter().find(|m| m.name == s).map(|m| m.ty)
 }
 
-/// Iterator over the canonical singular names of every addable type — the
-/// single source for `VALID_GRAIN_TYPES_ADD` and the ADD allow-set.
-pub fn addable_names() -> impl Iterator<Item = &'static str> {
-    GRAIN_TYPES.iter().filter(|m| m.addable).map(|m| m.name)
+/// Canonical singular names of every type buildable from generic `ADD … SET`.
+/// The single source for the CAL ADD allow-set. Not an allow-list of what may
+/// be *written* — see [`GrainTypeMeta::add_via_set`].
+pub fn add_via_set_names() -> impl Iterator<Item = &'static str> {
+    GRAIN_TYPES.iter().filter(|m| m.add_via_set).map(|m| m.name)
 }
 
 #[cfg(test)]
@@ -283,16 +307,16 @@ mod tests {
         assert_eq!(s.byte, 0x0B);
         assert_eq!(s.name, "skill");
         assert_eq!(s.plural, "skills");
-        assert!(s.addable);
+        assert!(s.add_via_set);
         assert_eq!(s.required_add_fields, &["name", "description"]);
     }
 
     #[test]
-    fn addable_names_match_addable_rows() {
-        let from_iter: Vec<&str> = addable_names().collect();
+    fn add_via_set_names_match_rows() {
+        let from_iter: Vec<&str> = add_via_set_names().collect();
         let from_filter: Vec<&str> = GRAIN_TYPES
             .iter()
-            .filter(|m| m.addable)
+            .filter(|m| m.add_via_set)
             .map(|m| m.name)
             .collect();
         assert_eq!(from_iter, from_filter);

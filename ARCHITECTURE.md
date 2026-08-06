@@ -171,7 +171,7 @@ canonical name, and the fields are part of the format contract.
 |---|---|---|---|
 | `0x01` | **Fact** | A subject–relation–object triple: durable structured knowledge | `subject`, `relation`, `object`, `confidence` |
 | `0x02` | **Event** | A conversational or system event; the transcript unit | `role`, `session_id`, `content`, `created_at` |
-| `0x03` | **State** | An agent state snapshot / checkpoint | `context`, `plan`, `checkpoint_data` |
+| `0x03` | **State** | An agent state snapshot / checkpoint | `context`, `plan`, `history` |
 | `0x04` | **Workflow** | A DAG of steps bound to tool definitions | `nodes`, `edges`, `bindings`, `trigger` |
 | `0x05` | **Tool** | A tool definition, call, or result across its lifecycle | `tool_name`, `tool_phase`, `input`, `is_error` |
 | `0x06` | **Observation** | A raw observation from a sensor or observer | `observer_id`, `observer_type`, `value`, `unit` |

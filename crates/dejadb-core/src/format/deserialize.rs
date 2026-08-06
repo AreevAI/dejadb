@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rmpv::Value;
 
 use crate::error::{DejaDbError, Hash, Result};
-use crate::format::field_map::{expand_context_field, expand_field};
+use crate::format::field_map::{expand_context_field, expand_field, expand_workflow_edge_field};
 use crate::format::header::MgHeader;
 #[allow(clippy::wildcard_imports)]
 use crate::types::*;
@@ -359,6 +359,11 @@ enum KeyMode {
     ContextTop,
     /// A user-controlled / already-verbatim nested map — never rewrite keys.
     Verbatim,
+    /// The `edges` array of a Workflow grain. Its elements are OMS-defined edge
+    /// maps (§8.4), the one nested structure that carries a compacted key.
+    WorkflowEdgeArray,
+    /// One element of that array.
+    WorkflowEdgeMap,
 }
 
 /// Convert a msgpack Value to JSON, expanding field names ONLY where the
@@ -400,8 +405,14 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
         Value::Binary(b) => Ok(serde_json::Value::String(hex::encode(b))),
         Value::Array(arr) => {
             // Array elements are values, not OMS field names — verbatim keys.
+            // The sole exception is a Workflow `edges` array, whose elements are
+            // spec-defined maps carrying the compacted `mxc` key.
+            let child = match mode {
+                KeyMode::WorkflowEdgeArray => KeyMode::WorkflowEdgeMap,
+                _ => KeyMode::Verbatim,
+            };
             let items: Result<Vec<serde_json::Value>> =
-                arr.iter().map(|x| msgpack_to_json(x, KeyMode::Verbatim)).collect();
+                arr.iter().map(|x| msgpack_to_json(x, child)).collect();
             Ok(serde_json::Value::Array(items?))
         }
         Value::Map(pairs) => {
@@ -416,15 +427,22 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
                         let expanded = expand_field(raw).to_string();
                         // Only the `context` field's immediate keys carry the
                         // restricted int:* reversal; everything else is verbatim.
-                        let child = if expanded == "context" {
-                            KeyMode::ContextTop
-                        } else {
-                            KeyMode::Verbatim
+                        let child = match expanded.as_str() {
+                            "context" => KeyMode::ContextTop,
+                            "edges" => KeyMode::WorkflowEdgeArray,
+                            _ => KeyMode::Verbatim,
                         };
                         (expanded, child)
                     }
                     KeyMode::ContextTop => (expand_context_field(raw).to_string(), KeyMode::Verbatim),
-                    KeyMode::Verbatim => (raw.to_string(), KeyMode::Verbatim),
+                    KeyMode::WorkflowEdgeMap => {
+                        (expand_workflow_edge_field(raw).to_string(), KeyMode::Verbatim)
+                    }
+                    // An `edges` value that is a map rather than an array is not
+                    // spec-shaped; treat its keys as data.
+                    KeyMode::WorkflowEdgeArray | KeyMode::Verbatim => {
+                        (raw.to_string(), KeyMode::Verbatim)
+                    }
                 };
                 map.insert(key, msgpack_to_json(v, child)?);
             }
@@ -1041,6 +1059,129 @@ impl DeserializedGrain {
         }
 
         Ok(s)
+    }
+
+    /// Fill the common fields every typed reconstructor restores.
+    fn fill_common_scalars(&self, common: &mut GrainCommon) {
+        if let Some(c) = self.get_f64("confidence") {
+            common.confidence = c;
+        }
+        if let Some(ns) = self.get_str("namespace") {
+            common.namespace = Some(ns.to_string());
+        }
+        if let Some(uid) = self.get_str("user_id") {
+            common.user_id = Some(uid.to_string());
+        }
+        if let Some(st) = self.get_str("source_type") {
+            common.source_type = Some(st.to_string());
+        }
+        if let Some(ca) = self.get_i64("created_at") {
+            common.created_at = Some(ca);
+        }
+        if let Some(adid) = self.get_str("author_did") {
+            common.author_did = Some(adid.to_string());
+        }
+        if let Some(odid) = self.get_str("origin_did") {
+            common.origin_did = Some(odid.to_string());
+        }
+        if let Some(df) = self.get_str("derived_from") {
+            common.derived_from = Some(df.to_string());
+        }
+        if let Some(et) = self.get_str("embedding_text") {
+            common.embedding_text = Some(et.to_string());
+        }
+    }
+
+    /// Reconstruct a [`State`] (OMS §8.3).
+    ///
+    /// `context` is the snapshot; its inner keys were never compacted, so they
+    /// come back verbatim. Note this does NOT restore `common.context` — for a
+    /// State the two share the wire key `ctx` and the snapshot owns it.
+    pub fn to_state(&self) -> Result<State> {
+        if self.grain_type != GrainType::State {
+            return Err(DejaDbError::Validation("not a State grain".into()));
+        }
+        let context = self
+            .fields
+            .get("context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let mut st = State::new(context);
+
+        if let Some(arr) = self.fields.get("plan").and_then(|v| v.as_array()) {
+            st.plan = Some(
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        if let Some(arr) = self.fields.get("history").and_then(|v| v.as_array()) {
+            st.history = Some(arr.clone());
+        }
+
+        self.fill_common_scalars(&mut st.common);
+        Ok(st)
+    }
+
+    /// Reconstruct a [`Workflow`] (OMS §8.4) with its full topology — nodes,
+    /// edges (including conditions and cycle bounds), tool bindings and retries.
+    ///
+    /// Node order is load-bearing: the first element is the graph's entry point.
+    pub fn to_workflow(&self) -> Result<Workflow> {
+        if self.grain_type != GrainType::Workflow {
+            return Err(DejaDbError::Validation("not a Workflow grain".into()));
+        }
+        let nodes: Vec<String> = self
+            .fields
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut wf = Workflow::new(nodes);
+
+        if let Some(t) = self.get_str("trigger") {
+            wf.trigger = Some(t.to_string());
+        }
+        if let Some(arr) = self.fields.get("edges").and_then(|v| v.as_array()) {
+            for e in arr {
+                let (Some(src), Some(dst)) = (
+                    e.get("src").and_then(|v| v.as_str()),
+                    e.get("dst").and_then(|v| v.as_str()),
+                ) else {
+                    continue; // forward-compatible: skip malformed edges, never fail
+                };
+                wf.edges.push(WorkflowEdge {
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                    cond: e
+                        .get("cond")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    max_cycles: e.get("max_cycles").and_then(|v| v.as_u64()).map(|v| v as u32),
+                });
+            }
+        }
+        if let Some(obj) = self.fields.get("bindings").and_then(|v| v.as_object()) {
+            for (node, hash) in obj {
+                if let Some(h) = hash.as_str() {
+                    wf.bindings.insert(node.clone(), h.to_string());
+                }
+            }
+        }
+        if let Some(obj) = self.fields.get("retries").and_then(|v| v.as_object()) {
+            for (node, max) in obj {
+                if let Some(m) = max.as_u64() {
+                    wf.retries.insert(node.clone(), m as u32);
+                }
+            }
+        }
+
+        self.fill_common_scalars(&mut wf.common);
+        Ok(wf)
     }
 }
 

@@ -46,7 +46,7 @@ and breaks OMS §21 conformance. Treat as frozen unless the spec moves:
 - `format/tool_schema/` — render Tool-definition grains to 9 provider formats.
 - `types/grain.rs` — `Grain` trait, `GrainCommon`, `GrainType`, `GrainData`.
 - `types/registry.rs` — `GRAIN_TYPES` table: **source of truth** for
-  byte/name/plural/addable/queryable per type.
+  byte/name/plural/add_via_set/queryable per type.
 - `types/<type>.rs` — the 11 grain structs: Fact 0x01, Event 0x02, State 0x03,
   Workflow 0x04, Tool 0x05, Observation 0x06, Goal 0x07, Reasoning 0x08,
   Consensus 0x09, Consent 0x0A, Skill 0x0B.

@@ -365,6 +365,21 @@ pub fn compact_workflow_edge_field(name: &str) -> &str {
     WORKFLOW_EDGE_FIELD_MAP.get(name).copied().unwrap_or(name)
 }
 
+/// Expand a compacted workflow-edge key (`mxc` → `max_cycles`).
+///
+/// Restricted to the edge table on purpose: an edge map is OMS-defined, not
+/// user-controlled, but running the general [`expand_field`] over it would still
+/// rewrite `src`/`dst`/`cond` if they ever collided with a short code. Without
+/// this, `max_cycles` came back off the wire as the raw `mxc`, so every reader
+/// (renderers, `to_workflow`, the JSON builder) looked for a key that was never
+/// there and cycle bounds silently vanished on read.
+pub fn expand_workflow_edge_field(short: &str) -> &str {
+    match short {
+        "mxc" => "max_cycles",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -790,18 +790,21 @@ impl CalExecutor {
                         span: add.span,
                     });
                 }
-                // Reject grain types that cannot be created via ADD. The
-                // addable set is sourced from the grain-type registry (D1) so
-                // there is no separate list to keep in sync.
+                // Reject grain types that cannot be built from flat `SET k = v`
+                // pairs. Sourced from the grain-type registry (D1) so there is
+                // no separate list to keep in sync. This is a shape check, not a
+                // permission check — the structured write paths (ADD WORKFLOW,
+                // the per-type JSON builders behind `cal_add`, `capture()`) are
+                // deliberately not gated by it.
                 let add_type = add.grain_type.as_str();
-                if !dejadb_core::types::registry::addable_names().any(|n| n == add_type) {
-                    let addable: Vec<&str> = dejadb_core::types::registry::addable_names().collect();
+                if !dejadb_core::types::registry::add_via_set_names().any(|n| n == add_type) {
+                    let shapeable: Vec<&str> = dejadb_core::types::registry::add_via_set_names().collect();
                     return Ok(CalResultPayload::Unsupported {
                         statement: "add".into(),
                         message: format!(
                             "Grain type '{}' cannot be created via ADD. Addable types: {}.",
                             add_type,
-                            addable.join(", ")
+                            shapeable.join(", ")
                         ),
                     });
                 }
@@ -954,12 +957,21 @@ impl CalExecutor {
                 // retries: `* N` on an edge means "retry the target node
                 // up to N times on failure".  This is stored as a top-level
                 // `retries` map keyed by the destination node name.
+                // Several edges may share a destination (a join, or a diamond), and
+                // each may carry its own `* N`. The map is keyed by node, so a plain
+                // insert lets the last edge win and the other bounds vanish — take
+                // the largest instead, the only merge that never retries a node
+                // fewer times than some edge asked for.
                 let mut retries_map = serde_json::Map::new();
                 for e in &wf.edges {
                     if let Some(r) = e.repeat {
+                        let merged = retries_map
+                            .get(&e.dst)
+                            .and_then(|v| v.as_u64())
+                            .map_or(r, |prev| (prev as u32).max(r));
                         retries_map.insert(
                             e.dst.clone(),
-                            serde_json::Value::Number(serde_json::Number::from(r)),
+                            serde_json::Value::Number(serde_json::Number::from(merged)),
                         );
                     }
                 }
@@ -1037,12 +1049,21 @@ impl CalExecutor {
                     fields.insert("bindings".into(), serde_json::Value::Object(bind_map));
                 }
                 // retries: same semantics as AddWorkflow.
+                // Several edges may share a destination (a join, or a diamond), and
+                // each may carry its own `* N`. The map is keyed by node, so a plain
+                // insert lets the last edge win and the other bounds vanish — take
+                // the largest instead, the only merge that never retries a node
+                // fewer times than some edge asked for.
                 let mut retries_map = serde_json::Map::new();
                 for e in &wf.edges {
                     if let Some(r) = e.repeat {
+                        let merged = retries_map
+                            .get(&e.dst)
+                            .and_then(|v| v.as_u64())
+                            .map_or(r, |prev| (prev as u32).max(r));
                         retries_map.insert(
                             e.dst.clone(),
-                            serde_json::Value::Number(serde_json::Number::from(r)),
+                            serde_json::Value::Number(serde_json::Number::from(merged)),
                         );
                     }
                 }
@@ -2707,6 +2728,7 @@ impl CalExecutor {
                     }
                     GrainTypePlural::Events => &[
                         "session_id",
+                        "run_id",
                         "content",
                         "created_at",
                         "role",
@@ -2714,7 +2736,9 @@ impl CalExecutor {
                         "model_id",
                         "stop_reason",
                     ],
-                    GrainTypePlural::States => &["session_id", "checkpoint_data"],
+                    // OMS §8.3. `checkpoint_data` never existed as a field, and
+                    // `session_id` is Event-only.
+                    GrainTypePlural::States => &["context", "plan", "history"],
                     GrainTypePlural::Workflows => &[
                         "name",
                         "nodes",
@@ -6757,11 +6781,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 14b: ADD with non-addable grain type returns Unsupported.
+    // Test 14b: generic ADD ... SET with a type that cannot be shaped that
+    // way returns Unsupported (see GrainTypeMeta::add_via_set).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_execute_add_non_addable_grain_type() {
+    fn test_execute_generic_add_rejects_unshapeable_type() {
         let store = MockStore::empty();
         let ex = exec();
         let result = ex
@@ -8824,11 +8849,14 @@ mod tests {
     #[test]
     fn test_type_specific_fields_states() {
         let fields = super::type_specific_fields(&GrainTypePlural::States);
-        // Per spec §6.3: context, plan; DejaDB keeps `checkpoint_data` as
-        // an extension. `session_id` is Event-only and no longer leaks here.
+        // Per spec §8.3/§6.3: context (required), plan + history (optional).
+        // `checkpoint_data` was advertised here as "a DejaDB extension" but had
+        // no struct field, serializer, or deserializer — it was never storable.
+        // `session_id` is Event-only and no longer leaks here.
         assert!(fields.contains(&"context"));
         assert!(fields.contains(&"plan"));
-        assert!(fields.contains(&"checkpoint_data"));
+        assert!(fields.contains(&"history"));
+        assert!(!fields.contains(&"checkpoint_data"));
         assert!(!fields.contains(&"session_id"));
     }
 

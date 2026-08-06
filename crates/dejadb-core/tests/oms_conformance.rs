@@ -455,5 +455,174 @@ fn test_blob_too_short() {
     assert!(result.is_err());
 }
 
+/// Fixed epoch ms — no wall clock, so blobs stay deterministic.
+const FIXED_AT: i64 = 1_768_471_200_000;
+
+/// OMS §8.3 gives State a required `context` map; §6.1 gives every grain a
+/// common `context` field. Both compact to the same wire key `ctx`, and
+/// `add_common_fields` runs after `add_type_specific_fields` into one BTreeMap —
+/// so an unconditional insert replaced the entire State snapshot with the common
+/// metadata map. Type-specific fields must win.
+#[test]
+fn state_context_is_not_clobbered_by_common_context() {
+    let mut st = State::new(serde_json::json!({
+        "label": "planning_phase",
+        "active_node": "build",
+        "step": 3
+    }));
+    st.common.context = Some(serde_json::json!({ "source": "unit-test" }));
+    st.common.created_at = Some(FIXED_AT);
+
+    let (blob, _hash) = serialize_grain(&st).unwrap();
+    let back = deserialize_blob(&blob).unwrap();
+    let ctx = back
+        .fields
+        .get("context")
+        .expect("State snapshot must be present under `context`");
+
+    assert_eq!(ctx["label"], "planning_phase");
+    assert_eq!(ctx["active_node"], "build");
+    assert_eq!(ctx["step"], 3);
+    assert!(
+        ctx.get("source").is_none(),
+        "common.context leaked into the State snapshot: {ctx}"
+    );
+}
+
+/// Until now there was no `to_workflow()`: nothing in the codebase could hand
+/// back a Workflow with its edges, bindings and retries populated, so every
+/// reader hand-parsed raw JSON. Node order is load-bearing (entry point).
+#[test]
+fn to_workflow_restores_the_full_topology() {
+    let mut wf = Workflow::new(vec!["build".into(), "test".into(), "deploy".into()])
+        .trigger("merge to main")
+        .edge("build", "test")
+        .cond_edge("test", "deploy", "tests green")
+        .bind("test", "sha256:abc")
+        .retry("test", 3);
+    wf.edges.push(WorkflowEdge {
+        src: "deploy".into(),
+        dst: "build".into(),
+        cond: None,
+        max_cycles: Some(2),
+    });
+    wf.common.created_at = Some(FIXED_AT);
+    wf.common.namespace = Some("conformance".into());
+
+    let (blob, _hash) = serialize_grain(&wf).unwrap();
+    let back = deserialize_blob(&blob).unwrap().to_workflow().unwrap();
+
+    assert_eq!(back.nodes, vec!["build", "test", "deploy"]);
+    assert_eq!(back.trigger.as_deref(), Some("merge to main"));
+    assert_eq!(back.edges.len(), 3);
+    assert_eq!(back.edges[0].src, "build");
+    assert_eq!(back.edges[1].cond.as_deref(), Some("tests green"));
+    assert_eq!(back.edges[2].max_cycles, Some(2), "back-edge bound must survive");
+    assert_eq!(back.bindings.get("test").map(String::as_str), Some("sha256:abc"));
+    assert_eq!(back.retries.get("test"), Some(&3));
+    assert_eq!(back.common.namespace.as_deref(), Some("conformance"));
+
+    // Wrong type must be refused, not silently coerced.
+    let (fblob, _) = serialize_grain(&Fact::new("a", "b", "c")).unwrap();
+    assert!(deserialize_blob(&fblob).unwrap().to_workflow().is_err());
+}
+
+/// `to_state()` likewise did not exist.
+#[test]
+fn to_state_restores_snapshot_plan_and_history() {
+    let st = State::new(serde_json::json!({ "label": "mid-run", "cursor": 7 }))
+        .plan(vec!["fetch".into(), "load".into()])
+        .history(vec![serde_json::json!({ "node": "fetch", "ok": true })])
+        .created_at(FIXED_AT)
+        .namespace("conformance");
+
+    let (blob, _hash) = serialize_grain(&st).unwrap();
+    let back = deserialize_blob(&blob).unwrap().to_state().unwrap();
+
+    assert_eq!(back.context_data["label"], "mid-run");
+    assert_eq!(back.context_data["cursor"], 7);
+    assert_eq!(
+        back.plan.as_deref(),
+        Some(["fetch".to_string(), "load".to_string()].as_slice())
+    );
+    assert_eq!(back.history.as_ref().unwrap()[0]["node"], "fetch");
+    assert_eq!(back.common.namespace.as_deref(), Some("conformance"));
+
+    let (fblob, _) = serialize_grain(&Fact::new("a", "b", "c")).unwrap();
+    assert!(deserialize_blob(&fblob).unwrap().to_state().is_err());
+}
+
+/// OMS §8.3 optional fields. They had no struct field at all, so any caller that
+/// wanted a plan or a history had nowhere to put it.
+#[test]
+fn state_plan_and_history_round_trip() {
+    let st = State::new(serde_json::json!({ "label": "mid-run" }))
+        .plan(vec!["fetch".into(), "transform".into(), "load".into()])
+        .history(vec![serde_json::json!({ "node": "fetch", "ok": true })])
+        .created_at(FIXED_AT)
+        .namespace("conformance");
+
+    let (blob, _hash) = serialize_grain(&st).unwrap();
+    let back = deserialize_blob(&blob).unwrap();
+
+    assert_eq!(
+        back.fields["plan"],
+        serde_json::json!(["fetch", "transform", "load"])
+    );
+    assert_eq!(back.fields["history"][0]["node"], "fetch");
+
+    // Omit-when-default: a State without them must not emit the keys at all.
+    let bare = State::new(serde_json::json!({ "label": "x" })).created_at(FIXED_AT);
+    let (bare_blob, _) = serialize_grain(&bare).unwrap();
+    let bare_back = deserialize_blob(&bare_blob).unwrap();
+    assert!(!bare_back.fields.contains_key("plan"));
+    assert!(!bare_back.fields.contains_key("history"));
+}
+
+/// These six Goal fields had struct fields and compact keys in `field_map.rs`
+/// but no arm in `add_type_specific_fields`, so every write silently dropped
+/// them — the data never reached the blob.
+#[test]
+fn goal_optional_fields_reach_the_blob() {
+    let mut goal = Goal::new("ship the release");
+    goal.criteria_structured = Some(serde_json::json!([{ "check": "tests green" }]));
+    goal.expiry_policy = Some(serde_json::json!("on_deadline"));
+    goal.recurrence = Some(serde_json::json!("weekly"));
+    goal.evidence_required = Some(true);
+    goal.rollback_on_failure = Some(true);
+    goal.allowed_transitions = Some(vec!["active".into(), "satisfied".into()]);
+    goal.common.created_at = Some(FIXED_AT);
+
+    let (blob, _hash) = serialize_grain(&goal).unwrap();
+    let back = deserialize_blob(&blob).unwrap();
+
+    assert_eq!(back.fields["criteria_structured"][0]["check"], "tests green");
+    assert_eq!(back.fields["expiry_policy"], "on_deadline");
+    assert_eq!(back.fields["recurrence"], "weekly");
+    assert_eq!(back.fields["evidence_required"], true);
+    assert_eq!(back.fields["rollback_on_failure"], true);
+    assert_eq!(
+        back.fields["allowed_transitions"],
+        serde_json::json!(["active", "satisfied"])
+    );
+
+    // Unset stays unset — that is what keeps existing Goal blobs byte-identical.
+    let bare = Goal::new("ship the release");
+    let mut bare = bare;
+    bare.common.created_at = Some(FIXED_AT);
+    let (bare_blob, _) = serialize_grain(&bare).unwrap();
+    let bare_back = deserialize_blob(&bare_blob).unwrap();
+    for k in [
+        "criteria_structured",
+        "expiry_policy",
+        "recurrence",
+        "evidence_required",
+        "rollback_on_failure",
+        "allowed_transitions",
+    ] {
+        assert!(!bare_back.fields.contains_key(k), "{k} must be omitted");
+    }
+}
+
 // --- Grain Builder Pattern ---
 

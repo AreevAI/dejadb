@@ -44,6 +44,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`to_state()` and `to_workflow()` typed reconstructors.** There was no way to
+  get a `State` or a `Workflow` struct back out of a blob — the only typed
+  reconstruction was `to_fact`/`to_event`/`to_tool`/`to_skill`, so every reader
+  of a workflow hand-parsed raw JSON. `to_workflow()` restores the full topology
+  (nodes in order, edges with conditions and cycle bounds, tool bindings,
+  retries); `to_state()` restores the snapshot plus `plan`/`history`.
+
+- **State grain: `plan` and `history` (OMS §8.3).** The struct previously had
+  only `context`, so a caller with an ordered plan or a prior-state list had
+  nowhere to put it.
+
 - **`remember()` can extract facts with an LLM.** `remember` always took free
   text, but distilling it into Facts was a Rust-only closure seam — the CLI and
   both bindings could pass *pre-extracted* facts and nothing else (the CLI said
@@ -81,6 +92,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FactDraft::from_json_array`. `remember()`'s signature is unchanged.
 
 ### Fixed
+
+- **`GrainTypeMeta::addable` renamed to `add_via_set`, and its doc corrected.**
+  The field claimed to gate "creation via `ADD` / the `add` HTTP+SDK path", but
+  the HTTP/SDK path never consulted it — so it read like a permission boundary
+  that leaked. It is not a permission at all: it records whether a type can be
+  built from a flat list of `SET k = v` pairs, and it has exactly one consumer,
+  the `CalStatement::Add` arm. Types marked `false` are created through
+  purpose-built paths that validate structure themselves — a dedicated CAL
+  statement (`ADD workflow … build -> test`), the per-type JSON builders behind
+  `cal_add`, or a host API such as `capture()`. Those are deliberately not
+  gated; gating them would break `remember()`, the memory-tool adapter, the
+  `migrate` importers, and State checkpointing. Values are unchanged; a test now
+  pins the invariant in both directions. Access control remains scopes and
+  `allow_destructive_ops`.
+
+- **The State (`0x03`) and Workflow (`0x04`) grains now actually work.** Both
+  types were writable from CAL, MCP and both bindings, but no test crossed the
+  parser boundary — every workflow test asserted on the AST and stopped. That
+  gap hid a family of read/write asymmetries:
+
+  - A State's snapshot was **destroyed on write**. OMS §8.3 gives State a
+    required `context` map; §6.1 gives every grain a common `context`. Both
+    compact to the wire key `ctx`, and common fields were serialized *after*
+    type-specific ones with an unconditional insert — so the common metadata map
+    replaced the entire snapshot. Type-specific fields now win on collision.
+  - `add("state", {"context_data": …})` was accepted and silently stored an
+    **empty** snapshot: `context_data` was listed as a known field but the
+    builder only ever read `data`. `context` (the spec name) is now primary,
+    with `data`/`context_data` as aliases.
+  - State never rendered its payload. Five sites across `render.rs` and
+    `assembly.rs` read `fields["context_data"]` — the *Rust field name*, which
+    never appears in a deserialized grain — so `state_label()` always fell
+    through to the literal `"state"`.
+  - `plan` and `history` (OMS §8.3) had **no struct field at all**, and the
+    registry advertised a `checkpoint_data` field that existed nowhere: no
+    struct field, no serializer, no deserializer. It was never storable.
+  - Workflow `name` was routed into `common.context`, where `field_str` — which
+    only reads top-level fields — could not see it, so every shipped `{{name}}`
+    template rendered blank. The graph (`nodes`/`edges`/`bindings`/`retries`)
+    was also written **twice**: typed at top level and verbatim inside `ctx`.
+  - An edge's `max_cycles` came back off the wire as the raw compacted key
+    `mxc`, so every reader looked for a key that was never there and **cycle
+    bounds silently vanished on read**.
+  - Renderers emitted only `trigger (N nodes, M edges)` — an agent that
+    recalled a workflow got its size and never its shape. They now render the
+    topology (`build -> test [when …]`), eliding past 12 edges.
+
+- **Six Goal fields were silently dropped on every write.**
+  `criteria_structured`, `expiry_policy`, `recurrence`, `evidence_required`,
+  `rollback_on_failure` and `allowed_transitions` had struct fields *and*
+  compact keys in `field_map.rs`, but no arm in `add_type_specific_fields`, so
+  the data never reached the blob. All are optional, so unset stays unset and
+  existing Goal blobs remain byte-identical.
+
+- **`Event.run_id` is queryable.** It has been serialized since 1.0 but was
+  absent from the registry's `queryable_fields`, making it write-only —
+  storable, and impossible to ask for back. `RECALL events WHERE run_id = …`
+  now works, and the JSON write path sets the typed field (wire key `rid`)
+  instead of leaking it into both `extra_fields` and `context`. Note this is a
+  post-filter over a bounded scan, not an index.
 
 - **`remember` no longer stores empty-field Facts from malformed input.** The
   `--facts` / `facts_json` parse, duplicated across the CLI and both bindings,

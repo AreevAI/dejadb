@@ -653,9 +653,17 @@ impl GrainRenderer for StateRenderer {
                     "type": "state",
                     "label": label,
                 });
-                // Include context_data if present
-                if let Some(ctx) = grain.fields.get("context_data") {
-                    obj["context_data"] = ctx.clone();
+                // Include the state snapshot if present. The wire key is `ctx`,
+                // which expands to `context` (OMS §8.3) — not `context_data`.
+                if let Some(ctx) = grain.fields.get("context") {
+                    obj["context"] = ctx.clone();
+                }
+                // OMS §8.3 optional fields — a checkpoint whose plan is invisible
+                // is a checkpoint the model cannot resume from.
+                for key in ["plan", "history"] {
+                    if let Some(v) = grain.fields.get(key) {
+                        obj[key] = v.clone();
+                    }
                 }
                 if let Some(ref m) = meta {
                     add_json_metadata(&mut obj, m, policy.metadata);
@@ -664,7 +672,7 @@ impl GrainRenderer for StateRenderer {
             }
             OutputFormat::Toon => {
                 // CAL spec Section 10.9.3: CSV row — context, content
-                let content_summary = if let Some(ctx) = grain.fields.get("context_data") {
+                let content_summary = if let Some(ctx) = grain.fields.get("context") {
                     if let Some(obj) = ctx.as_object() {
                         let summary: Vec<String> = obj
                             .iter()
@@ -706,8 +714,9 @@ impl GrainRenderer for StateRenderer {
 }
 
 fn state_label(grain: &DeserializedGrain) -> String {
-    // Search context_data for label/description/title/name
-    if let Some(ctx) = grain.fields.get("context_data") {
+    // Search the state snapshot for label/description/title/name. The wire key is
+    // `ctx`, which expands to `context` (OMS §8.3) — not `context_data`.
+    if let Some(ctx) = grain.fields.get("context") {
         for key in &["label", "description", "title", "name"] {
             if let Some(s) = ctx.get(key).and_then(|v| v.as_str()) {
                 if !s.is_empty() {
@@ -729,12 +738,79 @@ fn state_label(grain: &DeserializedGrain) -> String {
 
 struct WorkflowRenderer;
 
+/// How many edges a full workflow render will spell out before eliding. A plan
+/// the model cannot see is a plan it cannot follow, but an unbounded graph would
+/// swallow the whole context budget.
+const WORKFLOW_EDGE_RENDER_CAP: usize = 12;
+
+/// Render a workflow's topology as `src -> dst` steps, carrying edge conditions
+/// and cycle bounds. Renderers used to emit only `(N nodes, M edges)`, so an
+/// agent that recalled a workflow got its size and never its shape.
+fn workflow_topology(grain: &DeserializedGrain) -> String {
+    let Some(edges) = grain.fields.get("edges").and_then(|v| v.as_array()) else {
+        // No edges: the nodes are unconnected steps (OMS §8.4).
+        return grain
+            .fields
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for e in edges.iter().take(WORKFLOW_EDGE_RENDER_CAP) {
+        let (Some(src), Some(dst)) = (
+            e.get("src").and_then(|v| v.as_str()),
+            e.get("dst").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let mut step = format!("{src} -> {dst}");
+        if let Some(cond) = e.get("cond").and_then(|v| v.as_str()) {
+            step.push_str(&format!(" [when {cond}]"));
+        }
+        if let Some(mc) = e.get("max_cycles").and_then(|v| v.as_u64()) {
+            step.push_str(&format!(" [max {mc}x]"));
+        }
+        parts.push(step);
+    }
+    let elided = edges.len().saturating_sub(WORKFLOW_EDGE_RENDER_CAP);
+    if elided > 0 {
+        parts.push(format!("… +{elided} more"));
+    }
+    parts.join("; ")
+}
+
+/// `node=tool-hash` pairs, so a bound step shows what it will actually run.
+fn workflow_bindings(grain: &DeserializedGrain) -> Option<String> {
+    let obj = grain.fields.get("bindings")?.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut pairs: Vec<String> = obj
+        .iter()
+        .filter_map(|(node, hash)| hash.as_str().map(|h| format!("{node}={h}")))
+        .collect();
+    pairs.sort(); // deterministic output regardless of map order
+    Some(pairs.join(", "))
+}
+
 impl GrainRenderer for WorkflowRenderer {
     fn grain_type(&self) -> GrainType {
         GrainType::Workflow
     }
 
     fn render(&self, grain: &DeserializedGrain, policy: &FormatPolicy) -> String {
+        // `name` has no OMS §8.4 field — it rides in extra_fields at top level.
+        let label = grain
+            .get_str("name")
+            .or_else(|| grain.get_str("trigger"))
+            .unwrap_or("workflow");
         let trigger = grain.get_str("trigger").unwrap_or("workflow");
         let node_count = grain
             .fields
@@ -748,6 +824,7 @@ impl GrainRenderer for WorkflowRenderer {
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
+        let topology = workflow_topology(grain);
         let meta = extract_metadata(grain, policy.metadata);
 
         match &policy.format {
@@ -756,9 +833,13 @@ impl GrainRenderer for WorkflowRenderer {
                     .as_ref()
                     .map(|m| format_meta_sml_attrs(m, policy.metadata))
                     .unwrap_or_default();
+                let bindings = workflow_bindings(grain)
+                    .map(|b| format!(" bindings=\"{}\"", sml_escape(&b)))
+                    .unwrap_or_default();
                 format!(
-                    "<workflow nodes=\"{node_count}\" edges=\"{edge_count}\"{attrs}>{}</workflow>",
-                    sml_escape(trigger)
+                    "<workflow trigger=\"{}\" nodes=\"{node_count}\" edges=\"{edge_count}\"{bindings}{attrs}>{}</workflow>",
+                    sml_escape(trigger),
+                    sml_escape(&topology)
                 )
             }
             OutputFormat::Markdown => {
@@ -766,22 +847,31 @@ impl GrainRenderer for WorkflowRenderer {
                     .as_ref()
                     .map(|m| format_meta_markdown(m, policy.metadata))
                     .unwrap_or_default();
-                format!("{trigger} ({node_count} nodes, {edge_count} edges){suffix}")
+                format!("**{label}** (on: {trigger}): {topology}{suffix}")
             }
             OutputFormat::PlainText => {
                 let suffix = meta
                     .as_ref()
                     .map(|m| format_meta_plain(m, policy.metadata))
                     .unwrap_or_default();
-                format!("{trigger} ({node_count} nodes, {edge_count} edges){suffix}")
+                format!("{label} (on: {trigger}): {topology}{suffix}")
             }
             OutputFormat::Json => {
+                // Machine consumers get the real structures, not a summary.
                 let mut obj = serde_json::json!({
                     "type": "workflow",
                     "trigger": trigger,
                     "node_count": node_count,
                     "edge_count": edge_count,
                 });
+                if let Some(n) = grain.get_str("name") {
+                    obj["name"] = serde_json::Value::String(n.to_string());
+                }
+                for key in ["nodes", "edges", "bindings", "retries"] {
+                    if let Some(v) = grain.fields.get(key) {
+                        obj[key] = v.clone();
+                    }
+                }
                 if let Some(ref m) = meta {
                     add_json_metadata(&mut obj, m, policy.metadata);
                 }
@@ -789,8 +879,7 @@ impl GrainRenderer for WorkflowRenderer {
             }
             OutputFormat::Toon => {
                 // CAL spec Section 10.9.3: CSV row — trigger, content
-                let content = format!("{node_count} nodes, {edge_count} edges");
-                format!("{},{}", toon_escape(trigger), toon_escape(&content))
+                format!("{},{}", toon_escape(trigger), toon_escape(&topology))
             }
         }
     }
@@ -1772,12 +1861,128 @@ mod tests {
         assert_eq!(result, "did:john grants for analytics");
     }
 
+    /// A workflow fixture: `build -> test -> deploy`, with a condition on the
+    /// last hop and a tool bound to `test`.
+    fn workflow_fixture() -> DeserializedGrain {
+        test_grain(
+            GrainType::Workflow,
+            vec![
+                ("name", serde_json::json!("CI pipeline")),
+                ("trigger", serde_json::json!("merge to main")),
+                ("nodes", serde_json::json!(["build", "test", "deploy"])),
+                (
+                    "edges",
+                    serde_json::json!([
+                        { "src": "build", "dst": "test" },
+                        { "src": "test", "dst": "deploy", "cond": "tests green" },
+                    ]),
+                ),
+                ("bindings", serde_json::json!({ "test": "sha256:abc" })),
+            ],
+        )
+    }
+
+    fn render_with(grain: &DeserializedGrain, fmt: OutputFormat) -> String {
+        let policy = FormatPolicy::new(fmt).metadata(MetadataLevel::None);
+        RendererRegistry::new()
+            .get(grain.grain_type)
+            .unwrap()
+            .render(grain, &policy)
+    }
+
+    #[test]
+    fn workflow_render_shows_topology_not_just_counts() {
+        let g = workflow_fixture();
+
+        let plain = render_with(&g, OutputFormat::PlainText);
+        assert!(
+            plain.contains("build -> test") && plain.contains("test -> deploy"),
+            "topology must be visible, got: {plain}"
+        );
+        assert!(
+            plain.contains("CI pipeline") && plain.contains("merge to main"),
+            "name and trigger must both appear, got: {plain}"
+        );
+        assert!(
+            plain.contains("tests green"),
+            "edge conditions decide the path — they must render: {plain}"
+        );
+    }
+
+    #[test]
+    fn workflow_render_json_carries_the_real_structures() {
+        let out = render_with(&workflow_fixture(), OutputFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["nodes"], serde_json::json!(["build", "test", "deploy"]));
+        assert_eq!(v["edges"][1]["cond"], "tests green");
+        assert_eq!(v["bindings"]["test"], "sha256:abc");
+        assert_eq!(v["name"], "CI pipeline");
+        // Counts stay for consumers that only want the shape's size.
+        assert_eq!(v["node_count"], 3);
+        assert_eq!(v["edge_count"], 2);
+    }
+
+    #[test]
+    fn workflow_render_elides_very_large_graphs() {
+        // Rendering an unbounded graph would swallow the context budget.
+        let edges: Vec<serde_json::Value> = (0..40)
+            .map(|i| serde_json::json!({ "src": format!("n{i}"), "dst": format!("n{}", i + 1) }))
+            .collect();
+        let g = test_grain(
+            GrainType::Workflow,
+            vec![
+                ("trigger", serde_json::json!("big")),
+                ("edges", serde_json::Value::Array(edges)),
+            ],
+        );
+        let plain = render_with(&g, OutputFormat::PlainText);
+        assert!(plain.contains("n0 -> n1"), "got: {plain}");
+        assert!(
+            plain.contains("+28 more"),
+            "must report what it elided, got: {plain}"
+        );
+        assert!(!plain.contains("n39 -> n40"), "cap must hold: {plain}");
+    }
+
+    #[test]
+    fn workflow_render_handles_unconnected_nodes() {
+        // OMS §8.4: "When absent, nodes are unconnected."
+        let g = test_grain(
+            GrainType::Workflow,
+            vec![
+                ("trigger", serde_json::json!("adhoc")),
+                ("nodes", serde_json::json!(["a", "b"])),
+            ],
+        );
+        let plain = render_with(&g, OutputFormat::PlainText);
+        assert!(plain.contains('a') && plain.contains('b'), "got: {plain}");
+    }
+
+    #[test]
+    fn state_render_json_includes_plan_and_history() {
+        let g = test_grain(
+            GrainType::State,
+            vec![
+                ("context", serde_json::json!({ "label": "mid-run" })),
+                ("plan", serde_json::json!(["fetch", "load"])),
+                ("history", serde_json::json!([{ "node": "fetch" }])),
+            ],
+        );
+        let out = render_with(&g, OutputFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["plan"], serde_json::json!(["fetch", "load"]));
+        assert_eq!(v["history"][0]["node"], "fetch");
+    }
+
     #[test]
     fn test_state_label_extraction() {
+        // The key is `context` — what `ctx` expands to on deserialize (OMS §8.3).
+        // This test used to fabricate `context_data`, a key the serializer never
+        // writes, which masked the renderer reading a field that is never present.
         let grain = test_grain(
             GrainType::State,
             vec![(
-                "context_data",
+                "context",
                 serde_json::json!({"label": "planning_phase", "data": {}}),
             )],
         );

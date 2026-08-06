@@ -45,11 +45,14 @@ const COMMON_KNOWN_FIELDS: &[&str] = &[
 fn type_known_fields(grain_type: &str) -> &'static [&'static str] {
     match grain_type {
         "fact" => &["subject", "relation", "object"],
-        "event" => &["content", "subject", "object"],
-        "state" => &["data", "context_data"],
-        "workflow" => &[
-            "name", "nodes", "edges", "bindings", "retries", "trigger", "status",
-        ],
+        "event" => &["content", "subject", "object", "run_id"],
+        "state" => &["data", "context_data", "plan", "history"],
+        // `name`/`status` are deliberately absent: OMS §8.4 has no such Workflow
+        // fields, so they fall through to `extra_fields` and serialize verbatim at
+        // top level, where the templates' `{{name}}`/`{{status}}` can find them.
+        // Listing them here routed both into `common.context`, where `field_str`
+        // (top-level only) never looked.
+        "workflow" => &["nodes", "edges", "bindings", "retries", "trigger"],
         "tool" => &[
             "tool_name",
             "input",
@@ -367,6 +370,22 @@ const ADD_JSON_KNOWN_FIELDS: &[&str] = &[
         "structural_tags",
         "trigger",
         "steps",
+        // Workflow graph fields (OMS §8.4). Without these, `collect_context_extras`
+        // swept them into `common.context` as well, writing the whole graph twice —
+        // once typed at top level, once verbatim inside `ctx`. Deliberately NOT
+        // adding `name`/`status` here: `name` is a Skill field (§6.11) and `status`
+        // is claimed by no builder, so listing them would move them out of `ctx`
+        // for every grain type and change those types' content addresses.
+        "nodes",
+        "edges",
+        "bindings",
+        "retries",
+        // State (OMS §8.3).
+        "plan",
+        "history",
+        // Event (OMS §8.2) — consumed by the typed builder, so it must not also
+        // be swept into `common.context`.
+        "run_id",
         "tool_name",
         "tool_call_id",
         "input",
@@ -517,14 +536,37 @@ pub fn build_grain_from_json<S: GrainSink>(
                 let mut ev = Event::new(&content);
                 if let Some(s) = get_str("subject") { ev = ev.subject(&s); }
                 if let Some(o) = get_str("object") { ev = ev.object(&o); }
+                // OMS §8.2 `run_id` (wire key `rid`). Without this it fell through
+                // to `extra_fields` *and* `common.context`, so it was written twice
+                // and never under its spec key.
+                if let Some(r) = get_str("run_id") { ev = ev.run_id(r); }
                 let mut grain = apply_common!(ev);
                 grain.common_mut().extra_fields = collect_extra_fields(fields, "event");
                 sink.consume(&grain)
             }
             "state" => {
-                let data = fields.get("data").cloned()
+                // `context` is the OMS §8.3 field name; `data`/`context_data` are
+                // accepted aliases. `context_data` was previously listed as a known
+                // field but never read, so `add("state", {"context_data": …})`
+                // silently stored an empty snapshot.
+                let data = fields
+                    .get("context")
+                    .or_else(|| fields.get("data"))
+                    .or_else(|| fields.get("context_data"))
+                    .cloned()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                let mut grain = apply_common!(State::new(data));
+                let mut st = State::new(data);
+                if let Some(plan) = fields.get("plan").and_then(|v| v.as_array()) {
+                    st = st.plan(
+                        plan.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect(),
+                    );
+                }
+                if let Some(history) = fields.get("history").and_then(|v| v.as_array()) {
+                    st = st.history(history.clone());
+                }
+                let mut grain = apply_common!(st);
                 grain.common_mut().extra_fields = collect_extra_fields(fields, "state");
                 sink.consume(&grain)
             }
