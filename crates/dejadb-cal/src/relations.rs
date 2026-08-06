@@ -82,7 +82,9 @@ pub const MG_RELATIONS: &[(&str, RelationCategory)] = &[
     ("mg:handed_off_to", RelationCategory::Interaction),
     // Consensus
     ("mg:agrees_with", RelationCategory::Consensus),
-    // Workflow
+    // Workflow. Note the parameterized `mg:step_action:<node_id>` family
+    // (OMS §8.4) also belongs to this category but cannot be listed here — see
+    // `is_known_relation`.
     ("mg:requires_steps", RelationCategory::Workflow),
     // Lifecycle
     ("mg:intends", RelationCategory::Lifecycle),
@@ -155,7 +157,7 @@ pub fn validate_relation(relation: &str) -> Option<CalWarning> {
     if !relation.starts_with("mg:") {
         return None;
     }
-    let known = MG_RELATIONS.iter().any(|(r, _)| *r == relation);
+    let known = is_known_relation(relation);
     if known {
         None
     } else {
@@ -167,8 +169,14 @@ pub fn validate_relation(relation: &str) -> Option<CalWarning> {
 }
 
 /// Check if a relation string is a known `mg:` relation.
+///
+/// Covers the 24 fixed entries plus the one *parameterized* family the spec
+/// defines: `mg:step_action:<node_id>` (OMS §8.4), the execution-record link
+/// from a Tool grain to the Workflow node it ran. That family cannot live in
+/// the static table — its tail is a node id — so it is matched by prefix.
 pub fn is_known_relation(relation: &str) -> bool {
     MG_RELATIONS.iter().any(|(r, _)| *r == relation)
+        || dejadb_core::types::step_action_node(relation).is_some()
 }
 
 /// Look up the category for a given `mg:` relation.

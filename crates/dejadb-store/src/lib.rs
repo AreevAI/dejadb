@@ -16,6 +16,7 @@ use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::{deserialize_blob, DeserializedGrain};
 use dejadb_core::format::serialize::serialize_grain;
 use dejadb_core::types::Grain;
+use dejadb_core::types::{step_action_node, step_action_relation, STEP_ACTION_PREFIX};
 use turso::{Builder, Connection, Value};
 use zeroize::Zeroize;
 
@@ -811,6 +812,13 @@ struct GrainPrep {
     /// document length in tokens. Empty when text indexing is off or deferred.
     tokens: Vec<(i64, i64)>,
     doc_len: i64,
+    /// Term-encoded `related_to` cross-links: `(subject = this grain's own
+    /// hash, predicate = relation_type, object = target hash)`. Indexed into
+    /// `triples`/`osp` for retrieval but deliberately **not** into
+    /// `heads`/`entity_latest` — OMS §15.3 is normative that a `related_to`
+    /// link is an annotation and MUST NOT change the target's supersession
+    /// state. Empty for the overwhelming majority of grains.
+    links: Vec<(i64, i64, i64)>,
 }
 
 /// Extracted index-relevant fields of a grain about to be stored.
@@ -824,6 +832,8 @@ struct GrainView {
     vt: Option<i64>,
     created_at: i64,
     gtype: u8,
+    /// `(relation_type, target hash)` pairs from `related_to`.
+    links: Vec<(String, String)>,
 }
 
 fn extract_view(view: &DeserializedGrain) -> GrainView {
@@ -837,6 +847,21 @@ fn extract_view(view: &DeserializedGrain) -> GrainView {
         vt: view.get_i64("valid_to"),
         created_at: view.get_i64("created_at").unwrap_or_else(now_ms),
         gtype: view.grain_type as u8,
+        links: view
+            .fields
+            .get("related_to")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| {
+                        Some((
+                            l.get("relation_type")?.as_str()?.to_string(),
+                            l.get("hash")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1741,6 +1766,15 @@ impl DejaDB {
             (Some(e), Some(t)) => Some(e.embed(t)?),
             _ => None,
         };
+        // Cross-grain links are subject-ed on the grain's own hash, so a link
+        // is queryable from either end without inventing a synthetic node.
+        let mut links = Vec::with_capacity(gv.links.len());
+        if !gv.links.is_empty() {
+            let self_id = self.term_id(&hash.to_hex())?;
+            for (rel, target) in &gv.links {
+                links.push((self_id, self.term_id(rel)?, self.term_id(target)?));
+            }
+        }
         Ok(GrainPrep {
             blob,
             hash,
@@ -1758,6 +1792,7 @@ impl DejaDB {
             embedding,
             tokens,
             doc_len,
+            links,
         })
     }
 
@@ -2500,6 +2535,98 @@ impl DejaDB {
     }
 
     // ----- graph ops (bounded, indexed, capped) -----
+
+    /// Execution records for a Workflow grain (OMS §8.4).
+    ///
+    /// Returns `(node_id, executing grain hash)` for every grain carrying a
+    /// `mg:step_action:<node_id>` link to `workflow_hash`, newest first. This is
+    /// how a run is reconstructed against its plan: the Workflow grain is
+    /// immutable and content-addressed, so it never accumulates run state — the
+    /// execution records point back at it instead.
+    ///
+    /// Pass `node_id` to narrow to one step. Results are capped.
+    pub fn step_actions(
+        &mut self,
+        ns: &str,
+        workflow_hash: &Hash,
+        node_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Hash)>> {
+        let Some(ns_id) = self.term_lookup(ns) else {
+            return Ok(Vec::new());
+        };
+        let Some(target_id) = self.term_lookup(&workflow_hash.to_hex()) else {
+            return Ok(Vec::new());
+        };
+        // Which predicates count: one exact relation, or every step_action.
+        let pred_ids: Vec<i64> = match node_id {
+            Some(n) => match self.term_lookup(&step_action_relation(n)) {
+                Some(id) => vec![id],
+                None => return Ok(Vec::new()),
+            },
+            None => self
+                .terms_with_prefix(STEP_ACTION_PREFIX)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+        };
+        if pred_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(1024);
+        let conn = &self.conn;
+        // The OSP index is keyed (ns, o, s) — the link's object is the workflow
+        // hash, so this reads the reverse direction directly.
+        let rows = self.rt.block_on(async {
+            let mut out: Vec<(i64, i64)> = Vec::new();
+            for p in &pred_ids {
+                let mut r = conn
+                    .query(
+                        "SELECT s, p FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1
+                         ORDER BY seq DESC LIMIT ?4",
+                        (pi(ns_id), pi(target_id), pi(*p), pi(limit as i64)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                while let Some(row) = r.next().await.map_err(db_err)? {
+                    let (Some(s), Some(p)) = (
+                        v_i64(&row.get_value(0).map_err(db_err)?),
+                        v_i64(&row.get_value(1).map_err(db_err)?),
+                    ) else {
+                        continue;
+                    };
+                    out.push((s, p));
+                }
+            }
+            Ok::<_, DejaDbError>(out)
+        })?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for (s, p) in rows {
+            let (Some(subj), Some(rel)) = (self.term_str(s), self.term_str(p)) else {
+                continue;
+            };
+            let (Some(node), Ok(h)) = (step_action_node(&rel), Hash::from_hex(&subj)) else {
+                continue;
+            };
+            result.push((node.to_string(), h));
+        }
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    /// Dictionary terms starting with `prefix`, as `(id, term)`.
+    ///
+    /// The relation for an execution record is parameterized by node id, so the
+    /// vocabulary cannot be enumerated statically. Bounded by the number of
+    /// distinct node ids ever written, not by grain count.
+    fn terms_with_prefix(&self, prefix: &str) -> Vec<(i64, String)> {
+        self.dict
+            .iter()
+            .filter(|(term, _)| term.starts_with(prefix))
+            .map(|(term, id)| (*id, term.clone()))
+            .collect()
+    }
 
     /// Bounded k-hop traversal over the given relations.
     /// Returns reached entity terms (excluding the start), BFS order.
@@ -4280,6 +4407,23 @@ impl DejaDB {
                         .map_err(db_err)?;
                     }
                 }
+                // Cross-grain `related_to` links — same treatment as the local
+                // write path: triples + osp for retrieval, never heads or
+                // entity_latest (OMS §15.3).
+                for (ls, lp, lo) in &pr.links {
+                    conn.execute(
+                        "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                        (pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    conn.execute(
+                        "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                        (pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)),
+                    )
+                    .await
+                    .map_err(db_err)?;
+                }
                 if let Some(sess) = pr.session {
                     conn.execute(
                         "INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)",
@@ -4691,6 +4835,22 @@ async fn insert_prepped(
             )
             .await
             .map_err(db_err)?;
+        }
+        // Cross-grain `related_to` links (OMS §6.1), e.g. the §8.4 execution
+        // record `mg:step_action:<node>` pointing a Tool grain at the Workflow
+        // it executed a step of. Indexed into triples + osp so both directions
+        // are traversable — but NOT into heads/entity_latest: §15.3 is
+        // normative that such a link must not alter the target's supersession
+        // state, and heads is exactly that state. osp is unconditional here
+        // because a link's object is always a grain hash, i.e. always an
+        // entity, regardless of the file's `entity_relations` declaration.
+        for (ls, lp, lo) in &pr.links {
+            st_t.execute((pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)))
+                .await
+                .map_err(db_err)?;
+            st_o.execute((pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)))
+                .await
+                .map_err(db_err)?;
         }
         if let Some(sess) = pr.session {
             st_th

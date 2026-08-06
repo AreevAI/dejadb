@@ -317,6 +317,23 @@ pub trait Grain: Send + Sync {
         self
     }
 
+    /// Record that this grain is the execution record for `node_id` of the
+    /// Workflow at `workflow_hash` (OMS §8.4).
+    ///
+    /// Normally called on a Tool grain in `call`/`result` phase. No weight — the
+    /// link is a structural fact, not a similarity score.
+    fn step_action(mut self, workflow_hash: &str, node_id: &str) -> Self
+    where
+        Self: Sized,
+    {
+        self.common_mut().related_to.push(RelatedTo {
+            hash: workflow_hash.to_string(),
+            relation_type: super::workflow::step_action_relation(node_id),
+            weight: None,
+        });
+        self
+    }
+
     fn created_at(mut self, ts: i64) -> Self
     where
         Self: Sized,

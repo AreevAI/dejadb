@@ -365,6 +365,22 @@ pub fn compact_workflow_edge_field(name: &str) -> &str {
     WORKFLOW_EDGE_FIELD_MAP.get(name).copied().unwrap_or(name)
 }
 
+/// Expand a compacted `related_to` entry key (`h`/`rl`/`w`).
+///
+/// Like the workflow-edge table this is a closed, OMS-defined map, so the
+/// reversal is safe — but it must stay scoped: `h`, `rl` and `w` are common
+/// enough short codes that running the general [`expand_field`] over arbitrary
+/// nested data would corrupt it. Without this, a cross-grain link came back as
+/// `{"h":…, "rl":…}` and every reader looking for `relation_type` found nothing.
+pub fn expand_related_to_field(short: &str) -> &str {
+    match short {
+        "h" => "hash",
+        "rl" => "relation_type",
+        "w" => "weight",
+        other => other,
+    }
+}
+
 /// Expand a compacted workflow-edge key (`mxc` → `max_cycles`).
 ///
 /// Restricted to the edge table on purpose: an edge map is OMS-defined, not

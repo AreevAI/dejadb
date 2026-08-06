@@ -489,6 +489,35 @@ fn state_context_is_not_clobbered_by_common_context() {
     );
 }
 
+/// `related_to` serializes its entries with compacted keys (`h`/`rl`/`w`), and
+/// nested maps decode verbatim — so a cross-grain link came back as
+/// `{"h":…,"rl":…}` and every reader looking for `hash`/`relation_type` found
+/// nothing. Same asymmetry class as the workflow edge's `mxc`.
+#[test]
+fn related_to_links_expand_their_nested_keys() {
+    let wf_hash = "a".repeat(64);
+    let tool = Tool::new("cargo test")
+        .created_at(FIXED_AT)
+        .step_action(&wf_hash, "test");
+
+    let (blob, _hash) = serialize_grain(&tool).unwrap();
+    let back = deserialize_blob(&blob).unwrap();
+    let links = back.fields["related_to"].as_array().unwrap();
+
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0]["hash"], wf_hash);
+    assert_eq!(links[0]["relation_type"], "mg:step_action:test");
+    assert!(links[0].get("h").is_none(), "compact key must be expanded");
+    assert!(links[0].get("rl").is_none(), "compact key must be expanded");
+    // No weight: an execution record is a structural fact, not a similarity.
+    assert!(links[0].get("weight").is_none());
+
+    assert_eq!(
+        step_action_node(links[0]["relation_type"].as_str().unwrap()),
+        Some("test")
+    );
+}
+
 /// Until now there was no `to_workflow()`: nothing in the codebase could hand
 /// back a Workflow with its edges, bindings and retries populated, so every
 /// reader hand-parsed raw JSON. Node order is load-bearing (entry point).

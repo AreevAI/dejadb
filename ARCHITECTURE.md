@@ -172,7 +172,7 @@ canonical name, and the fields are part of the format contract.
 | `0x01` | **Fact** | A subject–relation–object triple: durable structured knowledge | `subject`, `relation`, `object`, `confidence` |
 | `0x02` | **Event** | A conversational or system event; the transcript unit | `role`, `session_id`, `content`, `created_at` |
 | `0x03` | **State** | An agent state snapshot / checkpoint | `context`, `plan`, `history` |
-| `0x04` | **Workflow** | A DAG of steps bound to tool definitions | `nodes`, `edges`, `bindings`, `trigger` |
+| `0x04` | **Workflow** | A DAG of steps bound to tool definitions | `nodes`, `edges`, `bindings`, `retries`, `trigger` |
 | `0x05` | **Tool** | A tool definition, call, or result across its lifecycle | `tool_name`, `tool_phase`, `input`, `is_error` |
 | `0x06` | **Observation** | A raw observation from a sensor or observer | `observer_id`, `observer_type`, `value`, `unit` |
 | `0x07` | **Goal** | A goal or task with state and dependencies | `description`, `goal_state`, `deadline`, `depends_on` |
@@ -192,6 +192,16 @@ fields above are what each type adds on top.
 > engine can render stored definitions to nine provider tool-schema formats
 > (OpenAI, Anthropic, Gemini, MCP, and text variants) for tool-RAG, but
 > execution is always the host's job.
+
+> **A plan never accumulates its runs.** A Workflow grain is immutable and
+> content-addressed, so run state cannot be written into it. Execution records
+> point the other way: a Tool grain carries a `related_to` link of type
+> `mg:step_action:<node_id>` targeting the Workflow's hash (OMS §8.4), read back
+> via `step_actions()`. Retries and parallel branches are simply several records
+> against the same node — none supersedes another. Per OMS §15.3 the link is an
+> annotation: it is indexed for retrieval and never alters the plan's
+> supersession state. With `Event.run_id` for correlation and a State grain as
+> the resumable checkpoint, a run is persisted entirely in existing types.
 
 ---
 

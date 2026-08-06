@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use rmpv::Value;
 
 use crate::error::{DejaDbError, Hash, Result};
-use crate::format::field_map::{expand_context_field, expand_field, expand_workflow_edge_field};
+use crate::format::field_map::{
+    expand_context_field, expand_field, expand_related_to_field, expand_workflow_edge_field,
+};
 use crate::format::header::MgHeader;
 #[allow(clippy::wildcard_imports)]
 use crate::types::*;
@@ -360,10 +362,15 @@ enum KeyMode {
     /// A user-controlled / already-verbatim nested map — never rewrite keys.
     Verbatim,
     /// The `edges` array of a Workflow grain. Its elements are OMS-defined edge
-    /// maps (§8.4), the one nested structure that carries a compacted key.
+    /// maps (§8.4), which carry a compacted key.
     WorkflowEdgeArray,
     /// One element of that array.
     WorkflowEdgeMap,
+    /// The `related_to` array (§6.1). Its elements are OMS-defined link maps
+    /// with compacted keys.
+    RelatedToArray,
+    /// One element of that array.
+    RelatedToMap,
 }
 
 /// Convert a msgpack Value to JSON, expanding field names ONLY where the
@@ -409,6 +416,7 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
             // spec-defined maps carrying the compacted `mxc` key.
             let child = match mode {
                 KeyMode::WorkflowEdgeArray => KeyMode::WorkflowEdgeMap,
+                KeyMode::RelatedToArray => KeyMode::RelatedToMap,
                 _ => KeyMode::Verbatim,
             };
             let items: Result<Vec<serde_json::Value>> =
@@ -430,6 +438,7 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
                         let child = match expanded.as_str() {
                             "context" => KeyMode::ContextTop,
                             "edges" => KeyMode::WorkflowEdgeArray,
+                            "related_to" => KeyMode::RelatedToArray,
                             _ => KeyMode::Verbatim,
                         };
                         (expanded, child)
@@ -438,11 +447,14 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
                     KeyMode::WorkflowEdgeMap => {
                         (expand_workflow_edge_field(raw).to_string(), KeyMode::Verbatim)
                     }
-                    // An `edges` value that is a map rather than an array is not
-                    // spec-shaped; treat its keys as data.
-                    KeyMode::WorkflowEdgeArray | KeyMode::Verbatim => {
-                        (raw.to_string(), KeyMode::Verbatim)
+                    KeyMode::RelatedToMap => {
+                        (expand_related_to_field(raw).to_string(), KeyMode::Verbatim)
                     }
+                    // An `edges`/`related_to` value that is a map rather than an
+                    // array is not spec-shaped; treat its keys as data.
+                    KeyMode::WorkflowEdgeArray
+                    | KeyMode::RelatedToArray
+                    | KeyMode::Verbatim => (raw.to_string(), KeyMode::Verbatim),
                 };
                 map.insert(key, msgpack_to_json(v, child)?);
             }

@@ -2,6 +2,35 @@ use std::collections::HashMap;
 
 use super::grain::{Grain, GrainCommon, GrainType};
 
+/// Namespace for the OMS §8.4 execution-record relation.
+///
+/// When an agent executes a workflow node it records a Tool grain carrying a
+/// `related_to` link of type `mg:step_action:<node_id>` whose target is the
+/// Workflow grain's hash. That links the execution record to the plan **without
+/// modifying the immutable Workflow grain** — the plan is content-addressed, so
+/// it cannot accumulate run state; the runs point back at it instead.
+///
+/// Per OMS §15.3 a `related_to` link is an annotation: a conformant store
+/// indexes it for retrieval but MUST NOT let it change the target's
+/// supersession state.
+pub const STEP_ACTION_PREFIX: &str = "mg:step_action:";
+
+/// Build the execution-record relation for a workflow node.
+pub fn step_action_relation(node_id: &str) -> String {
+    format!("{STEP_ACTION_PREFIX}{node_id}")
+}
+
+/// The node id inside a `mg:step_action:<node_id>` relation, if it is one.
+///
+/// Returns `None` for every other relation, including a bare
+/// `"mg:step_action:"` with no node — an execution record has to say which step
+/// it executed.
+pub fn step_action_node(relation: &str) -> Option<&str> {
+    relation
+        .strip_prefix(STEP_ACTION_PREFIX)
+        .filter(|n| !n.is_empty())
+}
+
 /// A directed edge in a workflow graph.
 #[derive(Debug, Clone)]
 pub struct WorkflowEdge {

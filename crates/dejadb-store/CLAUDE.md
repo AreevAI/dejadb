@@ -18,7 +18,19 @@ lazily prepared and cached (`ensure_stmt`).
 - "2½ permutations": `triples` with `idx_spo` + `idx_pos` (mandatory) plus a
   separate `osp` table — the "½" — written **only** when the relation is in
   `DejaDbOptions::entity_relations`. Reverse traversal (`Direction::In/Both`)
-  silently finds nothing for relations outside that set.
+  silently finds nothing for relations outside that set. **Exception**:
+  `related_to` cross-links always get `osp` rows, because a link's object is a
+  grain hash and therefore always an entity.
+- **Cross-grain links**: `GrainCommon.related_to` entries index as triples
+  subject-ed on the linking grain's *own* hash — `(own_hash, relation_type,
+  target_hash)` — so `related()`/`path()` traverse them like any edge. They are
+  written to `triples`/`osp` **only**, never `heads`/`entity_latest`: OMS §15.3
+  is normative that such a link is an annotation and MUST NOT alter the target's
+  supersession state. `step_actions()` reads the OMS §8.4 execution-record
+  family `mg:step_action:<node_id>` (Tool grain → the Workflow node it ran);
+  that relation is parameterized, so its predicates are found by dictionary
+  prefix scan rather than a static vocabulary. Files written before this
+  indexing existed need `deja reindex`.
 - `entity_latest` PK(ns,s,p) — the µs point read. `heads` PK(ns,s,p,seq) —
   fork tips. `oplog(op_seq, hlc, op, hash)` — OP_ADD/OP_SUPERSEDE/OP_FORGET.
   `thread_idx` — session transcripts. `embeddings(seq, vec)`.

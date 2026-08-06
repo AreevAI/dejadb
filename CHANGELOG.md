@@ -44,6 +44,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Workflow execution records — OMS §8.4 `mg:step_action:<node_id>`.** A
+  Workflow grain is immutable and content-addressed, so it can never accumulate
+  run state; the spec's answer is to point the execution records at the plan
+  instead. `grain.step_action(workflow_hash, node_id)` attaches that link to a
+  Tool grain, and `DejaDB::step_actions(ns, workflow_hash, node_id, limit)`
+  reads it back as `(node_id, executing grain)`. Combined with the now-queryable
+  `Event.run_id` and a working State checkpoint, a run can be persisted and
+  reconstructed against its plan without a new grain type.
+
+- **`related_to` cross-links are indexed.** The field has always serialized, but
+  `related_to` appeared nowhere in `dejadb-store` — links were written and
+  unreachable. They now index into `triples`/`osp`, subject-ed on the linking
+  grain's own hash, so the existing `related()` traversal reaches them from
+  either end. They are deliberately **not** written to `heads`/`entity_latest`:
+  OMS §15.3 is normative that a `related_to` link is an annotation and MUST NOT
+  change the target's supersession state. `osp` is unconditional for links
+  (their object is always a grain hash, hence always an entity) regardless of
+  the file's `entity_relations` declaration. **Existing files need `deja
+  reindex` before old links become queryable.**
+
 - **`to_state()` and `to_workflow()` typed reconstructors.** There was no way to
   get a `State` or a `Workflow` struct back out of a blob — the only typed
   reconstruction was `to_fact`/`to_event`/`to_tool`/`to_skill`, so every reader
