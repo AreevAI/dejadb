@@ -92,6 +92,31 @@ fn concurrent_writers_all_land() {
     assert_eq!(m.recall("ns", "b7", Some("writes"), 4).unwrap().len(), 1);
 }
 
+/// Two processes opening a BRAND-NEW memory simultaneously: the schema
+/// bootstrap (DDL + seeding) runs under an advisory lock, so both succeed —
+/// Postgres's IF NOT EXISTS DDL alone is racy and the loser would otherwise
+/// fail open with a spurious 23505.
+#[test]
+fn concurrent_first_open_bootstraps_once() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let schema = b.schema_for("boot");
+    let opener = || {
+        let url = url.clone();
+        let schema = schema.clone();
+        std::thread::spawn(move || {
+            dejadb_store::DejaDB::open_postgres(&url, &schema).map(|mut m| m.count().unwrap())
+        })
+    };
+    let (t1, t2) = (opener(), opener());
+    let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "both concurrent first-openers must succeed: {r1:?} / {r2:?}"
+    );
+    drop(b.open_named("boot")); // register the schema for cleanup
+}
+
 /// Two instances racing to supersede the SAME head: exactly one winner and
 /// one clean SupersessionConflict — the single-writer contract, kept under
 /// concurrency by the in-transaction FOR UPDATE recheck.

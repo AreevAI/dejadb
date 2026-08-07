@@ -97,11 +97,14 @@ impl PgBackend {
         }
     }
 
-    /// The schema `open_named(name)` maps to — for tests that need to reach
-    /// the same storage through a raw `open_postgres` (e.g. the second-writer
-    /// lock test).
+    /// The schema `open_named(name)` maps to — for tests that reach the same
+    /// storage through a raw `open_postgres`. Registers the name for Drop
+    /// cleanup exactly like `open_named`, so direct-open tests can't leak
+    /// schemas.
     pub fn schema_for(&self, name: &str) -> String {
-        format!("{}_{}", self.prefix, name)
+        let schema = format!("{}_{}", self.prefix, name);
+        self.opened.borrow_mut().insert(schema.clone());
+        schema
     }
 }
 

@@ -201,6 +201,14 @@ impl Telemetry {
         for sql in TELEM_SCHEMA {
             db.execute(sql, vec![])?;
         }
+        // Pre-rename sidecars carry the old unprefixed tables. Drop them —
+        // telemetry is disposable, but an ORPHANED copy would silently
+        // escape `scrub`, letting recall evidence outlive a forgotten
+        // grain. (File sidecar only: on the postgres backend the memory's
+        // schema owns tables with these names.)
+        for legacy in ["meta", "recall_log", "grain_access", "query_stat", "budget_stat"] {
+            let _ = db.execute(&format!("DROP TABLE IF EXISTS {legacy}"), vec![]);
+        }
         Self::finish(db, mode)
     }
 
@@ -210,10 +218,7 @@ impl Telemetry {
     /// else in the memory.
     #[cfg(feature = "postgres")]
     pub fn open_pg(url: &str, schema: &str, mode: TelemetryMode) -> Result<Self> {
-        let db: Box<dyn Db> = Box::new(crate::pg::PgDb::open(url, schema)?);
-        for sql in TELEM_SCHEMA_PG {
-            db.execute(sql, vec![])?;
-        }
+        let db: Box<dyn Db> = Box::new(crate::pg::PgDb::open(url, schema, TELEM_SCHEMA_PG)?);
         Self::finish(db, mode)
     }
 
@@ -262,7 +267,7 @@ impl Telemetry {
             self.prune_countdown = 32; // prune the ring roughly every 32 flushes
         }
         let db = self.db.as_ref();
-        with_txn(db, || {
+        let flush_body = |db: &dyn Db| -> Result<()> {
             for ev in &events {
                 let qkey = ev.query_key();
                 // grain-access rollup (all recalls)
@@ -326,7 +331,16 @@ impl Telemetry {
                 )?;
             }
             Ok(())
-        })
+        };
+        if db.prefers_batched_reads() {
+            // Shared multi-writer sidecar (postgres): every rollup upsert is
+            // atomic on its own, and skipping the wrapping transaction means
+            // two instances' flushes can't deadlock on row locks. A partial
+            // flush loses only disposable evidence.
+            flush_body(db)
+        } else {
+            with_txn(db, || flush_body(db))
+        }
     }
 
     /// Record one assembly-budget sample (whether it overflowed). Off the

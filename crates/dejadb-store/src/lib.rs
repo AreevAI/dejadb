@@ -1207,10 +1207,17 @@ impl DejaDB {
     /// Open (or create) a memory in a PostgreSQL schema, honoring the
     /// schema's own `meta` declarations — the server-tier analogue of
     /// [`open`](Self::open). One memory = one schema (the unit of isolation,
-    /// `pg_dump -n` export, and `DROP SCHEMA` erasure); single-writer is
-    /// ENFORCED via a session advisory lock (`STO-E002` when contended).
-    /// CAS blobs live in an in-schema table. The page cipher and the
-    /// telemetry sidecar are file-backend capabilities and are rejected here.
+    /// `pg_dump -n` export, and `DROP SCHEMA` erasure via
+    /// [`pg::drop_postgres_schema`]). Unlike the single-writer file backend,
+    /// this backend admits MULTIPLE CONCURRENT WRITERS per memory: any
+    /// number of handles (across processes) may hold the same schema; write
+    /// transactions serialize briefly on an in-schema counters row, reads
+    /// never block, and racing supersedes/forgets resolve to one winner
+    /// plus a clean error — see `pg.rs` for the model. CAS blobs live in an
+    /// in-schema table; the telemetry sidecar (see
+    /// [`open_postgres_with_telemetry`](Self::open_postgres_with_telemetry))
+    /// rides the schema too. The page cipher is a file-backend capability
+    /// and an `encryption_key` here is rejected.
     #[cfg(feature = "postgres")]
     pub fn open_postgres(url: &str, schema: &str) -> Result<Self> {
         Self::open_postgres_internal(url, schema, None, TelemetryMode::Off)
@@ -1254,13 +1261,13 @@ impl DejaDB {
                 ));
             }
         }
-        let dbh: Box<dyn Db> = Box::new(pg::PgDb::open(url, schema)?);
-        for sql in pg::PG_SCHEMA {
-            dbh.execute(sql, vec![])?;
-        }
-        for sql in pg::PG_SEED {
-            dbh.execute(sql, vec![])?;
-        }
+        // DDL + seeding run inside PgDb::open, under the schema's bootstrap
+        // advisory lock — concurrent openers of a brand-new memory would
+        // otherwise race the IF NOT EXISTS statements.
+        let mut bootstrap: Vec<&str> = Vec::with_capacity(pg::PG_SCHEMA.len() + pg::PG_SEED.len());
+        bootstrap.extend_from_slice(pg::PG_SCHEMA);
+        bootstrap.extend_from_slice(pg::PG_SEED);
+        let dbh: Box<dyn Db> = Box::new(pg::PgDb::open(url, schema, &bootstrap)?);
         let telemetry = match telemetry_mode {
             TelemetryMode::Off => None,
             mode => Some(Telemetry::open_pg(url, schema, mode)?),
@@ -1646,90 +1653,129 @@ impl DejaDB {
                     .to_string(),
             ));
         }
-        // 1) Backfill NULL text from the immutable blobs (cheap: no index yet
-        //    or index about to be rebuilt; the projection is identical to the
-        //    write path's).
-        let mut updates: Vec<(i64, String)> = Vec::new();
-        for row in self.db.query("SELECT seq, blob FROM grains WHERE text IS NULL", vec![])? {
-            let seq = row.i64(0).unwrap_or(0);
-            if let Some(b) = row.blob(1) {
-                let view = deserialize_blob(&b)?;
-                if let Some(t) = projected_text(&view) {
-                    updates.push((seq, t));
+        // Warm pass, outside the transaction: intern every vocabulary token
+        // the current corpus snapshot needs — including the tokens of text
+        // that is only PROJECTED during the in-transaction backfill (a file
+        // written with indexing off has NULL text for everything). Interning
+        // is autocommit by convention, so orphan vocab rows on a later
+        // failure are harmless; the transaction below re-reads its own
+        // consistent corpus and only LOOKS UP ids, so nothing it does can
+        // poison the caches on rollback.
+        for row in self.db.query("SELECT text, blob FROM grains", vec![])? {
+            let text = match row.text(0) {
+                Some(t) => Some(t.to_string()),
+                None => match row.blob(1) {
+                    Some(b) => projected_text(&deserialize_blob(&b)?),
+                    None => None,
+                },
+            };
+            if let Some(t) = text {
+                for (term, _) in token_freqs(&t).0 {
+                    self.fts_term_id(&term)?;
                 }
             }
         }
-        let backfilled = updates.len();
-        with_txn(self.db.as_ref(), || {
-            // Serialize with concurrent writers (no ids consumed).
-            self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
-            for (seq, t) in &updates {
-                self.db.execute(
-                    "UPDATE grains SET text = ?1 WHERE seq = ?2",
-                    vec![pt(t), pi(*seq)],
-                )?;
-            }
-            Ok(())
-        })?;
-        // 2) Rebuild the postings from scratch. Cheaper than reconciling: the
-        //    text column is the source of truth and re-tokenizing it is linear
-        //    in total text, which is the same work an incremental fixup would
-        //    do anyway.
         self.fts_deferred = false;
-        self.db.execute("DELETE FROM fts_post", vec![])?;
-        self.db.execute("DELETE FROM fts_doc", vec![])?;
-        let mut texts: Vec<(i64, i64, String)> = Vec::new();
-        for row in self
-            .db
-            .query("SELECT seq, ns, text FROM grains WHERE text IS NOT NULL", vec![])?
-        {
-            let seq = row.i64(0).unwrap_or(0);
-            let ns = row.i64(1).unwrap_or(0);
-            if let Some(t) = row.text(2) {
-                texts.push((seq, ns, t.to_string()));
-            }
-        }
 
-        // Resolve every vocabulary id first (needs `&mut self`), then write the
-        // postings in one transaction.
-        //
-        // `(seq, ns, doc length, [(vocab id, term frequency)])`.
-        type PreparedDoc = (i64, i64, i64, Vec<(i64, i64)>);
-        let mut prepared: Vec<PreparedDoc> = Vec::with_capacity(texts.len());
-        let (mut docs, mut total_len) = (0i64, 0i64);
-        for (seq, ns, text) in &texts {
-            let (freqs, len) = token_freqs(text);
-            if freqs.is_empty() {
-                continue;
-            }
-            let mut ids = Vec::with_capacity(freqs.len());
-            for (term, tf) in freqs {
-                ids.push((self.fts_term_id(&term)?, tf));
-            }
-            docs += 1;
-            total_len += len;
-            prepared.push((*seq, *ns, len, ids));
-        }
-        with_txn(self.db.as_ref(), || {
-            // Serialize with concurrent writers (no ids consumed).
+        // One transaction for EVERYTHING — backfill, delete, corpus read,
+        // posting writes — serialized against concurrent writers by the
+        // zero-id reservation. Two transactions with autocommit deletes
+        // between them let a concurrent add slip into the window and get its
+        // postings doubled (its own txn's copy survives the delete, the
+        // rebuild inserts them again).
+        self.db.begin()?;
+        let r = (|| -> Result<(usize, i64, i64)> {
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
-            for (seq, ns, len, ids) in &prepared {
-                for (term, tf) in ids {
+            // Backfill NULL text from the immutable blobs (projection
+            // identical to the write path's).
+            let mut updates: Vec<(i64, String)> = Vec::new();
+            for row in self.db.query("SELECT seq, blob FROM grains WHERE text IS NULL", vec![])? {
+                let seq = row.i64(0).unwrap_or(0);
+                if let Some(b) = row.blob(1) {
+                    let view = deserialize_blob(&b)?;
+                    if let Some(t) = projected_text(&view) {
+                        updates.push((seq, t));
+                    }
+                }
+            }
+            for (seq, t) in &updates {
+                self.db
+                    .execute("UPDATE grains SET text = ?1 WHERE seq = ?2", vec![pt(t), pi(*seq)])?;
+            }
+            self.db.execute("DELETE FROM fts_post", vec![])?;
+            self.db.execute("DELETE FROM fts_doc", vec![])?;
+            let mut texts: Vec<(i64, i64, String)> = Vec::new();
+            for row in self
+                .db
+                .query("SELECT seq, ns, text FROM grains WHERE text IS NOT NULL", vec![])?
+            {
+                let seq = row.i64(0).unwrap_or(0);
+                let ns = row.i64(1).unwrap_or(0);
+                if let Some(t) = row.text(2) {
+                    texts.push((seq, ns, t.to_string()));
+                }
+            }
+            let (mut docs, mut total_len) = (0i64, 0i64);
+            for (seq, ns, text) in &texts {
+                let (freqs, len) = token_freqs(text);
+                if freqs.is_empty() {
+                    continue;
+                }
+                let mut wrote = false;
+                for (term, tf) in freqs {
+                    // Lookup only: the warm pass interned the snapshot's
+                    // tokens, and a grain committed since then had its own
+                    // add intern its tokens. A miss is out-of-model; skip
+                    // the token rather than intern inside the txn.
+                    let Some(id) = self.fts_term_lookup(&term)? else {
+                        continue;
+                    };
                     self.db.execute_hot(
                         "INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)",
-                        vec![pi(*term), pi(*seq), pi(*ns), pi(*tf)],
+                        vec![pi(id), pi(*seq), pi(*ns), pi(tf)],
                     )?;
+                    wrote = true;
                 }
-                self.db.execute_hot(
-                    "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
-                    vec![pi(*seq), pi(*len)],
-                )?;
+                if wrote {
+                    self.db.execute_hot(
+                        "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
+                        vec![pi(*seq), pi(len)],
+                    )?;
+                    docs += 1;
+                    total_len += len;
+                }
             }
-            Ok(())
-        })?;
-        self.fts_docs = docs;
-        self.fts_total_len = total_len;
-        Ok(backfilled)
+            Ok((updates.len(), docs, total_len))
+        })();
+        match r {
+            Ok((backfilled, docs, total_len)) => {
+                self.db.commit()?;
+                self.fts_docs = docs;
+                self.fts_total_len = total_len;
+                Ok(backfilled)
+            }
+            Err(e) => {
+                let _ = self.db.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Vocabulary id for `term` WITHOUT interning — cache, then the table.
+    /// Rebuilds use this inside their transaction so a rollback can never
+    /// leave the cache pointing at a vocab row that was never committed.
+    fn fts_term_lookup(&mut self, term: &str) -> Result<Option<i64>> {
+        if let Some(id) = self.fts_vocab.get(term) {
+            return Ok(Some(*id));
+        }
+        let rows = self.db.query("SELECT id FROM fts_vocab WHERE term = ?1", vec![pt(term)])?;
+        match rows.first().and_then(|r| r.i64(0)) {
+            Some(id) => {
+                self.fts_vocab.insert(term.to_string(), id);
+                Ok(Some(id))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Dimension of the installed embedding backend, if any. `None` means
@@ -1845,10 +1891,57 @@ impl DejaDB {
                 }
             }
         }
-        let h = self
-            .add_batch_inner(std::slice::from_ref(&grain))?
-            .remove(0);
-        Ok((h, true))
+        // The probe above ran OUTSIDE the write transaction; with concurrent
+        // writers (postgres) another instance can land the same value between
+        // probe and insert. Re-probe INSIDE the transaction, after the
+        // serialization point (reserve_write's counter-row lock), where every
+        // committed duplicate is visible and racing writers are blocked. On
+        // the embedded single-writer backend this is one redundant point read.
+        let (preps, first_seq, first_op, hlc0) =
+            self.prep_and_reserve(std::slice::from_ref(&grain))?;
+        if self.needs_min_reader_stamp
+            && preps
+                .iter()
+                .any(|p| p.blob.get(2).is_some_and(|b| *b > LEGACY_MAX_GRAIN_BYTE))
+        {
+            self.meta_put(MIN_READER_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
+            self.needs_min_reader_stamp = false;
+        }
+        let key = match (preps[0].s, preps[0].p, preps[0].o) {
+            (Some(s), Some(p), Some(o)) => Some((preps[0].ns_id, s, p, o)),
+            _ => None,
+        };
+        let hash = preps[0].hash;
+        let (d_docs, d_len) = fts_delta(&preps);
+        let dbr = self.db.as_ref();
+        let duplicate = with_txn(dbr, || {
+            // Serialize first WITHOUT consuming ids: a duplicate hit must
+            // commit an empty transaction, not leave a gap in the op-log.
+            dbr.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
+            if let Some((ns, s, p, o)) = key {
+                let rows = dbr.query(
+                    "SELECT hash FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND o=?4",
+                    vec![pi(ns), pi(s), pi(p), pi(o)],
+                )?;
+                if let Some(b) = rows.first().and_then(|r| r.blob(0)) {
+                    return Ok(Some(Hash::try_from_bytes(&b)?));
+                }
+            }
+            let (s0, o0, h0) = match dbr.reserve_write(1, 1, 1, now_ms() << 16, 0)? {
+                Some(w) => (w.seq0, w.op0, w.hlc0),
+                None => (first_seq, first_op, hlc0),
+            };
+            insert_prepped(dbr, &preps, s0, o0, h0)?;
+            Ok(None)
+        })?;
+        match duplicate {
+            Some(existing) => Ok((existing, false)),
+            None => {
+                self.fts_docs += d_docs;
+                self.fts_total_len += d_len;
+                Ok((hash, true))
+            }
+        }
     }
 
     /// Hash of the current provisional head for `(ns, s, p)` iff its object is
@@ -2034,21 +2127,27 @@ impl DejaDB {
     /// cleared first, so running it twice is not double-counting. Reads every
     /// blob once, so it is a maintenance operation, not a hot path.
     pub fn rebuild_link_indexes(&mut self) -> Result<usize> {
-        self.db.execute("DELETE FROM prov_idx", vec![])?;
-        self.db.execute("DELETE FROM run_idx", vec![])?;
-        let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
-        for row in self
-            .db
-            .query("SELECT seq, ns, blob FROM grains ORDER BY seq", vec![])?
-        {
-            let (Some(seq), Some(ns), Some(blob)) = (row.i64(0), row.i64(1), row.blob(2)) else {
-                continue;
-            };
-            rows.push((seq, ns, blob));
+        // Warm pass, outside the transaction: intern every dictionary term
+        // the current snapshot's links/runs need (interning is autocommit by
+        // convention). The transaction below re-reads its own consistent
+        // corpus and only LOOKS UP ids, so a rollback can never leave the
+        // dictionary cache pointing at uncommitted rows.
+        for row in self.db.query("SELECT blob FROM grains ORDER BY seq", vec![])? {
+            let Some(blob) = row.blob(0) else { continue };
+            let view = deserialize_blob(&blob)?;
+            let gv = extract_view(&view);
+            if let Some(r) = &gv.run {
+                self.term_id(r)?;
+            }
+            if !gv.links.is_empty() {
+                self.term_id(&view.hash.to_hex())?;
+                for (rel, target) in &gv.links {
+                    self.term_id(rel)?;
+                    self.term_id(target)?;
+                }
+            }
         }
 
-        // Resolve dictionary ids first: term interning needs `&mut self`, and
-        // the write loop below only has the connection.
         struct Row {
             seq: i64,
             ns: i64,
@@ -2056,32 +2155,58 @@ impl DejaDB {
             parent: Option<Vec<u8>>,
             links: Vec<(i64, i64, i64)>,
         }
-        let mut plan: Vec<Row> = Vec::with_capacity(rows.len());
-        for (seq, ns, blob) in &rows {
-            let view = deserialize_blob(blob)?;
-            let gv = extract_view(&view);
-            let run = match &gv.run {
-                Some(r) => Some(self.term_id(r)?),
-                None => None,
-            };
-            let parent = gv
-                .parent
-                .as_deref()
-                .and_then(|p| Hash::from_hex(p).ok())
-                .map(|h| h.as_bytes().to_vec());
-            let mut links = Vec::with_capacity(gv.links.len());
-            if !gv.links.is_empty() {
-                let self_id = self.term_id(&view.hash.to_hex())?;
-                for (rel, target) in &gv.links {
-                    links.push((self_id, self.term_id(rel)?, self.term_id(target)?));
-                }
-            }
-            plan.push(Row { seq: *seq, ns: *ns, run, parent, links });
-        }
-
-        let written = with_txn(self.db.as_ref(), || {
-            // Serialize with concurrent writers (no ids consumed).
+        // One transaction for delete + corpus read + plan + writes,
+        // serialized against concurrent writers by the zero-id reservation —
+        // autocommit deletes before the read let a concurrent add slip into
+        // the window and lose (or double) its index rows.
+        self.db.begin()?;
+        let r = (|| -> Result<usize> {
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
+            self.db.execute("DELETE FROM prov_idx", vec![])?;
+            self.db.execute("DELETE FROM run_idx", vec![])?;
+            let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+            for row in self
+                .db
+                .query("SELECT seq, ns, blob FROM grains ORDER BY seq", vec![])?
+            {
+                let (Some(seq), Some(ns), Some(blob)) = (row.i64(0), row.i64(1), row.blob(2))
+                else {
+                    continue;
+                };
+                rows.push((seq, ns, blob));
+            }
+            let mut plan: Vec<Row> = Vec::with_capacity(rows.len());
+            for (seq, ns, blob) in &rows {
+                let view = deserialize_blob(blob)?;
+                let gv = extract_view(&view);
+                // Lookup only: the warm pass interned this snapshot's terms,
+                // and a grain committed since then had its own add intern
+                // its terms. A miss is out-of-model; skip rather than
+                // intern inside the txn.
+                let run = match &gv.run {
+                    Some(r) => self.term_lookup(r)?,
+                    None => None,
+                };
+                let parent = gv
+                    .parent
+                    .as_deref()
+                    .and_then(|p| Hash::from_hex(p).ok())
+                    .map(|h| h.as_bytes().to_vec());
+                let mut links = Vec::with_capacity(gv.links.len());
+                if !gv.links.is_empty() {
+                    if let Some(self_id) = self.term_lookup(&view.hash.to_hex())? {
+                        for (rel, target) in &gv.links {
+                            if let (Some(rl), Some(tg)) =
+                                (self.term_lookup(rel)?, self.term_lookup(target)?)
+                            {
+                                links.push((self_id, rl, tg));
+                            }
+                        }
+                    }
+                }
+                plan.push(Row { seq: *seq, ns: *ns, run, parent, links });
+            }
+
             let mut n = 0usize;
             for r in &plan {
                 if let Some(run) = r.run {
@@ -2121,7 +2246,17 @@ impl DejaDB {
                 }
             }
             Ok(n)
-        })?;
+        })();
+        let written = match r {
+            Ok(n) => {
+                self.db.commit()?;
+                n
+            }
+            Err(e) => {
+                let _ = self.db.rollback();
+                return Err(e);
+            }
+        };
         // Declare the file current, so open() stops re-scanning it.
         self.meta_put(LINK_INDEX_KEY, LINK_INDEX_VERSION)?;
         Ok(written)
@@ -2483,21 +2618,24 @@ impl DejaDB {
                 Some(w) => (w.seq0, w.op0, w.hlc0, w.op0 + 1, w.hlc0 + 1),
                 None => (first_seq, first_op, hlc0, ram_op, ram_hlc),
             };
-            // Re-check the head UNDER the row lock: with concurrent writers
-            // the pre-transaction read above can be stale, and two racing
-            // supersedes of one head must produce one winner and one clean
-            // SupersessionConflict — the single-writer contract.
+            // Re-resolve the head BY HASH under the row lock: with
+            // concurrent writers the pre-transaction read can be stale in
+            // two ways — the head may have been superseded (two racing
+            // supersedes must produce one winner and one clean
+            // SupersessionConflict), and a forget + re-add of identical
+            // content can move this hash to a NEW seq (flipping the stale
+            // seq would silently miss the live row).
             let recheck = dbr.query(
-                &format!("SELECT svt FROM grains WHERE seq=?1{}", dbr.for_update()),
-                vec![pi(old_seq)],
+                &format!("SELECT seq, svt FROM grains WHERE hash=?1{}", dbr.for_update()),
+                vec![pb(old.as_bytes().to_vec())],
             )?;
-            match recheck.first() {
+            let old_seq = match recheck.first() {
                 None => return Err(DejaDbError::NotFound(*old)),
-                Some(row) if row.i64(0).is_some() => {
+                Some(row) if row.i64(1).is_some() => {
                     return Err(DejaDbError::SupersessionConflict(*old))
                 }
-                _ => {}
-            }
+                Some(row) => row.i64(0).unwrap_or(old_seq),
+            };
             insert_prepped(dbr, &preps, s0, o0, h0)?;
             dbr.execute(
                 "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
@@ -2560,40 +2698,48 @@ impl DejaDB {
     /// Forget (erase from hot store) — writes a tombstone to the op-log.
     /// File-level crypto-erasure remains the strong path.
     pub fn forget(&mut self, hash: &Hash) -> Result<()> {
+        // Pre-transaction read for the (ns,s,p) key only. The SEQ is
+        // deliberately not taken from here: it is re-resolved under the row
+        // lock inside the transaction (a concurrent forget + re-add can move
+        // this hash to a new seq). ns/s/p are stale-safe — identical content
+        // means an identical key.
         let rows = self.db.query(
-            "SELECT seq, ns, s, p FROM grains WHERE hash = ?1",
+            "SELECT ns, s, p FROM grains WHERE hash = ?1",
             vec![pb(hash.as_bytes().to_vec())],
         )?;
-        let (seq, ns, s, p) = match rows.first() {
-            Some(row) => (row.i64(0).unwrap_or(0), row.i64(1), row.i64(2), row.i64(3)),
+        let (ns, s, p) = match rows.first() {
+            Some(row) => (row.i64(0), row.i64(1), row.i64(2)),
             None => return Err(DejaDbError::NotFound(*hash)),
         };
-        // Read the document's length before the delete removes it, so the
-        // in-memory BM25 collection stats can be corrected afterwards.
-        let doc_len = self
-            .db
-            .query("SELECT len FROM fts_doc WHERE seq = ?1", vec![pi(seq)])?
-            .first()
-            .and_then(|row| row.i64(0));
         let ram_op = self.next_op;
         self.next_op += 1;
         let ram_hlc = self.next_hlc();
         let dbr = self.db.as_ref();
-        with_txn(dbr, || {
+        let doc_len = with_txn(dbr, || {
             let (op_seq, hlc) = match dbr.reserve_write(0, 1, 1, now_ms() << 16, 0)? {
                 Some(w) => (w.op0, w.hlc0),
                 None => (ram_op, ram_hlc),
             };
-            // Re-check existence UNDER the row lock: with concurrent writers
-            // two racing forgets must produce one success and one NotFound —
-            // the single-writer contract.
+            // Re-resolve BY HASH under the row lock and use the FRESH seq
+            // for every delete: with concurrent writers, two racing forgets
+            // must produce one success and one NotFound, and a forget +
+            // re-add of identical content can move this hash to a NEW seq —
+            // deleting the stale one would report success while erasing
+            // nothing (and diverge replicas via the tombstone).
             let recheck = dbr.query(
                 &format!("SELECT seq FROM grains WHERE hash=?1{}", dbr.for_update()),
                 vec![pb(hash.as_bytes().to_vec())],
             )?;
-            if recheck.first().and_then(|r| r.i64(0)).is_none() {
-                return Err(DejaDbError::NotFound(*hash));
-            }
+            let seq = match recheck.first().and_then(|r| r.i64(0)) {
+                Some(s) => s,
+                None => return Err(DejaDbError::NotFound(*hash)),
+            };
+            // Document length before the delete removes it, so the BM25
+            // collection stats can be corrected after commit.
+            let doc_len = dbr
+                .query("SELECT len FROM fts_doc WHERE seq = ?1", vec![pi(seq)])?
+                .first()
+                .and_then(|row| row.i64(0));
             dbr.execute("DELETE FROM triples WHERE seq=?1", vec![pi(seq)])?;
             dbr.execute("DELETE FROM osp WHERE seq=?1", vec![pi(seq)])?;
             dbr.execute("DELETE FROM embeddings WHERE seq=?1", vec![pi(seq)])?;
@@ -2654,7 +2800,7 @@ impl DejaDB {
                 "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
                 vec![pi(op_seq), pi(hlc), pi(OP_FORGET), pb(hash.as_bytes().to_vec())],
             )?;
-            Ok(())
+            Ok(doc_len)
         })?;
         if let Some(len) = doc_len {
             self.fts_docs = (self.fts_docs - 1).max(0);
