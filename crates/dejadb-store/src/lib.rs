@@ -6,8 +6,12 @@
 //! thread index, and the vaais operation profile (add / recall / batch /
 //! supersede / forget) plus bounded graph ops and two-axis `entity_at`.
 //!
-//! Sync facade over the async turso crate: `DejaDB` owns a current-thread
-//! runtime; point ops measured at µs-class through this path in M0.
+//! `DejaDB` drives a sync storage seam (`db::Db`); the embedded Turso backend
+//! hides its own current-thread runtime behind it, so point ops stay µs-class
+//! with no executor hop at the call site, and a second backend can implement
+//! the same seam without touching the store logic.
+
+mod db;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +21,10 @@ use dejadb_core::format::deserialize::{deserialize_blob, DeserializedGrain};
 use dejadb_core::format::serialize::serialize_grain;
 use dejadb_core::types::Grain;
 use dejadb_core::types::{step_action_node, step_action_relation, STEP_ACTION_PREFIX};
-use turso::{Builder, Connection, Value};
+use turso::Value;
 use zeroize::Zeroize;
+
+use db::{db_err, with_txn, Db, TursoDb};
 
 /// Op-log operation kinds.
 pub const OP_ADD: i64 = 1;
@@ -715,7 +721,9 @@ fn opt_i(v: Option<i64>) -> Value {
     }
 }
 
-/// Hex-encode a 32-byte key for Turso `PRAGMA hexkey`.
+/// Hex-encode a 32-byte key. The engine-open copy lives in db.rs; this one
+/// remains only for the byte-order pin below.
+#[cfg(test)]
 fn hex32(k: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
@@ -865,10 +873,9 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn db_err<E: std::fmt::Display>(e: E) -> DejaDbError {
-    DejaDbError::Storage(e.to_string())
-}
-
+// The read-side coercion contract now lives on `db::Row`'s accessors; these
+// remain only for the pin below that documents it against raw `Value`s.
+#[cfg(test)]
 fn v_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Integer(i) => Some(*i),
@@ -876,6 +883,7 @@ fn v_i64(v: &Value) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
 fn v_blob(v: &Value) -> Option<Vec<u8>> {
     match v {
         Value::Blob(b) => Some(b.clone()),
@@ -883,6 +891,7 @@ fn v_blob(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
 fn v_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Real(r) => Some(*r),
@@ -1057,9 +1066,7 @@ fn projected_text(view: &DeserializedGrain) -> Option<String> {
 
 /// The embedded DejaDB store handle — one file per memory.
 pub struct DejaDB {
-    rt: tokio::runtime::Runtime,
-    _db: turso::Database,
-    conn: Connection,
+    db: Box<dyn Db>,
     dict: HashMap<String, i64>,
     next_term: i64,
     next_seq: i64,
@@ -1100,27 +1107,6 @@ pub struct DejaDB {
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
     telemetry: Option<Telemetry>,
-    // cached hot-path statements (lazily prepared)
-    st_probe_sp: Option<turso::Statement>,
-    st_probe_s: Option<turso::Statement>,
-    // same two probes without the `cur=1` predicate — the include-superseded
-    // scan, kept in their own slots so the heads-only path stays prepared
-    st_probe_sp_all: Option<turso::Statement>,
-    st_probe_s_all: Option<turso::Statement>,
-    st_fetch_seq: Option<turso::Statement>,
-    st_latest: Option<turso::Statement>,
-    st_superseder: Option<turso::Statement>,
-}
-
-async fn ensure_stmt<'a>(
-    slot: &'a mut Option<turso::Statement>,
-    conn: &Connection,
-    sql: &str,
-) -> Result<&'a mut turso::Statement> {
-    if slot.is_none() {
-        *slot = Some(conn.prepare(sql).await.map_err(db_err)?);
-    }
-    Ok(slot.as_mut().unwrap())
 }
 
 impl DejaDB {
@@ -1168,55 +1154,28 @@ impl DejaDB {
         explicit: Option<DejaDbOptions>,
         telemetry_mode: TelemetryMode,
     ) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(db_err)?;
         // Keep the AEAD key only in a Zeroizing buffer for the duration of the
-        // open; the raw copies (options + this local) are wiped once turso has
-        // ingested it, so no unzeroized key bytes linger on the heap.
+        // open; the raw copies (options + this local) are wiped once the engine
+        // has ingested it, so no unzeroized key bytes linger on the heap.
         let enc_key = explicit
             .as_ref()
             .and_then(|o| o.encryption_key)
             .map(zeroize::Zeroizing::new);
-        let (db, conn) = rt.block_on(async {
-            let mut b = Builder::new_local(path).experimental_index_method(true);
-            if let Some(k) = &enc_key {
-                // Provide the AEAD key at BUILD time so the encrypted file
-                // header decrypts on the first read. (PRAGMA-after-connect
-                // works for create but not reopen — the header is read at
-                // connect, before a PRAGMA could set the key.)
-                // Wipe our hex rendering of the key after the builder copies it;
-                // the storage engine necessarily retains its own copy while the
-                // database is open.
-                let hexkey = zeroize::Zeroizing::new(hex32(k));
-                b = b.experimental_encryption(true).with_encryption(turso::EncryptionOpts {
-                    cipher: "aes256gcm".to_string(),
-                    hexkey: (*hexkey).clone(),
-                });
-            }
-            let db = b.build().await.map_err(db_err)?;
-            let conn = db.connect().map_err(db_err)?;
-            for sql in SCHEMA {
-                conn.execute(sql, ()).await.map_err(db_err)?;
-            }
-            Ok::<_, DejaDbError>((db, conn))
-        })?;
+        let dbh: Box<dyn Db> = Box::new(TursoDb::open(path, enc_key.as_deref())?);
+        for sql in SCHEMA {
+            dbh.execute(sql, vec![])?;
+        }
 
         // ---- file-carried declarations (meta k/v) --------------------
-        let meta: HashMap<String, String> = rt.block_on(async {
+        let meta: HashMap<String, String> = {
             let mut m = HashMap::new();
-            let mut rows = conn.query("SELECT k, v FROM meta", ()).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let (Value::Text(k), Value::Text(v)) = (
-                    row.get_value(0).map_err(db_err)?,
-                    row.get_value(1).map_err(db_err)?,
-                ) {
-                    m.insert(k, v);
+            for row in dbh.query("SELECT k, v FROM meta", vec![])? {
+                if let (Some(k), Some(v)) = (row.text(0), row.text(1)) {
+                    m.insert(k.to_string(), v.to_string());
                 }
             }
-            Ok::<_, DejaDbError>(m)
-        })?;
+            m
+        };
         let declared_text = meta.get("text_index").map(|v| v == "1");
         let declared_rels: Option<HashSet<String>> = meta
             .get("entity_relations")
@@ -1278,78 +1237,43 @@ impl DejaDB {
         opts.encryption_key.zeroize();
 
         // Stamp declarations + create the FTS index if wanted.
-        rt.block_on(async {
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES ('text_index', ?1)",
-                (pt(if opts.index_text { "1" } else { "0" }),),
-            )
-            .await
-            .map_err(db_err)?;
-            let mut rels: Vec<&String> = opts.entity_relations.iter().collect();
-            rels.sort();
-            let rels = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES ('entity_relations', ?1)",
-                (pt(&rels),),
-            )
-            .await
-            .map_err(db_err)?;
-            // Files written before the BM25 leg moved off Turso's experimental
-            // FTS carry an `idx_fts` index that nothing reads any more, and
-            // that still taxes every write to this table. Drop it on sight.
-            // Absent (the normal case) it errors; that is not a problem.
-            let _ = conn.execute("DROP INDEX idx_fts", ()).await;
-            Ok::<_, DejaDbError>(())
-        })?;
+        dbh.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('text_index', ?1)",
+            vec![pt(if opts.index_text { "1" } else { "0" })],
+        )?;
+        let mut rels: Vec<&String> = opts.entity_relations.iter().collect();
+        rels.sort();
+        let rels = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
+        dbh.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('entity_relations', ?1)",
+            vec![pt(&rels)],
+        )?;
+        // Files written before the BM25 leg moved off Turso's experimental
+        // FTS carry an `idx_fts` index that nothing reads any more, and
+        // that still taxes every write to this table. Drop it on sight.
+        // Absent (the normal case) it errors; that is not a problem.
+        let _ = dbh.execute("DROP INDEX idx_fts", vec![]);
 
         // Load dictionary + counters.
-        let (
-            dict,
-            next_term,
-            next_seq,
-            next_op,
-            hlc_last,
-            fts_docs,
-            fts_total_len,
-            indexed_text,
-            grain_count,
-        ) =
-            rt.block_on(async {
-            let mut dict = HashMap::new();
-            let mut next_term = 1i64;
-            {
-                let mut rows = conn.query("SELECT id, term FROM terms", ()).await.map_err(db_err)?;
-                while let Some(row) = rows.next().await.map_err(db_err)? {
-                    let id = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                    if let Value::Text(t) = row.get_value(1).map_err(db_err)? {
-                        dict.insert(t, id);
-                    }
-                    next_term = next_term.max(id + 1);
-                }
+        let mut dict = HashMap::new();
+        let mut next_term = 1i64;
+        for row in dbh.query("SELECT id, term FROM terms", vec![])? {
+            let id = row.i64(0).unwrap_or(0);
+            if let Some(t) = row.text(1) {
+                dict.insert(t.to_string(), id);
             }
-            let one = |sql: &'static str| {
-                let conn = conn.clone();
-                async move {
-                    let mut rows = conn.query(sql, ()).await.map_err(db_err)?;
-                    let v = match rows.next().await.map_err(db_err)? {
-                        Some(row) => v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                        None => 0,
-                    };
-                    Ok::<i64, DejaDbError>(v)
-                }
-            };
-            let next_seq = one("SELECT COALESCE(MAX(seq),0) FROM grains").await? + 1;
-            let next_op = one("SELECT COALESCE(MAX(op_seq),0) FROM oplog").await? + 1;
-            let hlc_last = one("SELECT COALESCE(MAX(hlc),0) FROM oplog").await?;
-            let fts_docs = one("SELECT COUNT(*) FROM fts_doc").await?;
-            let fts_total_len = one("SELECT COALESCE(SUM(len),0) FROM fts_doc").await?;
-            let indexed_text = one("SELECT COUNT(*) FROM grains WHERE text IS NOT NULL").await?;
-            let grain_count = one("SELECT COUNT(*) FROM grains").await?;
-            Ok::<_, DejaDbError>((
-                dict, next_term, next_seq, next_op, hlc_last, fts_docs, fts_total_len, indexed_text,
-                grain_count,
-            ))
-        })?;
+            next_term = next_term.max(id + 1);
+        }
+        let one = |sql: &'static str| -> Result<i64> {
+            Ok(dbh.query(sql, vec![])?.first().and_then(|r| r.i64(0)).unwrap_or(0))
+        };
+        let next_seq = one("SELECT COALESCE(MAX(seq),0) FROM grains")? + 1;
+        let next_op = one("SELECT COALESCE(MAX(op_seq),0) FROM oplog")? + 1;
+        let hlc_last = one("SELECT COALESCE(MAX(hlc),0) FROM oplog")?;
+        let fts_docs = one("SELECT COUNT(*) FROM fts_doc")?;
+        let fts_total_len = one("SELECT COALESCE(SUM(len),0) FROM fts_doc")?;
+        let indexed_text = one("SELECT COUNT(*) FROM grains WHERE text IS NOT NULL")?;
+        let grain_count = one("SELECT COUNT(*) FROM grains")?;
 
         let blob_dir = std::path::PathBuf::from(format!("{}.blobs", path));
         std::fs::create_dir_all(&blob_dir).map_err(db_err)?;
@@ -1363,13 +1287,11 @@ impl DejaDB {
         // re-stamping file-truths.
         let telemetry = match telemetry_mode {
             TelemetryMode::Off => None,
-            mode => Some(Telemetry::open(&rt, path, enc_key.as_deref(), mode)?),
+            mode => Some(Telemetry::open(path, enc_key.as_deref(), mode)?),
         };
 
         let mut store = DejaDB {
-            rt,
-            _db: db,
-            conn,
+            db: dbh,
             dict,
             next_term,
             next_seq,
@@ -1389,13 +1311,6 @@ impl DejaDB {
             needs_min_reader_stamp: !meta.contains_key(MIN_READER_VERSION_KEY),
             blob_dir,
             telemetry,
-            st_probe_sp: None,
-            st_probe_s: None,
-            st_probe_sp_all: None,
-            st_probe_s_all: None,
-            st_fetch_seq: None,
-            st_latest: None,
-            st_superseder: None,
         };
 
         // The file may declare that it needs a newer reader than this build (a
@@ -1482,22 +1397,18 @@ impl DejaDB {
                 }
             }
             None => {
-                let conn = &self.conn;
-                let ok = self.rt.block_on(async {
-                    conn.execute(
+                let ok = self
+                    .db
+                    .execute(
                         "INSERT OR REPLACE INTO meta(k, v) VALUES ('embedding_model', ?1)",
-                        (pt(&model),),
+                        vec![pt(&model)],
                     )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
-                        "INSERT OR REPLACE INTO meta(k, v) VALUES ('embedding_dim', ?1)",
-                        (pt(&dim.to_string()),),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    Ok::<_, DejaDbError>(())
-                });
+                    .and_then(|_| {
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO meta(k, v) VALUES ('embedding_dim', ?1)",
+                            vec![pt(&dim.to_string())],
+                        )
+                    });
                 if ok.is_ok() {
                     self.meta_embed = Some((model, dim));
                 }
@@ -1553,7 +1464,6 @@ impl DejaDB {
     /// Read every `meta` row whose key starts with `prefix`, returning
     /// `(key-without-prefix, value)` pairs.
     pub fn meta_scan(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let conn = &self.conn;
         // `%` and `_` are LIKE wildcards, so a prefix containing either would
         // silently widen the scan. Escape them and say so with ESCAPE; the
         // `strip_prefix` check below is the backstop, not the mechanism.
@@ -1562,71 +1472,40 @@ impl DejaDB {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("{escaped}%");
-        self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    "SELECT k, v FROM meta WHERE k LIKE ?1 ESCAPE '\\'",
-                    (pt(&pattern),),
-                )
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let (Value::Text(k), Value::Text(v)) = (
-                    row.get_value(0).map_err(db_err)?,
-                    row.get_value(1).map_err(db_err)?,
-                ) {
-                    if let Some(rest) = k.strip_prefix(prefix) {
-                        out.push((rest.to_string(), v));
-                    }
+        let mut out = Vec::new();
+        for row in self.db.query(
+            "SELECT k, v FROM meta WHERE k LIKE ?1 ESCAPE '\\'",
+            vec![pt(&pattern)],
+        )? {
+            if let (Some(k), Some(v)) = (row.text(0), row.text(1)) {
+                if let Some(rest) = k.strip_prefix(prefix) {
+                    out.push((rest.to_string(), v.to_string()));
                 }
             }
-            Ok::<_, DejaDbError>(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Upsert a single `meta` row.
     /// Read one `meta` row. `None` for a missing key — a file that has never
     /// declared something is not an error.
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query("SELECT v FROM meta WHERE k = ?1", (pt(key),))
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => Ok(match row.get_value(0).map_err(db_err)? {
-                    Value::Text(v) => Some(v),
-                    _ => None,
-                }),
-                None => Ok(None),
-            }
-        })
+        let rows = self.db.query("SELECT v FROM meta WHERE k = ?1", vec![pt(key)])?;
+        Ok(rows.first().and_then(|row| row.text(0)).map(str::to_string))
     }
 
     pub fn meta_put(&self, key: &str, value: &str) -> Result<()> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)",
-                (pt(key), pt(value)),
-            )
-            .await
-            .map_err(db_err)?;
-            Ok::<_, DejaDbError>(())
-        })
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)",
+            vec![pt(key), pt(value)],
+        )?;
+        Ok(())
     }
 
     /// Delete a single `meta` row. A missing key is not an error.
     pub fn meta_delete(&self, key: &str) -> Result<()> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("DELETE FROM meta WHERE k = ?1", (pt(key),))
-                .await
-                .map_err(db_err)?;
-            Ok::<_, DejaDbError>(())
-        })
+        self.db.execute("DELETE FROM meta WHERE k = ?1", vec![pt(key)])?;
+        Ok(())
     }
 
     /// Suspend BM25 posting writes ahead of a bulk load.
@@ -1674,73 +1553,44 @@ impl DejaDB {
         // 1) Backfill NULL text from the immutable blobs (cheap: no index yet
         //    or index about to be rebuilt; the projection is identical to the
         //    write path's).
-        let conn = &self.conn;
-        let rows: Vec<(i64, Vec<u8>)> = self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query("SELECT seq, blob FROM grains WHERE text IS NULL", ())
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                if let Value::Blob(b) = row.get_value(1).map_err(db_err)? {
-                    out.push((seq, b));
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
         let mut updates: Vec<(i64, String)> = Vec::new();
-        for (seq, blob) in &rows {
-            let view = deserialize_blob(blob)?;
-            if let Some(t) = projected_text(&view) {
-                updates.push((*seq, t));
+        for row in self.db.query("SELECT seq, blob FROM grains WHERE text IS NULL", vec![])? {
+            let seq = row.i64(0).unwrap_or(0);
+            if let Some(b) = row.blob(1) {
+                let view = deserialize_blob(&b)?;
+                if let Some(t) = projected_text(&view) {
+                    updates.push((seq, t));
+                }
             }
         }
         let backfilled = updates.len();
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                for (seq, t) in &updates {
-                    conn.execute(
-                        "UPDATE grains SET text = ?1 WHERE seq = ?2",
-                        (pt(t), pi(*seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                }
-                Ok::<_, DejaDbError>(())
+        with_txn(self.db.as_ref(), || {
+            for (seq, t) in &updates {
+                self.db.execute(
+                    "UPDATE grains SET text = ?1 WHERE seq = ?2",
+                    vec![pt(t), pi(*seq)],
+                )?;
             }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
-                }
-            }
+            Ok(())
         })?;
         // 2) Rebuild the postings from scratch. Cheaper than reconciling: the
         //    text column is the source of truth and re-tokenizing it is linear
         //    in total text, which is the same work an incremental fixup would
         //    do anyway.
         self.fts_deferred = false;
-        let texts: Vec<(i64, i64, String)> = self.rt.block_on(async {
-            conn.execute("DELETE FROM fts_post", ()).await.map_err(db_err)?;
-            conn.execute("DELETE FROM fts_doc", ()).await.map_err(db_err)?;
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query("SELECT seq, ns, text FROM grains WHERE text IS NOT NULL", ())
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                let ns = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
-                if let Value::Text(t) = row.get_value(2).map_err(db_err)? {
-                    out.push((seq, ns, t));
-                }
+        self.db.execute("DELETE FROM fts_post", vec![])?;
+        self.db.execute("DELETE FROM fts_doc", vec![])?;
+        let mut texts: Vec<(i64, i64, String)> = Vec::new();
+        for row in self
+            .db
+            .query("SELECT seq, ns, text FROM grains WHERE text IS NOT NULL", vec![])?
+        {
+            let seq = row.i64(0).unwrap_or(0);
+            let ns = row.i64(1).unwrap_or(0);
+            if let Some(t) = row.text(2) {
+                texts.push((seq, ns, t.to_string()));
             }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        }
 
         // Resolve every vocabulary id first (needs `&mut self`), then write the
         // postings in one transaction.
@@ -1762,36 +1612,20 @@ impl DejaDB {
             total_len += len;
             prepared.push((*seq, *ns, len, ids));
         }
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                for (seq, ns, len, ids) in &prepared {
-                    for (term, tf) in ids {
-                        conn.execute(
-                            "INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)",
-                            (pi(*term), pi(*seq), pi(*ns), pi(*tf)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    conn.execute(
-                        "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
-                        (pi(*seq), pi(*len)),
-                    )
-                    .await
-                    .map_err(db_err)?;
+        with_txn(self.db.as_ref(), || {
+            for (seq, ns, len, ids) in &prepared {
+                for (term, tf) in ids {
+                    self.db.execute_hot(
+                        "INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)",
+                        vec![pi(*term), pi(*seq), pi(*ns), pi(*tf)],
+                    )?;
                 }
-                Ok::<_, DejaDbError>(())
+                self.db.execute_hot(
+                    "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
+                    vec![pi(*seq), pi(*len)],
+                )?;
             }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
-                }
-            }
+            Ok(())
         })?;
         self.fts_docs = docs;
         self.fts_total_len = total_len;
@@ -1829,12 +1663,8 @@ impl DejaDB {
         }
         let id = self.next_term;
         self.next_term += 1;
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("INSERT INTO terms(id, term) VALUES (?1, ?2)", (pi(id), pt(term)))
-                .await
-                .map_err(db_err)
-        })?;
+        self.db
+            .execute("INSERT INTO terms(id, term) VALUES (?1, ?2)", vec![pi(id), pt(term)])?;
         self.dict.insert(term.to_string(), id);
         Ok(id)
     }
@@ -1907,21 +1737,11 @@ impl DejaDB {
     /// Hash of the current provisional head for `(ns, s, p)` iff its object is
     /// exactly `o` — the µs probe behind [`add_if_novel`](Self::add_if_novel).
     fn head_hash_for_object(&mut self, ns: i64, s: i64, p: i64, o: i64) -> Result<Option<Hash>> {
-        let conn = &self.conn;
-        let bytes = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT hash FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND o=?4",
-                    (pi(ns), pi(s), pi(p), pi(o)),
-                )
-                .await
-                .map_err(db_err)?;
-            Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                None => None,
-            })
-        })?;
-        match bytes {
+        let rows = self.db.query(
+            "SELECT hash FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND o=?4",
+            vec![pi(ns), pi(s), pi(p), pi(o)],
+        )?;
+        match rows.first().and_then(|row| row.blob(0)) {
             Some(b) => Ok(Some(Hash::try_from_bytes(&b)?)),
             None => Ok(None),
         }
@@ -2016,22 +1836,15 @@ impl DejaDB {
         if let Some(id) = self.fts_vocab.get(term) {
             return Ok(*id);
         }
-        let conn = &self.conn;
-        let id = self.rt.block_on(async {
-            conn.execute("INSERT OR IGNORE INTO fts_vocab(term) VALUES (?1)", (pt(term),))
-                .await
-                .map_err(db_err)?;
-            let mut rows = conn
-                .query("SELECT id FROM fts_vocab WHERE term = ?1", (pt(term),))
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => Ok::<i64, DejaDbError>(
-                    v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                ),
-                None => Err(DejaDbError::Storage("fts_vocab insert vanished".into())),
-            }
-        })?;
+        self.db
+            .execute("INSERT OR IGNORE INTO fts_vocab(term) VALUES (?1)", vec![pt(term)])?;
+        let rows = self
+            .db
+            .query("SELECT id FROM fts_vocab WHERE term = ?1", vec![pt(term)])?;
+        let id = match rows.first().and_then(|row| row.i64(0)) {
+            Some(id) => id,
+            None => return Err(DejaDbError::Storage("fts_vocab insert vanished".into())),
+        };
         self.fts_vocab.insert(term.to_string(), id);
         Ok(id)
     }
@@ -2051,19 +1864,10 @@ impl DejaDB {
             self.meta_put(MIN_READER_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
             self.needs_min_reader_stamp = false;
         }
-        let conn = &self.conn;
         let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         let (d_docs, d_len) = fts_delta(&preps);
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = insert_prepped(conn, &preps, first_seq, first_op, hlc0).await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
-                }
-            }
+        with_txn(self.db.as_ref(), || {
+            insert_prepped(self.db.as_ref(), &preps, first_seq, first_op, hlc0)
         })?;
         self.fts_docs += d_docs;
         self.fts_total_len += d_len;
@@ -2104,27 +1908,18 @@ impl DejaDB {
     /// cleared first, so running it twice is not double-counting. Reads every
     /// blob once, so it is a maintenance operation, not a hot path.
     pub fn rebuild_link_indexes(&mut self) -> Result<usize> {
-        let conn = &self.conn;
-        let rows: Vec<(i64, i64, Vec<u8>)> = self.rt.block_on(async {
-            conn.execute("DELETE FROM prov_idx", ()).await.map_err(db_err)?;
-            conn.execute("DELETE FROM run_idx", ()).await.map_err(db_err)?;
-            let mut r = conn
-                .query("SELECT seq, ns, blob FROM grains ORDER BY seq", ())
-                .await
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = r.next().await.map_err(db_err)? {
-                let (Some(seq), Some(ns), Some(blob)) = (
-                    v_i64(&row.get_value(0).map_err(db_err)?),
-                    v_i64(&row.get_value(1).map_err(db_err)?),
-                    v_blob(&row.get_value(2).map_err(db_err)?),
-                ) else {
-                    continue;
-                };
-                out.push((seq, ns, blob));
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        self.db.execute("DELETE FROM prov_idx", vec![])?;
+        self.db.execute("DELETE FROM run_idx", vec![])?;
+        let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+        for row in self
+            .db
+            .query("SELECT seq, ns, blob FROM grains ORDER BY seq", vec![])?
+        {
+            let (Some(seq), Some(ns), Some(blob)) = (row.i64(0), row.i64(1), row.blob(2)) else {
+                continue;
+            };
+            rows.push((seq, ns, blob));
+        }
 
         // Resolve dictionary ids first: term interning needs `&mut self`, and
         // the write loop below only has the connection.
@@ -2158,73 +1953,46 @@ impl DejaDB {
             plan.push(Row { seq: *seq, ns: *ns, run, parent, links });
         }
 
-        let conn = &self.conn;
-        let written = self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let body = async {
+        let written = with_txn(self.db.as_ref(), || {
             let mut n = 0usize;
             for r in &plan {
                 if let Some(run) = r.run {
-                    conn.execute(
+                    self.db.execute(
                         "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
-                        (pi(r.ns), pi(run), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                        vec![pi(r.ns), pi(run), pi(r.seq)],
+                    )?;
                     n += 1;
                 }
                 if let Some(ref p) = r.parent {
-                    conn.execute(
+                    self.db.execute(
                         "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
-                        (pi(r.ns), pb(p.clone()), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                        vec![pi(r.ns), pb(p.clone()), pi(r.seq)],
+                    )?;
                     n += 1;
                 }
                 for (ls, lp, lo) in &r.links {
                     // Replayed rather than appended: a re-run must not stack
                     // duplicate edges onto the traversal index.
-                    conn.execute(
+                    self.db.execute(
                         "DELETE FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND o=?4 AND seq=?5",
-                        (pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
+                        vec![pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)],
+                    )?;
+                    self.db.execute(
                         "DELETE FROM osp WHERE ns=?1 AND o=?2 AND s=?3 AND p=?4 AND seq=?5",
-                        (pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
+                        vec![pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)],
+                    )?;
+                    self.db.execute(
                         "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                        (pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
+                        vec![pi(r.ns), pi(*ls), pi(*lp), pi(*lo), pi(r.seq)],
+                    )?;
+                    self.db.execute(
                         "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                        (pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                        vec![pi(r.ns), pi(*lo), pi(*ls), pi(*lp), pi(r.seq)],
+                    )?;
                     n += 1;
                 }
             }
-            Ok::<_, DejaDbError>(n)
-            }
-            .await;
-            match body {
-                Ok(n) => {
-                    conn.execute("COMMIT", ()).await.map_err(db_err)?;
-                    Ok(n)
-                }
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
-                }
-            }
+            Ok(n)
         })?;
         // Declare the file current, so open() stops re-scanning it.
         self.meta_put(LINK_INDEX_KEY, LINK_INDEX_VERSION)?;
@@ -2242,26 +2010,17 @@ impl DejaDB {
     /// the store** on each call, which made a provenance question cost the
     /// whole corpus. Files written before that index existed need `reindex`.
     pub fn grains_derived_from(&mut self, parent: &Hash) -> Result<Vec<DeserializedGrain>> {
-        let conn = &self.conn;
         let key = parent.as_bytes().to_vec();
-        let blobs = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT g.blob FROM prov_idx p JOIN grains g ON g.seq = p.seq
-                     WHERE p.parent = ?1 ORDER BY p.seq DESC",
-                    (pb(key),),
-                )
-                .await
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                    out.push(b);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        self.db
+            .query(
+                "SELECT g.blob FROM prov_idx p JOIN grains g ON g.seq = p.seq
+                 WHERE p.parent = ?1 ORDER BY p.seq DESC",
+                vec![pb(key)],
+            )?
+            .iter()
+            .filter_map(|row| row.blob(0))
+            .map(|b| deserialize_blob(&b))
+            .collect()
     }
 
     /// Every grain recorded during `run_id`, newest first — the run's own
@@ -2274,26 +2033,17 @@ impl DejaDB {
         let (Some(ns_id), Some(run)) = (self.term_lookup(ns), self.term_lookup(run_id)) else {
             return Ok(Vec::new());
         };
-        let conn = &self.conn;
         let limit = limit.min(1024) as i64;
-        let blobs = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT g.blob FROM run_idx r JOIN grains g ON g.seq = r.seq
-                     WHERE r.ns = ?1 AND r.run = ?2 ORDER BY r.seq DESC LIMIT ?3",
-                    (pi(ns_id), pi(run), pi(limit)),
-                )
-                .await
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                    out.push(b);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        self.db
+            .query(
+                "SELECT g.blob FROM run_idx r JOIN grains g ON g.seq = r.seq
+                 WHERE r.ns = ?1 AND r.run = ?2 ORDER BY r.seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(run), pi(limit)],
+            )?
+            .iter()
+            .filter_map(|row| row.blob(0))
+            .map(|b| deserialize_blob(&b))
+            .collect()
     }
 
     /// What a run produced downstream: the grains derived from the run's own
@@ -2426,52 +2176,34 @@ impl DejaDB {
         // The `gtype` column stores the enum ordinal (see `extract_view`:
         // `view.grain_type as u8`), not the .mg header type-byte.
         let gt_ord = gtype.map(|g| g as u8 as i64);
-        let conn = &self.conn;
-        let blobs = self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = match gt_ord {
-                Some(gt) => conn
-                    .query(
-                        &format!("SELECT blob FROM grains WHERE ns=?1 AND gtype=?2{live} ORDER BY seq DESC LIMIT ?3"),
-                        (pi(ns_id), pi(gt), pi(limit as i64)),
-                    )
-                    .await
-                    .map_err(db_err)?,
-                None => conn
-                    .query(
-                        &format!("SELECT blob FROM grains WHERE ns=?1{live} ORDER BY seq DESC LIMIT ?2"),
-                        (pi(ns_id), pi(limit as i64)),
-                    )
-                    .await
-                    .map_err(db_err)?,
-            };
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                    out.push(b);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        let rows = match gt_ord {
+            Some(gt) => self.db.query(
+                &format!("SELECT blob FROM grains WHERE ns=?1 AND gtype=?2{live} ORDER BY seq DESC LIMIT ?3"),
+                vec![pi(ns_id), pi(gt), pi(limit as i64)],
+            )?,
+            None => self.db.query(
+                &format!("SELECT blob FROM grains WHERE ns=?1{live} ORDER BY seq DESC LIMIT ?2"),
+                vec![pi(ns_id), pi(limit as i64)],
+            )?,
+        };
+        rows.iter()
+            .filter_map(|row| row.blob(0))
+            .map(|b| deserialize_blob(&b))
+            .collect()
     }
 
     /// Fetch a grain by content address.
     pub fn get(&mut self, hash: &Hash) -> Result<DeserializedGrain> {
-        let conn = &self.conn;
-        let blob = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT blob FROM grains WHERE hash = ?1",
-                    (pb(hash.as_bytes().to_vec()),),
-                )
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => v_blob(&row.get_value(0).map_err(db_err)?)
-                    .ok_or_else(|| DejaDbError::Storage("blob column not a blob".into())),
-                None => Err(DejaDbError::NotFound(*hash)),
-            }
-        })?;
+        let rows = self.db.query(
+            "SELECT blob FROM grains WHERE hash = ?1",
+            vec![pb(hash.as_bytes().to_vec())],
+        )?;
+        let blob = match rows.first() {
+            Some(row) => row
+                .blob(0)
+                .ok_or_else(|| DejaDbError::Storage("blob column not a blob".into()))?,
+            None => return Err(DejaDbError::NotFound(*hash)),
+        };
         deserialize_blob(&blob)
     }
 
@@ -2496,65 +2228,37 @@ impl DejaDB {
             },
             None => None,
         };
-        let conn = &self.conn;
-        let rt = &self.rt;
-        let slot_sp = &mut self.st_probe_sp;
-        let slot_s = &mut self.st_probe_s;
-        let slot_f = &mut self.st_fetch_seq;
-        let blobs = rt.block_on(async {
-            let mut out = Vec::new();
-            let mut seqs: Vec<i64> = Vec::new();
-            match p_id {
-                Some(p) => {
-                    let st = ensure_stmt(
-                        slot_sp,
-                        conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
-                    )
-                    .await?;
-                    let mut rows = st
-                        .query((pi(ns_id), pi(s_id), pi(p), pi(k as i64)))
-                        .await
-                        .map_err(db_err)?;
-                    while let Some(row) = rows.next().await.map_err(db_err)? {
-                        if let Some(x) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                            seqs.push(x);
-                        }
-                    }
-                }
-                None => {
-                    let st = ensure_stmt(
-                        slot_s,
-                        conn,
-                        "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
-                    )
-                    .await?;
-                    let mut rows = st
-                        .query((pi(ns_id), pi(s_id), pi(k as i64)))
-                        .await
-                        .map_err(db_err)?;
-                    while let Some(row) = rows.next().await.map_err(db_err)? {
-                        if let Some(x) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                            seqs.push(x);
-                        }
-                    }
-                }
+        let seqs: Vec<i64> = match p_id {
+            Some(p) => self
+                .db
+                .query_hot(
+                    "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
+                    vec![pi(ns_id), pi(s_id), pi(p), pi(k as i64)],
+                )?
+                .iter()
+                .filter_map(|row| row.i64(0))
+                .collect(),
+            None => self
+                .db
+                .query_hot(
+                    "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
+                    vec![pi(ns_id), pi(s_id), pi(k as i64)],
+                )?
+                .iter()
+                .filter_map(|row| row.i64(0))
+                .collect(),
+        };
+        let mut out = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            if let Some(b) = self
+                .db
+                .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
+                .first()
+                .and_then(|row| row.blob(0))
+            {
+                out.push(deserialize_blob(&b)?);
             }
-            let st_f = ensure_stmt(slot_f, conn, "SELECT blob FROM grains WHERE seq = ?1").await?;
-            for seq in seqs {
-                let mut rows = st_f.query((pi(seq),)).await.map_err(db_err)?;
-                if let Some(row) = rows.next().await.map_err(db_err)? {
-                    if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                        out.push(b);
-                    }
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        let out = blobs
-            .iter()
-            .map(|b| deserialize_blob(b))
-            .collect::<Result<Vec<_>>>()?;
+        }
         // Structural recall feeds telemetry too, so `cold_grains` doesn't
         // false-positive on grains that are recalled by subject (not query).
         self.record_recall_event(ns, Some(subject), relation, None, &out, start);
@@ -2571,25 +2275,14 @@ impl DejaDB {
             (Some(a), Some(b), Some(c)) => (a, b, c),
             _ => return Ok(None),
         };
-        let conn = &self.conn;
-        let rt = &self.rt;
-        let slot = &mut self.st_latest;
-        let hash = rt.block_on(async {
-            let st = ensure_stmt(
-                slot,
-                conn,
+        let hash = self
+            .db
+            .query_hot(
                 "SELECT hash FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3",
-            )
-            .await?;
-            let mut rows = st
-                .query((pi(ns_id), pi(s_id), pi(p_id)))
-                .await
-                .map_err(db_err)?;
-            Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                None => None,
-            })
-        })?;
+                vec![pi(ns_id), pi(s_id), pi(p_id)],
+            )?
+            .first()
+            .and_then(|row| row.blob(0));
         match hash {
             Some(h) => {
                 let h = Hash::try_from_bytes(&h)?;
@@ -2605,38 +2298,27 @@ impl DejaDB {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
-        let conn = &self.conn;
-        let blobs = self.rt.block_on(async {
-            let mut seqs = Vec::new();
+        let seqs: Vec<i64> = self
+            .db
+            .query(
+                "SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2 ORDER BY seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(sess_id), pi(n as i64)],
+            )?
+            .iter()
+            .filter_map(|row| row.i64(0))
+            .collect();
+        let mut out = Vec::with_capacity(seqs.len());
+        for seq in seqs.into_iter().rev() {
+            if let Some(b) = self
+                .db
+                .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
+                .first()
+                .and_then(|row| row.blob(0))
             {
-                let mut rows = conn
-                    .query(
-                        "SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2 ORDER BY seq DESC LIMIT ?3",
-                        (pi(ns_id), pi(sess_id), pi(n as i64)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                while let Some(row) = rows.next().await.map_err(db_err)? {
-                    if let Some(x) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                        seqs.push(x);
-                    }
-                }
+                out.push(deserialize_blob(&b)?);
             }
-            let mut out = Vec::new();
-            for seq in seqs.into_iter().rev() {
-                let mut rows = conn
-                    .query("SELECT blob FROM grains WHERE seq = ?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                if let Some(row) = rows.next().await.map_err(db_err)? {
-                    if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                        out.push(b);
-                    }
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        }
+        Ok(out)
     }
 
     // ----- evolution path -----
@@ -2646,29 +2328,18 @@ impl DejaDB {
     /// touched — only its index-layer fields change.
     pub fn supersede<G: Grain + 'static>(&mut self, old: &Hash, new_grain: &mut G) -> Result<Hash> {
         // Old head must exist and be current.
-        let conn = &self.conn;
-        let old_row = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT seq, ns, s, p, svt FROM grains WHERE hash = ?1",
-                    (pb(old.as_bytes().to_vec()),),
-                )
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => {
-                    let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                    let ns = v_i64(&row.get_value(1).map_err(db_err)?);
-                    let s = v_i64(&row.get_value(2).map_err(db_err)?);
-                    let p = v_i64(&row.get_value(3).map_err(db_err)?);
-                    let svt = v_i64(&row.get_value(4).map_err(db_err)?);
-                    Ok::<_, DejaDbError>(Some((seq, ns, s, p, svt)))
-                }
-                None => Ok(None),
-            }
-        })?;
-        let (old_seq, _ns, old_s, old_p, old_svt) = match old_row {
-            Some(x) => x,
+        let rows = self.db.query(
+            "SELECT seq, ns, s, p, svt FROM grains WHERE hash = ?1",
+            vec![pb(old.as_bytes().to_vec())],
+        )?;
+        let (old_seq, _ns, old_s, old_p, old_svt) = match rows.first() {
+            Some(row) => (
+                row.i64(0).unwrap_or(0),
+                row.i64(1),
+                row.i64(2),
+                row.i64(3),
+                row.i64(4),
+            ),
             None => return Err(DejaDbError::NotFound(*old)),
         };
         if old_svt.is_some() {
@@ -2692,91 +2363,61 @@ impl DejaDB {
         self.next_op += 1;
         let hlc = self.next_hlc();
         let (d_docs, d_len) = fts_delta(&preps);
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                insert_prepped(conn, &preps, first_seq, first_op, hlc0).await?;
-                conn.execute(
-                    "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
-                    (pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)),
-                )
-                .await
-                .map_err(db_err)?;
-                conn.execute(
-                    "UPDATE grains SET supersedes=?1 WHERE hash=?2",
-                    (pb(old.as_bytes().to_vec()), pb(new_hash.as_bytes().to_vec())),
-                )
-                .await
-                .map_err(db_err)?;
-                conn.execute("UPDATE triples SET cur=0 WHERE seq=?1", (pi(old_seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(old_seq),))
-                    .await
-                    .map_err(db_err)?;
-                // Reconcile the OLD key's head/entity_latest indexes. Normally
-                // add(new) handles this because new shares (ns,s,p) with old; but
-                // when the new grain carries a DIFFERENT (subject,relation) — or
-                // no triple — add reconciles the new key and leaves the old key
-                // pointing at the now-superseded grain. Mirror forget so
-                // latest()/heads() for the old key don't surface it. Harmless
-                // no-op in the common same-key case (old is already out of heads).
-                if let (Some(ns), Some(s), Some(p)) = (_ns, old_s, old_p) {
-                    conn.execute(
-                        "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
-                        (pi(ns), pi(s), pi(p), pi(old_seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
-                        "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
-                        (pi(ns), pi(s), pi(p), pi(old_seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    // Key the join on (ns,s,p), not seq alone: a link-bearing
-                    // grain has extra triples rows for the same seq, and an
-                    // unkeyed join lets the engine pick a link target as t.o.
-                    let mut rows = conn
-                        .query(
-                            "SELECT t.o, h.seq, h.hash, h.created_at
-                             FROM heads h JOIN triples t
-                               ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
-                             WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
-                             ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
-                            (pi(ns), pi(s), pi(p)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    if let Some(row) = rows.next().await.map_err(db_err)? {
-                        let o = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                        let sq = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
-                        let h = v_blob(&row.get_value(2).map_err(db_err)?).unwrap_or_default();
-                        conn.execute(
-                            "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
-                            (pi(ns), pi(s), pi(p), pi(o), pi(sq), pb(h)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                }
-                conn.execute(
-                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-                    (pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(new_hash.as_bytes().to_vec())),
-                )
-                .await
-                .map_err(db_err)?;
-                Ok::<(), DejaDbError>(())
-            }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            insert_prepped(dbr, &preps, first_seq, first_op, hlc0)?;
+            dbr.execute(
+                "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
+                vec![pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)],
+            )?;
+            dbr.execute(
+                "UPDATE grains SET supersedes=?1 WHERE hash=?2",
+                vec![pb(old.as_bytes().to_vec()), pb(new_hash.as_bytes().to_vec())],
+            )?;
+            dbr.execute("UPDATE triples SET cur=0 WHERE seq=?1", vec![pi(old_seq)])?;
+            dbr.execute("UPDATE osp SET cur=0 WHERE seq=?1", vec![pi(old_seq)])?;
+            // Reconcile the OLD key's head/entity_latest indexes. Normally
+            // add(new) handles this because new shares (ns,s,p) with old; but
+            // when the new grain carries a DIFFERENT (subject,relation) — or
+            // no triple — add reconciles the new key and leaves the old key
+            // pointing at the now-superseded grain. Mirror forget so
+            // latest()/heads() for the old key don't surface it. Harmless
+            // no-op in the common same-key case (old is already out of heads).
+            if let (Some(ns), Some(s), Some(p)) = (_ns, old_s, old_p) {
+                dbr.execute(
+                    "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                    vec![pi(ns), pi(s), pi(p), pi(old_seq)],
+                )?;
+                dbr.execute(
+                    "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                    vec![pi(ns), pi(s), pi(p), pi(old_seq)],
+                )?;
+                // Key the join on (ns,s,p), not seq alone: a link-bearing
+                // grain has extra triples rows for the same seq, and an
+                // unkeyed join lets the engine pick a link target as t.o.
+                let rows = dbr.query(
+                    "SELECT t.o, h.seq, h.hash, h.created_at
+                     FROM heads h JOIN triples t
+                       ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
+                     WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
+                     ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
+                    vec![pi(ns), pi(s), pi(p)],
+                )?;
+                if let Some(row) = rows.first() {
+                    let o = row.i64(0).unwrap_or(0);
+                    let sq = row.i64(1).unwrap_or(0);
+                    let h = row.blob(2).unwrap_or_default();
+                    dbr.execute(
+                        "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                        vec![pi(ns), pi(s), pi(p), pi(o), pi(sq), pb(h)],
+                    )?;
                 }
             }
+            dbr.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                vec![pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(new_hash.as_bytes().to_vec())],
+            )?;
+            Ok(())
         })?;
         self.fts_docs += d_docs;
         self.fts_total_len += d_len;
@@ -2786,148 +2427,87 @@ impl DejaDB {
     /// Forget (erase from hot store) — writes a tombstone to the op-log.
     /// File-level crypto-erasure remains the strong path.
     pub fn forget(&mut self, hash: &Hash) -> Result<()> {
-        let conn = &self.conn;
-        let row = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT seq, ns, s, p FROM grains WHERE hash = ?1",
-                    (pb(hash.as_bytes().to_vec()),),
-                )
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => Ok::<_, DejaDbError>(Some((
-                    v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                    v_i64(&row.get_value(1).map_err(db_err)?),
-                    v_i64(&row.get_value(2).map_err(db_err)?),
-                    v_i64(&row.get_value(3).map_err(db_err)?),
-                ))),
-                None => Ok(None),
-            }
-        })?;
-        let (seq, ns, s, p) = match row {
-            Some(x) => x,
+        let rows = self.db.query(
+            "SELECT seq, ns, s, p FROM grains WHERE hash = ?1",
+            vec![pb(hash.as_bytes().to_vec())],
+        )?;
+        let (seq, ns, s, p) = match rows.first() {
+            Some(row) => (row.i64(0).unwrap_or(0), row.i64(1), row.i64(2), row.i64(3)),
             None => return Err(DejaDbError::NotFound(*hash)),
         };
         // Read the document's length before the delete removes it, so the
         // in-memory BM25 collection stats can be corrected afterwards.
-        let conn = &self.conn;
-        let doc_len = self.rt.block_on(async {
-            let mut rows = conn
-                .query("SELECT len FROM fts_doc WHERE seq = ?1", (pi(seq),))
-                .await
-                .map_err(db_err)?;
-            Ok::<Option<i64>, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_i64(&row.get_value(0).map_err(db_err)?),
-                None => None,
-            })
-        })?;
+        let doc_len = self
+            .db
+            .query("SELECT len FROM fts_doc WHERE seq = ?1", vec![pi(seq)])?
+            .first()
+            .and_then(|row| row.i64(0));
         let op_seq = self.next_op;
         self.next_op += 1;
         let hlc = self.next_hlc();
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                conn.execute("DELETE FROM triples WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM osp WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM embeddings WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM thread_idx WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                // The join's two indexes, for the same reason every other index
-                // is reconciled here. `seq` is re-derived as MAX(seq)+1 on open,
-                // so forgetting the newest grain hands its seq to the next write
-                // — a surviving row would then re-attach a stranger to this
-                // grain's parent or run.
-                conn.execute("DELETE FROM prov_idx WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM run_idx WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                // Postings too, or a forgotten grain's words keep answering
-                // free-text recall — a tombstone that leaves the text findable
-                // is not a tombstone.
-                conn.execute("DELETE FROM fts_post WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM fts_doc WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                conn.execute("DELETE FROM grains WHERE seq=?1", (pi(seq),))
-                    .await
-                    .map_err(db_err)?;
-                // Reconcile the head/entity_latest indexes for the cell.
-                if let (Some(ns), Some(s), Some(p)) = (ns, s, p) {
-                    // Forget must drop the grain's fork-tip row too — every other
-                    // index is reconciled here, but `heads` was left dangling, so
-                    // heads()/open_forks() kept surfacing a hash whose get() fails
-                    // (and merge_heads could merge a forgotten tip).
-                    conn.execute(
-                        "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
-                        (pi(ns), pi(s), pi(p), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
-                        "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
-                        (pi(ns), pi(s), pi(p), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    // Re-elect the provisional head from the surviving tips using
-                    // the SAME (created_at, hash) rule as heads()/insert_blob —
-                    // was `ORDER BY seq DESC`, which can disagree with the
-                    // provisional-head rule in a 3+-way fork after a forget.
-                    // Key the join on (ns,s,p), not seq alone: a link-bearing
-                    // grain has extra triples rows for the same seq, and an
-                    // unkeyed join lets the engine pick a link target as t.o.
-                    let mut rows = conn
-                        .query(
-                            "SELECT t.o, h.seq, h.hash, h.created_at
-                             FROM heads h JOIN triples t
-                               ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
-                             WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
-                             ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
-                            (pi(ns), pi(s), pi(p)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    if let Some(row) = rows.next().await.map_err(db_err)? {
-                        let o = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                        let sq = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
-                        let h = v_blob(&row.get_value(2).map_err(db_err)?).unwrap_or_default();
-                        conn.execute(
-                            "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
-                            (pi(ns), pi(s), pi(p), pi(o), pi(sq), pb(h)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                }
-                conn.execute(
-                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-                    (pi(op_seq), pi(hlc), pi(OP_FORGET), pb(hash.as_bytes().to_vec())),
-                )
-                .await
-                .map_err(db_err)?;
-                Ok::<(), DejaDbError>(())
-            }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            dbr.execute("DELETE FROM triples WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM osp WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM embeddings WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM thread_idx WHERE seq=?1", vec![pi(seq)])?;
+            // The join's two indexes, for the same reason every other index
+            // is reconciled here. `seq` is re-derived as MAX(seq)+1 on open,
+            // so forgetting the newest grain hands its seq to the next write
+            // — a surviving row would then re-attach a stranger to this
+            // grain's parent or run.
+            dbr.execute("DELETE FROM prov_idx WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM run_idx WHERE seq=?1", vec![pi(seq)])?;
+            // Postings too, or a forgotten grain's words keep answering
+            // free-text recall — a tombstone that leaves the text findable
+            // is not a tombstone.
+            dbr.execute("DELETE FROM fts_post WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM fts_doc WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM grains WHERE seq=?1", vec![pi(seq)])?;
+            // Reconcile the head/entity_latest indexes for the cell.
+            if let (Some(ns), Some(s), Some(p)) = (ns, s, p) {
+                // Forget must drop the grain's fork-tip row too — every other
+                // index is reconciled here, but `heads` was left dangling, so
+                // heads()/open_forks() kept surfacing a hash whose get() fails
+                // (and merge_heads could merge a forgotten tip).
+                dbr.execute(
+                    "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                    vec![pi(ns), pi(s), pi(p), pi(seq)],
+                )?;
+                dbr.execute(
+                    "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                    vec![pi(ns), pi(s), pi(p), pi(seq)],
+                )?;
+                // Re-elect the provisional head from the surviving tips using
+                // the SAME (created_at, hash) rule as heads()/insert_blob —
+                // was `ORDER BY seq DESC`, which can disagree with the
+                // provisional-head rule in a 3+-way fork after a forget.
+                // Key the join on (ns,s,p), not seq alone: a link-bearing
+                // grain has extra triples rows for the same seq, and an
+                // unkeyed join lets the engine pick a link target as t.o.
+                let rows = dbr.query(
+                    "SELECT t.o, h.seq, h.hash, h.created_at
+                     FROM heads h JOIN triples t
+                       ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
+                     WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
+                     ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
+                    vec![pi(ns), pi(s), pi(p)],
+                )?;
+                if let Some(row) = rows.first() {
+                    let o = row.i64(0).unwrap_or(0);
+                    let sq = row.i64(1).unwrap_or(0);
+                    let h = row.blob(2).unwrap_or_default();
+                    dbr.execute(
+                        "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                        vec![pi(ns), pi(s), pi(p), pi(o), pi(sq), pb(h)],
+                    )?;
                 }
             }
+            dbr.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                vec![pi(op_seq), pi(hlc), pi(OP_FORGET), pb(hash.as_bytes().to_vec())],
+            )?;
+            Ok(())
         })?;
         if let Some(len) = doc_len {
             self.fts_docs = (self.fts_docs - 1).max(0);
@@ -2938,9 +2518,8 @@ impl DejaDB {
         // Best-effort: the main erasure already committed, and the sidecar is
         // encrypted under the same key (crypto-erasure covers any residue) and
         // is rebuildable — a scrub hiccup must not fail an accomplished forget.
-        let rt = &self.rt;
         if let Some(tel) = self.telemetry.as_mut() {
-            let _ = tel.scrub(rt, hash);
+            let _ = tel.scrub(hash);
         }
         Ok(())
     }
@@ -2953,17 +2532,11 @@ impl DejaDB {
     fn log_op(&mut self, op: i64, hash: &Hash, hlc: i64) -> Result<()> {
         let op_seq = self.next_op;
         self.next_op += 1;
-        let conn = &self.conn;
-        let h = hash.as_bytes().to_vec();
-        self.rt.block_on(async {
-            conn.execute(
-                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-                (pi(op_seq), pi(hlc), pi(op), pb(h)),
-            )
-            .await
-            .map_err(db_err)?;
-            Ok::<(), DejaDbError>(())
-        })
+        self.db.execute(
+            "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+            vec![pi(op_seq), pi(hlc), pi(op), pb(hash.as_bytes().to_vec())],
+        )?;
+        Ok(())
     }
 
     // ----- telemetry sidecar (host capability; off the recall path) -----
@@ -2979,18 +2552,16 @@ impl DejaDB {
     /// Drain buffered recall telemetry into the sidecar. A no-op when the
     /// buffer is empty; called from write ops and on close — never from recall.
     pub fn telemetry_flush(&mut self) -> Result<()> {
-        let rt = &self.rt;
         if let Some(tel) = self.telemetry.as_mut() {
-            tel.flush(rt)?;
+            tel.flush()?;
         }
         Ok(())
     }
 
     /// Record one assembly-budget sample (feeds the `budget_pressure` analyzer).
     pub fn telemetry_note_budget(&mut self, overflow: bool) -> Result<()> {
-        let rt = &self.rt;
         if let Some(tel) = self.telemetry.as_mut() {
-            tel.note_budget(rt, overflow)?;
+            tel.note_budget(overflow)?;
         }
         Ok(())
     }
@@ -2999,9 +2570,8 @@ impl DejaDB {
     /// recalls are counted; empty when telemetry is off.
     pub fn telemetry_access_stats(&mut self, ns: Option<&str>) -> Result<Vec<AccessStat>> {
         self.telemetry_flush()?;
-        let rt = &self.rt;
         match self.telemetry.as_ref() {
-            Some(tel) => tel.access_stats(rt, ns),
+            Some(tel) => tel.access_stats(ns),
             None => Ok(Vec::new()),
         }
     }
@@ -3009,9 +2579,8 @@ impl DejaDB {
     /// Query rollups (feeds `coverage_gap`). Flushes first; empty when off.
     pub fn telemetry_query_stats(&mut self, ns: Option<&str>) -> Result<Vec<QueryStat>> {
         self.telemetry_flush()?;
-        let rt = &self.rt;
         match self.telemetry.as_ref() {
-            Some(tel) => tel.query_stats(rt, ns),
+            Some(tel) => tel.query_stats(ns),
             None => Ok(Vec::new()),
         }
     }
@@ -3019,9 +2588,8 @@ impl DejaDB {
     /// The assembly-budget rollup (feeds `budget_pressure`). Empty when off.
     pub fn telemetry_budget_stats(&mut self) -> Result<BudgetStat> {
         self.telemetry_flush()?;
-        let rt = &self.rt;
         match self.telemetry.as_ref() {
-            Some(tel) => tel.budget_stats(rt),
+            Some(tel) => tel.budget_stats(),
             None => Ok(BudgetStat::default()),
         }
     }
@@ -3066,40 +2634,27 @@ impl DejaDB {
             return Ok(Vec::new());
         }
         let limit = limit.min(1024);
-        let conn = &self.conn;
         // The OSP index is keyed (ns, o, s) — the link's object is the workflow
         // hash, so this reads the reverse direction directly.
-        let rows = self.rt.block_on(async {
-            let mut out: Vec<(i64, i64, i64)> = Vec::new();
-            for p in &pred_ids {
-                let mut r = conn
-                    .query(
-                        "SELECT seq, s, p FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1
-                         ORDER BY seq DESC LIMIT ?4",
-                        (pi(ns_id), pi(target_id), pi(*p), pi(limit as i64)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                while let Some(row) = r.next().await.map_err(db_err)? {
-                    let (Some(seq), Some(s), Some(p)) = (
-                        v_i64(&row.get_value(0).map_err(db_err)?),
-                        v_i64(&row.get_value(1).map_err(db_err)?),
-                        v_i64(&row.get_value(2).map_err(db_err)?),
-                    ) else {
-                        continue;
-                    };
-                    out.push((seq, s, p));
-                }
+        let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+        for p in &pred_ids {
+            for row in self.db.query(
+                "SELECT seq, s, p FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1
+                 ORDER BY seq DESC LIMIT ?4",
+                vec![pi(ns_id), pi(target_id), pi(*p), pi(limit as i64)],
+            )? {
+                let (Some(seq), Some(s), Some(p)) = (row.i64(0), row.i64(1), row.i64(2)) else {
+                    continue;
+                };
+                rows.push((seq, s, p));
             }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        }
 
         // Each predicate was queried and capped separately, and with no
         // `node_id` the predicate set comes from a dictionary scan whose order
         // is a HashMap's — i.e. no order at all. Sort by seq before truncating,
         // or "newest first" is false across nodes and *which* records survive
         // the cap changes from one process to the next.
-        let mut rows = rows;
         rows.sort_unstable_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
 
         let mut result = Vec::with_capacity(rows.len());
@@ -3148,25 +2703,16 @@ impl DejaDB {
             return Ok(Vec::new());
         };
         let limit = limit.min(1024) as i64;
-        let conn = &self.conn;
-        let blobs = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT g.blob FROM osp o JOIN grains g ON g.seq = o.seq
-                     WHERE o.ns = ?1 AND o.o = ?2 AND o.cur = 1 ORDER BY o.seq DESC LIMIT ?3",
-                    (pi(ns_id), pi(obj_id), pi(limit)),
-                )
-                .await
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                    out.push(b);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
-        blobs.iter().map(|b| deserialize_blob(b)).collect()
+        self.db
+            .query(
+                "SELECT g.blob FROM osp o JOIN grains g ON g.seq = o.seq
+                 WHERE o.ns = ?1 AND o.o = ?2 AND o.cur = 1 ORDER BY o.seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(obj_id), pi(limit)],
+            )?
+            .iter()
+            .filter_map(|row| row.blob(0))
+            .map(|b| deserialize_blob(&b))
+            .collect()
     }
 
     /// Bounded k-hop traversal over the given relations.
@@ -3196,8 +2742,7 @@ impl DejaDB {
         }
         let depth = depth.min(4);
         let cap = cap.min(512);
-        let conn = &self.conn;
-        let reached = self.rt.block_on(async {
+        let reached = 'bfs: {
             let mut seen: HashSet<i64> = HashSet::new();
             seen.insert(start_id);
             let mut order: Vec<i64> = Vec::new();
@@ -3207,40 +2752,32 @@ impl DejaDB {
                 for node in &frontier {
                     for p in &rel_ids {
                         if matches!(dir, Direction::Out | Direction::Both) {
-                            let mut rows = conn
-                                .query(
-                                    "SELECT o FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 LIMIT 64",
-                                    (pi(ns_id), pi(*node), pi(*p)),
-                                )
-                                .await
-                                .map_err(db_err)?;
-                            while let Some(row) = rows.next().await.map_err(db_err)? {
-                                if let Some(o) = v_i64(&row.get_value(0).map_err(db_err)?) {
+                            for row in self.db.query(
+                                "SELECT o FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 LIMIT 64",
+                                vec![pi(ns_id), pi(*node), pi(*p)],
+                            )? {
+                                if let Some(o) = row.i64(0) {
                                     if seen.insert(o) {
                                         order.push(o);
                                         next.push(o);
                                         if order.len() >= cap {
-                                            return Ok::<_, DejaDbError>(order);
+                                            break 'bfs order;
                                         }
                                     }
                                 }
                             }
                         }
                         if matches!(dir, Direction::In | Direction::Both) {
-                            let mut rows = conn
-                                .query(
-                                    "SELECT s FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1 LIMIT 64",
-                                    (pi(ns_id), pi(*node), pi(*p)),
-                                )
-                                .await
-                                .map_err(db_err)?;
-                            while let Some(row) = rows.next().await.map_err(db_err)? {
-                                if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
+                            for row in self.db.query(
+                                "SELECT s FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1 LIMIT 64",
+                                vec![pi(ns_id), pi(*node), pi(*p)],
+                            )? {
+                                if let Some(s) = row.i64(0) {
                                     if seen.insert(s) {
                                         order.push(s);
                                         next.push(s);
                                         if order.len() >= cap {
-                                            return Ok::<_, DejaDbError>(order);
+                                            break 'bfs order;
                                         }
                                     }
                                 }
@@ -3253,8 +2790,8 @@ impl DejaDB {
                 }
                 frontier = next;
             }
-            Ok(order)
-        })?;
+            order
+        };
         Ok(reached.into_iter().filter_map(|id| self.term_str(id)).collect())
     }
 
@@ -3280,8 +2817,7 @@ impl DejaDB {
             return Ok(None);
         }
         let max_depth = max_depth.min(6);
-        let conn = &self.conn;
-        let parents = self.rt.block_on(async {
+        let parents = {
             let mut parent: HashMap<i64, i64> = HashMap::new();
             let mut q = VecDeque::from([a]);
             let mut found = false;
@@ -3291,15 +2827,11 @@ impl DejaDB {
                 let level: Vec<i64> = q.drain(..).collect();
                 for node in level {
                     for p in &rel_ids {
-                        let mut rows = conn
-                            .query(
-                                "SELECT o FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 LIMIT 64",
-                                (pi(ns_id), pi(node), pi(*p)),
-                            )
-                            .await
-                            .map_err(db_err)?;
-                        while let Some(row) = rows.next().await.map_err(db_err)? {
-                            if let Some(o) = v_i64(&row.get_value(0).map_err(db_err)?) {
+                        for row in self.db.query(
+                            "SELECT o FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 LIMIT 64",
+                            vec![pi(ns_id), pi(node), pi(*p)],
+                        )? {
+                            if let Some(o) = row.i64(0) {
                                 if visited.insert(o) {
                                     parent.insert(o, node);
                                     if o == b {
@@ -3317,8 +2849,8 @@ impl DejaDB {
                 }
                 hops += 1;
             }
-            Ok::<_, DejaDbError>(if found { Some(parent) } else { None })
-        })?;
+            if found { Some(parent) } else { None }
+        };
         Ok(parents.map(|parent| {
             let mut chain = vec![b];
             let mut cur = b;
@@ -3352,27 +2884,12 @@ impl DejaDB {
                 };
                 let mut cur = head;
                 loop {
-                    let conn = &self.conn;
-                    let row = self.rt.block_on(async {
-                        let mut rows = conn
-                            .query(
-                                "SELECT svf, supersedes, blob FROM grains WHERE hash = ?1",
-                                (pb(cur.as_bytes().to_vec()),),
-                            )
-                            .await
-                            .map_err(db_err)?;
-                        match rows.next().await.map_err(db_err)? {
-                            Some(row) => {
-                                let svf = v_i64(&row.get_value(0).map_err(db_err)?);
-                                let sup = v_blob(&row.get_value(1).map_err(db_err)?);
-                                let blob = v_blob(&row.get_value(2).map_err(db_err)?);
-                                Ok::<_, DejaDbError>(Some((svf, sup, blob)))
-                            }
-                            None => Ok(None),
-                        }
-                    })?;
-                    let (svf, sup, blob) = match row {
-                        Some(x) => x,
+                    let rows = self.db.query(
+                        "SELECT svf, supersedes, blob FROM grains WHERE hash = ?1",
+                        vec![pb(cur.as_bytes().to_vec())],
+                    )?;
+                    let (svf, sup, blob) = match rows.first() {
+                        Some(row) => (row.i64(0), row.blob(1), row.blob(2)),
                         None => return Ok(None),
                     };
                     if svf.unwrap_or(i64::MIN) <= t {
@@ -3394,25 +2911,19 @@ impl DejaDB {
                     (Some(a), Some(b), Some(c)) => (a, b, c),
                     _ => return Ok(None),
                 };
-                let conn = &self.conn;
-                let blob = self.rt.block_on(async {
-                    let mut rows = conn
-                        .query(
-                            "SELECT g.blob FROM triples tr JOIN grains g ON g.seq = tr.seq
-                             WHERE tr.ns=?1 AND tr.s=?2 AND tr.p=?3
-                               AND g.svt IS NULL
-                               AND (g.vf IS NULL OR g.vf <= ?4)
-                               AND (g.vt IS NULL OR g.vt > ?4)
-                             ORDER BY tr.seq DESC LIMIT 1",
-                            (pi(ns_id), pi(s_id), pi(p_id), pi(t)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                        Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                        None => None,
-                    })
-                })?;
+                let blob = self
+                    .db
+                    .query(
+                        "SELECT g.blob FROM triples tr JOIN grains g ON g.seq = tr.seq
+                         WHERE tr.ns=?1 AND tr.s=?2 AND tr.p=?3
+                           AND g.svt IS NULL
+                           AND (g.vf IS NULL OR g.vf <= ?4)
+                           AND (g.vt IS NULL OR g.vt > ?4)
+                         ORDER BY tr.seq DESC LIMIT 1",
+                        vec![pi(ns_id), pi(s_id), pi(p_id), pi(t)],
+                    )?
+                    .first()
+                    .and_then(|row| row.blob(0));
                 match blob {
                     Some(b) => Ok(Some(deserialize_blob(&b)?)),
                     None => Ok(None),
@@ -3488,31 +2999,28 @@ impl DejaDB {
             1.0
         };
 
-        let conn = &self.conn;
         let mut scores: HashMap<i64, f64> = HashMap::new();
         for term in terms {
             // Document length comes back with the posting, so scoring a term
             // is one query regardless of how many documents contain it.
-            let postings: Vec<(i64, i64, i64)> = self.rt.block_on(async {
-                let mut out = Vec::new();
-                let mut rows = conn
-                    .query(
-                        "SELECT p.seq, p.tf, d.len FROM fts_post p
-                          JOIN fts_vocab v ON v.id = p.term
-                          JOIN fts_doc d ON d.seq = p.seq
-                         WHERE v.term = ?1 AND p.ns = ?2",
-                        (pt(&term), pi(ns_id)),
+            let postings: Vec<(i64, i64, i64)> = self
+                .db
+                .query_hot(
+                    "SELECT p.seq, p.tf, d.len FROM fts_post p
+                      JOIN fts_vocab v ON v.id = p.term
+                      JOIN fts_doc d ON d.seq = p.seq
+                     WHERE v.term = ?1 AND p.ns = ?2",
+                    vec![pt(&term), pi(ns_id)],
+                )?
+                .iter()
+                .map(|row| {
+                    (
+                        row.i64(0).unwrap_or(0),
+                        row.i64(1).unwrap_or(0),
+                        row.i64(2).unwrap_or(1).max(1),
                     )
-                    .await
-                    .map_err(db_err)?;
-                while let Some(row) = rows.next().await.map_err(db_err)? {
-                    let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                    let tf = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
-                    let len = v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(1).max(1);
-                    out.push((seq, tf, len));
-                }
-                Ok::<_, DejaDbError>(out)
-            })?;
+                })
+                .collect();
             if postings.is_empty() {
                 continue;
             }
@@ -3564,17 +3072,12 @@ impl DejaDB {
             "SELECT seq FROM grains WHERE svt IS NULL AND seq IN ({})",
             list.join(",")
         );
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = HashSet::new();
-            let mut rows = conn.query(&sql, ()).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                    out.insert(s);
-                }
-            }
-            Ok(out)
-        })
+        Ok(self
+            .db
+            .query(&sql, vec![])?
+            .iter()
+            .filter_map(|row| row.i64(0))
+            .collect())
     }
 
     /// Which of `hashes` have been superseded, and by what.
@@ -3593,31 +3096,21 @@ impl DejaDB {
         if hashes.is_empty() {
             return Ok(out);
         }
-        let conn = &self.conn;
-        let rt = &self.rt;
-        let slot = &mut self.st_superseder;
-        rt.block_on(async {
-            let st = ensure_stmt(
-                slot,
-                conn,
-                "SELECT superseded_by FROM grains WHERE hash = ?1",
-            )
-            .await?;
-            for h in hashes {
-                let mut rows = st
-                    .query((pb(h.as_bytes().to_vec()),))
-                    .await
-                    .map_err(db_err)?;
-                if let Some(row) = rows.next().await.map_err(db_err)? {
-                    if let Some(sup) = v_blob(&row.get_value(0).map_err(db_err)?)
-                        .and_then(|b| Hash::try_from_bytes(&b).ok())
-                    {
-                        out.insert(*h, sup);
-                    }
-                }
+        for h in hashes {
+            if let Some(sup) = self
+                .db
+                .query_hot(
+                    "SELECT superseded_by FROM grains WHERE hash = ?1",
+                    vec![pb(h.as_bytes().to_vec())],
+                )?
+                .first()
+                .and_then(|row| row.blob(0))
+                .and_then(|b| Hash::try_from_bytes(&b).ok())
+            {
+                out.insert(*h, sup);
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Vector leg: cosine top-k over embedded grain text (brute force —
@@ -3670,47 +3163,33 @@ impl DejaDB {
             },
             None => None,
         };
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let base = "SELECT g.hash, vector_distance_cos(e.vec, vector32(?2)) AS dist \
-                        FROM embeddings e JOIN grains g ON g.seq = e.seq \
-                        WHERE g.ns = ?1 AND g.svt IS NULL";
-            let mut rows = match (s_id, p_id) {
-                (Some(s), Some(p)) => {
-                    conn.query(
-                        &format!("{base} AND g.s = ?3 AND g.p = ?4 ORDER BY dist LIMIT ?5"),
-                        (pi(ns_id), pt(&qjson), pi(s), pi(p), pi(k as i64)),
-                    )
-                    .await
-                }
-                (Some(s), None) => {
-                    conn.query(
-                        &format!("{base} AND g.s = ?3 ORDER BY dist LIMIT ?4"),
-                        (pi(ns_id), pt(&qjson), pi(s), pi(k as i64)),
-                    )
-                    .await
-                }
-                _ => {
-                    conn.query(
-                        &format!("{base} ORDER BY dist LIMIT ?3"),
-                        (pi(ns_id), pt(&qjson), pi(k as i64)),
-                    )
-                    .await
-                }
+        let base = "SELECT g.hash, vector_distance_cos(e.vec, vector32(?2)) AS dist \
+                    FROM embeddings e JOIN grains g ON g.seq = e.seq \
+                    WHERE g.ns = ?1 AND g.svt IS NULL";
+        let rows = match (s_id, p_id) {
+            (Some(s), Some(p)) => self.db.query(
+                &format!("{base} AND g.s = ?3 AND g.p = ?4 ORDER BY dist LIMIT ?5"),
+                vec![pi(ns_id), pt(&qjson), pi(s), pi(p), pi(k as i64)],
+            )?,
+            (Some(s), None) => self.db.query(
+                &format!("{base} AND g.s = ?3 ORDER BY dist LIMIT ?4"),
+                vec![pi(ns_id), pt(&qjson), pi(s), pi(k as i64)],
+            )?,
+            _ => self.db.query(
+                &format!("{base} ORDER BY dist LIMIT ?3"),
+                vec![pi(ns_id), pt(&qjson), pi(k as i64)],
+            )?,
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            let h = row.blob(0).and_then(|b| Hash::try_from_bytes(&b).ok());
+            // vector_distance_cos is cosine *distance* (1 − similarity).
+            let dist = row.f64(1).unwrap_or(1.0);
+            if let Some(h) = h {
+                out.push((h, (1.0 - dist) as f32));
             }
-            .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let h = v_blob(&row.get_value(0).map_err(db_err)?)
-                    .and_then(|b| Hash::try_from_bytes(&b).ok());
-                // vector_distance_cos is cosine *distance* (1 − similarity).
-                let dist = v_f64(&row.get_value(1).map_err(db_err)?).unwrap_or(1.0);
-                if let Some(h) = h {
-                    out.push((h, (1.0 - dist) as f32));
-                }
-            }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     pub fn search_vector(&mut self, ns: &str, query: &str, k: usize) -> Result<Vec<i64>> {
@@ -3735,31 +3214,23 @@ impl DejaDB {
         };
         let qv = embedder.embed(query)?;
         let qjson = vec_to_json(&qv);
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    if include_superseded {
-                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
-                         WHERE g.ns = ?1
-                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
-                    } else {
-                        "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
-                         WHERE g.ns = ?1 AND g.svt IS NULL
-                         ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
-                    },
-                    (pi(ns_id), pt(&qjson), pi(k as i64)),
-                )
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                    out.push(s);
-                }
-            }
-            Ok(out)
-        })
+        Ok(self
+            .db
+            .query(
+                if include_superseded {
+                    "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                     WHERE g.ns = ?1
+                     ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                } else {
+                    "SELECT e.seq FROM embeddings e JOIN grains g ON g.seq = e.seq
+                     WHERE g.ns = ?1 AND g.svt IS NULL
+                     ORDER BY vector_distance_cos(e.vec, vector32(?2)) LIMIT ?3"
+                },
+                vec![pi(ns_id), pt(&qjson), pi(k as i64)],
+            )?
+            .iter()
+            .filter_map(|row| row.i64(0))
+            .collect())
     }
 
     /// Hybrid recall: structural leg + BM25 leg fused
@@ -4090,19 +3561,13 @@ impl DejaDB {
             "SELECT seq, vector_distance_cos(vec, vector32(?1)) FROM embeddings WHERE seq IN ({})",
             seq_csv(seqs)
         );
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = HashMap::new();
-            let mut rows = conn.query(&sql, (pt(qjson),)).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let seq = v_i64(&row.get_value(0).map_err(db_err)?);
-                let dist = v_f64(&row.get_value(1).map_err(db_err)?);
-                if let (Some(s), Some(d)) = (seq, dist) {
-                    out.insert(s, 1.0 - d as f32);
-                }
+        let mut out = HashMap::new();
+        for row in self.db.query(&sql, vec![pt(qjson)])? {
+            if let (Some(s), Some(d)) = (row.i64(0), row.f64(1)) {
+                out.insert(s, 1.0 - d as f32);
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Pairwise cosine similarity (1 − distance) among embedded candidates,
@@ -4117,20 +3582,13 @@ impl DejaDB {
              FROM embeddings a JOIN embeddings b ON a.seq < b.seq \
              WHERE a.seq IN ({csv}) AND b.seq IN ({csv})"
         );
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = HashMap::new();
-            let mut rows = conn.query(&sql, ()).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let a = v_i64(&row.get_value(0).map_err(db_err)?);
-                let b = v_i64(&row.get_value(1).map_err(db_err)?);
-                let dist = v_f64(&row.get_value(2).map_err(db_err)?);
-                if let (Some(a), Some(b), Some(d)) = (a, b, dist) {
-                    out.insert((a, b), 1.0 - d as f32);
-                }
+        let mut out = HashMap::new();
+        for row in self.db.query(&sql, vec![])? {
+            if let (Some(a), Some(b), Some(d)) = (row.i64(0), row.i64(1), row.f64(2)) {
+                out.insert((a, b), 1.0 - d as f32);
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Structural leg. `all_versions` drops the `cur=1` predicate so the whole
@@ -4156,67 +3614,36 @@ impl DejaDB {
             },
             None => None,
         };
-        let conn = &self.conn;
-        let rt = &self.rt;
-        let (slot_sp, slot_s) = if all_versions {
-            (&mut self.st_probe_sp_all, &mut self.st_probe_s_all)
-        } else {
-            (&mut self.st_probe_sp, &mut self.st_probe_s)
+        // Each probe variant is its own SQL literal, so each keeps its own
+        // prepared-statement cache entry — the heads-only hot path never loses
+        // its plan to the widened scan.
+        let rows = match (p_id, all_versions) {
+            (Some(p), true) => self.db.query_hot(
+                "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 ORDER BY seq DESC LIMIT ?4",
+                vec![pi(ns_id), pi(s_id), pi(p), pi(k as i64)],
+            )?,
+            (Some(p), false) => self.db.query_hot(
+                "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
+                vec![pi(ns_id), pi(s_id), pi(p), pi(k as i64)],
+            )?,
+            (None, true) => self.db.query_hot(
+                "SELECT seq FROM triples WHERE ns=?1 AND s=?2 ORDER BY seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(s_id), pi(k as i64)],
+            )?,
+            (None, false) => self.db.query_hot(
+                "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(s_id), pi(k as i64)],
+            )?,
         };
-        rt.block_on(async {
-            let mut seqs = Vec::new();
-            let mut rows = match p_id {
-                Some(p) => {
-                    let st = ensure_stmt(
-                        slot_sp,
-                        conn,
-                        if all_versions {
-                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 ORDER BY seq DESC LIMIT ?4"
-                        } else {
-                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4"
-                        },
-                    )
-                    .await?;
-                    st.query((pi(ns_id), pi(s_id), pi(p), pi(k as i64))).await.map_err(db_err)?
-                }
-                None => {
-                    let st = ensure_stmt(
-                        slot_s,
-                        conn,
-                        if all_versions {
-                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 ORDER BY seq DESC LIMIT ?3"
-                        } else {
-                            "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3"
-                        },
-                    )
-                    .await?;
-                    st.query((pi(ns_id), pi(s_id), pi(k as i64))).await.map_err(db_err)?
-                }
-            };
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(x) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                    seqs.push(x);
-                }
-            }
-            Ok(seqs)
-        })
+        Ok(rows.iter().filter_map(|row| row.i64(0)).collect())
     }
 
     fn blob_by_seq(&mut self, seq: i64) -> Result<Option<Vec<u8>>> {
-        let conn = &self.conn;
-        let rt = &self.rt;
-        let slot = &mut self.st_fetch_seq;
-        rt.block_on(async {
-            let st = ensure_stmt(slot, conn, "SELECT blob FROM grains WHERE seq = ?1").await?;
-            let mut rows = st
-                .query((pi(seq),))
-                .await
-                .map_err(db_err)?;
-            Ok(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                None => None,
-            })
-        })
+        Ok(self
+            .db
+            .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
+            .first()
+            .and_then(|row| row.blob(0)))
     }
 
     /// Distinct subjects holding `relation` in `ns` (POS-index scan).
@@ -4226,23 +3653,15 @@ impl DejaDB {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
-        let conn = &self.conn;
-        let ids = self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    "SELECT DISTINCT s FROM triples WHERE ns=?1 AND p=?2 AND cur=1",
-                    (pi(ns_id), pi(p_id)),
-                )
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(s) = v_i64(&row.get_value(0).map_err(db_err)?) {
-                    out.push(s);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        let ids: Vec<i64> = self
+            .db
+            .query(
+                "SELECT DISTINCT s FROM triples WHERE ns=?1 AND p=?2 AND cur=1",
+                vec![pi(ns_id), pi(p_id)],
+            )?
+            .iter()
+            .filter_map(|row| row.i64(0))
+            .collect();
         let mut subjects: Vec<String> = ids.into_iter().filter_map(|id| self.term_str(id)).collect();
         subjects.sort();
         Ok(subjects)
@@ -4335,17 +3754,12 @@ impl DejaDB {
 
     /// Total number of grains in the hot store.
     pub fn count(&mut self) -> Result<usize> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM grains", ())
-                .await
-                .map_err(db_err)?;
-            Ok(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0) as usize,
-                None => 0,
-            })
-        })
+        Ok(self
+            .db
+            .query("SELECT COUNT(*) FROM grains", vec![])?
+            .first()
+            .and_then(|row| row.i64(0))
+            .unwrap_or(0) as usize)
     }
 
     /// Open supersession tips for (subject, relation) — normally one; more
@@ -4358,26 +3772,18 @@ impl DejaDB {
     /// call `deja forks` to find and merge them. Not a hot path (scans the
     /// heads table + reverse term lookups).
     pub fn open_forks(&mut self) -> Result<Vec<ForkGroup>> {
-        let conn = &self.conn;
-        let groups: Vec<(i64, i64, i64)> = self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT ns, s, p FROM heads GROUP BY ns, s, p HAVING COUNT(*) > 1",
-                    (),
-                )
-                .await
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let ns = v_i64(&row.get_value(0).map_err(db_err)?);
-                let s = v_i64(&row.get_value(1).map_err(db_err)?);
-                let p = v_i64(&row.get_value(2).map_err(db_err)?);
-                if let (Some(ns), Some(s), Some(p)) = (ns, s, p) {
-                    out.push((ns, s, p));
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        let groups: Vec<(i64, i64, i64)> = self
+            .db
+            .query(
+                "SELECT ns, s, p FROM heads GROUP BY ns, s, p HAVING COUNT(*) > 1",
+                vec![],
+            )?
+            .iter()
+            .filter_map(|row| match (row.i64(0), row.i64(1), row.i64(2)) {
+                (Some(ns), Some(s), Some(p)) => Some((ns, s, p)),
+                _ => None,
+            })
+            .collect();
 
         let mut forks = Vec::new();
         for (ns_id, s_id, p_id) in groups {
@@ -4409,26 +3815,19 @@ impl DejaDB {
         ) else {
             return Ok(Vec::new());
         };
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    "SELECT hash, created_at FROM heads WHERE ns=?1 AND s=?2 AND p=?3
-                     ORDER BY created_at DESC, hash DESC",
-                    (pi(ns_id), pi(s_id), pi(p_id)),
-                )
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let h = v_blob(&row.get_value(0).map_err(db_err)?).unwrap_or_default();
-                let c = v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0);
-                if let Ok(h) = Hash::try_from_bytes(&h) {
-                    out.push((h, c));
-                }
+        let mut out = Vec::new();
+        for row in self.db.query(
+            "SELECT hash, created_at FROM heads WHERE ns=?1 AND s=?2 AND p=?3
+             ORDER BY created_at DESC, hash DESC",
+            vec![pi(ns_id), pi(s_id), pi(p_id)],
+        )? {
+            let h = row.blob(0).unwrap_or_default();
+            let c = row.i64(1).unwrap_or(0);
+            if let Ok(h) = Hash::try_from_bytes(&h) {
+                out.push((h, c));
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Close a fork: write `merged` superseding EVERY open tip, with all
@@ -4473,57 +3872,34 @@ impl DejaDB {
         self.next_op += 1;
         let hlc = self.next_hlc();
         let (d_docs, d_len) = fts_delta(&preps);
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                insert_prepped(conn, &preps, first_seq, first_op, hlc0).await?; // OP_ADD; collapses heads to {merge}
-                for (tip, _) in &tips {
-                    let seq = {
-                        let mut rows = conn
-                            .query("SELECT seq, svt FROM grains WHERE hash=?1", (pb(tip.as_bytes().to_vec()),))
-                            .await
-                            .map_err(db_err)?;
-                        match rows.next().await.map_err(db_err)? {
-                            Some(row) => {
-                                let seq = v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0);
-                                let svt = v_i64(&row.get_value(1).map_err(db_err)?);
-                                (svt.is_none()).then_some(seq)
-                            }
-                            None => None,
-                        }
-                    };
-                    if let Some(seq) = seq {
-                        conn.execute(
-                            "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
-                            (pb(merge_hash.as_bytes().to_vec()), pi(now), pi(seq)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                        conn.execute("UPDATE triples SET cur=0 WHERE seq=?1", (pi(seq),))
-                            .await
-                            .map_err(db_err)?;
-                        conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(seq),))
-                            .await
-                            .map_err(db_err)?;
-                    }
-                }
-                conn.execute(
-                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-                    (pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(merge_hash.as_bytes().to_vec())),
-                )
-                .await
-                .map_err(db_err)?;
-                Ok::<(), DejaDbError>(())
-            }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            insert_prepped(dbr, &preps, first_seq, first_op, hlc0)?; // OP_ADD; collapses heads to {merge}
+            for (tip, _) in &tips {
+                let seq = dbr
+                    .query(
+                        "SELECT seq, svt FROM grains WHERE hash=?1",
+                        vec![pb(tip.as_bytes().to_vec())],
+                    )?
+                    .first()
+                    .and_then(|row| {
+                        let seq = row.i64(0).unwrap_or(0);
+                        row.i64(1).is_none().then_some(seq)
+                    });
+                if let Some(seq) = seq {
+                    dbr.execute(
+                        "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
+                        vec![pb(merge_hash.as_bytes().to_vec()), pi(now), pi(seq)],
+                    )?;
+                    dbr.execute("UPDATE triples SET cur=0 WHERE seq=?1", vec![pi(seq)])?;
+                    dbr.execute("UPDATE osp SET cur=0 WHERE seq=?1", vec![pi(seq)])?;
                 }
             }
+            dbr.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                vec![pi(op_seq), pi(hlc), pi(OP_SUPERSEDE), pb(merge_hash.as_bytes().to_vec())],
+            )?;
+            Ok(())
         })?;
         self.fts_docs += d_docs;
         self.fts_total_len += d_len;
@@ -4540,26 +3916,12 @@ impl DejaDB {
         let mut out = Vec::new();
         let mut cur = Some(head);
         while let Some(h) = cur {
-            let conn = &self.conn;
-            let row = self.rt.block_on(async {
-                let mut rows = conn
-                    .query(
-                        "SELECT blob, superseded_by, supersedes FROM grains WHERE hash = ?1",
-                        (pb(h.as_bytes().to_vec()),),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                    Some(row) => Some((
-                        v_blob(&row.get_value(0).map_err(db_err)?),
-                        v_blob(&row.get_value(1).map_err(db_err)?),
-                        v_blob(&row.get_value(2).map_err(db_err)?),
-                    )),
-                    None => None,
-                })
-            })?;
-            let (blob, sup_by, supersedes) = match row {
-                Some(x) => x,
+            let rows = self.db.query(
+                "SELECT blob, superseded_by, supersedes FROM grains WHERE hash = ?1",
+                vec![pb(h.as_bytes().to_vec())],
+            )?;
+            let (blob, sup_by, supersedes) = match rows.first() {
+                Some(row) => (row.blob(0), row.blob(1), row.blob(2)),
                 None => break,
             };
             if let Some(b) = blob {
@@ -4590,39 +3952,31 @@ impl DejaDB {
     /// that requires an external anchor (stream segments, bundles, a
     /// replica). See docs/security-model.md "Known limitations".
     pub fn verify(&mut self) -> Result<VerifyReport> {
-        let conn = &self.conn;
-        let (integrity, fts_notes, rows) = self.rt.block_on(async {
-            // Collect every integrity line; Turso's experimental FTS keeps
-            // internal dir indexes that integrity_check miscounts — classify
-            // those as benign notes (candidate upstream report), never as
-            // corruption. Content-address verification below is the real
-            // tamper-evidence check and is unaffected.
-            let mut real: Vec<String> = Vec::new();
-            let mut fts_notes: Vec<String> = Vec::new();
-            {
-                let mut rows = conn.query("PRAGMA integrity_check", ()).await.map_err(db_err)?;
-                while let Some(row) = rows.next().await.map_err(db_err)? {
-                    if let Value::Text(s) = row.get_value(0).map_err(db_err)? {
-                        if s == "ok" {
-                            continue;
-                        } else if s.contains("__turso_internal_fts") {
-                            fts_notes.push(s);
-                        } else {
-                            real.push(s);
-                        }
-                    }
+        // Collect every integrity line; Turso's experimental FTS keeps
+        // internal dir indexes that integrity_check miscounts — classify
+        // those as benign notes (candidate upstream report), never as
+        // corruption. Content-address verification below is the real
+        // tamper-evidence check and is unaffected.
+        let mut real: Vec<String> = Vec::new();
+        let mut fts_notes: Vec<String> = Vec::new();
+        for row in self.db.query("PRAGMA integrity_check", vec![])? {
+            if let Some(s) = row.text(0) {
+                if s == "ok" {
+                    continue;
+                } else if s.contains("__turso_internal_fts") {
+                    fts_notes.push(s.to_string());
+                } else {
+                    real.push(s.to_string());
                 }
             }
-            let integ = if real.is_empty() { "ok".to_string() } else { real.join("; ") };
-            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut rows = conn.query("SELECT hash, blob FROM grains", ()).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                let h = v_blob(&row.get_value(0).map_err(db_err)?).unwrap_or_default();
-                let b = v_blob(&row.get_value(1).map_err(db_err)?).unwrap_or_default();
-                out.push((h, b));
-            }
-            Ok::<_, DejaDbError>((integ, fts_notes, out))
-        })?;
+        }
+        let integrity = if real.is_empty() { "ok".to_string() } else { real.join("; ") };
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self
+            .db
+            .query("SELECT hash, blob FROM grains", vec![])?
+            .iter()
+            .map(|row| (row.blob(0).unwrap_or_default(), row.blob(1).unwrap_or_default()))
+            .collect();
         let mut report = VerifyReport {
             integrity,
             fts_notes,
@@ -4645,51 +3999,39 @@ impl DejaDB {
 
     /// Store statistics (CLI `stats`).
     pub fn stats(&mut self) -> Result<StoreStats> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let one = |sql: &'static str| {
-                let conn = conn.clone();
-                async move {
-                    let mut rows = conn.query(sql, ()).await.map_err(db_err)?;
-                    Ok::<i64, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                        Some(row) => v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                        None => 0,
-                    })
-                }
-            };
-            Ok(StoreStats {
-                grains: one("SELECT COUNT(*) FROM grains").await? as usize,
-                current: one("SELECT COUNT(*) FROM grains WHERE svt IS NULL").await? as usize,
-                triples: one("SELECT COUNT(*) FROM triples").await? as usize,
-                terms: one("SELECT COUNT(*) FROM terms").await? as usize,
-                ops: one("SELECT COUNT(*) FROM oplog").await? as usize,
-                events_indexed: one("SELECT COUNT(*) FROM thread_idx").await? as usize,
-            })
+        let one = |sql: &'static str| -> Result<i64> {
+            Ok(self
+                .db
+                .query(sql, vec![])?
+                .first()
+                .and_then(|row| row.i64(0))
+                .unwrap_or(0))
+        };
+        Ok(StoreStats {
+            grains: one("SELECT COUNT(*) FROM grains")? as usize,
+            current: one("SELECT COUNT(*) FROM grains WHERE svt IS NULL")? as usize,
+            triples: one("SELECT COUNT(*) FROM triples")? as usize,
+            terms: one("SELECT COUNT(*) FROM terms")? as usize,
+            ops: one("SELECT COUNT(*) FROM oplog")? as usize,
+            events_indexed: one("SELECT COUNT(*) FROM thread_idx")? as usize,
         })
     }
 
     /// Op-log cursor read — the change feed (backs sync + UIs).
     pub fn changes_since(&mut self, after_op_seq: i64, limit: usize) -> Result<Vec<OpRecord>> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query(
-                    "SELECT op_seq, hlc, op, hash FROM oplog WHERE op_seq > ?1 ORDER BY op_seq LIMIT ?2",
-                    (pi(after_op_seq), pi(limit as i64)),
-                )
-                .await
-                .map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                out.push(OpRecord {
-                    op_seq: v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                    hlc: v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0),
-                    op: v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(0),
-                    hash: Hash::try_from_bytes(&v_blob(&row.get_value(3).map_err(db_err)?).unwrap_or_default())?,
-                });
-            }
-            Ok(out)
-        })
+        let mut out = Vec::new();
+        for row in self.db.query(
+            "SELECT op_seq, hlc, op, hash FROM oplog WHERE op_seq > ?1 ORDER BY op_seq LIMIT ?2",
+            vec![pi(after_op_seq), pi(limit as i64)],
+        )? {
+            out.push(OpRecord {
+                op_seq: row.i64(0).unwrap_or(0),
+                hlc: row.i64(1).unwrap_or(0),
+                op: row.i64(2).unwrap_or(0),
+                hash: Hash::try_from_bytes(&row.blob(3).unwrap_or_default())?,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -4739,17 +4081,12 @@ impl DejaDB {
     /// Returns the number of blobs removed.
     pub fn gc_blobs(&mut self) -> Result<usize> {
         // Collect referenced hashes from live grains.
-        let conn = &self.conn;
-        let blobs: Vec<Vec<u8>> = self.rt.block_on(async {
-            let mut out = Vec::new();
-            let mut rows = conn.query("SELECT blob FROM grains", ()).await.map_err(db_err)?;
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
-                    out.push(b);
-                }
-            }
-            Ok::<_, DejaDbError>(out)
-        })?;
+        let blobs: Vec<Vec<u8>> = self
+            .db
+            .query("SELECT blob FROM grains", vec![])?
+            .iter()
+            .filter_map(|row| row.blob(0))
+            .collect();
         let mut referenced: HashSet<String> = HashSet::new();
         for b in &blobs {
             if let Ok(view) = deserialize_blob(b) {
@@ -4793,8 +4130,6 @@ impl DejaDB {
     /// relies on the subsequent tombstone for net-equivalence.
     pub fn bundle_since(&mut self, after_op_seq: i64, path: &str) -> Result<BundleStats> {
         let ops = self.changes_since(after_op_seq, usize::MAX / 2)?;
-        let conn = &self.conn;
-        let rt = &self.rt;
         let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
         out.extend_from_slice(BUNDLE_MAGIC);
         let mut last = after_op_seq;
@@ -4802,19 +4137,13 @@ impl DejaDB {
             let blob: Option<Vec<u8>> = if rec.op == OP_FORGET {
                 None
             } else {
-                rt.block_on(async {
-                    let mut rows = conn
-                        .query(
-                            "SELECT blob FROM grains WHERE hash = ?1",
-                            (pb(rec.hash.as_bytes().to_vec()),),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                        Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                        None => None,
-                    })
-                })?
+                self.db
+                    .query_hot(
+                        "SELECT blob FROM grains WHERE hash = ?1",
+                        vec![pb(rec.hash.as_bytes().to_vec())],
+                    )?
+                    .first()
+                    .and_then(|row| row.blob(0))
             };
             out.push(rec.op as u8);
             out.extend_from_slice(&rec.hlc.to_le_bytes());
@@ -4833,34 +4162,24 @@ impl DejaDB {
     }
 
     fn blob_by_hash(&mut self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT blob FROM grains WHERE hash = ?1",
-                    (pb(hash.as_bytes().to_vec()),),
-                )
-                .await
-                .map_err(db_err)?;
-            Ok::<_, DejaDbError>(match rows.next().await.map_err(db_err)? {
-                Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                None => None,
-            })
-        })
+        Ok(self
+            .db
+            .query_hot(
+                "SELECT blob FROM grains WHERE hash = ?1",
+                vec![pb(hash.as_bytes().to_vec())],
+            )?
+            .first()
+            .and_then(|row| row.blob(0)))
     }
 
     fn has_grain(&mut self, hash: &Hash) -> Result<bool> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM grains WHERE hash = ?1",
-                    (pb(hash.as_bytes().to_vec()),),
-                )
-                .await
-                .map_err(db_err)?;
-            Ok(rows.next().await.map_err(db_err)?.is_some())
-        })
+        Ok(!self
+            .db
+            .query_hot(
+                "SELECT 1 FROM grains WHERE hash = ?1",
+                vec![pb(hash.as_bytes().to_vec())],
+            )?
+            .is_empty())
     }
 
     /// Insert one already-serialized grain (bundle import path).
@@ -4871,182 +4190,132 @@ impl DejaDB {
         let op_seq = self.next_op;
         self.next_op += 1;
         self.hlc_last = self.hlc_last.max(hlc_in);
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                conn.execute(
-                    "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
-                    (
-                        pi(seq),
-                        pb(pr.hash.as_bytes().to_vec()),
-                        pi(pr.ns_id),
-                        pi(pr.gtype),
-                        pi(pr.created),
-                        opt_i(pr.s),
-                        opt_i(pr.p),
-                        opt_i(pr.o),
-                        opt_i(pr.vf),
-                        opt_i(pr.vt),
-                        pi(pr.created),
-                        match &pr.text { Some(t) => pt(t), None => Value::Null },
-                        pb(pr.blob.clone()),
-                    ),
-                )
-                .await
-                .map_err(db_err)?;
-                if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
-                    conn.execute(
-                        "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                        (pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    if pr.osp {
-                        conn.execute(
-                            "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                            (pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    // import path: UNION into heads (never collapse other
-                    // tips — that's the local single-writer semantic only)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                        (pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    // provisional election for entity_latest: replace only if
-                    // (created_at, hash) beats the current head — deterministic
-                    // on every node, no coordination.
-                    let cur = {
-                        let mut rows = conn
-                            .query(
-                                "SELECT h.created_at, h.hash FROM heads h JOIN entity_latest e
-                                 ON e.ns=h.ns AND e.s=h.s AND e.p=h.p AND e.seq=h.seq
-                                 WHERE e.ns=?1 AND e.s=?2 AND e.p=?3",
-                                (pi(pr.ns_id), pi(s), pi(p)),
-                            )
-                            .await
-                            .map_err(db_err)?;
-                        match rows.next().await.map_err(db_err)? {
-                            Some(row) => Some((
-                                v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                                v_blob(&row.get_value(1).map_err(db_err)?).unwrap_or_default(),
-                            )),
-                            None => None,
-                        }
-                    };
-                    let wins = match &cur {
-                        Some((c, h)) => (pr.created, pr.hash.as_bytes().as_slice()) > (*c, h.as_slice()),
-                        None => true,
-                    };
-                    if wins {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
-                            (pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq), pb(pr.hash.as_bytes().to_vec())),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                }
-                // Cross-grain `related_to` links — same treatment as the local
-                // write path: triples + osp for retrieval, never heads or
-                // entity_latest (OMS §15.3).
-                for (ls, lp, lo) in &pr.links {
-                    conn.execute(
-                        "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                        (pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                    conn.execute(
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            dbr.execute(
+                "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
+                vec![
+                    pi(seq),
+                    pb(pr.hash.as_bytes().to_vec()),
+                    pi(pr.ns_id),
+                    pi(pr.gtype),
+                    pi(pr.created),
+                    opt_i(pr.s),
+                    opt_i(pr.p),
+                    opt_i(pr.o),
+                    opt_i(pr.vf),
+                    opt_i(pr.vt),
+                    pi(pr.created),
+                    match &pr.text { Some(t) => pt(t), None => Value::Null },
+                    pb(pr.blob.clone()),
+                ],
+            )?;
+            if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
+                dbr.execute(
+                    "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                    vec![pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)],
+                )?;
+                if pr.osp {
+                    dbr.execute(
                         "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
-                        (pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                        vec![pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)],
+                    )?;
                 }
-                if let Some(sess) = pr.session {
-                    conn.execute(
-                        "INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)",
-                        (pi(pr.ns_id), pi(sess), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                }
-                if let Some(run) = pr.run {
-                    conn.execute(
-                        "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
-                        (pi(pr.ns_id), pi(run), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                }
-                if let Some(ref parent) = pr.parent {
-                    conn.execute(
-                        "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
-                        (pi(pr.ns_id), pb(parent.clone()), pi(seq)),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                }
-                if let Some(ref emb) = pr.embedding {
-                    conn.execute(
-                        "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
-                        (pi(seq), pt(&vec_to_json(emb))),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                }
-                conn.execute(
-                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-                    (pi(op_seq), pi(hlc_in), pi(op), pb(pr.hash.as_bytes().to_vec())),
-                )
-                .await
-                .map_err(db_err)?;
-                Ok::<(), DejaDbError>(())
-            }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
+                // import path: UNION into heads (never collapse other
+                // tips — that's the local single-writer semantic only)
+                dbr.execute(
+                    "INSERT OR REPLACE INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                    vec![pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)],
+                )?;
+                // provisional election for entity_latest: replace only if
+                // (created_at, hash) beats the current head — deterministic
+                // on every node, no coordination.
+                let cur = dbr
+                    .query(
+                        "SELECT h.created_at, h.hash FROM heads h JOIN entity_latest e
+                         ON e.ns=h.ns AND e.s=h.s AND e.p=h.p AND e.seq=h.seq
+                         WHERE e.ns=?1 AND e.s=?2 AND e.p=?3",
+                        vec![pi(pr.ns_id), pi(s), pi(p)],
+                    )?
+                    .first()
+                    .map(|row| (row.i64(0).unwrap_or(0), row.blob(1).unwrap_or_default()));
+                let wins = match &cur {
+                    Some((c, h)) => (pr.created, pr.hash.as_bytes().as_slice()) > (*c, h.as_slice()),
+                    None => true,
+                };
+                if wins {
+                    dbr.execute(
+                        "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                        vec![pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq), pb(pr.hash.as_bytes().to_vec())],
+                    )?;
                 }
             }
+            // Cross-grain `related_to` links — same treatment as the local
+            // write path: triples + osp for retrieval, never heads or
+            // entity_latest (OMS §15.3).
+            for (ls, lp, lo) in &pr.links {
+                dbr.execute(
+                    "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                    vec![pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)],
+                )?;
+                dbr.execute(
+                    "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                    vec![pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)],
+                )?;
+            }
+            if let Some(sess) = pr.session {
+                dbr.execute(
+                    "INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)",
+                    vec![pi(pr.ns_id), pi(sess), pi(seq)],
+                )?;
+            }
+            if let Some(run) = pr.run {
+                dbr.execute(
+                    "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
+                    vec![pi(pr.ns_id), pi(run), pi(seq)],
+                )?;
+            }
+            if let Some(ref parent) = pr.parent {
+                dbr.execute(
+                    "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
+                    vec![pi(pr.ns_id), pb(parent.clone()), pi(seq)],
+                )?;
+            }
+            if let Some(ref emb) = pr.embedding {
+                dbr.execute(
+                    "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
+                    vec![pi(seq), pt(&vec_to_json(emb))],
+                )?;
+            }
+            dbr.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                vec![pi(op_seq), pi(hlc_in), pi(op), pb(pr.hash.as_bytes().to_vec())],
+            )?;
+            Ok(())
         })
     }
 
     /// Apply the index-layer supersession flip old → new (import path).
     /// Returns whether anything changed (false = idempotent no-op).
+    /// One transaction: a crash mid-flip must not leave the fork model
+    /// half-registered (this ran statement-by-statement in autocommit before
+    /// the Db seam).
     fn apply_supersede_flip(&mut self, old: &Hash, new_hash: &Hash) -> Result<bool> {
-        let conn = &self.conn;
-        self.rt.block_on(async {
-            let old_row = {
-                let mut rows = conn
-                    .query(
-                        "SELECT seq, svt, ns, s, p FROM grains WHERE hash = ?1",
-                        (pb(old.as_bytes().to_vec()),),
-                    )
-                    .await
-                    .map_err(db_err)?;
-                match rows.next().await.map_err(db_err)? {
-                    Some(row) => Some((
-                        v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                        v_i64(&row.get_value(1).map_err(db_err)?),
-                        v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(0),
-                        v_i64(&row.get_value(3).map_err(db_err)?),
-                        v_i64(&row.get_value(4).map_err(db_err)?),
-                    )),
-                    None => None,
-                }
-            };
-            let (old_seq, old_svt, old_ns, old_s, old_p) = match old_row {
-                Some(x) => x,
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            let rows = dbr.query(
+                "SELECT seq, svt, ns, s, p FROM grains WHERE hash = ?1",
+                vec![pb(old.as_bytes().to_vec())],
+            )?;
+            let (old_seq, old_svt, old_ns, old_s, old_p) = match rows.first() {
+                Some(row) => (
+                    row.i64(0).unwrap_or(0),
+                    row.i64(1),
+                    row.i64(2).unwrap_or(0),
+                    row.i64(3),
+                    row.i64(4),
+                ),
                 None => return Ok(false), // partial history — fast-forward tolerates
             };
             if old_svt.is_some() {
@@ -5054,66 +4323,48 @@ impl DejaDB {
                 // idempotent replay. Different superseder → a FORK: both tips
                 // stay alive as heads; entity_latest gets the provisional head
                 // (created_at, then hash — deterministic on every node).
-                let existing = {
-                    let mut rows = conn
-                        .query("SELECT superseded_by FROM grains WHERE seq=?1", (pi(old_seq),))
-                        .await
-                        .map_err(db_err)?;
-                    match rows.next().await.map_err(db_err)? {
-                        Some(row) => v_blob(&row.get_value(0).map_err(db_err)?),
-                        None => None,
-                    }
-                };
+                let existing = dbr
+                    .query(
+                        "SELECT superseded_by FROM grains WHERE seq=?1",
+                        vec![pi(old_seq)],
+                    )?
+                    .first()
+                    .and_then(|row| row.blob(0));
                 if existing.as_deref() == Some(new_hash.as_bytes().as_slice()) {
                     return Ok(false); // same supersede — idempotent
                 }
                 // incoming tip row
-                let inc = {
-                    let mut rows = conn
-                        .query(
-                            "SELECT seq, ns, s, p, o, created_at FROM grains WHERE hash=?1",
-                            (pb(new_hash.as_bytes().to_vec()),),
+                let inc = dbr
+                    .query(
+                        "SELECT seq, ns, s, p, o, created_at FROM grains WHERE hash=?1",
+                        vec![pb(new_hash.as_bytes().to_vec())],
+                    )?
+                    .first()
+                    .map(|row| {
+                        (
+                            row.i64(0).unwrap_or(0),
+                            row.i64(1).unwrap_or(0),
+                            row.i64(2).unwrap_or(0),
+                            row.i64(3).unwrap_or(0),
+                            row.i64(4).unwrap_or(0),
+                            row.i64(5).unwrap_or(0),
                         )
-                        .await
-                        .map_err(db_err)?;
-                    match rows.next().await.map_err(db_err)? {
-                        Some(row) => Some((
-                            v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                            v_i64(&row.get_value(1).map_err(db_err)?).unwrap_or(0),
-                            v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(0),
-                            v_i64(&row.get_value(3).map_err(db_err)?).unwrap_or(0),
-                            v_i64(&row.get_value(4).map_err(db_err)?).unwrap_or(0),
-                            v_i64(&row.get_value(5).map_err(db_err)?).unwrap_or(0),
-                        )),
-                        None => None,
-                    }
-                };
+                    });
                 let Some((inc_seq, ns, s, p, o, inc_created)) = inc else { return Ok(false) };
-                conn.execute(
+                dbr.execute(
                     "INSERT OR REPLACE INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                    (pi(ns), pi(s), pi(p), pi(inc_seq), pb(new_hash.as_bytes().to_vec()), pi(inc_created)),
-                )
-                .await
-                .map_err(db_err)?;
+                    vec![pi(ns), pi(s), pi(p), pi(inc_seq), pb(new_hash.as_bytes().to_vec()), pi(inc_created)],
+                )?;
                 // provisional election vs current entity_latest head
-                let cur = {
-                    let mut rows = conn
-                        .query(
-                            "SELECT h.created_at, h.hash FROM heads h JOIN entity_latest e
-                             ON e.ns=h.ns AND e.s=h.s AND e.p=h.p AND e.seq=h.seq
-                             WHERE e.ns=?1 AND e.s=?2 AND e.p=?3",
-                            (pi(ns), pi(s), pi(p)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    match rows.next().await.map_err(db_err)? {
-                        Some(row) => Some((
-                            v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
-                            v_blob(&row.get_value(1).map_err(db_err)?).unwrap_or_default(),
-                        )),
-                        None => None,
-                    }
-                };
+                let cur = dbr
+                    .query(
+                        "SELECT h.created_at, h.hash FROM heads h JOIN entity_latest e
+                         ON e.ns=h.ns AND e.s=h.s AND e.p=h.p AND e.seq=h.seq
+                         WHERE e.ns=?1 AND e.s=?2 AND e.p=?3",
+                        vec![pi(ns), pi(s), pi(p)],
+                    )?
+                    .first()
+                    .map(|row| (row.i64(0).unwrap_or(0), row.blob(1).unwrap_or_default()));
                 let incoming_wins = match &cur {
                     Some((c_created, c_hash)) => {
                         (inc_created, new_hash.as_bytes().as_slice()) > (*c_created, c_hash.as_slice())
@@ -5121,43 +4372,31 @@ impl DejaDB {
                     None => true,
                 };
                 if incoming_wins {
-                    conn.execute(
+                    dbr.execute(
                         "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
-                        (pi(ns), pi(s), pi(p), pi(o), pi(inc_seq), pb(new_hash.as_bytes().to_vec())),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                        vec![pi(ns), pi(s), pi(p), pi(o), pi(inc_seq), pb(new_hash.as_bytes().to_vec())],
+                    )?;
                 }
                 return Ok(true); // fork registered
             }
             let now = now_ms();
-            conn.execute(
+            dbr.execute(
                 "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
-                (pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)),
-            )
-            .await
-            .map_err(db_err)?;
-            conn.execute(
+                vec![pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)],
+            )?;
+            dbr.execute(
                 "UPDATE grains SET supersedes=?1 WHERE hash=?2",
-                (pb(old.as_bytes().to_vec()), pb(new_hash.as_bytes().to_vec())),
-            )
-            .await
-            .map_err(db_err)?;
-            conn.execute("UPDATE triples SET cur=0 WHERE seq=?1", (pi(old_seq),))
-                .await
-                .map_err(db_err)?;
-            conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(old_seq),))
-                .await
-                .map_err(db_err)?;
+                vec![pb(old.as_bytes().to_vec()), pb(new_hash.as_bytes().to_vec())],
+            )?;
+            dbr.execute("UPDATE triples SET cur=0 WHERE seq=?1", vec![pi(old_seq)])?;
+            dbr.execute("UPDATE osp SET cur=0 WHERE seq=?1", vec![pi(old_seq)])?;
             if let (Some(s), Some(p)) = (old_s, old_p) {
-                conn.execute(
+                dbr.execute(
                     "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
-                    (pi(old_ns), pi(s), pi(p), pi(old_seq)),
-                )
-                .await
-                .map_err(db_err)?;
+                    vec![pi(old_ns), pi(s), pi(p), pi(old_seq)],
+                )?;
             }
-            Ok::<bool, DejaDbError>(true)
+            Ok(true)
         })
     }
 
@@ -5303,108 +4542,74 @@ fn fts_delta(preps: &[GrainPrep]) -> (i64, i64) {
     (docs, preps.iter().map(|p| p.doc_len).sum())
 }
 
-async fn insert_prepped(
-    conn: &Connection,
+fn insert_prepped(
+    db: &dyn Db,
     preps: &[GrainPrep],
     first_seq: i64,
     first_op: i64,
     hlc0: i64,
 ) -> Result<()> {
-    let mut st_g = conn
-        .prepare(
-            "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
-        )
-        .await
-        .map_err(db_err)?;
-    let mut st_t = conn
-        .prepare("INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
-        .await
-        .map_err(db_err)?;
-    let mut st_o = conn
-        .prepare("INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)")
-        .await
-        .map_err(db_err)?;
-    let mut st_e = conn
-        .prepare("INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)")
-        .await
-        .map_err(db_err)?;
-    let mut st_l = conn
-        .prepare("INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)")
-        .await
-        .map_err(db_err)?;
-    let mut st_th = conn
-        .prepare("INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)")
-        .await
-        .map_err(db_err)?;
-    let mut st_fp = conn
-        .prepare("INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)")
-        .await
-        .map_err(db_err)?;
-    let mut st_fd = conn
-        .prepare("INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)")
-        .await
-        .map_err(db_err)?;
+    // Every statement here is a fixed literal on the write hot path — the
+    // backend's `_hot` cache makes each a prepare-once (this used to re-prepare
+    // eight statements per call).
     for (i, pr) in preps.iter().enumerate() {
         let seq = first_seq + i as i64;
-        st_g.execute((
-            pi(seq),
-            pb(pr.hash.as_bytes().to_vec()),
-            pi(pr.ns_id),
-            pi(pr.gtype),
-            pi(pr.created),
-            opt_i(pr.s),
-            opt_i(pr.p),
-            opt_i(pr.o),
-            opt_i(pr.vf),
-            opt_i(pr.vt),
-            pi(pr.created),
-            match &pr.text { Some(t) => pt(t), None => Value::Null },
-            pb(pr.blob.clone()),
-        ))
-        .await
-        .map_err(db_err)?;
+        db.execute_hot(
+            "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
+            vec![
+                pi(seq),
+                pb(pr.hash.as_bytes().to_vec()),
+                pi(pr.ns_id),
+                pi(pr.gtype),
+                pi(pr.created),
+                opt_i(pr.s),
+                opt_i(pr.p),
+                opt_i(pr.o),
+                opt_i(pr.vf),
+                opt_i(pr.vt),
+                pi(pr.created),
+                match &pr.text { Some(t) => pt(t), None => Value::Null },
+                pb(pr.blob.clone()),
+            ],
+        )?;
         // BM25 postings: one row per distinct token. Cost is proportional to
         // the grain's own length, not to how much is already stored.
         if !pr.tokens.is_empty() {
             for (term, tf) in &pr.tokens {
-                st_fp.execute((pi(*term), pi(seq), pi(pr.ns_id), pi(*tf)))
-                    .await
-                    .map_err(db_err)?;
+                db.execute_hot(
+                    "INSERT INTO fts_post(term,seq,ns,tf) VALUES (?1,?2,?3,?4)",
+                    vec![pi(*term), pi(seq), pi(pr.ns_id), pi(*tf)],
+                )?;
             }
-            st_fd.execute((pi(seq), pi(pr.doc_len))).await.map_err(db_err)?;
+            db.execute_hot(
+                "INSERT OR REPLACE INTO fts_doc(seq,len) VALUES (?1,?2)",
+                vec![pi(seq), pi(pr.doc_len)],
+            )?;
         }
         if let (Some(s), Some(p), Some(o)) = (pr.s, pr.p, pr.o) {
-            st_t.execute((pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)))
-                .await
-                .map_err(db_err)?;
+            db.execute_hot(
+                "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                vec![pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq)],
+            )?;
             if pr.osp {
-                st_o.execute((pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)))
-                    .await
-                    .map_err(db_err)?;
+                db.execute_hot(
+                    "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                    vec![pi(pr.ns_id), pi(o), pi(s), pi(p), pi(seq)],
+                )?;
             }
-            st_e.execute((
-                pi(pr.ns_id),
-                pi(s),
-                pi(p),
-                pi(o),
-                pi(seq),
-                pb(pr.hash.as_bytes().to_vec()),
-            ))
-            .await
-            .map_err(db_err)?;
-            conn.execute(
+            db.execute_hot(
+                "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                vec![pi(pr.ns_id), pi(s), pi(p), pi(o), pi(seq), pb(pr.hash.as_bytes().to_vec())],
+            )?;
+            db.execute_hot(
                 "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3",
-                (pi(pr.ns_id), pi(s), pi(p)),
-            )
-            .await
-            .map_err(db_err)?;
-            conn.execute(
+                vec![pi(pr.ns_id), pi(s), pi(p)],
+            )?;
+            db.execute_hot(
                 "INSERT INTO heads(ns,s,p,seq,hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                (pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)),
-            )
-            .await
-            .map_err(db_err)?;
+                vec![pi(pr.ns_id), pi(s), pi(p), pi(seq), pb(pr.hash.as_bytes().to_vec()), pi(pr.created)],
+            )?;
         }
         // Cross-grain `related_to` links (OMS §6.1), e.g. the §8.4 execution
         // record `mg:step_action:<node>` pointing a Tool grain at the Workflow
@@ -5415,54 +4620,46 @@ async fn insert_prepped(
         // because a link's object is always a grain hash, i.e. always an
         // entity, regardless of the file's `entity_relations` declaration.
         for (ls, lp, lo) in &pr.links {
-            st_t.execute((pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)))
-                .await
-                .map_err(db_err)?;
-            st_o.execute((pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)))
-                .await
-                .map_err(db_err)?;
+            db.execute_hot(
+                "INSERT INTO triples(ns,s,p,o,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                vec![pi(pr.ns_id), pi(*ls), pi(*lp), pi(*lo), pi(seq)],
+            )?;
+            db.execute_hot(
+                "INSERT INTO osp(ns,o,s,p,seq,cur) VALUES (?1,?2,?3,?4,?5,1)",
+                vec![pi(pr.ns_id), pi(*lo), pi(*ls), pi(*lp), pi(seq)],
+            )?;
         }
         if let Some(sess) = pr.session {
-            st_th
-                .execute((pi(pr.ns_id), pi(sess), pi(seq)))
-                .await
-                .map_err(db_err)?;
+            db.execute_hot(
+                "INSERT INTO thread_idx(ns,session,seq) VALUES (?1,?2,?3)",
+                vec![pi(pr.ns_id), pi(sess), pi(seq)],
+            )?;
         }
         // Run correlation + reverse provenance. Both are plain index rows: they
         // record where a grain came from and which run recorded it, and neither
         // participates in supersession.
         if let Some(run) = pr.run {
-            conn.execute(
+            db.execute_hot(
                 "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
-                (pi(pr.ns_id), pi(run), pi(seq)),
-            )
-            .await
-            .map_err(db_err)?;
+                vec![pi(pr.ns_id), pi(run), pi(seq)],
+            )?;
         }
         if let Some(ref parent) = pr.parent {
-            conn.execute(
+            db.execute_hot(
                 "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
-                (pi(pr.ns_id), pb(parent.clone()), pi(seq)),
-            )
-            .await
-            .map_err(db_err)?;
+                vec![pi(pr.ns_id), pb(parent.clone()), pi(seq)],
+            )?;
         }
         if let Some(ref emb) = pr.embedding {
-            conn.execute(
+            db.execute_hot(
                 "INSERT INTO embeddings(seq, vec) VALUES (?1, vector32(?2))",
-                (pi(seq), pt(&vec_to_json(emb))),
-            )
-            .await
-            .map_err(db_err)?;
+                vec![pi(seq), pt(&vec_to_json(emb))],
+            )?;
         }
-        st_l.execute((
-            pi(first_op + i as i64),
-            pi(hlc0 + i as i64),
-            pi(OP_ADD),
-            pb(pr.hash.as_bytes().to_vec()),
-        ))
-        .await
-        .map_err(db_err)?;
+        db.execute_hot(
+            "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+            vec![pi(first_op + i as i64), pi(hlc0 + i as i64), pi(OP_ADD), pb(pr.hash.as_bytes().to_vec())],
+        )?;
     }
     Ok(())
 }

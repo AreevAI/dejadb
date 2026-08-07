@@ -19,11 +19,10 @@
 //! - It **never syncs** (the hub carries the memory file only) and is
 //!   rebuildable, so losing it costs evidence detail, never state.
 
-use crate::{db_err, hex32, now_ms, pi, pt};
+use crate::db::{with_txn, Db, TursoDb};
+use crate::{now_ms, pi, pt};
 use dejadb_core::{Hash, Result};
 use std::collections::VecDeque;
-use tokio::runtime::Runtime;
-use turso::{Builder, Connection, Database, Value};
 
 /// How much recall telemetry to retain. Host-only; never a file-truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -159,12 +158,11 @@ const LOG_RETAIN_MS: i64 = 90 * 24 * 3600 * 1000;
 /// Recall-log row cap (~64 MiB proxy), newest-kept, pruned on flush.
 const LOG_ROW_CAP: i64 = 200_000;
 
-/// The telemetry sidecar: its own Turso db + connection, an in-memory recall
-/// buffer, and the recorded mode. Driven by `DejaDB` through the shared
-/// runtime.
+/// The telemetry sidecar: its own backend (own engine, own runtime — fully
+/// decoupled from the main store's), an in-memory recall buffer, and the
+/// recorded mode. Every write here is off the recall path.
 pub struct Telemetry {
-    _db: Database,
-    conn: Connection,
+    db: TursoDb,
     mode: TelemetryMode,
     buf: VecDeque<RecallEvent>,
     prune_countdown: u32,
@@ -174,33 +172,18 @@ impl Telemetry {
     /// Open (or create) `<path>.telemetry.db`. `key` reuses the main file's
     /// AEAD key so crypto-erasure covers the sidecar too. Never called for
     /// `TelemetryMode::Off`.
-    pub fn open(rt: &Runtime, path: &str, key: Option<&[u8; 32]>, mode: TelemetryMode) -> Result<Self> {
+    pub fn open(path: &str, key: Option<&[u8; 32]>, mode: TelemetryMode) -> Result<Self> {
         let sidecar = format!("{}.telemetry.db", path);
-        let (db, conn) = rt.block_on(async {
-            let mut b = Builder::new_local(&sidecar).experimental_index_method(true);
-            if let Some(k) = key {
-                let hexkey = zeroize::Zeroizing::new(hex32(k));
-                b = b.experimental_encryption(true).with_encryption(turso::EncryptionOpts {
-                    cipher: "aes256gcm".to_string(),
-                    hexkey: (*hexkey).clone(),
-                });
-            }
-            let db = b.build().await.map_err(db_err)?;
-            let conn = db.connect().map_err(db_err)?;
-            for sql in TELEM_SCHEMA {
-                conn.execute(sql, ()).await.map_err(db_err)?;
-            }
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', '1')",
-                (),
-            )
-            .await
-            .map_err(db_err)?;
-            Ok::<_, dejadb_core::DejaDbError>((db, conn))
-        })?;
+        let db = TursoDb::open(&sidecar, key)?;
+        for sql in TELEM_SCHEMA {
+            db.execute(sql, vec![])?;
+        }
+        db.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', '1')",
+            vec![],
+        )?;
         Ok(Telemetry {
-            _db: db,
-            conn,
+            db,
             mode,
             buf: VecDeque::new(),
             prune_countdown: 0,
@@ -225,13 +208,12 @@ impl Telemetry {
     /// Off-path drain: persist buffered events into the rollups (and the ring
     /// log in `full` mode) in one transaction. Called from write ops / close /
     /// explicit flush — never from the recall path.
-    pub fn flush(&mut self, rt: &Runtime) -> Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
         let events: Vec<RecallEvent> = self.buf.drain(..).collect();
         let records_log = self.mode.records_log();
-        let conn = &self.conn;
         let prune = {
             self.prune_countdown = self.prune_countdown.saturating_sub(1);
             self.prune_countdown == 0
@@ -239,222 +221,159 @@ impl Telemetry {
         if prune {
             self.prune_countdown = 32; // prune the ring roughly every 32 flushes
         }
-        rt.block_on(async move {
-            conn.execute("BEGIN", ()).await.map_err(db_err)?;
-            let r = async {
-                for ev in &events {
-                    let qkey = ev.query_key();
-                    // grain-access rollup (all recalls)
-                    for h in &ev.hashes {
-                        let hex = h.to_hex();
-                        conn.execute(
-                            "INSERT OR REPLACE INTO grain_access(hash, ns, recall_count, first_ms, last_ms)
-                             VALUES (?1, ?2,
-                               COALESCE((SELECT recall_count FROM grain_access WHERE hash=?1),0)+1,
-                               COALESCE((SELECT first_ms FROM grain_access WHERE hash=?1),?3),
-                               ?3)",
-                            (pt(&hex), pt(&ev.ns), pi(ev.ts_ms)),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    // query rollup (free-text "questions" only)
-                    if ev.is_query() {
-                        let empty = if ev.n_results == 0 { 1 } else { 0 };
-                        conn.execute(
-                            "INSERT OR REPLACE INTO query_stat(qkey, ns, sample, run_count, last_ms, empty_count, sum_results)
-                             VALUES (?1, ?2, ?3,
-                               COALESCE((SELECT run_count FROM query_stat WHERE qkey=?1),0)+1,
-                               ?4,
-                               COALESCE((SELECT empty_count FROM query_stat WHERE qkey=?1),0)+?5,
-                               COALESCE((SELECT sum_results FROM query_stat WHERE qkey=?1),0)+?6)",
-                            (
-                                pt(&qkey),
-                                pt(&ev.ns),
-                                pt(&ev.sample()),
-                                pi(ev.ts_ms),
-                                pi(empty),
-                                pi(ev.n_results as i64),
-                            ),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
-                    // per-recall ring log (full mode only)
-                    if records_log {
-                        let hashes: Vec<String> = ev.hashes.iter().map(|h| h.to_hex()).collect();
-                        let top = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
-                        conn.execute(
-                            "INSERT INTO recall_log(ts_ms, ns, subject, query, n_results, latency_us, top_hashes)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                            (
-                                pi(ev.ts_ms),
-                                pt(&ev.ns),
-                                pt(ev.subject.as_deref().unwrap_or("")),
-                                pt(ev.query.as_deref().unwrap_or("")),
-                                pi(ev.n_results as i64),
-                                pi(ev.latency_us),
-                                pt(&top),
-                            ),
-                        )
-                        .await
-                        .map_err(db_err)?;
-                    }
+        let db = &self.db;
+        with_txn(db, || {
+            for ev in &events {
+                let qkey = ev.query_key();
+                // grain-access rollup (all recalls)
+                for h in &ev.hashes {
+                    let hex = h.to_hex();
+                    db.execute(
+                        "INSERT OR REPLACE INTO grain_access(hash, ns, recall_count, first_ms, last_ms)
+                         VALUES (?1, ?2,
+                           COALESCE((SELECT recall_count FROM grain_access WHERE hash=?1),0)+1,
+                           COALESCE((SELECT first_ms FROM grain_access WHERE hash=?1),?3),
+                           ?3)",
+                        vec![pt(&hex), pt(&ev.ns), pi(ev.ts_ms)],
+                    )?;
                 }
-                if records_log && prune {
-                    let cutoff = now_ms() - LOG_RETAIN_MS;
-                    conn.execute("DELETE FROM recall_log WHERE ts_ms < ?1", (pi(cutoff),))
-                        .await
-                        .map_err(db_err)?;
-                    conn.execute(
-                        "DELETE FROM recall_log WHERE id NOT IN
-                         (SELECT id FROM recall_log ORDER BY id DESC LIMIT ?1)",
-                        (pi(LOG_ROW_CAP),),
-                    )
-                    .await
-                    .map_err(db_err)?;
+                // query rollup (free-text "questions" only)
+                if ev.is_query() {
+                    let empty = if ev.n_results == 0 { 1 } else { 0 };
+                    db.execute(
+                        "INSERT OR REPLACE INTO query_stat(qkey, ns, sample, run_count, last_ms, empty_count, sum_results)
+                         VALUES (?1, ?2, ?3,
+                           COALESCE((SELECT run_count FROM query_stat WHERE qkey=?1),0)+1,
+                           ?4,
+                           COALESCE((SELECT empty_count FROM query_stat WHERE qkey=?1),0)+?5,
+                           COALESCE((SELECT sum_results FROM query_stat WHERE qkey=?1),0)+?6)",
+                        vec![
+                            pt(&qkey),
+                            pt(&ev.ns),
+                            pt(&ev.sample()),
+                            pi(ev.ts_ms),
+                            pi(empty),
+                            pi(ev.n_results as i64),
+                        ],
+                    )?;
                 }
-                Ok::<(), dejadb_core::DejaDbError>(())
-            }
-            .await;
-            match r {
-                Ok(()) => conn.execute("COMMIT", ()).await.map_err(db_err).map(|_| ()),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(e)
+                // per-recall ring log (full mode only)
+                if records_log {
+                    let hashes: Vec<String> = ev.hashes.iter().map(|h| h.to_hex()).collect();
+                    let top = serde_json::to_string(&hashes).unwrap_or_else(|_| "[]".into());
+                    db.execute(
+                        "INSERT INTO recall_log(ts_ms, ns, subject, query, n_results, latency_us, top_hashes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        vec![
+                            pi(ev.ts_ms),
+                            pt(&ev.ns),
+                            pt(ev.subject.as_deref().unwrap_or("")),
+                            pt(ev.query.as_deref().unwrap_or("")),
+                            pi(ev.n_results as i64),
+                            pi(ev.latency_us),
+                            pt(&top),
+                        ],
+                    )?;
                 }
             }
+            if records_log && prune {
+                let cutoff = now_ms() - LOG_RETAIN_MS;
+                db.execute("DELETE FROM recall_log WHERE ts_ms < ?1", vec![pi(cutoff)])?;
+                db.execute(
+                    "DELETE FROM recall_log WHERE id NOT IN
+                     (SELECT id FROM recall_log ORDER BY id DESC LIMIT ?1)",
+                    vec![pi(LOG_ROW_CAP)],
+                )?;
+            }
+            Ok(())
         })
     }
 
     /// Record one assembly-budget sample (whether it overflowed). Off the
     /// recall path — called from the ASSEMBLE/context budget check.
-    pub fn note_budget(&mut self, rt: &Runtime, overflow: bool) -> Result<()> {
-        let conn = &self.conn;
+    pub fn note_budget(&mut self, overflow: bool) -> Result<()> {
         let ov = if overflow { 1 } else { 0 };
-        rt.block_on(async move {
-            conn.execute(
-                "INSERT OR REPLACE INTO budget_stat(id, sample_count, overflow_count)
-                 VALUES (1,
-                   COALESCE((SELECT sample_count FROM budget_stat WHERE id=1),0)+1,
-                   COALESCE((SELECT overflow_count FROM budget_stat WHERE id=1),0)+?1)",
-                (pi(ov),),
-            )
-            .await
-            .map_err(db_err)?;
-            Ok::<(), dejadb_core::DejaDbError>(())
-        })
+        self.db.execute(
+            "INSERT OR REPLACE INTO budget_stat(id, sample_count, overflow_count)
+             VALUES (1,
+               COALESCE((SELECT sample_count FROM budget_stat WHERE id=1),0)+1,
+               COALESCE((SELECT overflow_count FROM budget_stat WHERE id=1),0)+?1)",
+            vec![pi(ov)],
+        )?;
+        Ok(())
     }
 
     /// FORGET hook: synchronously scrub telemetry that references a forgotten
     /// grain, so the sidecar never outlives an erased grain. Drops the
     /// grain-access row, any ring-log rows that surfaced it, and any buffered
     /// events that named it.
-    pub fn scrub(&mut self, rt: &Runtime, hash: &Hash) -> Result<()> {
+    pub fn scrub(&mut self, hash: &Hash) -> Result<()> {
         let hex = hash.to_hex();
         self.buf.retain(|ev| !ev.hashes.iter().any(|h| h == hash));
-        let conn = &self.conn;
         let like = format!("%{}%", hex);
-        rt.block_on(async move {
-            conn.execute("DELETE FROM grain_access WHERE hash=?1", (pt(&hex),))
-                .await
-                .map_err(db_err)?;
-            conn.execute("DELETE FROM recall_log WHERE top_hashes LIKE ?1", (pt(&like),))
-                .await
-                .map_err(db_err)?;
-            Ok::<(), dejadb_core::DejaDbError>(())
-        })
+        self.db
+            .execute("DELETE FROM grain_access WHERE hash=?1", vec![pt(&hex)])?;
+        self.db
+            .execute("DELETE FROM recall_log WHERE top_hashes LIKE ?1", vec![pt(&like)])?;
+        Ok(())
     }
 
     // ---- readers (consumed by the telemetry-fed analyzers + console) ----
 
     /// Grain-access rollups, optionally scoped to a namespace.
-    pub fn access_stats(&self, rt: &Runtime, ns: Option<&str>) -> Result<Vec<AccessStat>> {
-        let conn = &self.conn;
-        rt.block_on(async move {
-            let mut out = Vec::new();
-            let mut rows = match ns {
-                Some(n) => conn
-                    .query(
-                        "SELECT hash, ns, recall_count, last_ms FROM grain_access WHERE ns=?1",
-                        (pt(n),),
-                    )
-                    .await
-                    .map_err(db_err)?,
-                None => conn
-                    .query("SELECT hash, ns, recall_count, last_ms FROM grain_access", ())
-                    .await
-                    .map_err(db_err)?,
-            };
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                out.push(AccessStat {
-                    hash: text(&row.get_value(0).map_err(db_err)?),
-                    ns: text(&row.get_value(1).map_err(db_err)?),
-                    recall_count: int(&row.get_value(2).map_err(db_err)?),
-                    last_ms: int(&row.get_value(3).map_err(db_err)?),
-                });
-            }
-            Ok(out)
-        })
+    pub fn access_stats(&self, ns: Option<&str>) -> Result<Vec<AccessStat>> {
+        let rows = match ns {
+            Some(n) => self.db.query(
+                "SELECT hash, ns, recall_count, last_ms FROM grain_access WHERE ns=?1",
+                vec![pt(n)],
+            )?,
+            None => self
+                .db
+                .query("SELECT hash, ns, recall_count, last_ms FROM grain_access", vec![])?,
+        };
+        Ok(rows
+            .iter()
+            .map(|row| AccessStat {
+                hash: row.text(0).unwrap_or_default().to_string(),
+                ns: row.text(1).unwrap_or_default().to_string(),
+                recall_count: row.i64(2).unwrap_or(0),
+                last_ms: row.i64(3).unwrap_or(0),
+            })
+            .collect())
     }
 
     /// Query rollups, optionally scoped to a namespace.
-    pub fn query_stats(&self, rt: &Runtime, ns: Option<&str>) -> Result<Vec<QueryStat>> {
-        let conn = &self.conn;
-        rt.block_on(async move {
-            let mut out = Vec::new();
-            let sql = "SELECT qkey, ns, sample, run_count, last_ms, empty_count, sum_results FROM query_stat";
-            let mut rows = match ns {
-                Some(n) => conn
-                    .query(&format!("{sql} WHERE ns=?1"), (pt(n),))
-                    .await
-                    .map_err(db_err)?,
-                None => conn.query(sql, ()).await.map_err(db_err)?,
-            };
-            while let Some(row) = rows.next().await.map_err(db_err)? {
-                out.push(QueryStat {
-                    key: text(&row.get_value(0).map_err(db_err)?),
-                    ns: text(&row.get_value(1).map_err(db_err)?),
-                    sample: text(&row.get_value(2).map_err(db_err)?),
-                    run_count: int(&row.get_value(3).map_err(db_err)?),
-                    last_ms: int(&row.get_value(4).map_err(db_err)?),
-                    empty_count: int(&row.get_value(5).map_err(db_err)?),
-                    sum_results: int(&row.get_value(6).map_err(db_err)?),
-                });
-            }
-            Ok(out)
-        })
+    pub fn query_stats(&self, ns: Option<&str>) -> Result<Vec<QueryStat>> {
+        let sql = "SELECT qkey, ns, sample, run_count, last_ms, empty_count, sum_results FROM query_stat";
+        let rows = match ns {
+            Some(n) => self.db.query(&format!("{sql} WHERE ns=?1"), vec![pt(n)])?,
+            None => self.db.query(sql, vec![])?,
+        };
+        Ok(rows
+            .iter()
+            .map(|row| QueryStat {
+                key: row.text(0).unwrap_or_default().to_string(),
+                ns: row.text(1).unwrap_or_default().to_string(),
+                sample: row.text(2).unwrap_or_default().to_string(),
+                run_count: row.i64(3).unwrap_or(0),
+                last_ms: row.i64(4).unwrap_or(0),
+                empty_count: row.i64(5).unwrap_or(0),
+                sum_results: row.i64(6).unwrap_or(0),
+            })
+            .collect())
     }
 
     /// The assembly-budget rollup.
-    pub fn budget_stats(&self, rt: &Runtime) -> Result<BudgetStat> {
-        let conn = &self.conn;
-        rt.block_on(async move {
-            let mut rows = conn
-                .query("SELECT sample_count, overflow_count FROM budget_stat WHERE id=1", ())
-                .await
-                .map_err(db_err)?;
-            match rows.next().await.map_err(db_err)? {
-                Some(row) => Ok(BudgetStat {
-                    sample_count: int(&row.get_value(0).map_err(db_err)?),
-                    overflow_count: int(&row.get_value(1).map_err(db_err)?),
-                }),
-                None => Ok(BudgetStat::default()),
-            }
+    pub fn budget_stats(&self) -> Result<BudgetStat> {
+        let rows = self
+            .db
+            .query("SELECT sample_count, overflow_count FROM budget_stat WHERE id=1", vec![])?;
+        Ok(match rows.first() {
+            Some(row) => BudgetStat {
+                sample_count: row.i64(0).unwrap_or(0),
+                overflow_count: row.i64(1).unwrap_or(0),
+            },
+            None => BudgetStat::default(),
         })
-    }
-}
-
-fn text(v: &Value) -> String {
-    match v {
-        Value::Text(t) => t.clone(),
-        _ => String::new(),
-    }
-}
-
-fn int(v: &Value) -> i64 {
-    match v {
-        Value::Integer(i) => *i,
-        _ => 0,
     }
 }

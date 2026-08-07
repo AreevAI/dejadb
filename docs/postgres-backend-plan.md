@@ -27,6 +27,25 @@ numbers and confirmed the rest:
 
 ## 1. Architecture
 
+> **Build-time decision (2026-08-07, during Phase 0.1).** The backend plugs in
+> at the `Db` seam **inside `DejaDB`** — `DejaDB { db: Box<dyn Db> }` runs the
+> identical store logic (index maintenance, fork election, BM25) over either a
+> `TursoDb` or a `PgDb` transport. `PgStore` as a *separate* `CalStoreFacade`
+> implementation is dropped: it would duplicate the write path, which the
+> audits flagged as the #1 parity risk. Consequences:
+> - Fork/head/oplog semantics are in parity **by construction** — the same
+>   Rust code executes on both backends; only SQL dialect + transport differ.
+> - Every existing surface (facade, `with_store` call sites, MemoryTool,
+>   migrate, bindings, CLI) works unchanged on a Postgres-backed `DejaDB`.
+>   **Phase 1 (trait promotion) is therefore OFF the Postgres critical path**
+>   — it remains worthwhile API hygiene, deferred to post-pilot.
+> - The conformance suite is store-level: cases run over a `Backend` opener
+>   yielding `DejaDB` handles (tempdir file vs schema), not over facade
+>   objects.
+> - The ~30 genuinely divergent statements (upserts, vector fns, IN-lists,
+>   PRAGMA) go through a small dialect surface in the `Db` backend; `?N`→`$N`
+>   is a mechanical rewrite inside `PgDb::prepare`.
+
 ### 1.1 Crate & feature layout
 
 - `crates/dejadb-store`:
