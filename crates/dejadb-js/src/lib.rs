@@ -507,6 +507,69 @@ impl DejaDb {
         })
     }
 
+    /// Right-to-erasure for one identity: erase every grain holding a
+    /// STRUCTURED reference to `subject` in the session namespace (or `ns`) —
+    /// the full supersession history, grains referencing it in object
+    /// position, its thread events, its dictionary entry, and erased-only
+    /// vocabulary — with replicating tombstones. Resolves to the erasure
+    /// report as JSON (counts only, no identity material). Host-level
+    /// destructive op: gate it like your other compliance endpoints. See
+    /// docs/erasure.md for the scope contract.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn forget_subject(
+        &self,
+        subject: String,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        StringJob::spawn(move || {
+            let rep = facade.with_store(|m| m.forget_subject(&ns, &subject)).map_err(err)?;
+            Ok(serde_json::json!({
+                "grains_erased": rep.grains_erased,
+                "terms_removed": rep.terms_removed,
+                "vocab_removed": rep.vocab_removed,
+                "blobs_reclaimed": rep.blobs_reclaimed,
+            })
+            .to_string())
+        })
+    }
+
+    /// Retention sweep: erase every grain with `created_at` older than
+    /// `cutoffMs` (epoch milliseconds), optionally limited to one grain type
+    /// (e.g. "event") and scoped to the session namespace (or `ns`; pass
+    /// ns="" to sweep every namespace). Resolves to the report JSON.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn forget_older_than(
+        &self,
+        cutoff_ms: i64,
+        ns: Option<String>,
+        grain_type: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let facade = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        StringJob::spawn(move || {
+            let gt = match &grain_type {
+                Some(s) => Some(
+                    dejadb_core::types::GrainType::from_str(s)
+                        .ok_or_else(|| err(format!("unknown grain type '{s}'")))?,
+                ),
+                None => None,
+            };
+            let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+            let rep = facade
+                .with_store(|m| m.forget_older_than(ns_opt, cutoff_ms, gt))
+                .map_err(err)?;
+            Ok(serde_json::json!({
+                "grains_erased": rep.grains_erased,
+                "terms_removed": rep.terms_removed,
+                "vocab_removed": rep.vocab_removed,
+                "blobs_reclaimed": rep.blobs_reclaimed,
+            })
+            .to_string())
+        })
+    }
+
     /// remember(): store content as an Event, then attach the facts
     /// distilled from it. Three routes to those facts, in precedence order:
     /// `factsJson` (pre-extracted by the host — a JSON list of

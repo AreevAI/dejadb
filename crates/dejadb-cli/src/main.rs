@@ -1545,6 +1545,63 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 );
             }
         }
+        "forget-subject" => {
+            // Right-to-erasure for one identity: erase every grain holding a
+            // structured reference to the subject (history included), its
+            // thread events, its dictionary entry, and erased-only
+            // vocabulary — with replicating tombstones. Destructive and
+            // bulk, so it demands an explicit --yes.
+            let subject = positional.first().cloned().or_else(|| flag(&flags, "subject")).ok_or(
+                "usage: deja forget-subject <subject> [--ns NS] --yes".to_string(),
+            )?;
+            if !flags.contains_key("yes") {
+                return Err(format!(
+                    "forget-subject erases EVERY grain referencing '{subject}' in namespace \
+                     '{ns}' (history included) and replicates the erasure to peers. \
+                     Re-run with --yes to proceed."
+                ));
+            }
+            let rep = m.forget_subject(&ns, &subject).map_err(|e| e.to_string())?;
+            println!(
+                "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
+                rep.grains_erased, rep.terms_removed, rep.vocab_removed, rep.blobs_reclaimed
+            );
+        }
+        "purge-older-than" => {
+            // Retention sweep: erase grains older than N days (created_at),
+            // optionally limited to one grain type. --ns "" sweeps every
+            // namespace. Destructive and bulk: demands --yes.
+            let days: i64 = positional
+                .first()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| flag(&flags, "days").and_then(|v| v.parse().ok()))
+                .ok_or("usage: deja purge-older-than <days> [--ns NS] [--type event] --yes".to_string())?;
+            let gt = match flag(&flags, "type") {
+                Some(t) => Some(
+                    dejadb_core::types::GrainType::from_str(&t)
+                        .ok_or_else(|| format!("unknown grain type '{t}'"))?,
+                ),
+                None => None,
+            };
+            if !flags.contains_key("yes") {
+                return Err(format!(
+                    "purge-older-than erases every{} grain older than {days} days in namespace \
+                     '{ns}' and replicates the erasure to peers. Re-run with --yes to proceed.",
+                    gt.map(|g| format!(" {g:?}")).unwrap_or_default()
+                ));
+            }
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+                - days * 24 * 3600 * 1000;
+            let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+            let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
+            println!(
+                "erased {} grains ({} vocabulary tokens, {} blobs reclaimed)",
+                rep.grains_erased, rep.vocab_removed, rep.blobs_reclaimed
+            );
+        }
         "merge" => {
             // Close an open fork by writing a resolved value that supersedes
             // every tip; the merge grain records all parents in its blob.

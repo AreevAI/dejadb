@@ -60,3 +60,26 @@ def test_two_instances_share_one_memory():
 def test_passphrase_with_dsn_is_rejected():
     with pytest.raises(ValueError, match="file-backed"):
         dejadb.DejaDB(dsn_for("never_created"), ns="ns", passphrase="secret")
+
+
+def test_subject_erasure_and_retention():
+    schema = f"py_erase_{os.getpid()}"
+    try:
+        m = dejadb.DejaDB(dsn_for(schema), ns="ns", telemetry="off")
+        m.add_fact("pat", "condition", "onset")
+        m.add_fact("dr_lee", "treats", "pat")
+        m.add_fact("mara", "prefers", "tea")
+        rep = json.loads(m.forget_subject("pat"))
+        assert rep["grains_erased"] == 2
+        assert rep["terms_removed"] == 1
+        assert json.loads(m.recall("pat")) == []
+        assert json.loads(m.recall("dr_lee")) == []
+        assert len(json.loads(m.recall("mara"))) == 1
+        # retention: everything to date is older than "now + 1s"
+        import time
+
+        rep = json.loads(m.forget_older_than(int(time.time() * 1000) + 1000))
+        assert rep["grains_erased"] == 1
+        assert json.loads(m.stats())["grains"] == 0
+    finally:
+        dejadb.drop_postgres_schema(URL, schema)

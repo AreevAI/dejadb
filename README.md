@@ -394,6 +394,13 @@ differences are deliberate and explicit:
   `drop_postgres_schema`). Recall telemetry rides the memory's schema too.
   Page-level crypto-erasure remains a file-backend capability; encrypt at
   the deployment layer (TDE/pgcrypto) instead.
+- **Right to erasure and retention** (both backends): `forget_subject`
+  erases every structured reference to one identity — full history, object
+  references, thread events, the dictionary entry itself — with replicating
+  tombstones; `forget_older_than` is the age-based retention sweep. Both
+  are host-level operations, deliberately not reachable from CAL; see
+  [docs/erasure.md](docs/erasure.md) for the scope contract and the
+  documented OMS deviation.
 - **HA is inherited**: run it on a regionally-replicated Postgres and the
   memory inherits the failover, PITR, and backup story your ops team already
   drilled.

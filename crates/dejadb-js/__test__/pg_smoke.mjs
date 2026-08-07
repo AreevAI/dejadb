@@ -55,3 +55,24 @@ test('a passphrase with a DSN is a clear error', { skip }, () => {
     'page cipher is file-backend-only'
   )
 })
+
+test('subject erasure and retention sweep', { skip }, async () => {
+  const schema = `js_erase_${process.pid}`
+  try {
+    const m = new DejaDb(dsnFor(schema), 'ns', undefined, undefined, 'off')
+    await m.addFact('pat', 'condition', 'onset')
+    await m.addFact('dr_lee', 'treats', 'pat')
+    await m.addFact('mara', 'prefers', 'tea')
+    const rep = JSON.parse(await m.forgetSubject('pat'))
+    assert.equal(rep.grains_erased, 2, 'the chain and the referencing grain')
+    assert.equal(rep.terms_removed, 1, 'the identity dictionary entry')
+    assert.deepEqual(JSON.parse(await m.recall('pat')), [])
+    assert.deepEqual(JSON.parse(await m.recall('dr_lee')), [])
+    assert.equal(JSON.parse(await m.recall('mara')).length, 1)
+    const sweep = JSON.parse(await m.forgetOlderThan(Date.now() + 1000))
+    assert.equal(sweep.grains_erased, 1)
+    assert.equal(JSON.parse(await m.stats()).grains, 0)
+  } finally {
+    dropPostgresSchema(url, schema)
+  }
+})

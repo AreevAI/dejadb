@@ -115,6 +115,30 @@ pub struct ImportStats {
     pub skipped: usize,
 }
 
+/// What a bulk erasure targets (internal to the erasure core).
+enum ErasureSelector {
+    /// Every structured reference to one dictionary term in one namespace.
+    Identity { ns_id: i64, term: i64 },
+    /// Everything older than the cutoff, optionally scoped.
+    OlderThan { ns_id: Option<i64>, cutoff_ms: i64, gtype: Option<i64> },
+}
+
+/// Result of a bulk erasure ([`DejaDB::forget_subject`] /
+/// [`DejaDB::forget_older_than`]) — the numbers a host's compliance audit
+/// records. Deliberately contains no identity material.
+#[derive(Debug, Clone, Default)]
+pub struct ErasureReport {
+    /// Grains tombstoned and physically deleted from the hot store.
+    pub grains_erased: usize,
+    /// Dictionary entries removed because nothing references them any more
+    /// (the identity string itself is erasable data).
+    pub terms_removed: usize,
+    /// Vocabulary tokens removed because they occurred only in erased text.
+    pub vocab_removed: usize,
+    /// CAS blobs reclaimed because only erased grains referenced them.
+    pub blobs_reclaimed: usize,
+}
+
 /// Pluggable embedding backend. The host owns the model;
 /// multilingual recall quality comes from choosing a multilingual model
 /// (e.g. bge-m3 / multilingual-e5) — text reaches the backend as
@@ -2815,6 +2839,268 @@ impl DejaDB {
             let _ = tel.scrub(hash);
         }
         Ok(())
+    }
+
+    /// Erase every grain holding a STRUCTURED reference to `subject` in `ns`
+    /// — the right-to-erasure primitive for one identity. In one transaction
+    /// this removes:
+    ///
+    /// - every grain (live AND superseded — the whole history, not just the
+    ///   heads) whose triple subject or object is `subject`;
+    /// - every thread event of the session named `subject`;
+    /// - the dictionary entry for `subject` itself once nothing references
+    ///   it (the identifier string is erasable data), and vocabulary tokens
+    ///   that occurred only in the erased text;
+    ///
+    /// then reclaims CAS blobs only those grains referenced and scrubs the
+    /// telemetry sidecar. Every erased grain gets its own op-log tombstone,
+    /// so the erasure REPLICATES to peers exactly like individual forgets.
+    ///
+    /// Scope contract (see docs/erasure.md): only dictionary-indexed
+    /// references are findable. A free-text mention of the identity inside
+    /// ANOTHER subject's grain is not — hosts that need erasure must keep
+    /// identity references in structured fields. This is a deliberate
+    /// host-level extension beyond the OMS single-grain tombstone; it is
+    /// not reachable from CAL text (REQ-ERASE in docs/erasure.md).
+    pub fn forget_subject(&mut self, ns: &str, subject: &str) -> Result<ErasureReport> {
+        let (Some(ns_id), Some(s_id)) = (self.term_lookup(ns)?, self.term_lookup(subject)?)
+        else {
+            return Ok(ErasureReport::default());
+        };
+        self.erase_where(
+            ErasureSelector::Identity { ns_id, term: s_id },
+            Some((subject.to_string(), s_id)),
+        )
+    }
+
+    /// Erase every grain older than `cutoff_ms` (`created_at < cutoff`),
+    /// optionally scoped to one namespace and/or grain type — the
+    /// retention-sweep primitive (nightly age-based deletion). Same erasure
+    /// semantics as [`forget_subject`] minus the identity-dictionary sweep.
+    pub fn forget_older_than(
+        &mut self,
+        ns: Option<&str>,
+        cutoff_ms: i64,
+        gtype: Option<dejadb_core::types::GrainType>,
+    ) -> Result<ErasureReport> {
+        let ns_id = match ns {
+            Some(n) => match self.term_lookup(n)? {
+                Some(x) => Some(x),
+                None => return Ok(ErasureReport::default()),
+            },
+            None => None,
+        };
+        let gt = gtype.map(|g| g as u8 as i64);
+        self.erase_where(ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype: gt }, None)
+    }
+
+    /// Shared bulk-erasure core. Enumeration happens INSIDE the transaction,
+    /// after the serialization point, so no concurrently-committed grain can
+    /// slip between the census and the deletes (the lesson every
+    /// read-then-write path here has had to learn).
+    fn erase_where(
+        &mut self,
+        selector: ErasureSelector,
+        identity: Option<(String, i64)>,
+    ) -> Result<ErasureReport> {
+        struct Target {
+            seq: i64,
+            hash: Vec<u8>,
+            ns: i64,
+            s: Option<i64>,
+            p: Option<i64>,
+            doc_len: Option<i64>,
+        }
+        self.db.begin()?;
+        let r = (|| -> Result<(ErasureReport, Vec<Target>, i64, i64)> {
+            let mut report = ErasureReport::default();
+            // Serialize with concurrent writers before enumerating.
+            self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
+            let seq_rows = match &selector {
+                ErasureSelector::Identity { ns_id, term } => self.db.query(
+                    "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND (s=?2 OR o=?2) \
+                     UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2",
+                    vec![pi(*ns_id), pi(*term)],
+                )?,
+                ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype } => {
+                    let mut sql = String::from("SELECT seq FROM grains WHERE created_at < ?1");
+                    let mut params = vec![pi(*cutoff_ms)];
+                    if let Some(n) = ns_id {
+                        sql.push_str(" AND ns = ?2");
+                        params.push(pi(*n));
+                    }
+                    if let Some(g) = gtype {
+                        sql.push_str(if ns_id.is_some() { " AND gtype = ?3" } else { " AND gtype = ?2" });
+                        params.push(pi(*g));
+                    }
+                    self.db.query(&sql, params)?
+                }
+            };
+            let mut seqs: Vec<i64> = seq_rows.iter().filter_map(|r| r.i64(0)).collect();
+            seqs.sort_unstable();
+            if seqs.is_empty() {
+                return Ok((report, Vec::new(), 0, 0));
+            }
+            let n = seqs.len() as i64;
+            // One tombstone per grain: ids from the counters on multi-writer
+            // backends, from the process-local counters otherwise.
+            let (op0, hlc0) = match self.db.reserve_write(0, n, n, now_ms() << 16, 0)? {
+                Some(w) => (w.op0, w.hlc0),
+                None => {
+                    let op0 = self.next_op;
+                    self.next_op += n;
+                    let hlc0 = self.next_hlc();
+                    self.hlc_last = hlc0 + n - 1;
+                    (op0, hlc0)
+                }
+            };
+            let csv = seq_csv(&seqs);
+            // Vocabulary candidates BEFORE the postings are deleted.
+            let vocab_candidates: Vec<i64> = self
+                .db
+                .query(&format!("SELECT DISTINCT term FROM fts_post WHERE seq IN ({csv})"), vec![])?
+                .iter()
+                .filter_map(|r| r.i64(0))
+                .collect();
+            let mut targets: Vec<Target> = Vec::with_capacity(seqs.len());
+            for row in self.db.query(
+                &format!(
+                    "SELECT g.seq, g.hash, g.ns, g.s, g.p, d.len \
+                     FROM grains g LEFT JOIN fts_doc d ON d.seq = g.seq \
+                     WHERE g.seq IN ({csv})"
+                ),
+                vec![],
+            )? {
+                let (Some(seq), Some(hash), Some(ns)) = (row.i64(0), row.blob(1), row.i64(2))
+                else {
+                    continue;
+                };
+                targets.push(Target {
+                    seq,
+                    hash,
+                    ns,
+                    s: row.i64(3),
+                    p: row.i64(4),
+                    doc_len: row.i64(5),
+                });
+            }
+            let mut affected_keys: Vec<(i64, i64, i64)> = Vec::new();
+            for (i, t) in targets.iter().enumerate() {
+                for table in
+                    ["triples", "osp", "embeddings", "thread_idx", "prov_idx", "run_idx", "fts_post", "fts_doc"]
+                {
+                    self.db
+                        .execute(&format!("DELETE FROM {table} WHERE seq=?1"), vec![pi(t.seq)])?;
+                }
+                self.db.execute("DELETE FROM grains WHERE seq=?1", vec![pi(t.seq)])?;
+                if let (Some(s), Some(p)) = (t.s, t.p) {
+                    self.db.execute(
+                        "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                        vec![pi(t.ns), pi(s), pi(p), pi(t.seq)],
+                    )?;
+                    if !affected_keys.contains(&(t.ns, s, p)) {
+                        affected_keys.push((t.ns, s, p));
+                    }
+                }
+                self.db.execute(
+                    "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                    vec![
+                        pi(op0 + i as i64),
+                        pi(hlc0 + i as i64),
+                        pi(OP_FORGET),
+                        pb(t.hash.clone()),
+                    ],
+                )?;
+            }
+            // Reconcile entity_latest per affected key: drop rows pointing at
+            // erased grains, then re-elect from the surviving heads with the
+            // SAME (created_at, hash) rule as everywhere else.
+            for (ns, s, p) in &affected_keys {
+                self.db.execute(
+                    &format!(
+                        "DELETE FROM entity_latest WHERE ns=?1 AND s=?2 AND p=?3 AND seq IN ({csv})"
+                    ),
+                    vec![pi(*ns), pi(*s), pi(*p)],
+                )?;
+                let rows = self.db.query(
+                    "SELECT t.o, h.seq, h.hash, h.created_at
+                     FROM heads h JOIN triples t
+                       ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
+                     WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
+                     ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
+                    vec![pi(*ns), pi(*s), pi(*p)],
+                )?;
+                if let Some(row) = rows.first() {
+                    let o = row.i64(0).unwrap_or(0);
+                    let sq = row.i64(1).unwrap_or(0);
+                    let h = row.blob(2).unwrap_or_default();
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO entity_latest(ns,s,p,o,seq,hash) VALUES (?1,?2,?3,?4,?5,?6)",
+                        vec![pi(*ns), pi(*s), pi(*p), pi(o), pi(sq), pb(h)],
+                    )?;
+                }
+            }
+            // Vocabulary sweep: tokens that occurred only in the erased text
+            // carry erasable content — remove them once unreferenced.
+            for term in vocab_candidates {
+                let gone = self.db.execute(
+                    "DELETE FROM fts_vocab WHERE id=?1 AND NOT EXISTS \
+                     (SELECT 1 FROM fts_post WHERE term=?1)",
+                    vec![pi(term)],
+                )?;
+                report.vocab_removed += gone as usize;
+            }
+            // Identity sweep: the subject's dictionary entry IS the
+            // identifier string. Remove it once nothing references it.
+            if let Some((_, term)) = &identity {
+                let gone = self.db.execute(
+                    "DELETE FROM terms WHERE id=?1 \
+                     AND NOT EXISTS (SELECT 1 FROM triples WHERE s=?1 OR p=?1 OR o=?1) \
+                     AND NOT EXISTS (SELECT 1 FROM thread_idx WHERE session=?1) \
+                     AND NOT EXISTS (SELECT 1 FROM run_idx WHERE run=?1) \
+                     AND NOT EXISTS (SELECT 1 FROM grains WHERE ns=?1)",
+                    vec![pi(*term)],
+                )?;
+                report.terms_removed += gone as usize;
+            }
+            report.grains_erased = targets.len();
+            let docs: i64 = targets.iter().filter(|t| t.doc_len.is_some()).count() as i64;
+            let len_sum: i64 = targets.iter().filter_map(|t| t.doc_len).sum();
+            Ok((report, targets, docs, len_sum))
+        })();
+        match r {
+            Ok((mut report, targets, docs, len_sum)) => {
+                self.db.commit()?;
+                self.fts_docs = (self.fts_docs - docs).max(0);
+                self.fts_total_len = (self.fts_total_len - len_sum).max(0);
+                if report.terms_removed > 0 {
+                    if let Some((name, _)) = &identity {
+                        self.dict.remove(name);
+                    }
+                }
+                if report.vocab_removed > 0 {
+                    // Cheap and safe: the cache refills lazily from the table.
+                    self.fts_vocab.clear();
+                }
+                // Best-effort post-commit hygiene: the erasure itself has
+                // already committed and replicated.
+                for t in &targets {
+                    if let Ok(h) = Hash::try_from_bytes(&t.hash) {
+                        if let Some(tel) = self.telemetry.as_mut() {
+                            let _ = tel.scrub(&h);
+                        }
+                    }
+                }
+                if report.grains_erased > 0 {
+                    report.blobs_reclaimed = self.gc_blobs().unwrap_or(0);
+                }
+                Ok(report)
+            }
+            Err(e) => {
+                let _ = self.db.rollback();
+                Err(e)
+            }
+        }
     }
 
     /// Append one op-log record (fresh local `op_seq`, caller-supplied `hlc`).
