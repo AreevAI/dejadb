@@ -610,8 +610,16 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     let mut m = if is_pg_url {
         // The CLI's telemetry default is `aggregate` for files; the sidecar
         // is not supported on this backend yet, so only an EXPLICIT
-        // --telemetry request is an error — the default quietly stays off.
+        // --telemetry request is an error — the default drops to off WITH a
+        // warning (waiser's telemetry-fed analyzers would otherwise report
+        // an all-clear from silently empty stats).
         let explicit_telemetry = flag(&flags, "telemetry").map(|_| tel_mode);
+        if explicit_telemetry.is_none() {
+            eprintln!(
+                "deja: warning: recall telemetry is not yet supported on the postgres \
+                 backend; running with telemetry off"
+            );
+        }
         open_postgres_store(&db, explicit_telemetry, explicit_index.as_deref())?
     } else {
         if explicit_index.is_some() || enc_key.is_some() {
@@ -891,6 +899,18 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let from = need(&flags, "from")?;
             let interval: u64 = flag(&flags, "interval-ms").and_then(|v| v.parse().ok()).unwrap_or(1000);
             let once = flags.contains_key("once");
+            // The follower cursor lives beside a FILE db; a DSN has no
+            // "beside", so a postgres-backed follower keeps its cursor in
+            // the stream dir, keyed by the memory's schema.
+            #[cfg(feature = "postgres")]
+            let fcur_path = if is_pg_url {
+                let (_, schema) =
+                    dejadb_store::pg::split_schema_url(&db).map_err(|e| e.to_string())?;
+                format!("{from}/{schema}.follow")
+            } else {
+                format!("{db}.follow")
+            };
+            #[cfg(not(feature = "postgres"))]
             let fcur_path = format!("{db}.follow");
             loop {
                 let cursor = std::fs::read_to_string(format!("{from}/CURSOR")).unwrap_or_default();

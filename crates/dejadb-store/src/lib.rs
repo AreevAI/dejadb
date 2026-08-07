@@ -3497,16 +3497,23 @@ impl DejaDB {
 
         let mut out = Vec::new();
         if self.db.prefers_batched_reads() && !ordered.is_empty() && !over(&start) {
-            // Networked backend: one batched blob pull for the whole ranked
-            // set; the deadline still bounds per-candidate deserialization,
-            // so partial results beat a blown budget exactly as before.
-            let blobs = self.blobs_by_seqs(&ordered)?;
-            for seq in ordered {
+            // Networked backend: batched blob pulls in CHUNKS with a
+            // deadline check between them, so the deadline bounds the fetch
+            // phase within one chunk's round trip — the per-seq loop below
+            // bounds it within one blob, and an unchunked pull would not
+            // bound it at all on a stalled link.
+            for chunk in ordered.chunks(16) {
                 if over(&start) {
                     break;
                 }
-                if let Some(b) = blobs.get(&seq) {
-                    out.push(deserialize_blob(b)?);
+                let blobs = self.blobs_by_seqs(chunk)?;
+                for seq in chunk {
+                    if over(&start) {
+                        break;
+                    }
+                    if let Some(b) = blobs.get(seq) {
+                        out.push(deserialize_blob(b)?);
+                    }
                 }
             }
         } else {

@@ -122,14 +122,34 @@ impl PgDb {
                 .batch_execute(&format!("SET search_path TO \"{schema}\", public, ext"))
                 .await
                 .map_err(db_err)?;
-            let row = client
-                .query_one(
-                    "SELECT pg_try_advisory_lock(hashtext($1)::bigint)",
-                    &[&format!("dejadb:{schema}")],
-                )
-                .await
-                .map_err(db_err)?;
-            if !row.get::<_, bool>(0) {
+            // Two-argument advisory lock: (class, name) gives a 64-bit key
+            // space — the single-arg hashtext()::bigint form is only 32 bits
+            // and two schema names in one database could collide into a
+            // spurious StoreBusy. Session-scoped; released when this
+            // backend's connection closes.
+            //
+            // A just-closed previous session's lock releases only when the
+            // server reaps its backend, which RACES a fresh open (drop-then-
+            // reopen is a normal pattern: back-to-back CLI invocations).
+            // Retry briefly before declaring the memory busy — a live writer
+            // keeps holding the lock, so a genuine conflict still fails
+            // within ~1s.
+            let mut locked = false;
+            for _ in 0..20 {
+                let row = client
+                    .query_one(
+                        "SELECT pg_try_advisory_lock(hashtext('dejadb'), hashtext($1))",
+                        &[&schema],
+                    )
+                    .await
+                    .map_err(db_err)?;
+                if row.get::<_, bool>(0) {
+                    locked = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if !locked {
                 return Err(DejaDbError::StoreBusy(format!(
                     "another writer holds memory schema \"{schema}\" (single writer per memory)"
                 )));
@@ -139,6 +159,11 @@ impl PgDb {
         Ok(Self { rt, client, cache: RefCell::new(HashMap::new()) })
     }
 
+    /// Prepare-and-cache. ONLY the `_hot` calls come through here: their SQL
+    /// is a fixed set of `&'static` literals, so the cache (and the server-
+    /// side named statements behind it) is bounded. Plain `query`/`execute`
+    /// must NOT cache — the recall path builds per-call-unique IN-list SQL,
+    /// which would grow both sides without bound.
     fn prepared(&self, sql: &str) -> Result<tokio_postgres::Statement> {
         if let Some(st) = self.cache.borrow().get(sql) {
             return Ok(st.clone());
@@ -151,39 +176,54 @@ impl PgDb {
         Ok(st)
     }
 
-    fn run_query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Row>> {
-        let st = self.prepared(sql)?;
+    fn run_query(&self, sql: &str, params: Vec<Value>, hot: bool) -> Result<Vec<Row>> {
         let vals: Vec<PgVal> = params.into_iter().map(PgVal).collect();
         let refs: Vec<&(dyn ToSql + Sync)> =
             vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-        let rows = self.rt.block_on(self.client.query(&st, &refs)).map_err(db_err)?;
+        let rows = if hot {
+            let st = self.prepared(sql)?;
+            self.rt.block_on(self.client.query(&st, &refs))
+        } else {
+            // Uncached path: the temporary statement is closed on drop, so
+            // dynamic SQL leaves nothing behind on either side.
+            let translated = translate(sql)?;
+            self.rt.block_on(self.client.query(translated.as_str(), &refs))
+        }
+        .map_err(db_err)?;
         rows.iter().map(row_to_row).collect()
     }
 
-    fn run_execute(&self, sql: &str, params: Vec<Value>) -> Result<u64> {
-        let st = self.prepared(sql)?;
+    fn run_execute(&self, sql: &str, params: Vec<Value>, hot: bool) -> Result<u64> {
         let vals: Vec<PgVal> = params.into_iter().map(PgVal).collect();
         let refs: Vec<&(dyn ToSql + Sync)> =
             vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-        self.rt.block_on(self.client.execute(&st, &refs)).map_err(db_err)
+        if hot {
+            let st = self.prepared(sql)?;
+            self.rt.block_on(self.client.execute(&st, &refs)).map_err(db_err)
+        } else {
+            let translated = translate(sql)?;
+            self.rt
+                .block_on(self.client.execute(translated.as_str(), &refs))
+                .map_err(db_err)
+        }
     }
 }
 
 impl Db for PgDb {
     fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64> {
-        self.run_execute(sql, params)
+        self.run_execute(sql, params, false)
     }
 
     fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Row>> {
-        self.run_query(sql, params)
+        self.run_query(sql, params, false)
     }
 
     fn execute_hot(&self, sql: &'static str, params: Vec<Value>) -> Result<u64> {
-        self.run_execute(sql, params)
+        self.run_execute(sql, params, true)
     }
 
     fn query_hot(&self, sql: &'static str, params: Vec<Value>) -> Result<Vec<Row>> {
-        self.run_query(sql, params)
+        self.run_query(sql, params, true)
     }
 
     fn begin(&self) -> Result<()> {
@@ -207,7 +247,15 @@ impl Db for PgDb {
             // Best-effort: only required if the extension is not installed
             // yet, and refused on unprivileged roles where an admin already
             // installed it — the ALTER below gives the real error.
-            let _ = self.client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector").await;
+            // WITH SCHEMA public is load-bearing: search_path is pinned to
+            // the MEMORY's schema, and without it pgvector's objects would
+            // install into that schema — invisible to sibling memories, and
+            // destroyed database-wide by that one memory's DROP SCHEMA
+            // erasure.
+            let _ = self
+                .client
+                .batch_execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+                .await;
             self.client
                 .batch_execute(&format!(
                     "ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS vec vector({dim})"
@@ -351,9 +399,30 @@ pub(crate) fn translate(sql: &str) -> Result<String> {
     let trimmed = sql.trim();
     // Exact-match specials first.
     if trimmed == "PRAGMA integrity_check" {
-        // No Pg analogue; verify()'s portable half is the content-address
-        // re-hash. Report the engine side as ok.
-        return Ok("SELECT 'ok'".into());
+        // No engine-level analogue, so the check becomes the index-layer
+        // referential invariants (every index row must point at a grains
+        // row — forget deletes them all precisely because seq is reused).
+        // Zero rows = clean; verify() classifies any returned line as a
+        // real integrity problem. The content-address re-hash remains the
+        // portable tamper check.
+        return Ok("SELECT * FROM (\
+            SELECT 'heads rows without a grain: ' || count(*)::text AS line \
+              FROM heads h LEFT JOIN grains g ON g.seq = h.seq \
+             WHERE g.seq IS NULL HAVING count(*) > 0 \
+            UNION ALL \
+            SELECT 'entity_latest rows without a grain: ' || count(*)::text \
+              FROM entity_latest e LEFT JOIN grains g ON g.seq = e.seq \
+             WHERE g.seq IS NULL HAVING count(*) > 0 \
+            UNION ALL \
+            SELECT 'triples rows without a grain: ' || count(*)::text \
+              FROM triples t LEFT JOIN grains g ON g.seq = t.seq \
+             WHERE g.seq IS NULL HAVING count(*) > 0 \
+            UNION ALL \
+            SELECT 'osp rows without a grain: ' || count(*)::text \
+              FROM osp o LEFT JOIN grains g ON g.seq = o.seq \
+             WHERE g.seq IS NULL HAVING count(*) > 0 \
+            ) checks"
+            .into());
     }
     if trimmed == "DROP INDEX idx_fts" {
         return Ok("DROP INDEX IF EXISTS idx_fts".into());
@@ -405,17 +474,22 @@ pub(crate) fn translate(sql: &str) -> Result<String> {
         s = format!("{}(({})::text::vector){}", &s[..pos], inner, &s[args_start + end + 1..]);
     }
 
-    // Placeholders: ?N → $N.
+    // Placeholders: ?N → $N. Char-based (a byte scan would re-encode
+    // multi-byte UTF-8 one byte per char) and quote-aware (a '?1' inside a
+    // single-quoted literal is data, not a placeholder; the '' escape
+    // toggles the state twice, which nets out correct).
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'?' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-            out.push('$');
-        } else {
-            out.push(bytes[i] as char);
+    let mut in_str = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_str = !in_str;
+                out.push(c);
+            }
+            '?' if !in_str && chars.peek().is_some_and(|n| n.is_ascii_digit()) => out.push('$'),
+            _ => out.push(c),
         }
-        i += 1;
     }
 
     // Fail fast on anything divergent that slipped through.
@@ -515,6 +589,24 @@ mod tests {
         );
         // a bare ? (not a placeholder) is left alone
         assert_eq!(translate("SELECT '?' FROM meta").unwrap(), "SELECT '?' FROM meta");
+        // a '?1' inside a string literal is DATA, not a placeholder
+        assert_eq!(
+            translate("SELECT k FROM meta WHERE v = '?1' AND k = ?1").unwrap(),
+            "SELECT k FROM meta WHERE v = '?1' AND k = $1"
+        );
+        // multi-byte characters survive intact ('' is the literal escape)
+        assert_eq!(
+            translate("SELECT 'café ''?2'' naïve' FROM meta WHERE k = ?1").unwrap(),
+            "SELECT 'café ''?2'' naïve' FROM meta WHERE k = $1"
+        );
+    }
+
+    #[test]
+    fn integrity_check_maps_to_referential_invariants() {
+        let q = translate("PRAGMA integrity_check").unwrap();
+        for frag in ["heads rows without a grain", "entity_latest rows", "triples rows", "osp rows"] {
+            assert!(q.contains(frag), "{q}");
+        }
     }
 
     #[test]
@@ -544,7 +636,7 @@ mod tests {
             translate("INSERT OR IGNORE INTO fts_vocab(term) VALUES (?1)").unwrap(),
             "INSERT INTO fts_vocab(term) VALUES ($1) ON CONFLICT DO NOTHING"
         );
-        assert_eq!(translate("PRAGMA integrity_check").unwrap(), "SELECT 'ok'");
+        assert!(translate("PRAGMA integrity_check").unwrap().starts_with("SELECT * FROM ("));
         assert_eq!(
             translate("SELECT COALESCE(SUM(len),0) FROM fts_doc").unwrap(),
             "SELECT COALESCE(SUM(len),0)::bigint FROM fts_doc"

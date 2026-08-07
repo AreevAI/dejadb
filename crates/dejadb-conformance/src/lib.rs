@@ -131,6 +131,56 @@ impl Drop for PgBackend {
     }
 }
 
+/// THE conformance case list — the single source of truth both runners
+/// consume, so a case added here runs on every backend and a case added
+/// anywhere else does not compile. Each runner passes its own
+/// test-generating macro:
+///
+/// ```ignore
+/// macro_rules! my_case { ($name:ident) => { #[test] fn $name() { … } }; }
+/// dejadb_conformance::for_each_conformance_case!(my_case);
+/// ```
+#[macro_export]
+macro_rules! for_each_conformance_case {
+    ($per_case:ident) => {
+        // add / recall / reopen
+        $per_case!(add_recall_roundtrip);
+        $per_case!(unknown_terms_short_circuit_empty);
+        $per_case!(recall_orders_newest_first_and_honors_k);
+        $per_case!(reopen_preserves_state_and_counters);
+        // supersede × forget
+        $per_case!(supersede_returns_only_head);
+        $per_case!(forget_clears_head_row);
+        $per_case!(forget_new_head_does_not_resurrect_old);
+        $per_case!(forget_superseded_old_keeps_new_head);
+        $per_case!(double_supersede_is_a_local_conflict);
+        $per_case!(forget_missing_grain_is_not_found);
+        $per_case!(add_if_novel_dedupes_current_value);
+        $per_case!(reasserting_superseded_value_is_novel);
+        // heads / forks / merge
+        $per_case!(concurrent_supersede_forks_then_merges);
+        $per_case!(provisional_head_election_is_deterministic);
+        $per_case!(same_supersede_replay_stays_idempotent);
+        $per_case!(open_forks_enumerates_and_clears_on_merge);
+        $per_case!(fork_then_forget_one_tip_resolves_fork);
+        $per_case!(merge_requires_an_open_fork);
+        $per_case!(forget_tip_reelection_ignores_link_rows);
+        $per_case!(supersede_changed_key_reelection_ignores_link_rows);
+        $per_case!(supersede_changed_relation_reconciles_old_key);
+        // oplog / bundles / PITR
+        $per_case!(supersede_two_hop_replication_converges);
+        $per_case!(merge_replicates_as_fork_closure);
+        $per_case!(merge_heads_closure_logged);
+        $per_case!(forget_replicates_as_tombstone);
+        $per_case!(changes_since_cursor_pages_in_order);
+        $per_case!(pitr_max_hlc_cutoff_is_inclusive);
+        // CAS blobs + hybrid legs
+        $per_case!(cas_blob_roundtrip_and_gc);
+        $per_case!(bm25_leg_finds_text);
+        $per_case!(vector_leg_roundtrip);
+    };
+}
+
 /// Standard test fact: namespaced, mid confidence.
 pub fn fact(ns: &str, s: &str, r: &str, o: &str) -> Fact {
     let mut f = Fact::new(s, r, o).confidence(0.9);
