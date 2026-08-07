@@ -3,11 +3,13 @@
 //! them into `#[test]`s.
 
 mod add_recall;
+mod blobs_hybrid;
 mod heads_forks;
 mod oplog_import;
 mod supersede_forget;
 
 pub use add_recall::*;
+pub use blobs_hybrid::*;
 pub use heads_forks::*;
 pub use oplog_import::*;
 pub use supersede_forget::*;

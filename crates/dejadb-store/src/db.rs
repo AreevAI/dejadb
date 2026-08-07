@@ -75,6 +75,16 @@ pub(crate) trait Db: Send {
     fn prefers_batched_reads(&self) -> bool {
         false
     }
+
+    /// Make the vector storage for `dim`-sized embeddings usable, or say why
+    /// not. The embedded engine's `embeddings` table is dimension-less BLOB
+    /// storage created with the schema, so the default is a no-op; the
+    /// Postgres backend creates `vector(dim)` here (the dim is only known
+    /// when the host installs an embedder) and hard-errors on a dim
+    /// mismatch — a mismatched write would otherwise fail mid-transaction.
+    fn ensure_embeddings(&self, _dim: usize) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Run `f` atomically: BEGIN, then COMMIT on Ok / best-effort ROLLBACK on Err.

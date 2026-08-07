@@ -12,6 +12,8 @@
 //! the same seam without touching the store logic.
 
 mod db;
+#[cfg(feature = "postgres")]
+pub mod pg;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1064,6 +1066,19 @@ fn projected_text(view: &DeserializedGrain) -> Option<String> {
     }
 }
 
+/// Where the CAS blob payloads live: a `.blobs` fan-out directory next to
+/// the memory file (embedded backend), or an in-schema `blobs` table
+/// (postgres backend — a connection string has no "next to").
+enum BlobStore {
+    Fs(std::path::PathBuf),
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    Table,
+}
+
+fn fs_blob_path(dir: &std::path::Path, hex: &str) -> std::path::PathBuf {
+    dir.join(&hex[..2]).join(&hex[2..])
+}
+
 /// The embedded DejaDB store handle — one file per memory.
 pub struct DejaDB {
     db: Box<dyn Db>,
@@ -1103,7 +1118,7 @@ pub struct DejaDB {
     /// False once the file carries a `min_reader_version` stamp, so the check
     /// on the write path costs one bool after the first newer-than-1.4 grain.
     needs_min_reader_stamp: bool,
-    blob_dir: std::path::PathBuf,
+    blob_store: BlobStore,
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
     telemetry: Option<Telemetry>,
@@ -1165,7 +1180,87 @@ impl DejaDB {
         for sql in SCHEMA {
             dbh.execute(sql, vec![])?;
         }
+        let mut warnings: Vec<String> = Vec::new();
+        if enc_key.is_some() {
+            warnings.push(
+                "encryption-at-rest ON (AES-256-GCM): the memory database is encrypted; the \
+                 .blobs CAS sidecar is NOT yet encrypted — keep sensitive media out of this file \
+                 (or avoid put_blob) until blob encryption lands"
+                    .into(),
+            );
+        }
+        let blob_dir = std::path::PathBuf::from(format!("{}.blobs", path));
+        std::fs::create_dir_all(&blob_dir).map_err(db_err)?;
+        // Telemetry sidecar (`<file>.telemetry.db`): opened under the SAME AEAD
+        // key as the main file so crypto-erasure covers it. Only when the host
+        // asked for it — `Off` opens no sidecar and costs the recall path
+        // nothing. The mode is a separate argument, not read from `opts`, so
+        // telemetry can be enabled on a declaration-honoring open without
+        // re-stamping file-truths.
+        let telemetry = match telemetry_mode {
+            TelemetryMode::Off => None,
+            mode => Some(Telemetry::open(path, enc_key.as_deref(), mode)?),
+        };
+        Self::finish_open(dbh, explicit, BlobStore::Fs(blob_dir), telemetry, warnings)
+    }
 
+    /// Open (or create) a memory in a PostgreSQL schema, honoring the
+    /// schema's own `meta` declarations — the server-tier analogue of
+    /// [`open`](Self::open). One memory = one schema (the unit of isolation,
+    /// `pg_dump -n` export, and `DROP SCHEMA` erasure); single-writer is
+    /// ENFORCED via a session advisory lock (`STO-E002` when contended).
+    /// CAS blobs live in an in-schema table. The page cipher and the
+    /// telemetry sidecar are file-backend capabilities and are rejected here.
+    #[cfg(feature = "postgres")]
+    pub fn open_postgres(url: &str, schema: &str) -> Result<Self> {
+        Self::open_postgres_internal(url, schema, None)
+    }
+
+    /// Explicit-options variant of [`open_postgres`](Self::open_postgres) —
+    /// re-stamps the schema's declarations and records changes in
+    /// [`open_warnings`](Self::open_warnings), mirroring [`open_with`](Self::open_with).
+    #[cfg(feature = "postgres")]
+    pub fn open_postgres_with(url: &str, schema: &str, opts: DejaDbOptions) -> Result<Self> {
+        Self::open_postgres_internal(url, schema, Some(opts))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn open_postgres_internal(
+        url: &str,
+        schema: &str,
+        explicit: Option<DejaDbOptions>,
+    ) -> Result<Self> {
+        if let Some(o) = &explicit {
+            if o.encryption_key.is_some() {
+                return Err(DejaDbError::Validation(
+                    "encryption_key is a file-backend capability (page cipher); on the postgres \
+                     backend use TDE/pgcrypto at the deployment layer"
+                        .into(),
+                ));
+            }
+            if !matches!(o.telemetry, TelemetryMode::Off) {
+                return Err(DejaDbError::Validation(
+                    "the recall-telemetry sidecar is not yet supported on the postgres backend"
+                        .into(),
+                ));
+            }
+        }
+        let dbh: Box<dyn Db> = Box::new(pg::PgDb::open(url, schema)?);
+        for sql in pg::PG_SCHEMA {
+            dbh.execute(sql, vec![])?;
+        }
+        Self::finish_open(dbh, explicit, BlobStore::Table, None, Vec::new())
+    }
+
+    /// Backend-independent tail of every open: meta reconciliation and
+    /// stamping, dictionary/counter seeding, and the self-heal passes.
+    fn finish_open(
+        dbh: Box<dyn Db>,
+        explicit: Option<DejaDbOptions>,
+        blob_store: BlobStore,
+        telemetry: Option<Telemetry>,
+        mut warnings: Vec<String>,
+    ) -> Result<Self> {
         // ---- file-carried declarations (meta k/v) --------------------
         let meta: HashMap<String, String> = {
             let mut m = HashMap::new();
@@ -1189,15 +1284,6 @@ impl DejaDB {
             _ => None,
         };
 
-        let mut warnings: Vec<String> = Vec::new();
-        if enc_key.is_some() {
-            warnings.push(
-                "encryption-at-rest ON (AES-256-GCM): the memory database is encrypted; the \
-                 .blobs CAS sidecar is NOT yet encrypted — keep sensitive media out of this file \
-                 (or avoid put_blob) until blob encryption lands"
-                    .into(),
-            );
-        }
         let mut opts = match explicit {
             Some(o) => {
                 if let Some(d) = declared_text {
@@ -1275,21 +1361,6 @@ impl DejaDB {
         let indexed_text = one("SELECT COUNT(*) FROM grains WHERE text IS NOT NULL")?;
         let grain_count = one("SELECT COUNT(*) FROM grains")?;
 
-        let blob_dir = std::path::PathBuf::from(format!("{}.blobs", path));
-        std::fs::create_dir_all(&blob_dir).map_err(db_err)?;
-
-        // Telemetry sidecar (`<file>.telemetry.db`): opened under the SAME AEAD
-        // key as the main file (still live in `enc_key` here, before it is
-        // dropped/zeroized) so crypto-erasure covers it. Only when the host
-        // asked for it — `Off` opens no sidecar and costs the recall path
-        // nothing. The mode is a separate argument, not read from `opts`, so
-        // telemetry can be enabled on a declaration-honoring open without
-        // re-stamping file-truths.
-        let telemetry = match telemetry_mode {
-            TelemetryMode::Off => None,
-            mode => Some(Telemetry::open(path, enc_key.as_deref(), mode)?),
-        };
-
         let mut store = DejaDB {
             db: dbh,
             dict,
@@ -1309,7 +1380,7 @@ impl DejaDB {
             meta_embed,
             warnings,
             needs_min_reader_stamp: !meta.contains_key(MIN_READER_VERSION_KEY),
-            blob_dir,
+            blob_store,
             telemetry,
         };
 
@@ -1383,6 +1454,15 @@ impl DejaDB {
     /// silently mixing vector spaces.
     pub fn set_embedder(&mut self, e: Box<dyn EmbedBackend>) {
         let (model, dim) = (e.model().to_string(), e.dim());
+        // Make the vector storage usable FIRST (the postgres backend creates
+        // its vector(dim) table here and hard-refuses a dim mismatch). On
+        // failure the embedder is NOT installed — recall fails soft to the
+        // structural/BM25 legs instead of every add failing mid-transaction.
+        if let Err(err) = self.db.ensure_embeddings(dim) {
+            self.warnings
+                .push(format!("vector recall disabled — embedder {model}@{dim} not installed: {err}"));
+            return;
+        }
         match &self.meta_embed {
             Some((m, d)) => {
                 if *d != dim {
@@ -4106,23 +4186,30 @@ impl DejaDB {
 }
 
 impl DejaDB {
-    // ----- CAS blob sidecar -----
-
-    fn blob_path(&self, hex: &str) -> std::path::PathBuf {
-        self.blob_dir.join(&hex[..2]).join(&hex[2..])
-    }
+    // ----- CAS blob store (`.blobs` fan-out dir / in-schema table) -----
 
     /// Store bytes in the per-memory CAS; returns the `cas://sha256:` URI.
     /// Idempotent — content addressing dedupes by construction.
     pub fn put_blob(&mut self, bytes: &[u8]) -> Result<String> {
         use sha2::{Digest, Sha256};
-        let hex = hex::encode(Sha256::digest(bytes));
-        let path = self.blob_path(&hex);
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).map_err(db_err)?;
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, bytes).map_err(db_err)?;
-            std::fs::rename(&tmp, &path).map_err(db_err)?;
+        let digest = Sha256::digest(bytes);
+        let hex = hex::encode(digest);
+        match &self.blob_store {
+            BlobStore::Fs(dir) => {
+                let path = fs_blob_path(dir, &hex);
+                if !path.exists() {
+                    std::fs::create_dir_all(path.parent().unwrap()).map_err(db_err)?;
+                    let tmp = path.with_extension("tmp");
+                    std::fs::write(&tmp, bytes).map_err(db_err)?;
+                    std::fs::rename(&tmp, &path).map_err(db_err)?;
+                }
+            }
+            BlobStore::Table => {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO blobs(hash, body) VALUES (?1, ?2)",
+                    vec![pb(digest.to_vec()), pb(bytes.to_vec())],
+                )?;
+            }
         }
         Ok(format!("cas://sha256:{hex}"))
     }
@@ -4133,14 +4220,24 @@ impl DejaDB {
         let hex = uri
             .strip_prefix("cas://sha256:")
             .ok_or_else(|| DejaDbError::Validation(format!("not a cas uri: {uri}")))?;
-        // Validate before blob_path byte-slices `hex[..2]` — an untrusted or
+        // Validate before anything byte-slices `hex[..2]` — an untrusted or
         // truncated URI (e.g. from an imported content_ref) must return Err,
         // never panic on a short or non-char-boundary slice.
         if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(DejaDbError::Validation(format!("malformed cas uri: {uri}")));
         }
-        let bytes = std::fs::read(self.blob_path(hex))
-            .map_err(|_| DejaDbError::Storage(format!("blob missing: {uri}")))?;
+        let bytes = match &self.blob_store {
+            BlobStore::Fs(dir) => std::fs::read(fs_blob_path(dir, hex))
+                .map_err(|_| DejaDbError::Storage(format!("blob missing: {uri}")))?,
+            BlobStore::Table => {
+                let raw = hex::decode(hex).map_err(db_err)?;
+                self.db
+                    .query("SELECT body FROM blobs WHERE hash = ?1", vec![pb(raw)])?
+                    .first()
+                    .and_then(|row| row.blob(0))
+                    .ok_or_else(|| DejaDbError::Storage(format!("blob missing: {uri}")))?
+            }
+        };
         if hex::encode(Sha256::digest(&bytes)) != hex {
             return Err(DejaDbError::Storage(format!("blob corrupt: {uri}")));
         }
@@ -4175,16 +4272,36 @@ impl DejaDB {
             }
         }
         let mut removed = 0usize;
-        if let Ok(shards) = std::fs::read_dir(&self.blob_dir) {
-            for shard in shards.flatten() {
-                let prefix = shard.file_name().to_string_lossy().to_string();
-                if let Ok(files) = std::fs::read_dir(shard.path()) {
-                    for f in files.flatten() {
-                        let rest = f.file_name().to_string_lossy().to_string();
-                        let hex = format!("{prefix}{rest}");
-                        if !referenced.contains(&hex) && std::fs::remove_file(f.path()).is_ok() {
-                            removed += 1;
+        match &self.blob_store {
+            BlobStore::Fs(dir) => {
+                if let Ok(shards) = std::fs::read_dir(dir) {
+                    for shard in shards.flatten() {
+                        let prefix = shard.file_name().to_string_lossy().to_string();
+                        if let Ok(files) = std::fs::read_dir(shard.path()) {
+                            for f in files.flatten() {
+                                let rest = f.file_name().to_string_lossy().to_string();
+                                let hex = format!("{prefix}{rest}");
+                                if !referenced.contains(&hex)
+                                    && std::fs::remove_file(f.path()).is_ok()
+                                {
+                                    removed += 1;
+                                }
+                            }
                         }
+                    }
+                }
+            }
+            BlobStore::Table => {
+                let stored: Vec<Vec<u8>> = self
+                    .db
+                    .query("SELECT hash FROM blobs", vec![])?
+                    .iter()
+                    .filter_map(|row| row.blob(0))
+                    .collect();
+                for raw in stored {
+                    if !referenced.contains(&hex::encode(&raw)) {
+                        self.db.execute("DELETE FROM blobs WHERE hash = ?1", vec![pb(raw)])?;
+                        removed += 1;
                     }
                 }
             }

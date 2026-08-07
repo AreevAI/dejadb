@@ -70,6 +70,67 @@ impl Backend for TursoBackend {
     }
 }
 
+/// The Postgres backend: names map to schemas under a per-instance prefix
+/// (`conf_<pid>_<n>_<name>`), dropped on `Drop` — the schema-per-test
+/// analogue of the tempdir rule. No clock or RNG in the prefix (determinism
+/// rule), and a leaked schema from a killed run is prefix-recognizable.
+#[cfg(feature = "postgres")]
+pub struct PgBackend {
+    url: String,
+    prefix: String,
+    scratch: tempfile::TempDir,
+    opened: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+#[cfg(feature = "postgres")]
+static PG_BACKEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "postgres")]
+impl PgBackend {
+    pub fn new(url: &str) -> Self {
+        let n = PG_BACKEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            url: url.to_string(),
+            prefix: format!("conf_{}_{}", std::process::id(), n),
+            scratch: tempfile::TempDir::new().expect("tempdir"),
+            opened: Default::default(),
+        }
+    }
+
+    /// The schema `open_named(name)` maps to — for tests that need to reach
+    /// the same storage through a raw `open_postgres` (e.g. the second-writer
+    /// lock test).
+    pub fn schema_for(&self, name: &str) -> String {
+        format!("{}_{}", self.prefix, name)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Backend for PgBackend {
+    fn open_named(&self, name: &str) -> DejaDB {
+        let schema = format!("{}_{}", self.prefix, name);
+        self.opened.borrow_mut().insert(schema.clone());
+        DejaDB::open_postgres(&self.url, &schema).expect("open postgres store")
+    }
+
+    fn scratch(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for PgBackend {
+    fn drop(&mut self) {
+        for schema in self.opened.borrow().iter() {
+            let _ = dejadb_store::pg::drop_postgres_schema(&self.url, schema);
+        }
+    }
+}
+
 /// Standard test fact: namespaced, mid confidence.
 pub fn fact(ns: &str, s: &str, r: &str, o: &str) -> Fact {
     let mut f = Fact::new(s, r, o).confidence(0.9);

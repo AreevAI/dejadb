@@ -83,6 +83,9 @@ pub enum DejaDbError {
     Serialization(String),
     ToolRenderUnsupported(String),
     Storage(String),
+    /// Another writer holds this memory (single-writer-per-memory is
+    /// enforced, not advisory, on backends that can arbitrate it).
+    StoreBusy(String),
     SupersessionConflict(Hash),
     CryptoError(String),
     AccumulateRetryExhausted,
@@ -106,6 +109,7 @@ impl DejaDbError {
             Self::Serialization(_) => "FMT-E002",
             Self::Validation(_) => "VAL-E001",
             Self::Storage(_) => "STO-E001",
+            Self::StoreBusy(_) => "STO-E002",
             Self::CryptoError(_) => "CRY-E001",
             // These originate in CAL ACCUMULATE semantics and bubble up
             // through the store, so they keep their CAL-domain codes.
@@ -129,6 +133,7 @@ impl std::fmt::Display for DejaDbError {
             Self::Serialization(m) => write!(f, "FMT-E002: serialization error: {m}"),
             Self::Validation(m) => write!(f, "VAL-E001: validation error: {m}"),
             Self::Storage(m) => write!(f, "STO-E001: storage error: {m}"),
+            Self::StoreBusy(m) => write!(f, "STO-E002: store busy: {m}"),
             Self::CryptoError(m) => write!(f, "CRY-E001: crypto error: {m}"),
             Self::AccumulateRetryExhausted => write!(f, "CAL-E083: ACCUMULATE retry budget exhausted"),
             Self::AccumulateInternal(m) => write!(f, "CAL-E084: ACCUMULATE internal failure: {m}"),
@@ -157,6 +162,7 @@ mod error_code_tests {
             DejaDbError::Serialization("x".into()),
             DejaDbError::Validation("x".into()),
             DejaDbError::Storage("x".into()),
+            DejaDbError::StoreBusy("x".into()),
             DejaDbError::CryptoError("x".into()),
             DejaDbError::AccumulateRetryExhausted,
             DejaDbError::AccumulateInternal("x".into()),

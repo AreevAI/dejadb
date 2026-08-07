@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[features]
+postgres = ["dejadb-store/postgres"]
+
 [dependencies]
 dejadb-core = { path = "../dejadb-core" }
 dejadb-store = { path = "../dejadb-store" }

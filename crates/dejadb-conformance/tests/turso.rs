@@ -42,4 +42,8 @@ conformance!(
     forget_replicates_as_tombstone,
     changes_since_cursor_pages_in_order,
     pitr_max_hlc_cutoff_is_inclusive,
+    // CAS blobs + hybrid legs
+    cas_blob_roundtrip_and_gc,
+    bm25_leg_finds_text,
+    vector_leg_roundtrip,
 );
