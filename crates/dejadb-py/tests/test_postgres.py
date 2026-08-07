@@ -71,7 +71,7 @@ def test_subject_erasure_and_retention():
         m.add_fact("mara", "prefers", "tea")
         rep = json.loads(m.forget_subject("pat"))
         assert rep["grains_erased"] == 2
-        assert rep["terms_removed"] == 1
+        assert rep["terms_removed"] >= 1
         assert json.loads(m.recall("pat")) == []
         assert json.loads(m.recall("dr_lee")) == []
         assert len(json.loads(m.recall("mara"))) == 1

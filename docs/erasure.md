@@ -14,11 +14,13 @@ they deviate from OMS.
 - **REQ-ERASE-1 (right to erasure).** A host MUST be able to erase every
   grain holding a structured reference to one identity — the full
   supersession history, not just the live heads — including the identity's
-  dictionary entry (the identifier string is itself erasable data) and
-  vocabulary tokens that occurred only in the erased text. Result:
-  `DejaDB::forget_subject(ns, subject)`, exposed as `forget_subject` /
-  `forgetSubject` in the bindings and `deja forget-subject … --yes` in the
-  CLI.
+  dictionary entry (the identifier string is itself erasable data), the
+  erased grains' own value strings once unreferenced, vocabulary tokens
+  that occurred only in the erased text, telemetry rows keyed on the
+  identity string, and CAS attachments only those grains referenced.
+  Result: `DejaDB::forget_subject(ns, subject)`, exposed as
+  `forget_subject` / `forgetSubject` in the bindings and
+  `deja forget-subject … --yes` in the CLI.
 - **REQ-ERASE-2 (retention).** A host MUST be able to erase every grain
   older than a cutoff (`created_at`), optionally scoped to a namespace and
   grain type, suitable for a nightly sweep. Result:
@@ -71,8 +73,25 @@ references** in the namespace:
 - triple **object** position (the grain points at the identity —
   over-deletion is the safe direction for erasure),
 - **thread events** whose session id is the identity,
-- plus the identity's own `terms` row once unreferenced, and `fts_vocab`
-  tokens left with no postings.
+- **run records** whose run id is the identity (`run_trace` /
+  `runs_touching` must go empty for an erased identity).
+
+Dictionary hygiene rides the same transaction: every term the erased
+grains touched (their subject/relation/object VALUES, session and run
+ids) is **tombstoned** — the string replaced with an unrecallable
+placeholder — once nothing references it. Tombstoning rather than
+deleting is deliberate: under concurrent writers another instance may
+hold the id in its cache, and a dangling id would silently corrupt its
+next write, while a tombstoned id stays referentially valid and merely
+makes the old name unfindable. `fts_vocab` tokens left with no postings
+are removed, telemetry rows keyed on the identity string (query rollups,
+the recall ring log) are scrubbed, and CAS attachments are reclaimed
+**targeted** — only the erased grains' own references, checked for
+surviving users under the write serialization, never a store-wide gc
+that could race another writer's in-flight upload. (Residual window: a
+concurrent upload of byte-identical content in the erasure instant; and
+`gc_blobs`, the explicit full-store sweep, still requires quiescent
+writers — both documented on the APIs.)
 
 Not findable, by construction: a free-text mention of the identity inside
 another subject's prose (no index exists that maps text back to grains

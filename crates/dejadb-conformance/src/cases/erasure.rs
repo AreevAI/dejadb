@@ -22,24 +22,39 @@ pub fn subject_erasure_is_complete(b: &dyn Backend) {
             &Capture { session_id: Some("pat"), ..Capture::default() },
         )
         .unwrap();
+    // A grain recorded under the identity's run id (activity record).
+    let hrun = m
+        .capture(
+            "ns",
+            "automation transcript",
+            &Capture { run_id: Some("pat"), ..Capture::default() },
+        )
+        .unwrap();
     // An unrelated grain that must SURVIVE.
     m.add(&fact("ns", "mara", "prefers", "tea")).unwrap();
     // The erasable text is findable before…
     assert!(!m.recall_hybrid("ns", None, None, Some("zanthrofel"), 8, None).unwrap().is_empty());
 
     let rep = m.forget_subject("ns", "pat").unwrap();
-    assert_eq!(rep.grains_erased, 4, "chain (2) + reference (1) + session event (1)");
+    assert_eq!(
+        rep.grains_erased, 5,
+        "chain (2) + reference (1) + session event (1) + run record (1)"
+    );
     assert!(rep.vocab_removed >= 1, "erased-only vocabulary must go: {rep:?}");
-    assert_eq!(rep.terms_removed, 1, "the identity's dictionary entry must go");
+    // The identity's dictionary entry AND erased-only value strings are
+    // tombstoned (shared vocabulary like mara's stays — proven by mara's
+    // grain still recalling below).
+    assert!(rep.terms_removed >= 1, "the identity's dictionary entry must go: {rep:?}");
 
     // Every structured trace is gone — history included.
-    for h in [v1, v2, href, hev] {
+    for h in [v1, v2, href, hev, hrun] {
         assert!(m.get(&h).is_err(), "erased grain still readable");
     }
     assert!(m.recall("ns", "pat", None, 8).unwrap().is_empty());
     assert!(m.recall("ns", "dr_lee", None, 8).unwrap().is_empty(), "referencing grain erased");
     assert!(m.latest("ns", "dr_lee", "treats").unwrap().is_none());
     assert!(m.thread_tail("ns", "pat", 8).unwrap().is_empty());
+    assert!(m.run_trace("ns", "pat", 8).unwrap().is_empty(), "run records erased");
     assert!(m.heads("ns", "pat", "condition").unwrap().is_empty());
     // …and unfindable by text afterwards (postings + vocabulary gone).
     assert!(m.recall_hybrid("ns", None, None, Some("zanthrofel"), 8, None).unwrap().is_empty());

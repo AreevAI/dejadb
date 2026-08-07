@@ -49,6 +49,12 @@ COMMANDS:
   provenance <source-hash>            grains distilled from a source (reverse)
   forks                               open forks (>1 head for a subject+relation)
   merge    --subject S --relation R --object O   close a fork with a resolved value
+  forget-subject <subject> [--ns NS] --yes   erase EVERY grain referencing an
+                                      identity (history included) + its
+                                      dictionary entry; replicates as tombstones
+  purge-older-than <days> [--ns NS] [--type event] --yes   retention sweep:
+                                      erase grains older than N days
+                                      (--ns \"\" sweeps every namespace)
   novelty  --text T [--subject S] [--relation R] [-k N]   nearest existing grains
                                       (paraphrase check; needs --embed-cmd)
   log      [--since OP] [--limit N]   op-log (change feed)
@@ -1554,6 +1560,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let subject = positional.first().cloned().or_else(|| flag(&flags, "subject")).ok_or(
                 "usage: deja forget-subject <subject> [--ns NS] --yes".to_string(),
             )?;
+            if flags.contains_key("no-destructive-ops") {
+                return Err(
+                    "destructive operations are disabled for this invocation \
+                     (--no-destructive-ops)"
+                        .into(),
+                );
+            }
             if !flags.contains_key("yes") {
                 return Err(format!(
                     "forget-subject erases EVERY grain referencing '{subject}' in namespace \
@@ -1583,10 +1596,22 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 ),
                 None => None,
             };
+            if flags.contains_key("no-destructive-ops") {
+                return Err(
+                    "destructive operations are disabled for this invocation \
+                     (--no-destructive-ops)"
+                        .into(),
+                );
+            }
             if !flags.contains_key("yes") {
+                let scope = if ns.is_empty() {
+                    "across EVERY namespace".to_string()
+                } else {
+                    format!("in namespace '{ns}'")
+                };
                 return Err(format!(
-                    "purge-older-than erases every{} grain older than {days} days in namespace \
-                     '{ns}' and replicates the erasure to peers. Re-run with --yes to proceed.",
+                    "purge-older-than erases every{} grain older than {days} days {scope} \
+                     and replicates the erasure to peers. Re-run with --yes to proceed.",
                     gt.map(|g| format!(" {g:?}")).unwrap_or_default()
                 ));
             }

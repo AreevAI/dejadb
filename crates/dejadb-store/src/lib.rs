@@ -115,6 +115,24 @@ pub struct ImportStats {
     pub skipped: usize,
 }
 
+/// The `cas://sha256:` hex digests a grain's `content_refs` name (compact
+/// key `u` or expanded `uri`).
+fn cas_hexes(view: &DeserializedGrain) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(refs) = view.fields.get("content_refs").and_then(|v| v.as_array()) {
+        for r in refs {
+            let uri = r
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .or_else(|| r.get("u").and_then(|u| u.as_str()));
+            if let Some(hex) = uri.and_then(|u| u.strip_prefix("cas://sha256:")) {
+                out.push(hex.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// What a bulk erasure targets (internal to the erasure core).
 enum ErasureSelector {
     /// Every structured reference to one dictionary term in one namespace.
@@ -2909,17 +2927,39 @@ impl DejaDB {
             ns: i64,
             s: Option<i64>,
             p: Option<i64>,
+            o: Option<i64>,
             doc_len: Option<i64>,
+            blob: Vec<u8>,
+        }
+        struct EraseOut {
+            report: ErasureReport,
+            hashes: Vec<Vec<u8>>,
+            docs: i64,
+            len_sum: i64,
+            /// Fs-backend CAS files whose reclamation was decided in-txn;
+            /// the filesystem deletes happen post-commit.
+            fs_blobs: Vec<String>,
+            /// Term ids whose strings were tombstoned — evicted from the
+            /// local dictionary cache post-commit.
+            scrubbed_terms: Vec<i64>,
         }
         self.db.begin()?;
-        let r = (|| -> Result<(ErasureReport, Vec<Target>, i64, i64)> {
-            let mut report = ErasureReport::default();
+        let r = (|| -> Result<EraseOut> {
+            let mut out = EraseOut {
+                report: ErasureReport::default(),
+                hashes: Vec::new(),
+                docs: 0,
+                len_sum: 0,
+                fs_blobs: Vec::new(),
+                scrubbed_terms: Vec::new(),
+            };
             // Serialize with concurrent writers before enumerating.
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             let seq_rows = match &selector {
                 ErasureSelector::Identity { ns_id, term } => self.db.query(
                     "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND (s=?2 OR o=?2) \
-                     UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2",
+                     UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2 \
+                     UNION SELECT seq FROM run_idx WHERE ns=?1 AND run=?2",
                     vec![pi(*ns_id), pi(*term)],
                 )?,
                 ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype } => {
@@ -2939,7 +2979,17 @@ impl DejaDB {
             let mut seqs: Vec<i64> = seq_rows.iter().filter_map(|r| r.i64(0)).collect();
             seqs.sort_unstable();
             if seqs.is_empty() {
-                return Ok((report, Vec::new(), 0, 0));
+                // Nothing matched — but the IDENTIFIER may still exist in the
+                // dictionary (its grains were forgotten one by one earlier).
+                // Erasure of the string must still be possible.
+                if let Some((_, term)) = &identity {
+                    let gone = self.scrub_term_if_unreferenced(*term)?;
+                    out.report.terms_removed += gone as usize;
+                    if gone > 0 {
+                        out.scrubbed_terms.push(*term);
+                    }
+                }
+                return Ok(out);
             }
             let n = seqs.len() as i64;
             // One tombstone per grain: ids from the counters on multi-writer
@@ -2962,16 +3012,36 @@ impl DejaDB {
                 .iter()
                 .filter_map(|r| r.i64(0))
                 .collect();
+            // Dictionary candidates BEFORE their referencing rows are deleted:
+            // every term the erased grains touch (their subject/relation/
+            // object VALUES are the identity's data), plus session and run
+            // ids. The scrub below only tombstones the ones left with zero
+            // references, so shared vocabulary survives.
+            let mut term_candidates: Vec<i64> = Vec::new();
+            for sql in [
+                format!("SELECT DISTINCT session FROM thread_idx WHERE seq IN ({csv})"),
+                format!("SELECT DISTINCT run FROM run_idx WHERE seq IN ({csv})"),
+            ] {
+                for row in self.db.query(&sql, vec![])? {
+                    if let Some(id) = row.i64(0) {
+                        term_candidates.push(id);
+                    }
+                }
+            }
+            if let Some((_, term)) = &identity {
+                term_candidates.push(*term);
+            }
             let mut targets: Vec<Target> = Vec::with_capacity(seqs.len());
             for row in self.db.query(
                 &format!(
-                    "SELECT g.seq, g.hash, g.ns, g.s, g.p, d.len \
+                    "SELECT g.seq, g.hash, g.ns, g.s, g.p, g.o, d.len, g.blob \
                      FROM grains g LEFT JOIN fts_doc d ON d.seq = g.seq \
                      WHERE g.seq IN ({csv})"
                 ),
                 vec![],
             )? {
-                let (Some(seq), Some(hash), Some(ns)) = (row.i64(0), row.blob(1), row.i64(2))
+                let (Some(seq), Some(hash), Some(ns), Some(blob)) =
+                    (row.i64(0), row.blob(1), row.i64(2), row.blob(7))
                 else {
                     continue;
                 };
@@ -2981,9 +3051,18 @@ impl DejaDB {
                     ns,
                     s: row.i64(3),
                     p: row.i64(4),
-                    doc_len: row.i64(5),
+                    o: row.i64(5),
+                    doc_len: row.i64(6),
+                    blob,
                 });
             }
+            for t in &targets {
+                for id in [t.s, t.p, t.o].into_iter().flatten() {
+                    term_candidates.push(id);
+                }
+            }
+            term_candidates.sort_unstable();
+            term_candidates.dedup();
             let mut affected_keys: Vec<(i64, i64, i64)> = Vec::new();
             for (i, t) in targets.iter().enumerate() {
                 for table in
@@ -3048,59 +3127,138 @@ impl DejaDB {
                      (SELECT 1 FROM fts_post WHERE term=?1)",
                     vec![pi(term)],
                 )?;
-                report.vocab_removed += gone as usize;
+                out.report.vocab_removed += gone as usize;
             }
-            // Identity sweep: the subject's dictionary entry IS the
-            // identifier string. Remove it once nothing references it.
-            if let Some((_, term)) = &identity {
-                let gone = self.db.execute(
-                    "DELETE FROM terms WHERE id=?1 \
-                     AND NOT EXISTS (SELECT 1 FROM triples WHERE s=?1 OR p=?1 OR o=?1) \
-                     AND NOT EXISTS (SELECT 1 FROM thread_idx WHERE session=?1) \
-                     AND NOT EXISTS (SELECT 1 FROM run_idx WHERE run=?1) \
-                     AND NOT EXISTS (SELECT 1 FROM grains WHERE ns=?1)",
-                    vec![pi(*term)],
-                )?;
-                report.terms_removed += gone as usize;
+            // Dictionary sweep: TOMBSTONE (not delete) every candidate term
+            // left with zero references. Deleting the row would leave other
+            // instances' cached term ids dangling — grains written through a
+            // stale cache would silently reference a nonexistent row.
+            // Tombstoning replaces the STRING (the erasable data) while the
+            // id stays referentially valid; a stale-cache write afterwards
+            // degrades to "unfindable by the old name", never to corruption.
+            for id in term_candidates {
+                let gone = self.scrub_term_if_unreferenced(id)?;
+                out.report.terms_removed += gone as usize;
+                if gone > 0 {
+                    out.scrubbed_terms.push(id);
+                }
             }
-            report.grains_erased = targets.len();
-            let docs: i64 = targets.iter().filter(|t| t.doc_len.is_some()).count() as i64;
-            let len_sum: i64 = targets.iter().filter_map(|t| t.doc_len).sum();
-            Ok((report, targets, docs, len_sum))
-        })();
-        match r {
-            Ok((mut report, targets, docs, len_sum)) => {
-                self.db.commit()?;
-                self.fts_docs = (self.fts_docs - docs).max(0);
-                self.fts_total_len = (self.fts_total_len - len_sum).max(0);
-                if report.terms_removed > 0 {
-                    if let Some((name, _)) = &identity {
-                        self.dict.remove(name);
-                    }
+            // CAS reclamation, TARGETED to the erased grains' own
+            // attachments — never a store-wide gc (whose census would race a
+            // concurrent writer's put_blob -> add and destroy an unrelated
+            // blob). The surviving-reference check runs under the write
+            // serialization this transaction already holds; table deletes
+            // are transactional, filesystem deletes are decided here and
+            // executed post-commit.
+            let mut cas_candidates: Vec<String> = Vec::new();
+            for t in &targets {
+                if let Ok(view) = deserialize_blob(&t.blob) {
+                    cas_candidates.extend(cas_hexes(&view));
                 }
-                if report.vocab_removed > 0 {
-                    // Cheap and safe: the cache refills lazily from the table.
-                    self.fts_vocab.clear();
-                }
-                // Best-effort post-commit hygiene: the erasure itself has
-                // already committed and replicated.
-                for t in &targets {
-                    if let Ok(h) = Hash::try_from_bytes(&t.hash) {
-                        if let Some(tel) = self.telemetry.as_mut() {
-                            let _ = tel.scrub(&h);
+            }
+            cas_candidates.sort_unstable();
+            cas_candidates.dedup();
+            if !cas_candidates.is_empty() {
+                let mut referenced: HashSet<String> = HashSet::new();
+                for row in self.db.query("SELECT blob FROM grains", vec![])? {
+                    if let Some(b) = row.blob(0) {
+                        if let Ok(view) = deserialize_blob(&b) {
+                            referenced.extend(cas_hexes(&view));
                         }
                     }
                 }
-                if report.grains_erased > 0 {
-                    report.blobs_reclaimed = self.gc_blobs().unwrap_or(0);
+                for hex in cas_candidates {
+                    if referenced.contains(&hex) {
+                        continue;
+                    }
+                    match &self.blob_store {
+                        BlobStore::Table => {
+                            let Ok(raw) = hex::decode(&hex) else { continue };
+                            let gone = self
+                                .db
+                                .execute("DELETE FROM blobs WHERE hash=?1", vec![pb(raw)])?;
+                            out.report.blobs_reclaimed += gone as usize;
+                        }
+                        BlobStore::Fs(_) => out.fs_blobs.push(hex),
+                    }
                 }
-                Ok(report)
+            }
+            out.report.grains_erased = targets.len();
+            out.docs = targets.iter().filter(|t| t.doc_len.is_some()).count() as i64;
+            out.len_sum = targets.iter().filter_map(|t| t.doc_len).sum();
+            out.hashes = targets.into_iter().map(|t| t.hash).collect();
+            Ok(out)
+        })();
+        match r {
+            Ok(mut out) => {
+                self.db.commit()?;
+                self.fts_docs = (self.fts_docs - out.docs).max(0);
+                self.fts_total_len = (self.fts_total_len - out.len_sum).max(0);
+                if !out.scrubbed_terms.is_empty() {
+                    // Evict every scrubbed id from the local dictionary cache
+                    // (string -> id); the strings no longer resolve.
+                    self.dict.retain(|_, id| !out.scrubbed_terms.contains(id));
+                }
+                if out.report.vocab_removed > 0 {
+                    // Cheap and safe: the cache refills lazily from the table.
+                    self.fts_vocab.clear();
+                }
+                // Filesystem CAS deletes decided in-txn (single-writer file
+                // backend — no concurrent put can race this).
+                if let BlobStore::Fs(dir) = &self.blob_store {
+                    let dir = dir.clone();
+                    for hex in &out.fs_blobs {
+                        if std::fs::remove_file(fs_blob_path(&dir, hex)).is_ok() {
+                            out.report.blobs_reclaimed += 1;
+                        }
+                    }
+                }
+                // Best-effort post-commit hygiene: the erasure itself has
+                // already committed and replicated.
+                if self.telemetry.is_some() {
+                    let hashes: Vec<Hash> = out
+                        .hashes
+                        .iter()
+                        .filter_map(|h| Hash::try_from_bytes(h).ok())
+                        .collect();
+                    if let Some(tel) = self.telemetry.as_mut() {
+                        for h in &hashes {
+                            let _ = tel.scrub(h);
+                        }
+                        if let Some((name, _)) = &identity {
+                            // Query stats and the recall log key on the
+                            // SUBJECT STRING, not grain hashes — they must
+                            // not outlive the identity either.
+                            let _ = tel.scrub_subject(name);
+                        }
+                    }
+                }
+                Ok(out.report)
             }
             Err(e) => {
                 let _ = self.db.rollback();
                 Err(e)
             }
         }
+    }
+
+    /// Tombstone one dictionary entry once nothing references it: the STRING
+    /// is replaced with an unrecallable placeholder while the id stays valid
+    /// (see the dictionary-sweep comment in [`erase_where`](Self::erase_where)
+    /// for why deletion would be worse). Returns rows changed (0 or 1); the
+    /// guard also skips rows already tombstoned so repeat erasures don't
+    /// re-count them.
+    fn scrub_term_if_unreferenced(&mut self, id: i64) -> Result<u64> {
+        let placeholder = format!("\u{1}erased:{id}");
+        self.db.execute(
+            "UPDATE terms SET term = ?2 WHERE id = ?1 \
+             AND NOT EXISTS (SELECT 1 FROM triples WHERE s=?1 OR p=?1 OR o=?1) \
+             AND NOT EXISTS (SELECT 1 FROM thread_idx WHERE session=?1) \
+             AND NOT EXISTS (SELECT 1 FROM run_idx WHERE run=?1) \
+             AND NOT EXISTS (SELECT 1 FROM grains WHERE ns=?1) \
+             AND term NOT LIKE ?3",
+            vec![pi(id), pt(&placeholder), pt("\u{1}erased:%")],
+        )
     }
 
     /// Append one op-log record (fresh local `op_seq`, caller-supplied `hlc`).
@@ -4816,7 +4974,9 @@ impl DejaDB {
     }
 
     /// Remove CAS blobs not referenced by any live grain's `content_refs`.
-    /// Returns the number of blobs removed.
+    /// Returns the number of blobs removed. Full-store maintenance — invoke
+    /// it while writers are quiescent (a blob uploaded but not yet
+    /// referenced by its grain's commit looks unreferenced to the scan).
     pub fn gc_blobs(&mut self) -> Result<usize> {
         // Collect referenced hashes from live grains.
         let blobs: Vec<Vec<u8>> = self
@@ -4828,18 +4988,7 @@ impl DejaDB {
         let mut referenced: HashSet<String> = HashSet::new();
         for b in &blobs {
             if let Ok(view) = deserialize_blob(b) {
-                if let Some(refs) = view.fields.get("content_refs").and_then(|v| v.as_array()) {
-                    for r in refs {
-                        // inner keys may be compact ("u") or expanded ("uri")
-                        let uri = r
-                            .get("uri")
-                            .and_then(|u| u.as_str())
-                            .or_else(|| r.get("u").and_then(|u| u.as_str()));
-                        if let Some(hex) = uri.and_then(|u| u.strip_prefix("cas://sha256:")) {
-                            referenced.insert(hex.to_string());
-                        }
-                    }
-                }
+                referenced.extend(cas_hexes(&view));
             }
         }
         let mut removed = 0usize;

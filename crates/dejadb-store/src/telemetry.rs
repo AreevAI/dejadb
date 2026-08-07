@@ -372,6 +372,30 @@ impl Telemetry {
         Ok(())
     }
 
+    /// Identity-erasure hook: remove every sidecar row whose KEY or TEXT
+    /// embeds the subject string — query rollups key on `ns␁subject␁…` and
+    /// the ring log stores subject and query text verbatim, so per-hash
+    /// scrubbing alone would let the identifier outlive its grains.
+    /// Over-deletion (a query that merely CONTAINS the string) is the safe
+    /// direction: telemetry is disposable evidence.
+    pub fn scrub_subject(&mut self, subject: &str) -> Result<()> {
+        self.buf.retain(|ev| {
+            ev.subject.as_deref() != Some(subject)
+                && !ev.query.as_deref().is_some_and(|q| q.contains(subject))
+        });
+        let escaped = subject.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let like = format!("%{escaped}%");
+        self.db.execute(
+            "DELETE FROM telem_recall_log WHERE subject = ?1 OR query LIKE ?2 ESCAPE '\\'",
+            vec![pt(subject), pt(&like)],
+        )?;
+        self.db.execute(
+            "DELETE FROM telem_query_stat WHERE qkey LIKE ?1 ESCAPE '\\' OR sample LIKE ?1 ESCAPE '\\'",
+            vec![pt(&like)],
+        )?;
+        Ok(())
+    }
+
     // ---- readers (consumed by the telemetry-fed analyzers + console) ----
 
     /// Grain-access rollups, optionally scoped to a namespace.
