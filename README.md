@@ -366,9 +366,13 @@ differences are deliberate and explicit:
 
 - **Latency class**: point reads are microseconds embedded, milliseconds over
   a network. The voice frame path stays on the embedded backend by design.
-- **Single writer is enforced**, not assumed: a second writer on the same
-  schema gets a clean `STO-E002` (session advisory lock), instead of the
-  undefined behavior two file handles produce.
+- **Multiple concurrent writers per memory**: any number of app instances can
+  hold handles on the same schema. Write transactions claim their id blocks
+  from an in-schema counters row, which serializes them briefly — so the
+  op-log stays gapless and ordered for followers, racing supersedes of one
+  head produce one winner and one clean `SupersessionConflict`, and readers
+  never block (MVCC). One instance can likewise hold handles to many
+  memories (the schema-per-tenant shape).
 - **Vectors** use [pgvector](https://github.com/pgvector/pgvector); the
   `vector(dim)` column is created when the first embedder is installed, and a
   dimension mismatch is a hard refusal rather than a degraded leg.

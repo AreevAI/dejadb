@@ -85,6 +85,71 @@ pub(crate) trait Db: Send {
     fn ensure_embeddings(&self, _dim: usize) -> Result<()> {
         Ok(())
     }
+
+    // ---- multi-writer arbitration hooks -------------------------------
+    //
+    // The embedded engine keeps its single-writer-per-file model: every
+    // default below says "no opinion" and the store falls back to its
+    // process-local counters and dictionary. A backend that admits several
+    // concurrent writers (Postgres) overrides them to make allocation and
+    // dictionary state DB-authoritative.
+
+    /// Claim a contiguous id block for a write transaction: `n_seq` grain
+    /// seqs, `n_op` op-log seqs, `n_hlc` HLC ticks (with `wall_hlc` the
+    /// caller's wall clock already shifted into HLC space, and `hlc_floor`
+    /// raising the clock without consuming — the import path). MUST be
+    /// called INSIDE the write transaction: the returned block commits or
+    /// rolls back with it, and the row lock it takes serializes concurrent
+    /// write transactions per memory — which is also what keeps op-log
+    /// order equal to commit order for followers.
+    fn reserve_write(
+        &self,
+        _n_seq: i64,
+        _n_op: i64,
+        _n_hlc: i64,
+        _wall_hlc: i64,
+        _hlc_floor: i64,
+    ) -> Result<Option<WriteIds>> {
+        Ok(None)
+    }
+
+    /// Atomically get-or-create the dictionary id for `term`.
+    fn intern_term(&self, _term: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Authoritative forward dictionary lookup, consulted on a process-local
+    /// miss (another writer may have interned the term after this handle
+    /// opened).
+    fn lookup_term(&self, _term: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Authoritative reverse dictionary lookup on a process-local miss.
+    fn lookup_term_str(&self, _id: i64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Live BM25 collection stats (doc count, total token length) where the
+    /// process-local counters can be stale under concurrent writers.
+    fn collection_stats(&self) -> Result<Option<(i64, i64)>> {
+        Ok(None)
+    }
+
+    /// Row-lock suffix for in-transaction read-then-write rechecks
+    /// (`" FOR UPDATE"` on backends with concurrent writers, empty where a
+    /// single writer holds the file).
+    fn for_update(&self) -> &'static str {
+        ""
+    }
+}
+
+/// A reserved contiguous id block: the FIRST seq / op_seq / HLC of the
+/// requested ranges.
+pub(crate) struct WriteIds {
+    pub(crate) seq0: i64,
+    pub(crate) op0: i64,
+    pub(crate) hlc0: i64,
 }
 
 /// Run `f` atomically: BEGIN, then COMMIT on Ok / best-effort ROLLBACK on Err.

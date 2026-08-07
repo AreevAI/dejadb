@@ -50,23 +50,134 @@ macro_rules! pg_case {
 
 dejadb_conformance::for_each_conformance_case!(pg_case);
 
-/// Single-writer-per-memory is ENFORCED on this backend: a second open of
-/// the same schema while a writer holds it is a clean STO-E002, not the
-/// undefined behavior two file handles produce.
+/// Multiple writers per memory: two instances (own handles, own
+/// connections) write the same schema concurrently — everything lands,
+/// nothing collides, and the op-log is gapless and strictly ordered (id
+/// blocks are claimed inside each write transaction, which also serializes
+/// them).
 #[test]
-fn second_writer_gets_store_busy() {
+fn concurrent_writers_all_land() {
     let Some(b) = backend() else { return };
     let url = pg_url().unwrap();
-    let first = b.open_named("busy");
-    let err = match dejadb_store::DejaDB::open_postgres(&url, &b.schema_for("busy")) {
-        Err(e) => e,
-        Ok(_) => panic!("second writer must be refused"),
+    let schema = b.schema_for("mw");
+    drop(b.open_named("mw")); // create + seed the schema
+    let writer = |tag: &'static str| {
+        let url = url.clone();
+        let schema = schema.clone();
+        std::thread::spawn(move || {
+            let mut m = dejadb_store::DejaDB::open_postgres(&url, &schema).unwrap();
+            for i in 0..25 {
+                m.add(&dejadb_conformance::fact("ns", &format!("{tag}{i}"), "writes", "ok"))
+                    .unwrap();
+            }
+        })
     };
-    let msg = err.to_string();
-    assert!(msg.starts_with("STO-E002"), "expected STO-E002, got: {msg}");
-    drop(first);
-    // lock released with the first handle — the schema opens again
-    let _again = b.open_named("busy");
+    let (t1, t2) = (writer("a"), writer("b"));
+    t1.join().unwrap();
+    t2.join().unwrap();
+    let mut m = b.open_named("mw");
+    assert_eq!(m.count().unwrap(), 50, "every concurrent write must land");
+    let ops = m.changes_since(0, 1000).unwrap();
+    assert_eq!(ops.len(), 50);
+    for w in ops.windows(2) {
+        assert!(w[0].op_seq < w[1].op_seq, "op_seq strictly increasing");
+    }
+    assert_eq!(
+        ops.last().unwrap().op_seq - ops[0].op_seq + 1,
+        50,
+        "op_seq gapless — followers can never miss an op"
+    );
+    // cross-writer recall through a third handle
+    assert_eq!(m.recall("ns", "a3", Some("writes"), 4).unwrap().len(), 1);
+    assert_eq!(m.recall("ns", "b7", Some("writes"), 4).unwrap().len(), 1);
+}
+
+/// Two instances racing to supersede the SAME head: exactly one winner and
+/// one clean SupersessionConflict — the single-writer contract, kept under
+/// concurrency by the in-transaction FOR UPDATE recheck.
+#[test]
+fn concurrent_supersede_one_wins() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let schema = b.schema_for("race");
+    let v1 = {
+        let mut m = b.open_named("race");
+        m.add(&dejadb_conformance::fact("ns", "j", "plan", "basic")).unwrap()
+    };
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let racer = |val: &'static str| {
+        let url = url.clone();
+        let schema = schema.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let mut m = dejadb_store::DejaDB::open_postgres(&url, &schema).unwrap();
+            let mut v2 = dejadb_conformance::fact("ns", "j", "plan", val);
+            barrier.wait();
+            m.supersede(&v1, &mut v2).map(|_| val)
+        })
+    };
+    let (t1, t2) = (racer("pro"), racer("max"));
+    let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+    let (winner, loser_err) = match (r1, r2) {
+        (Ok(w), Err(e)) | (Err(e), Ok(w)) => (w, e),
+        other => panic!("expected exactly one winner, got {other:?}"),
+    };
+    assert!(
+        matches!(loser_err, dejadb_core::error::DejaDbError::SupersessionConflict(_)),
+        "loser must get SupersessionConflict, got {loser_err:?}"
+    );
+    let mut m = b.open_named("race");
+    assert_eq!(m.heads("ns", "j", "plan").unwrap().len(), 1, "one head, no fork");
+    assert_eq!(m.latest("ns", "j", "plan").unwrap().unwrap().get_str("object"), Some(winner));
+    assert_eq!(m.count().unwrap(), 2, "loser's grain rolled back with its transaction");
+}
+
+/// One instance holding several memories at once (the schema-per-org
+/// shape): handles to distinct schemas coexist in one process and stay
+/// strictly isolated.
+#[test]
+fn multi_memory_per_instance() {
+    let Some(b) = backend() else { return };
+    let mut org1 = b.open_named("org1");
+    let mut org2 = b.open_named("org2");
+    org1.add(&dejadb_conformance::fact("ns", "pat", "sees", "dr_lee")).unwrap();
+    org2.add(&dejadb_conformance::fact("ns", "pat", "sees", "dr_kim")).unwrap();
+    assert_eq!(org1.recall("ns", "pat", None, 8).unwrap().len(), 1);
+    assert_eq!(org2.recall("ns", "pat", None, 8).unwrap().len(), 1);
+    assert_eq!(
+        org1.latest("ns", "pat", "sees").unwrap().unwrap().get_str("object"),
+        Some("dr_lee"),
+        "memories must not bleed into each other"
+    );
+    assert_eq!(
+        org2.latest("ns", "pat", "sees").unwrap().unwrap().get_str("object"),
+        Some("dr_kim")
+    );
+    // both handles stay usable interleaved
+    org1.add(&dejadb_conformance::fact("ns", "kai", "sees", "dr_lee")).unwrap();
+    assert_eq!(org2.count().unwrap(), 1);
+    assert_eq!(org1.count().unwrap(), 2);
+}
+
+/// A handle opened BEFORE another instance wrote still sees the new data —
+/// including subjects whose dictionary terms were interned by the other
+/// writer (the DB-authoritative dictionary fallback).
+#[test]
+fn cross_instance_visibility() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let mut reader = b.open_named("vis");
+    let mut writer = dejadb_store::DejaDB::open_postgres(&url, &b.schema_for("vis")).unwrap();
+    writer.add(&dejadb_conformance::fact("ns", "zoe", "likes", "tea")).unwrap();
+    assert_eq!(
+        reader.recall("ns", "zoe", Some("likes"), 4).unwrap().len(),
+        1,
+        "reader must see subjects interned after it opened"
+    );
+    assert_eq!(
+        reader.latest("ns", "zoe", "likes").unwrap().unwrap().get_str("object"),
+        Some("tea")
+    );
 }
 
 /// File-backend capabilities are refused with clear errors, not ignored.

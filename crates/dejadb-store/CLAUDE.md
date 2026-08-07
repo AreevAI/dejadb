@@ -11,7 +11,12 @@ transports implement it:
   µs-class; `prefers_batched_reads = false` because a parameterized `IN` on
   the PK is a table scan on this engine — measured ~8x on the voice frame.
 - **`PgDb`** (src/pg.rs, `feature = "postgres"`): one memory = one Postgres
-  schema. Session advisory lock ENFORCES single-writer (`STO-E002`), an
+  schema, **multiple concurrent writers allowed**. Write txns claim id
+  blocks from the in-schema `counters` row via the `Db::reserve_write` hook
+  (which also serializes concurrent write txns, keeping op-log order equal
+  to commit order); the term dictionary and BM25 collection stats are
+  DB-authoritative on cache miss (`intern_term`/`lookup_term*`/
+  `collection_stats` hooks); in-txn rechecks use `Db::for_update`. An
   explicit statement translator handles the divergent dialect (per-table
   `ON CONFLICT` upserts, pgvector `<=>`/casts, `?N`→`$N`) and FAILS FAST on
   anything unmapped, the `vector(dim)` column is added at the first
@@ -20,9 +25,11 @@ transports implement it:
   telemetry sidecar are file-backend-only and rejected at open.
 
 In-memory counters (`next_seq/next_op/next_term/hlc_last`, BM25 stats)
-loaded on open → **single-writer-per-memory assumption** on both backends.
-Cross-backend parity is pinned by `crates/dejadb-conformance` — the same
-case list runs against both; extend it whenever store semantics change.
+loaded on open are authoritative only on the embedded backend
+(**single-writer-per-FILE**); on Postgres they are a fallback the
+multi-writer hooks override. Cross-backend parity is pinned by
+`crates/dejadb-conformance` — the same case list runs against both (plus
+Pg-only multi-writer race cases); extend it whenever store semantics change.
 
 ## Schema (SCHEMA const, lib.rs ~160)
 

@@ -14,9 +14,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   / open_postgres_with`, `deja --db postgres://…?schema=<name>` (CLI built
   with the feature), pgvector-backed vector recall (the `vector(dim)` column
   is created at the first `set_embedder`; a dim mismatch is a hard refusal),
-  CAS blobs in an in-schema table, and ENFORCED single-writer-per-memory via
-  a session advisory lock — a second writer gets the new **`STO-E002`
-  StoreBusy** error instead of undefined behavior. Erasure/portability map to
+  CAS blobs in an in-schema table, and **multiple concurrent writers per
+  memory**: write transactions claim id blocks from an in-schema counters
+  row (briefly serializing them, so the op-log stays gapless and ordered
+  for followers), the term dictionary and BM25 stats are DB-authoritative
+  on cache miss so instances immediately see each other's writes, and
+  racing supersedes/forgets of one grain produce one winner and one clean
+  `SupersessionConflict`/`NotFound` via in-transaction `FOR UPDATE`
+  rechecks. (The **`STO-E002` StoreBusy** code is registered but currently
+  unraised — reserved for exclusive-access arbitration.) One process can
+  hold handles to many memories at once. Erasure/portability map to
   `DROP SCHEMA … CASCADE` / `pg_dump -n`; the page cipher and the telemetry
   sidecar remain file-backend capabilities and are rejected with clear
   errors. Parity is pinned by the new **`dejadb-conformance`** crate: one

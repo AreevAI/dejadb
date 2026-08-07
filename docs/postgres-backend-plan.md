@@ -12,10 +12,21 @@
 > lock single-writer (`STO-E002`), lazy `vector(dim)` column, in-schema CAS
 > blobs, `deja --db postgres://…?schema=…`, and the `pgvector/pgvector:pg16`
 > CI job. Phase 1 (facade trait promotion) is deferred — with the Db-seam
-> design every surface works on a Pg-backed `DejaDB` unchanged. Phase 4
-> (stage-2 multi-writer + gated subject-scoped erasure) remains open and
-> gated on the pilot + the OMS destruction decision. Bindings openers
-> (py/js `open_postgres`) are follow-up work.
+> design every surface works on a Pg-backed `DejaDB` unchanged.
+>
+> **Stage 2 (multi-writer) landed the same day** after the deployment
+> requirement was confirmed: the exclusive advisory lock is gone; write
+> transactions claim id blocks from an in-schema `counters` row via
+> `Db::reserve_write` (allocation + brief serialization in one — op-log
+> order equals commit order, so followers never miss ops), the dictionary
+> and BM25 stats are DB-authoritative on cache miss, and supersede/forget
+> recheck under `FOR UPDATE` so races produce single-writer-identical
+> outcomes. Pinned by multi-writer conformance cases (concurrent writers
+> land gapless; racing supersedes → one winner + one SupersessionConflict
+> with the loser's txn rolled back; multi-memory-per-instance isolation).
+> Remaining open: gated subject-scoped erasure (OMS destruction decision),
+> bindings openers (py/js `open_postgres`), telemetry-on-Pg, Pg perf gates
+> in RESULTS.md.
 
 Decision taken: PostgreSQL as a **second** storage backend behind `CalStoreFacade`,
 feature-flagged, never the default. Turso remains the embedded backend and keeps

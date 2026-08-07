@@ -737,8 +737,12 @@ DejaDB has no platform dependency. Three tiers cover a multi-channel fleet:
    seam inside the store, so fork/head/oplog semantics are identical by
    construction and pinned by a two-backend conformance suite. Point reads
    are millisecond-class over a network — the voice frame path stays
-   embedded by design. Single-writer-per-memory is enforced with a session
-   advisory lock (`STO-E002` on contention); erasure and export map to
+   embedded by design. Unlike the single-writer file model, this tier admits
+   MULTIPLE CONCURRENT WRITERS per memory: write transactions claim id
+   blocks from an in-schema counters row (briefly serializing them, so
+   op-log order equals commit order and the fork/head semantics match the
+   single-writer model exactly), the dictionary is DB-authoritative on
+   cache miss, and reads never block. Erasure and export map to
    `DROP SCHEMA … CASCADE` and `pg_dump -n`. The op-log/bundle wire format
    is backend-independent, so edge files sync into a Postgres-backed memory
    with the same `MGB1` bundles.

@@ -1249,6 +1249,9 @@ impl DejaDB {
         for sql in pg::PG_SCHEMA {
             dbh.execute(sql, vec![])?;
         }
+        for sql in pg::PG_SEED {
+            dbh.execute(sql, vec![])?;
+        }
         Self::finish_open(dbh, explicit, BlobStore::Table, None, Vec::new())
     }
 
@@ -1645,6 +1648,8 @@ impl DejaDB {
         }
         let backfilled = updates.len();
         with_txn(self.db.as_ref(), || {
+            // Serialize with concurrent writers (no ids consumed).
+            self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             for (seq, t) in &updates {
                 self.db.execute(
                     "UPDATE grains SET text = ?1 WHERE seq = ?2",
@@ -1693,6 +1698,8 @@ impl DejaDB {
             prepared.push((*seq, *ns, len, ids));
         }
         with_txn(self.db.as_ref(), || {
+            // Serialize with concurrent writers (no ids consumed).
+            self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             for (seq, ns, len, ids) in &prepared {
                 for (term, tf) in ids {
                     self.db.execute_hot(
@@ -1736,10 +1743,16 @@ impl DejaDB {
         self.hlc_last
     }
 
-    /// Dictionary-encode a term (cached; inserts on miss).
+    /// Dictionary-encode a term (cached; inserts on miss). Multi-writer
+    /// backends own the id allocation (atomic get-or-create); the embedded
+    /// path mints from the process-local counter under single-writer.
     fn term_id(&mut self, term: &str) -> Result<i64> {
         if let Some(id) = self.dict.get(term) {
             return Ok(*id);
+        }
+        if let Some(id) = self.db.intern_term(term)? {
+            self.dict.insert(term.to_string(), id);
+            return Ok(id);
         }
         let id = self.next_term;
         self.next_term += 1;
@@ -1749,15 +1762,26 @@ impl DejaDB {
         Ok(id)
     }
 
-    fn term_lookup(&self, term: &str) -> Option<i64> {
-        self.dict.get(term).copied()
+    /// Forward dictionary lookup. The process-local map answers hits; on a
+    /// miss, multi-writer backends are consulted (another instance may have
+    /// interned the term after this handle opened) and the answer cached.
+    /// A miss stays "unknown term = empty result, never an error".
+    fn term_lookup(&mut self, term: &str) -> Result<Option<i64>> {
+        if let Some(id) = self.dict.get(term) {
+            return Ok(Some(*id));
+        }
+        if let Some(id) = self.db.lookup_term(term)? {
+            self.dict.insert(term.to_string(), id);
+            return Ok(Some(id));
+        }
+        Ok(None)
     }
 
-    fn term_str(&self, id: i64) -> Option<String> {
-        self.dict
-            .iter()
-            .find(|(_, v)| **v == id)
-            .map(|(k, _)| k.clone())
+    fn term_str(&self, id: i64) -> Result<Option<String>> {
+        if let Some(t) = self.dict.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()) {
+            return Ok(Some(t));
+        }
+        self.db.lookup_term_str(id)
     }
 
     // ----- write path -----
@@ -1798,10 +1822,10 @@ impl DejaDB {
             // All three terms must already exist for a prior head to match;
             // a never-seen object can't be a duplicate, so we skip the probe.
             if let (Some(ns_id), Some(s_id), Some(p_id), Some(o_id)) = (
-                self.term_lookup(&gv.ns),
-                self.term_lookup(sj),
-                self.term_lookup(rl),
-                self.term_lookup(ob),
+                self.term_lookup(&gv.ns)?,
+                self.term_lookup(sj)?,
+                self.term_lookup(rl)?,
+                self.term_lookup(ob)?,
             ) {
                 if let Some(existing) = self.head_hash_for_object(ns_id, s_id, p_id, o_id)? {
                     return Ok((existing, false));
@@ -1946,8 +1970,17 @@ impl DejaDB {
         }
         let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         let (d_docs, d_len) = fts_delta(&preps);
-        with_txn(self.db.as_ref(), || {
-            insert_prepped(self.db.as_ref(), &preps, first_seq, first_op, hlc0)
+        let n = preps.len() as i64;
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            // Multi-writer backends allocate the id block INSIDE the txn
+            // (which also serializes concurrent write txns); the embedded
+            // path keeps the process-local reservation made above.
+            let (s0, o0, h0) = match dbr.reserve_write(n, n, n, now_ms() << 16, 0)? {
+                Some(w) => (w.seq0, w.op0, w.hlc0),
+                None => (first_seq, first_op, hlc0),
+            };
+            insert_prepped(dbr, &preps, s0, o0, h0)
         })?;
         self.fts_docs += d_docs;
         self.fts_total_len += d_len;
@@ -2034,6 +2067,8 @@ impl DejaDB {
         }
 
         let written = with_txn(self.db.as_ref(), || {
+            // Serialize with concurrent writers (no ids consumed).
+            self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             let mut n = 0usize;
             for r in &plan {
                 if let Some(run) = r.run {
@@ -2110,7 +2145,7 @@ impl DejaDB {
     /// (OMS §8.2, Event). Pair with [`Self::run_yield`] for what the run
     /// *produced* downstream.
     pub fn run_trace(&mut self, ns: &str, run_id: &str, limit: usize) -> Result<Vec<DeserializedGrain>> {
-        let (Some(ns_id), Some(run)) = (self.term_lookup(ns), self.term_lookup(run_id)) else {
+        let (Some(ns_id), Some(run)) = (self.term_lookup(ns)?, self.term_lookup(run_id)?) else {
             return Ok(Vec::new());
         };
         let limit = limit.min(1024) as i64;
@@ -2244,7 +2279,7 @@ impl DejaDB {
         limit: usize,
         live_only: bool,
     ) -> Result<Vec<DeserializedGrain>> {
-        let ns_id = match self.term_lookup(ns) {
+        let ns_id = match self.term_lookup(ns)? {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
@@ -2297,12 +2332,12 @@ impl DejaDB {
         k: usize,
     ) -> Result<Vec<DeserializedGrain>> {
         let start = std::time::Instant::now();
-        let (ns_id, s_id) = match (self.term_lookup(ns), self.term_lookup(subject)) {
+        let (ns_id, s_id) = match (self.term_lookup(ns)?, self.term_lookup(subject)?) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
         let p_id = match relation {
-            Some(r) => match self.term_lookup(r) {
+            Some(r) => match self.term_lookup(r)? {
                 Some(x) => Some(x),
                 None => return Ok(Vec::new()),
             },
@@ -2340,9 +2375,9 @@ impl DejaDB {
     /// Current value head for (subject, relation) — the µs point read.
     pub fn latest(&mut self, ns: &str, subject: &str, relation: &str) -> Result<Option<DeserializedGrain>> {
         let (ns_id, s_id, p_id) = match (
-            self.term_lookup(ns),
-            self.term_lookup(subject),
-            self.term_lookup(relation),
+            self.term_lookup(ns)?,
+            self.term_lookup(subject)?,
+            self.term_lookup(relation)?,
         ) {
             (Some(a), Some(b), Some(c)) => (a, b, c),
             _ => return Ok(None),
@@ -2366,7 +2401,7 @@ impl DejaDB {
 
     /// Last `n` events of a session, oldest→newest (transcript tail).
     pub fn thread_tail(&mut self, ns: &str, session: &str, n: usize) -> Result<Vec<DeserializedGrain>> {
-        let (ns_id, sess_id) = match (self.term_lookup(ns), self.term_lookup(session)) {
+        let (ns_id, sess_id) = match (self.term_lookup(ns)?, self.term_lookup(session)?) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
@@ -2422,13 +2457,35 @@ impl DejaDB {
         let new_hash = preps[0].hash;
         let now = now_ms();
 
-        let op_seq = self.next_op;
+        let ram_op = self.next_op;
         self.next_op += 1;
-        let hlc = self.next_hlc();
+        let ram_hlc = self.next_hlc();
         let (d_docs, d_len) = fts_delta(&preps);
         let dbr = self.db.as_ref();
         with_txn(dbr, || {
-            insert_prepped(dbr, &preps, first_seq, first_op, hlc0)?;
+            // Reserve ADD + SUPERSEDE ids in one block on multi-writer
+            // backends (also the serialization point for concurrent write
+            // txns); the embedded path keeps the process-local reservation.
+            let (s0, o0, h0, op_seq, hlc) = match dbr.reserve_write(1, 2, 2, now_ms() << 16, 0)? {
+                Some(w) => (w.seq0, w.op0, w.hlc0, w.op0 + 1, w.hlc0 + 1),
+                None => (first_seq, first_op, hlc0, ram_op, ram_hlc),
+            };
+            // Re-check the head UNDER the row lock: with concurrent writers
+            // the pre-transaction read above can be stale, and two racing
+            // supersedes of one head must produce one winner and one clean
+            // SupersessionConflict — the single-writer contract.
+            let recheck = dbr.query(
+                &format!("SELECT svt FROM grains WHERE seq=?1{}", dbr.for_update()),
+                vec![pi(old_seq)],
+            )?;
+            match recheck.first() {
+                None => return Err(DejaDbError::NotFound(*old)),
+                Some(row) if row.i64(0).is_some() => {
+                    return Err(DejaDbError::SupersessionConflict(*old))
+                }
+                _ => {}
+            }
+            insert_prepped(dbr, &preps, s0, o0, h0)?;
             dbr.execute(
                 "UPDATE grains SET superseded_by=?1, svt=?2 WHERE seq=?3",
                 vec![pb(new_hash.as_bytes().to_vec()), pi(now), pi(old_seq)],
@@ -2505,11 +2562,25 @@ impl DejaDB {
             .query("SELECT len FROM fts_doc WHERE seq = ?1", vec![pi(seq)])?
             .first()
             .and_then(|row| row.i64(0));
-        let op_seq = self.next_op;
+        let ram_op = self.next_op;
         self.next_op += 1;
-        let hlc = self.next_hlc();
+        let ram_hlc = self.next_hlc();
         let dbr = self.db.as_ref();
         with_txn(dbr, || {
+            let (op_seq, hlc) = match dbr.reserve_write(0, 1, 1, now_ms() << 16, 0)? {
+                Some(w) => (w.op0, w.hlc0),
+                None => (ram_op, ram_hlc),
+            };
+            // Re-check existence UNDER the row lock: with concurrent writers
+            // two racing forgets must produce one success and one NotFound —
+            // the single-writer contract.
+            let recheck = dbr.query(
+                &format!("SELECT seq FROM grains WHERE hash=?1{}", dbr.for_update()),
+                vec![pb(hash.as_bytes().to_vec())],
+            )?;
+            if recheck.first().and_then(|r| r.i64(0)).is_none() {
+                return Err(DejaDbError::NotFound(*hash));
+            }
             dbr.execute("DELETE FROM triples WHERE seq=?1", vec![pi(seq)])?;
             dbr.execute("DELETE FROM osp WHERE seq=?1", vec![pi(seq)])?;
             dbr.execute("DELETE FROM embeddings WHERE seq=?1", vec![pi(seq)])?;
@@ -2593,13 +2664,22 @@ impl DejaDB {
     /// imported supersession whose grain already existed locally. Without it
     /// those transitions never replicate and downstream replicas diverge.
     fn log_op(&mut self, op: i64, hash: &Hash, hlc: i64) -> Result<()> {
-        let op_seq = self.next_op;
+        let ram_op = self.next_op;
         self.next_op += 1;
-        self.db.execute(
-            "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
-            vec![pi(op_seq), pi(hlc), pi(op), pb(hash.as_bytes().to_vec())],
-        )?;
-        Ok(())
+        let dbr = self.db.as_ref();
+        with_txn(dbr, || {
+            // The imported hlc is preserved on the row; the reservation only
+            // raises the clock floor so local allocations stay ahead of it.
+            let op_seq = match dbr.reserve_write(0, 1, 0, now_ms() << 16, hlc)? {
+                Some(w) => w.op0,
+                None => ram_op,
+            };
+            dbr.execute(
+                "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
+                vec![pi(op_seq), pi(hlc), pi(op), pb(hash.as_bytes().to_vec())],
+            )?;
+            Ok(())
+        })
     }
 
     // ----- telemetry sidecar (host capability; off the recall path) -----
@@ -2675,15 +2755,15 @@ impl DejaDB {
         node_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Hash)>> {
-        let Some(ns_id) = self.term_lookup(ns) else {
+        let Some(ns_id) = self.term_lookup(ns)? else {
             return Ok(Vec::new());
         };
-        let Some(target_id) = self.term_lookup(&workflow_hash.to_hex()) else {
+        let Some(target_id) = self.term_lookup(&workflow_hash.to_hex())? else {
             return Ok(Vec::new());
         };
         // Which predicates count: one exact relation, or every step_action.
         let pred_ids: Vec<i64> = match node_id {
-            Some(n) => match self.term_lookup(&step_action_relation(n)) {
+            Some(n) => match self.term_lookup(&step_action_relation(n))? {
                 Some(id) => vec![id],
                 None => return Ok(Vec::new()),
             },
@@ -2722,7 +2802,7 @@ impl DejaDB {
 
         let mut result = Vec::with_capacity(rows.len());
         for (_, s, p) in rows {
-            let (Some(subj), Some(rel)) = (self.term_str(s), self.term_str(p)) else {
+            let (Some(subj), Some(rel)) = (self.term_str(s)?, self.term_str(p)?) else {
                 continue;
             };
             let (Some(node), Ok(h)) = (step_action_node(&rel), Hash::from_hex(&subj)) else {
@@ -2762,7 +2842,7 @@ impl DejaDB {
         object: &str,
         limit: usize,
     ) -> Result<Vec<DeserializedGrain>> {
-        let (Some(ns_id), Some(obj_id)) = (self.term_lookup(ns), self.term_lookup(object)) else {
+        let (Some(ns_id), Some(obj_id)) = (self.term_lookup(ns)?, self.term_lookup(object)?) else {
             return Ok(Vec::new());
         };
         let limit = limit.min(1024) as i64;
@@ -2791,15 +2871,20 @@ impl DejaDB {
         depth: usize,
         cap: usize,
     ) -> Result<Vec<String>> {
-        let ns_id = match self.term_lookup(ns) {
+        let ns_id = match self.term_lookup(ns)? {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
-        let start_id = match self.term_lookup(start) {
+        let start_id = match self.term_lookup(start)? {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
-        let rel_ids: Vec<i64> = relations.iter().filter_map(|r| self.term_lookup(r)).collect();
+        let mut rel_ids: Vec<i64> = Vec::new();
+        for r in relations {
+            if let Some(id) = self.term_lookup(r)? {
+                rel_ids.push(id);
+            }
+        }
         if rel_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -2855,7 +2940,13 @@ impl DejaDB {
             }
             order
         };
-        Ok(reached.into_iter().filter_map(|id| self.term_str(id)).collect())
+        let mut out = Vec::with_capacity(reached.len());
+        for id in reached {
+            if let Some(t) = self.term_str(id)? {
+                out.push(t);
+            }
+        }
+        Ok(out)
     }
 
     /// Bounded bidirectional-ish path search (forward BFS with parents).
@@ -2867,15 +2958,20 @@ impl DejaDB {
         relations: &[&str],
         max_depth: usize,
     ) -> Result<Option<Vec<String>>> {
-        let ns_id = match self.term_lookup(ns) {
+        let ns_id = match self.term_lookup(ns)? {
             Some(x) => x,
             None => return Ok(None),
         };
-        let (a, b) = match (self.term_lookup(from), self.term_lookup(to)) {
+        let (a, b) = match (self.term_lookup(from)?, self.term_lookup(to)?) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(None),
         };
-        let rel_ids: Vec<i64> = relations.iter().filter_map(|r| self.term_lookup(r)).collect();
+        let mut rel_ids: Vec<i64> = Vec::new();
+        for r in relations {
+            if let Some(id) = self.term_lookup(r)? {
+                rel_ids.push(id);
+            }
+        }
         if rel_ids.is_empty() {
             return Ok(None);
         }
@@ -2914,19 +3010,26 @@ impl DejaDB {
             }
             if found { Some(parent) } else { None }
         };
-        Ok(parents.map(|parent| {
-            let mut chain = vec![b];
-            let mut cur = b;
-            while let Some(pr) = parent.get(&cur) {
-                chain.push(*pr);
-                cur = *pr;
-                if cur == a {
-                    break;
-                }
+        let Some(parent) = parents else {
+            return Ok(None);
+        };
+        let mut chain = vec![b];
+        let mut cur = b;
+        while let Some(pr) = parent.get(&cur) {
+            chain.push(*pr);
+            cur = *pr;
+            if cur == a {
+                break;
             }
-            chain.reverse();
-            chain.into_iter().filter_map(|id| self.term_str(id)).collect()
-        }))
+        }
+        chain.reverse();
+        let mut out = Vec::with_capacity(chain.len());
+        for id in chain {
+            if let Some(t) = self.term_str(id)? {
+                out.push(t);
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Two-axis as-of read.
@@ -2967,9 +3070,9 @@ impl DejaDB {
             Axis::World => {
                 // Current knowledge filtered by world validity at T.
                 let (ns_id, s_id, p_id) = match (
-                    self.term_lookup(ns),
-                    self.term_lookup(subject),
-                    self.term_lookup(relation),
+                    self.term_lookup(ns)?,
+                    self.term_lookup(subject)?,
+                    self.term_lookup(relation)?,
                 ) {
                     (Some(a), Some(b), Some(c)) => (a, b, c),
                     _ => return Ok(None),
@@ -3043,7 +3146,7 @@ impl DejaDB {
         if !self.index_text || k == 0 {
             return Ok(Vec::new()); // BM25 leg disabled (edge profile)
         }
-        let ns_id = match self.term_lookup(ns) {
+        let ns_id = match self.term_lookup(ns)? {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
@@ -3055,12 +3158,15 @@ impl DejaDB {
         // Their postings are still present and only filtered at the end, so
         // using the live count here would make idf disagree with the postings
         // actually being scored. The difference is immaterial to ranking.
-        let n_docs = self.fts_docs.max(1) as f64;
-        let avgdl = if self.fts_docs > 0 {
-            (self.fts_total_len as f64 / self.fts_docs as f64).max(1.0)
-        } else {
-            1.0
+        // Multi-writer backends supply live stats (the process-local counters
+        // can't see other writers' documents); the embedded path stays on its
+        // counters.
+        let (docs_i, len_i) = match self.db.collection_stats()? {
+            Some(s) => s,
+            None => (self.fts_docs, self.fts_total_len),
         };
+        let n_docs = docs_i.max(1) as f64;
+        let avgdl = if docs_i > 0 { (len_i as f64 / docs_i as f64).max(1.0) } else { 1.0 };
 
         // One postings pull for ALL distinct tokens (document length comes
         // back with the posting). Scoring still iterates the query's tokens
@@ -3254,26 +3360,27 @@ impl DejaDB {
         text: &str,
         k: usize,
     ) -> Result<Vec<(Hash, f32)>> {
-        let Some(embedder) = &self.embedder else {
+        if self.embedder.is_none() {
             return Err(DejaDbError::Validation(
                 "novelty check requires an embedder (e.g. --embed-cmd); none installed".into(),
             ));
-        };
-        let Some(ns_id) = self.term_lookup(ns) else {
+        }
+        let Some(ns_id) = self.term_lookup(ns)? else {
             return Ok(Vec::new());
         };
+        let embedder = self.embedder.as_ref().expect("checked above");
         let qjson = vec_to_json(&embedder.embed(text)?);
         // A named subject/relation that was never interned can have no
         // neighbours — short-circuit rather than scan.
         let s_id = match subject {
-            Some(s) => match self.term_lookup(s) {
+            Some(s) => match self.term_lookup(s)? {
                 Some(x) => Some(x),
                 None => return Ok(Vec::new()),
             },
             None => None,
         };
         let p_id = match relation {
-            Some(r) => match self.term_lookup(r) {
+            Some(r) => match self.term_lookup(r)? {
                 Some(x) => Some(x),
                 None => return Ok(Vec::new()),
             },
@@ -3325,7 +3432,10 @@ impl DejaDB {
         k: usize,
         include_superseded: bool,
     ) -> Result<Vec<i64>> {
-        let (Some(embedder), Some(ns_id)) = (&self.embedder, self.term_lookup(ns)) else {
+        let Some(ns_id) = self.term_lookup(ns)? else {
+            return Ok(Vec::new());
+        };
+        let Some(embedder) = &self.embedder else {
             return Ok(Vec::new());
         };
         let qv = embedder.embed(query)?;
@@ -3741,12 +3851,12 @@ impl DejaDB {
         k: usize,
         all_versions: bool,
     ) -> Result<Vec<i64>> {
-        let (ns_id, s_id) = match (self.term_lookup(ns), self.term_lookup(subject)) {
+        let (ns_id, s_id) = match (self.term_lookup(ns)?, self.term_lookup(subject)?) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
         let p_id = match relation {
-            Some(r) => match self.term_lookup(r) {
+            Some(r) => match self.term_lookup(r)? {
                 Some(x) => Some(x),
                 None => return Ok(Vec::new()),
             },
@@ -3806,7 +3916,7 @@ impl DejaDB {
     /// Distinct subjects holding `relation` in `ns` (POS-index scan).
     /// Backs directory-style listings (memory-tool `view` on a dir).
     pub fn subjects_with_relation(&mut self, ns: &str, relation: &str) -> Result<Vec<String>> {
-        let (ns_id, p_id) = match (self.term_lookup(ns), self.term_lookup(relation)) {
+        let (ns_id, p_id) = match (self.term_lookup(ns)?, self.term_lookup(relation)?) {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
@@ -3819,7 +3929,12 @@ impl DejaDB {
             .iter()
             .filter_map(|row| row.i64(0))
             .collect();
-        let mut subjects: Vec<String> = ids.into_iter().filter_map(|id| self.term_str(id)).collect();
+        let mut subjects: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = self.term_str(id)? {
+                subjects.push(t);
+            }
+        }
         subjects.sort();
         Ok(subjects)
     }
@@ -3945,7 +4060,7 @@ impl DejaDB {
         let mut forks = Vec::new();
         for (ns_id, s_id, p_id) in groups {
             let (Some(namespace), Some(subject), Some(relation)) =
-                (self.term_str(ns_id), self.term_str(s_id), self.term_str(p_id))
+                (self.term_str(ns_id)?, self.term_str(s_id)?, self.term_str(p_id)?)
             else {
                 continue;
             };
@@ -3966,9 +4081,9 @@ impl DejaDB {
 
     pub fn heads(&mut self, ns: &str, subject: &str, relation: &str) -> Result<Vec<(Hash, i64)>> {
         let (Some(ns_id), Some(s_id), Some(p_id)) = (
-            self.term_lookup(ns),
-            self.term_lookup(subject),
-            self.term_lookup(relation),
+            self.term_lookup(ns)?,
+            self.term_lookup(subject)?,
+            self.term_lookup(relation)?,
         ) else {
             return Ok(Vec::new());
         };
@@ -4025,13 +4140,17 @@ impl DejaDB {
         // Reserve the fork-closure OP_SUPERSEDE slot (written inside the txn so it
         // replicates; the merge grain's context.merge_parents lets import close
         // all tips — see superseded_parents + the import OP_SUPERSEDE branch).
-        let op_seq = self.next_op;
+        let ram_op = self.next_op;
         self.next_op += 1;
-        let hlc = self.next_hlc();
+        let ram_hlc = self.next_hlc();
         let (d_docs, d_len) = fts_delta(&preps);
         let dbr = self.db.as_ref();
         with_txn(dbr, || {
-            insert_prepped(dbr, &preps, first_seq, first_op, hlc0)?; // OP_ADD; collapses heads to {merge}
+            let (s0, o0, h0, op_seq, hlc) = match dbr.reserve_write(1, 2, 2, now_ms() << 16, 0)? {
+                Some(w) => (w.seq0, w.op0, w.hlc0, w.op0 + 1, w.hlc0 + 1),
+                None => (first_seq, first_op, hlc0, ram_op, ram_hlc),
+            };
+            insert_prepped(dbr, &preps, s0, o0, h0)?; // OP_ADD; collapses heads to {merge}
             for (tip, _) in &tips {
                 let seq = dbr
                     .query(
@@ -4379,13 +4498,20 @@ impl DejaDB {
     /// Insert one already-serialized grain (bundle import path).
     fn insert_blob(&mut self, blob: Vec<u8>, hash: Hash, op: i64, hlc_in: i64) -> Result<()> {
         let pr = self.prep_from_blob(blob, hash)?;
-        let seq = self.next_seq;
+        let ram_seq = self.next_seq;
         self.next_seq += 1;
-        let op_seq = self.next_op;
+        let ram_op = self.next_op;
         self.next_op += 1;
         self.hlc_last = self.hlc_last.max(hlc_in);
         let dbr = self.db.as_ref();
         with_txn(dbr, || {
+            // The imported hlc is preserved on the op-log row; the
+            // reservation raises the clock floor so local allocations stay
+            // ahead of imported history.
+            let (seq, op_seq) = match dbr.reserve_write(1, 1, 0, now_ms() << 16, hlc_in)? {
+                Some(w) => (w.seq0, w.op0),
+                None => (ram_seq, ram_op),
+            };
             dbr.execute(
                 "INSERT INTO grains(seq,hash,ns,gtype,created_at,s,p,o,vf,vt,svf,svt,superseded_by,supersedes,text,blob)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12,?13)",
@@ -4498,8 +4624,15 @@ impl DejaDB {
     fn apply_supersede_flip(&mut self, old: &Hash, new_hash: &Hash) -> Result<bool> {
         let dbr = self.db.as_ref();
         with_txn(dbr, || {
+            // Serialize with concurrent writers (no ids consumed): the flip's
+            // read-then-write election must not interleave with another
+            // writer's on the same key.
+            dbr.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             let rows = dbr.query(
-                "SELECT seq, svt, ns, s, p FROM grains WHERE hash = ?1",
+                &format!(
+                    "SELECT seq, svt, ns, s, p FROM grains WHERE hash = ?1{}",
+                    dbr.for_update()
+                ),
                 vec![pb(old.as_bytes().to_vec())],
             )?;
             let (old_seq, old_svt, old_ns, old_s, old_p) = match rows.first() {
@@ -5270,13 +5403,13 @@ mod tests {
         // Re-interning a known term is a cache hit -> same id.
         assert_eq!(db.term_id("alice").unwrap(), a);
         // Forward lookup.
-        assert_eq!(db.term_lookup("alice"), Some(a));
-        assert_eq!(db.term_lookup("bob"), Some(b));
-        assert_eq!(db.term_lookup("nobody"), None);
+        assert_eq!(db.term_lookup("alice").unwrap(), Some(a));
+        assert_eq!(db.term_lookup("bob").unwrap(), Some(b));
+        assert_eq!(db.term_lookup("nobody").unwrap(), None);
         // Reverse scan (id -> term).
-        assert_eq!(db.term_str(a).as_deref(), Some("alice"));
-        assert_eq!(db.term_str(b).as_deref(), Some("bob"));
-        assert_eq!(db.term_str(999_999), None);
+        assert_eq!(db.term_str(a).unwrap().as_deref(), Some("alice"));
+        assert_eq!(db.term_str(b).unwrap().as_deref(), Some("bob"));
+        assert_eq!(db.term_str(999_999).unwrap(), None);
     }
 
     #[test]
@@ -5295,11 +5428,11 @@ mod tests {
         // fresh term gets an id beyond the previous max (next_term continues).
         {
             let mut db = DejaDB::open(path).unwrap();
-            assert_eq!(db.term_lookup("x"), Some(a));
-            assert_eq!(db.term_lookup("y"), Some(b));
+            assert_eq!(db.term_lookup("x").unwrap(), Some(a));
+            assert_eq!(db.term_lookup("y").unwrap(), Some(b));
             let c = db.term_id("z").unwrap();
             assert!(c > b);
-            assert_eq!(db.term_str(c).as_deref(), Some("z"));
+            assert_eq!(db.term_str(c).unwrap().as_deref(), Some("z"));
         }
     }
 }
