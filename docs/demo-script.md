@@ -132,7 +132,7 @@ reversible, (4) *model-native* — one line to give an agent memory.
 - **Pre-seed** `john.db` and `agent.db` with a little history off-camera so
   `history` and `provenance` look lived-in, or run the beats in order so they
   build naturally. Beat 4's `$OBS` capture needs the two commands run in the same
-  shell session (the observation hash flows from `remember` into the lesson).
+  shell session (the event hash flows from `remember` into the lesson).
 - **Novelty check (Beat 4 VO):** `deja novelty` needs an embedder
   (`--embed-cmd`); mention it in narration rather than wiring one on-camera, or
   pre-install one so `deja novelty --text "give each test its own tempdir"

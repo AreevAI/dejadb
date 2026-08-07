@@ -1037,7 +1037,9 @@ impl Engine {
     }
 
     /// List stored recommendations, optionally filtered by status. Status comes
-    /// from the rebuildable index, not the immutable grain body.
+    /// from the rebuildable index, not the immutable grain body. Ordered for
+    /// review triage — highest severity first, then oldest first — and stable
+    /// across runs for identical input.
     pub fn recommendations<S: OmsSubstrate>(
         &self,
         sub: &S,
@@ -1067,7 +1069,21 @@ impl Engine {
             }
             out.push(rec);
         }
-        out.sort_by(|a, b| a.hash.cmp(&b.hash));
+        // Review-queue order: worst first, then oldest first. Hash is only the
+        // final tiebreak — sorting by it alone is deterministic per run but
+        // meaningless across runs, because a grain's hash covers its timestamp,
+        // so an identical queue comes back in a different order every time.
+        // `dedup_key` is the last tiebreak that actually decides anything: it is
+        // content-derived and stable across runs, whereas findings proposed in
+        // the same sweep routinely share a `created_at_ms`. Hash trails it only
+        // to make the ordering total.
+        out.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then(a.created_at_ms.cmp(&b.created_at_ms))
+                .then(a.dedup_key.cmp(&b.dedup_key))
+                .then(a.hash.cmp(&b.hash))
+        });
         Ok(out)
     }
 
@@ -1151,7 +1167,16 @@ impl Engine {
     pub fn outcomes<S: OmsSubstrate>(&self, sub: &S) -> Result<Vec<crate::recommendation::OutcomeResult>> {
         let p = WaiserPersisted::from_value(sub.load_state()?)?;
         let mut out: Vec<_> = p.outcomes.into_values().flatten().collect();
-        out.sort_by_key(|o| (o.measured_at_ms, o.horizon_ms));
+        // `metric` and `rec_hash` break the tie: checkpoints measured in the
+        // same sweep share a `measured_at_ms`, and without a tiebreak the order
+        // falls through to the map's rec_hash ordering, which shifts every run.
+        out.sort_by(|a, b| {
+            a.measured_at_ms
+                .cmp(&b.measured_at_ms)
+                .then(a.horizon_ms.cmp(&b.horizon_ms))
+                .then(a.metric.cmp(&b.metric))
+                .then(a.rec_hash.cmp(&b.rec_hash))
+        });
         Ok(out)
     }
 

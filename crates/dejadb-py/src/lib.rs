@@ -544,7 +544,7 @@ impl DejaDB {
             .map_err(err)
     }
 
-    /// remember(): store content as an Observation, then attach the facts
+    /// remember(): store content as an Event, then attach the facts
     /// distilled from it. Three routes to those facts, in precedence order:
     /// `facts_json` (pre-extracted by the host — a JSON list of
     /// {subject, relation, object, confidence}), `llm_cmd` (a subprocess

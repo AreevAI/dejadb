@@ -257,3 +257,54 @@ fn self_approval_block_holds_on_the_real_store() {
     );
     assert!(matches!(blocked, Err(waiser::Error::SelfApproval(_))));
 }
+
+/// The review queue must come back worst-first and in the *same* order every
+/// run. It used to sort on the content hash alone, which is deterministic
+/// within a run but reshuffles across runs, because a grain's hash covers its
+/// creation timestamp — so an identical queue was presented to the reviewer in
+/// a different order each time, and severity had no bearing on it at all.
+#[test]
+fn review_queue_is_severity_ordered_and_stable_across_runs() {
+    let mut orders = Vec::new();
+    for _ in 0..3 {
+        let (_d, mut store) = open_temp();
+        seed(&mut store);
+        // A tool failure lands a higher severity alongside the seeded findings.
+        for i in 0..4 {
+            store
+                .add(
+                    &Tool::new("crm_export")
+                        .content(&format!("timeout after 30s (attempt {i})"))
+                        .is_error(true)
+                        .namespace("caller"),
+                )
+                .unwrap();
+        }
+        let mut sub = DejaDbSubstrate::new(store, None);
+        let engine = Engine::with_builtins();
+        engine.run(&mut sub, &RunOptions::default(), NOW).unwrap();
+
+        let pending = engine
+            .recommendations(&sub, Some(RecStatus::Pending))
+            .unwrap();
+        assert!(pending.len() >= 2, "need several to have an order at all");
+
+        let severities: Vec<_> = pending.iter().map(|r| r.severity).collect();
+        let mut sorted = severities.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            severities, sorted,
+            "queue must be highest-severity-first, got {severities:?}"
+        );
+
+        orders.push(
+            pending
+                .iter()
+                .map(|r| (r.severity, r.analyzer.clone(), r.summary.render()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    assert_eq!(orders[0], orders[1], "order drifted between run 1 and 2");
+    assert_eq!(orders[1], orders[2], "order drifted between run 2 and 3");
+}

@@ -333,18 +333,18 @@ deja remember --db john.db --ns caller \
 ```
 
 ```json
-{"observation":"a1b2…","facts":["c3d4…","e5f6…"],"model":"gpt-4o-mini",
+{"event":"a1b2…","facts":["c3d4…","e5f6…"],"model":"gpt-4o-mini",
  "verification_status":"unverified","proposed":2,"dropped":0}
 ```
 
 Extraction is the point where a model can write its own hallucinations into
 memory, so the write is shaped to stay honest about that:
 
-- **The raw text lands first.** The Observation is written *before* the model is
+- **The raw text lands first.** The Event is written *before* the model is
   called. A failed or garbage extraction costs you the facts, never the source —
   the hash is still printed, and you can retry the extraction against it.
 - **Extracted facts are marked, not trusted.** Each one carries `derived_from`
-  (the observation), `source_type=derived`, `extractor_model` (which model wrote
+  (the event), `source_type=derived`, `extractor_model` (which model wrote
   it), and `verification_status="unverified"`. That last one is CAL-filterable,
   so the extraction queue is reviewable:
 
