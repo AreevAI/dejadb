@@ -1499,7 +1499,7 @@ fn resolve_llm(
     Ok(None)
 }
 
-/// `deja remember` — store free text as an Observation, then attach the facts
+/// `deja remember` — store free text as an Event, then attach the facts
 /// distilled from it.
 ///
 /// Three routes to those facts, in precedence order:

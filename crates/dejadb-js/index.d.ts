@@ -65,7 +65,7 @@ export declare class DejaDb {
   /** Erase a grain from the hot store (tombstoned). Host-level op. */
   forget(hash: string): Promise<void>
   /**
-   * remember(): store content as an Observation, then attach the facts
+   * remember(): store content as an Event, then attach the facts
    * distilled from it. Three routes to those facts, in precedence order:
    * `factsJson` (pre-extracted by the host — a JSON list of
    * {subject, relation, object, confidence}), `llmCmd` (a subprocess

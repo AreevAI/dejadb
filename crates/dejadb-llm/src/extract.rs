@@ -249,7 +249,7 @@ struct ExtractResponse {
 ///
 /// Rows missing any of subject/relation/object are dropped (a triple with a
 /// hole is not a fact); confidence is clamped into 0.0–1.0 and defaults to
-/// [`DEFAULT_CONFIDENCE`] when absent; the list is capped at [`MAX_FACTS`].
+/// `DEFAULT_CONFIDENCE` (0.8) when absent; the list is capped at [`MAX_FACTS`].
 pub fn parse_extract(raw: &str) -> Vec<ExtractedFact> {
     let resp: ExtractResponse = serde_json::from_str(&strip_fence(raw)).unwrap_or_default();
     resp.facts
