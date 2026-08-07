@@ -261,6 +261,23 @@ impl DejaDb {
         })
     }
 
+    /// Rebuild the link indexes: reverse provenance, run correlation, and
+    /// `related_to` cross-links. Returns index rows written.
+    ///
+    /// `open()` heals a file that predates these indexes, so this is for
+    /// rebuilding on demand — the counterpart of `reindexText()`, and what
+    /// `deja reindex` runs.
+    #[napi(ts_return_type = "Promise<number>")]
+    pub fn reindex_links(&self) -> napi::bindgen_prelude::AsyncTask<U32Job> {
+        let facade = self.facade.clone();
+        U32Job::spawn(move || {
+            facade
+                .with_store(|m| m.rebuild_link_indexes())
+                .map(|n| n as u32)
+                .map_err(err)
+        })
+    }
+
     /// Anthropic memory-tool command (view/create/str_replace/insert/delete/
     /// rename over /memories): pass the tool-call object as JSON; returns the
     /// tool result text. Wire this as your memory-tool backend.
@@ -492,6 +509,7 @@ impl DejaDb {
         min_confidence: Option<f64>,
         session_id: Option<String>,
         role: Option<String>,
+        run_id: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let facade = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
@@ -516,6 +534,7 @@ impl DejaDb {
                 observer: Some(observer.as_str()),
                 session_id: session_id.as_deref(),
                 role: role.as_deref(),
+                run_id: run_id.as_deref(),
             };
             let event = facade
                 .with_store(|m| m.capture(&ns, &content, &meta))

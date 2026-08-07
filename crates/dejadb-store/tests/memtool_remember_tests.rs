@@ -164,11 +164,16 @@ fn capture_threads_a_turn_by_session_and_role() {
         observer: Some("voice-agent"),
         session_id: Some("sess-1"),
         role: Some("user"),
+        run_id: Some("run-1"),
     };
     let h = m.capture("caller", "hello there", &meta).unwrap();
     let g = m.get(&h).unwrap();
     assert_eq!(g.fields["session_id"], "sess-1");
     assert_eq!(g.fields["role"], "user");
+    // A captured turn is reachable through the run join, not just the thread
+    // index — `run_id` had no write path outside Rust before this.
+    assert_eq!(g.fields["run_id"], "run-1");
+    assert_eq!(m.run_trace("caller", "run-1", 10).unwrap().len(), 1);
     // Reachable as part of its transcript, not just as a loose grain.
     let tail = m.thread_tail("caller", "sess-1", 8).unwrap();
     assert_eq!(tail.len(), 1);

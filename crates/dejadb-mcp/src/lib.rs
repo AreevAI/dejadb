@@ -409,6 +409,7 @@ impl McpServer {
                     observer: args.get("observer").and_then(|v| v.as_str()),
                     session_id: args.get("session_id").and_then(|v| v.as_str()),
                     role: args.get("role").and_then(|v| v.as_str()),
+                    run_id: args.get("run_id").and_then(|v| v.as_str()),
                 };
                 let h = self
                     .facade
@@ -618,6 +619,7 @@ fn tool_defs() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "content": s("the utterance/observation text"),
                 "session_id": s("optional session/thread id"),
+                "run_id": s("optional run id — makes this turn readable via dejadb_run_trace"),
                 "role": s("optional: user|assistant|system|tool"),
                 "observer": s("optional id of the agent capturing this"),
                 "namespace": s("optional namespace")

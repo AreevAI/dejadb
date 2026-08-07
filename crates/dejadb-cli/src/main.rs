@@ -88,7 +88,7 @@ COMMANDS:
                                        cross-file ASSEMBLE; ns \"alias.inner\")
   repl     [--ns NS]                  interactive CAL console in the terminal
   remember --content TEXT [--facts JSON] [--observer ID]
-           [--session-id ID] [--role user|assistant|system|tool]
+           [--session-id ID] [--run-id ID] [--role user|assistant|system|tool]
            [--model SPEC | --llm-cmd CMD] [--extract-hint TEXT]
            [--ground-model SPEC | --ground-cmd CMD]
            [--min-confidence F] [--dry-run]
@@ -1122,6 +1122,9 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                         observer: None,
                         session_id: Some(session.as_str()),
                         role: Some(role),
+                        // A hook capture is not a run; `deja remember --run-id`
+                        // is where a caller names one.
+                        run_id: None,
                     };
                     m.capture(&ns, text, &meta).map_err(|e| e.to_string())?;
                     stored += 1;
@@ -1702,6 +1705,7 @@ fn run_remember(mut m: DejaDB, ns: &str, flags: &HashMap<String, String>) -> Res
         observer: Some(observer.as_str()),
         session_id: flags.get("session-id").map(String::as_str),
         role,
+        run_id: flags.get("run-id").map(String::as_str),
     };
     let event = m
         .capture(ns, &content, &capture)

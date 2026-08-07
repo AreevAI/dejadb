@@ -206,3 +206,111 @@ fn rebuild_link_indexes_backfills_and_is_idempotent() {
     assert_eq!(m.run_trace("ops", "run-a", 100).unwrap().len(), 2);
     assert_eq!(m.grains_derived_from(&_e1).unwrap().len(), 1);
 }
+
+#[test]
+fn forget_clears_the_link_indexes_so_a_reused_seq_inherits_nothing() {
+    // `seq` is re-derived as MAX(seq)+1 on every open, so forgetting the newest
+    // grain hands its seq straight to the next write. An index row that outlives
+    // its grain therefore does not merely leak — it re-attaches a stranger to the
+    // forgotten grain's parent and run, and the join answers with a grain that
+    // has neither `derived_from` nor `run_id` set.
+    let d = TempDir::new().unwrap();
+    let path = d.path().join("m.db");
+    let path = path.to_str().unwrap();
+
+    let (parent, forgotten) = {
+        let mut m = DejaDB::open(path).unwrap();
+        let parent = m
+            .add(&Fact::new("refunds", "policy", "30 days").namespace("ops"))
+            .unwrap();
+
+        let mut child = Fact::new("refunds", "window_days", "30");
+        child.common.derived_from = Some(parent.to_hex());
+        child.common.namespace = Some("ops".into());
+        let child = m.add(&child).unwrap();
+
+        let evt = m
+            .add(
+                &Event::new("the turn that produced it")
+                    .run_id("run-x".to_string())
+                    .namespace("ops"),
+            )
+            .unwrap();
+
+        assert_eq!(m.grains_derived_from(&parent).unwrap().len(), 1);
+        assert_eq!(m.run_trace("ops", "run-x", 10).unwrap().len(), 1);
+
+        // Forget both; they hold the two highest seqs in the file.
+        m.forget(&child).unwrap();
+        m.forget(&evt).unwrap();
+        assert!(m.grains_derived_from(&parent).unwrap().is_empty());
+        assert!(m.run_trace("ops", "run-x", 10).unwrap().is_empty());
+        (parent, child)
+    };
+
+    // Reopen so next_seq is recomputed, then write grains that have nothing to
+    // do with either the parent or the run.
+    let mut m = DejaDB::open(path).unwrap();
+    m.add(&Fact::new("shipping", "carrier", "dhl").namespace("ops"))
+        .unwrap();
+    m.add(&Fact::new("shipping", "eta_days", "3").namespace("ops"))
+        .unwrap();
+
+    assert!(
+        m.grains_derived_from(&parent).unwrap().is_empty(),
+        "a stale prov_idx row re-attached an unrelated grain to {}",
+        parent.to_hex()
+    );
+    assert!(
+        m.run_trace("ops", "run-x", 10).unwrap().is_empty(),
+        "a stale run_idx row put an unrelated grain in run-x"
+    );
+    assert!(m.get(&forgotten).is_err(), "the forgotten grain stays gone");
+}
+
+#[test]
+fn open_heals_a_file_written_before_the_link_indexes_existed() {
+    // The failure this prevents is silence: an unhealed file answers every
+    // provenance and run question with an empty result, which reads exactly like
+    // an honest "nothing was derived from this".
+    let d = TempDir::new().unwrap();
+    let path = d.path().join("m.db");
+    let path = path.to_str().unwrap();
+
+    let (e1, fact) = {
+        let (mut m, _) = (DejaDB::open(path).unwrap(), ());
+        let (e1, _e2, fact) = a_run(&mut m, "run-a", 1_700_000_000_000);
+        (e1, fact)
+    };
+
+    // Simulate a file written before these indexes existed by rolling its
+    // file-truth back to an older version stamp.
+    {
+        let m = DejaDB::open(path).unwrap();
+        assert_eq!(
+            m.meta_get("link_index").unwrap().as_deref(),
+            Some("1"),
+            "a file written by this build declares its link indexes current"
+        );
+        m.meta_put("link_index", "0").unwrap();
+    }
+
+    let m = DejaDB::open(path).unwrap();
+    assert!(
+        m.open_warnings().iter().any(|w| w.contains("link indexes rebuilt")),
+        "the rebuild must announce itself: {:?}",
+        m.open_warnings()
+    );
+    let mut m = m;
+    assert_eq!(m.run_trace("ops", "run-a", 100).unwrap().len(), 2);
+    assert_eq!(m.grains_derived_from(&e1).unwrap().len(), 1);
+    assert_eq!(m.runs_touching("ops", &fact, 4).unwrap(), vec!["run-a"]);
+
+    // Stamped, so the next open does not re-scan the corpus.
+    let m2 = DejaDB::open(path).unwrap();
+    assert!(
+        !m2.open_warnings().iter().any(|w| w.contains("link indexes rebuilt")),
+        "second open must be quiet: {:?}",
+        m2.open_warnings()
+    );
+}

@@ -192,6 +192,12 @@ impl RecStatus {
 /// NFC-normalized but deliberately **not** case-folded: a `grain:sha256:`
 /// digest and a host-defined opaque segment may both be case-sensitive.
 /// Normalization is NFC applied *after* case-folding.
+///
+/// `action_kind` is hashed raw — neither folded nor NFC-normalized — because it
+/// is a closed ASCII vocabulary fixed by the spec, for which both operations are
+/// the identity. The asymmetry is deliberate: normalizing it here would be a
+/// unilateral change to a construction two implementations must agree on byte
+/// for byte, and agreement is the entire purpose of the recipe.
 pub fn compute_dedup_key(analyzer_family: &str, target_ref: &str, action_kind: &str) -> String {
     // Rust has no full Unicode case-folding in std; `to_lowercase` is the
     // closest available and agrees with full case-folding for every

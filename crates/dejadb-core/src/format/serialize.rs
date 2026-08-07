@@ -996,10 +996,27 @@ fn add_common_fields(common: &GrainCommon, created_at: i64, map: &mut BTreeMap<S
     // `context` field that shares this wire key, and `add_type_specific_fields` runs
     // first. Inserting unconditionally here silently replaced a State's whole
     // snapshot with the common metadata map. No other grain type writes `ctx`, so
-    // this is a no-op everywhere else.
+    // the common path below is what every type but State takes.
+    //
+    // When the key IS taken, the common context does not simply lose — it moves to
+    // `cctx`. Yielding is right (a State's `ctx` means its snapshot), but dropping
+    // is not: the common context is where `merge_heads` records `merge_parents` and
+    // where the import pipelines record provenance, so a State that was merged or
+    // imported was losing that record at the blob boundary. Merging into the
+    // snapshot was the other option and is worse — a checkpoint an agent resumes
+    // from should carry the agent's state and nothing else. Only State can reach
+    // this branch today, and only when it carries a common context, so no existing
+    // blob changes.
     if let Some(ref ctx) = common.context {
-        map.entry(compact_field("context").to_string())
-            .or_insert_with(|| json_to_msgpack_with_key_compaction(ctx));
+        let key = compact_field("context").to_string();
+        if map.contains_key(&key) {
+            map.insert(
+                compact_field("common_context").to_string(),
+                json_to_msgpack_with_key_compaction(ctx),
+            );
+        } else {
+            map.insert(key, json_to_msgpack_with_key_compaction(ctx));
+        }
     }
 
     // Invalidation policy

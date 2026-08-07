@@ -20,7 +20,10 @@ lazily prepared and cached (`ensure_stmt`).
   `DejaDbOptions::entity_relations`. Reverse traversal (`Direction::In/Both`)
   silently finds nothing for relations outside that set. **Exception**:
   `related_to` cross-links always get `osp` rows, because a link's object is a
-  grain hash and therefore always an entity.
+  grain hash and therefore always an entity. `grains_by_object` is the
+  object-anchored mirror of an anchored `recall_hybrid` ("what points at X"),
+  and is what makes `WITH multi_hop` follow reverse edges — so it inherits the
+  same entity-relations restriction.
 - **Cross-grain links**: `GrainCommon.related_to` entries index as triples
   subject-ed on the linking grain's *own* hash — `(own_hash, relation_type,
   target_hash)` — so `related()`/`path()` traverse them like any edge. They are
@@ -47,8 +50,16 @@ lazily prepared and cached (`ensure_stmt`).
   `run_yield` crosses from execution history into semantic memory (what a run
   *produced*, not what it recorded). `grains_derived_from` is served by
   `prov_idx`; it used to scan and deserialize every grain in the store.
-  `rebuild_link_indexes()` backfills all three (plus `related_to` links) for
-  files written before they existed — wired into `deja reindex`.
+  `run_id` is written through `Capture` (so `remember`/`capture` set it on
+  every surface, not just Rust).
+  `rebuild_link_indexes()` backfills all three (plus `related_to` links) and is
+  wired into `deja reindex`, `reindex_links()` and `reindexLinks()` — but
+  **open() heals automatically**: the `link_index` meta row is the file-truth,
+  and a missing or stale version triggers a rebuild plus an `open_warnings()`
+  note. Emptiness is not the signal (a file may legitimately have no links);
+  the stamp is. **`forget` must delete from `prov_idx`/`run_idx` like every
+  other index** — `seq` is re-derived as `MAX(seq)+1` on open, so a surviving
+  row gets inherited by the next write.
 - `meta(k, v)` — **file-carried declarations**:
   `text_index` ("1"/"0"), `entity_relations` (sorted JSON array),
   `embedding_model`/`embedding_dim` (provenance, stamped by the first

@@ -426,3 +426,27 @@ test('the join: run history and semantic memory queried together', async (t) => 
   assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
   await assert.rejects(() => m.runsTouching('not-a-hash'))
 })
+
+test('reindexLinks rebuilds the join indexes and is idempotent', async () => {
+  const m = makeDb()
+  await m.remember('the caller asked about refunds', null, 'node', null, null, null, null, null, null, null, null, null, 'run-a')
+  const rows = await m.reindexLinks()
+  assert.equal(typeof rows, 'number')
+  assert.equal(await m.reindexLinks(), rows)
+})
+
+test('remember can place a turn in a run that runTrace reads back', async () => {
+  // run_trace/runYield/runsTouching shipped with no way to *write* a run id,
+  // so from Node they could only ever answer "nothing".
+  const m = makeDb()
+  const args = [null, 'node', null, null, null, null, null, null, null, null, null]
+  await m.remember('the caller asked about refunds', ...args, 'run-a')
+  await m.remember('the agent quoted the 30-day policy', ...args, 'run-a')
+  await m.remember('unrelated turn', ...args, 'run-b')
+
+  const a = JSON.parse(await m.runTrace('run-a'))
+  assert.equal(a.run_id, 'run-a')
+  assert.equal(a.trace.length, 2)
+  assert.equal(JSON.parse(await m.runTrace('run-b')).trace.length, 1)
+  assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
+})

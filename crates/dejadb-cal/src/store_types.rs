@@ -1004,6 +1004,11 @@ pub struct RecallParams {
     /// happens before post-filtering and LIMIT, so hops compete for the slots
     /// the caller asked for rather than extending past them, and a direct match
     /// always outranks something reached by association.
+    ///
+    /// Each entity is followed in both directions — as a subject (what it
+    /// points at) and as an object (what points at it). The reverse leg reads
+    /// the OSP index, so it covers the relations the file declares as entity
+    /// relations, matching every other reverse traversal in the engine.
     pub multi_hop: Option<u8>,
     /// Target date (epoch ms) for proximity-based scoring.
     /// When set with target_date_weight, boosts grains near this specific date.

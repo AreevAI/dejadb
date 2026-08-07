@@ -8,6 +8,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING: some grains now hash differently, so re-ingestion writes
+  duplicates instead of deduplicating.** Content addressing is unchanged and
+  every stored blob is untouched — but several shapes were losing or
+  duplicating data on write, and fixing that changes the bytes a *newly built*
+  grain serializes to. A pipeline that re-adds logically identical grains and
+  relied on the content address to dedupe will now write a second copy of:
+
+  - a **State** (the §8.3 snapshot now owns the `ctx` wire key, and a common
+    context rides in `cctx`),
+  - a **Workflow** carrying a `name` (now written once at top level instead of
+    once there and once, unreadably, inside `ctx`),
+  - a **Goal** setting any of the six fields that were silently dropped,
+  - any grain with a `provenance_chain`, which was never serialized,
+  - any grain built through the JSON path with a field no builder claims —
+    those were written **twice**, verbatim at top level *and* compacted into
+    `ctx` under a short code nothing reverses (`priority` as `pri`, `name` as
+    `skname`, `status` as `ast`). The `ctx` copy is gone; the readable one
+    stays.
+
+  Nothing needs migrating: old grains remain valid and readable at their
+  existing addresses. If you re-import a corpus, expect one supersession-free
+  duplicate per affected grain, and `forget` the old copy if that matters.
+
+- **BREAKING: removed public API.** `GoalTree`, `GoalNode`, `StateDiff` and
+  `EngineEvent::AutoRelated` are gone from `dejadb-cal` — declarations with no
+  constructor, caller, test or doc reference anywhere in the tree.
+  `GrainTypeMeta::addable` is now `add_via_set` and
+  `registry::addable_names()` is now `add_via_set_names()` (see Fixed, below,
+  for why). `GrainType` gains a `Recommendation` variant, so an exhaustive
+  match over it needs a new arm.
+
+- **BREAKING: the rendered JSON for a State names the snapshot `context`.** It
+  was `context_data`, the *Rust field name*, which never appears in a
+  deserialized grain — so the key was always present and always empty. A
+  consumer reading `context_data` out of `render(OutputFormat::Json)` must read
+  `context`. Workflow's Markdown/plain/TOON renderings also changed shape, from
+  `trigger (N nodes, M edges)` to the actual topology.
+
 - **BREAKING: `remember()` stores an Event, not an Observation — every surface
   now agrees.** `deja remember` and the bindings wrote an **Observation** while
   the MCP `dejadb_remember` tool wrote an **Event**, for the same input. One
@@ -73,11 +111,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Shipped on the CLI (`deja run-trace` / `runs-touching`), MCP
   (`dejadb_run_trace` / `dejadb_runs_touching`), Python and Node.
 
+  The write half ships with it: `remember()` takes a `run_id` on every surface
+  (`deja remember --run-id`, the MCP tool's `run_id`, `run_id=` / `runId`), and
+  `Capture` carries it. Without that, `run_id` was settable only by building an
+  `Event` in Rust — so every non-Rust caller could ask which grains belonged to
+  a run but had no way to put one there, and the reads answered empty by
+  construction.
+
   Two narrow index tables back it: `prov_idx` (parent address → derived grains)
   and `run_idx` (run_id → grains). Deliberately not triple rows —
   `derived_from` sits on *every* grain, so indexing it as triples would inflate
-  the index that recall scans. **Existing files need `deja reindex`**, which now
-  also backfills these and the `related_to` cross-links.
+  the index that recall scans.
+
+  **A file written before these indexes existed heals itself on open**, the way
+  a pre-BM25-rewrite file already rebuilds its postings, and says so through
+  `open_warnings()`. Leaving it to a manual `deja reindex` would have made the
+  worst failure available the default: an unindexed file answers every
+  provenance and run question with an empty result, which is indistinguishable
+  from an honest "nothing was derived from this". A `link_index` file-truth
+  records the state — emptiness alone cannot tell "never indexed" from "nothing
+  to index" — and a version bump re-heals if what the indexes hold ever widens.
+  `deja reindex` still rebuilds on demand, and so do `reindex_links()` /
+  `reindexLinks()` on Python and Node.
 
 - **`grains_derived_from` no longer reads the whole store.** It scanned and
   deserialized **every grain** on each call, so one provenance question cost
@@ -204,6 +259,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`forget` left the join's indexes behind, and a reused `seq` inherited
+  them.** `forget` reconciles every index — triples, osp, embeddings, threads,
+  postings, heads, entity_latest — but the two new tables were not added to
+  that list. `seq` is re-derived as `MAX(seq)+1` on open, so forgetting the
+  newest grain hands its seq to the next write, and the orphaned row then
+  re-attached a completely unrelated grain to the forgotten one's parent and
+  run: `grains_derived_from` returned a grain with no `derived_from` at all,
+  and `run_trace` returned one that was never in the run.
+
+- **`step_actions` returned an arbitrary subset in an arbitrary order.** With
+  no `node_id`, the predicate set comes from a dictionary prefix scan over a
+  `HashMap` and each predicate was queried and capped separately, so results
+  arrived grouped by node in an order that varied per process — and the cap
+  kept whichever group came first rather than the newest records. Documented as
+  "newest first", which it now is.
+
+- **`WITH multi_hop(n)` only walked forward.** Entities were harvested from a
+  result's `subject` *and* `object` but each was re-anchored as a subject only,
+  so an entity reached through the object position was a dead end: "who else
+  reports to this manager" — one hop, the archetypal graph question — returned
+  nothing, while the forward direction worked and made the feature look
+  correct. Each entity is now followed both ways, the reverse leg via the OSP
+  index (so it covers the relations the file declares entity-valued, the same
+  rule every other reverse traversal follows). New: `grains_by_object`.
+
+- **A State's common context was dropped instead of merely yielding.** The
+  §8.3 snapshot rightly owns the `ctx` wire key, but the §6.1 common context
+  was then discarded with no error — and that is where `merge_heads` records
+  merge parents and the importers record provenance, so a merged or imported
+  State lost that record at the blob boundary. It now rides in `cctx` and
+  `to_state()` restores it. Only a colliding type pays; a Fact still keeps its
+  common context in `ctx`.
+
+- **`WITH auto_relate` warned under a code that means something else.** It
+  reused `CAL-W004`, which is `UnknownExtensionOption` — a code has to locate
+  one variant to be worth reporting. Now `CAL-W013`. The message also carried
+  three runs of ~22 spaces from a string literal missing its line
+  continuations.
+
 - **Dead code removed.** Deleted `GoalTree`, `GoalNode`, `StateDiff` and the `AutoRelated` engine
   event — declarations with no constructor, caller, test or doc reference
   anywhere in the tree.
@@ -227,7 +321,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`WITH auto_relate` says it is not implemented.** Parsed and accepted since
   1.0, never consumed by any store path. It stays in the grammar — it is
   documented, and removing it would turn working queries into parse errors —
-  but now emits CAL-W004 instead of silently doing nothing.
+  but now emits CAL-W013 instead of silently doing nothing.
 
 - **`GrainTypeMeta::addable` renamed to `add_via_set`, and its doc corrected.**
   The field claimed to gate "creation via `ADD` / the `add` HTTP+SDK path", but

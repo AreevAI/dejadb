@@ -788,3 +788,93 @@ fn an_inline_shorthand_can_be_aliased_alongside_another_format() {
     assert!(s.contains("structured"), "{s}");
     assert!(s.contains("oneliner"), "{s}");
 }
+
+#[test]
+fn multi_hop_follows_a_relation_in_both_directions() {
+    // Entities are harvested from a result's `subject` *and* `object`, but
+    // expansion used to re-anchor each one as a subject only. So "who else
+    // reports to this manager" — reaching an entity through the object position
+    // and looking back — returned nothing, and multi_hop looked like it worked
+    // because the forward direction did.
+    let (ex, facade, _d) = setup();
+    for q in [
+        r#"ADD fact SET subject = "alice" SET relation = "reports_to" SET object = "carol" REASON "seed""#,
+        r#"ADD fact SET subject = "bob" SET relation = "reports_to" SET object = "carol" REASON "seed""#,
+        r#"ADD fact SET subject = "carol" SET relation = "part_of" SET object = "platform" REASON "seed""#,
+    ] {
+        ex.execute(q, &facade).unwrap();
+    }
+
+    let out = ex
+        .execute(
+            r#"RECALL facts WHERE subject = "alice" LIMIT 20 WITH multi_hop(2)"#,
+            &facade,
+        )
+        .unwrap();
+    let s = serde_json::to_value(&out.result).unwrap().to_string();
+
+    assert!(
+        s.contains("platform"),
+        "forward hop alice -> carol -> platform must be reached: {s}"
+    );
+    assert!(
+        s.contains("bob"),
+        "reverse hop carol <- bob must be reached: {s}"
+    );
+}
+
+#[test]
+fn auto_relate_warns_under_its_own_code_and_reads_cleanly() {
+    let (ex, facade, _d) = setup();
+    let out = ex
+        .execute(
+            r#"ADD fact SET subject = "a" SET relation = "knows" SET object = "b" WITH auto_relate REASON "r""#,
+            &facade,
+        )
+        .unwrap();
+
+    let w = out
+        .warnings
+        .iter()
+        .find(|w| w.contains("auto_relate"))
+        .unwrap_or_else(|| panic!("expected an auto_relate warning, got {:?}", out.warnings));
+
+    assert!(w.starts_with("CAL-W013:"), "{w}");
+    assert!(
+        !w.contains("CAL-W004"),
+        "W004 is UnknownExtensionOption; a code must locate one variant: {w}"
+    );
+    assert!(
+        !w.contains("  "),
+        "a broken line continuation left runs of spaces in the message: {w:?}"
+    );
+}
+
+#[test]
+fn a_workflow_name_is_stored_once_and_readably() {
+    // `name` used to be written twice: verbatim at top level *and* inside the
+    // common context, where `common.context` compacts its keys and the reader
+    // reverses only the `int:*` profile set — so the second copy came back as
+    // the unreadable short code `skname`.
+    let (ex, facade, _d) = setup();
+    let added = ex
+        .execute(
+            r#"ADD workflow "CI pipeline" graph build -> test REASON "seed""#,
+            &facade,
+        )
+        .unwrap();
+    let hash = added_hash(&added.result);
+
+    let got = ex
+        .execute(r#"RECALL workflows RECENT 5"#, &facade)
+        .unwrap();
+    let v = serde_json::to_value(&got.result).unwrap();
+    let s = v.to_string();
+
+    assert!(s.contains(&hash), "the workflow must come back: {s}");
+    assert!(s.contains("CI pipeline"), "the name must survive: {s}");
+    assert!(
+        !s.contains("skname"),
+        "a compacted duplicate leaked into the context map: {s}"
+    );
+}

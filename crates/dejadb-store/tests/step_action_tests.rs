@@ -257,3 +257,46 @@ fn a_file_needing_a_newer_reader_warns_at_open() {
         "open must say the file needs a newer reader, got {w:?}"
     );
 }
+
+#[test]
+fn step_actions_are_newest_first_across_nodes_and_stable_under_a_cap() {
+    // With no `node_id` the predicate set comes from a dictionary prefix scan
+    // over a HashMap, and each predicate was queried and capped on its own. So
+    // results arrived grouped by node in an order that varied per process, and
+    // the cap then kept whichever group happened to come first — not the newest
+    // records. Interleave the nodes in time so per-node grouping cannot pass.
+    let (mut m, _d) = open_mem();
+    let wf = plan(&mut m);
+    let build = ran(&mut m, &wf, "build", 1_700_000_001_000);
+    let test = ran(&mut m, &wf, "test", 1_700_000_002_000);
+    let deploy = ran(&mut m, &wf, "deploy", 1_700_000_003_000);
+    let build2 = ran(&mut m, &wf, "build", 1_700_000_004_000);
+
+    let all = m.step_actions("ci", &wf, None, 100).unwrap();
+    assert_eq!(
+        all,
+        vec![
+            ("build".to_string(), build2),
+            ("deploy".to_string(), deploy),
+            ("test".to_string(), test),
+            ("build".to_string(), build),
+        ],
+        "newest first, regardless of which node each record belongs to"
+    );
+
+    // Under a cap the newest survive — not one node's whole group.
+    let capped = m.step_actions("ci", &wf, None, 2).unwrap();
+    assert_eq!(
+        capped,
+        vec![
+            ("build".to_string(), build2),
+            ("deploy".to_string(), deploy)
+        ],
+        "the cap keeps the newest records, not the first predicate scanned"
+    );
+
+    // Same answer every time: nothing here may depend on hash iteration order.
+    for _ in 0..8 {
+        assert_eq!(m.step_actions("ci", &wf, None, 2).unwrap(), capped);
+    }
+}

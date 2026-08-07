@@ -265,6 +265,17 @@ impl DejaDB {
             .map_err(err)
     }
 
+    /// Rebuild the link indexes: reverse provenance, run correlation, and
+    /// `related_to` cross-links. Returns index rows written.
+    ///
+    /// `open()` heals a file that predates these indexes, so this is for
+    /// rebuilding on demand — the counterpart of `reindex_text()`, and what
+    /// `deja reindex` runs.
+    fn reindex_links(&self, py: Python<'_>) -> PyResult<usize> {
+        py.detach(|| self.facade.with_store(|m| m.rebuild_link_indexes()))
+            .map_err(err)
+    }
+
     /// Import another memory system's export. `source`: mem0 | mem0-history |
     /// langgraph | letta | letta-archival | zep | jsonl. `payload` is the
     /// export file's contents; `history` the optional mem0 history payload.
@@ -547,7 +558,8 @@ impl DejaDB {
     /// support are dropped and survivors are stamped `"verified"`.
     ///
     /// The raw text is stored as an **Event** grain (a transcript turn) —
-    /// pass `session_id`/`role` to place it in a conversation thread.
+    /// pass `session_id`/`role` to place it in a conversation thread, and
+    /// `run_id` to place it in a run that `run_trace()` can read back.
     ///
     /// Returns {"event", "facts"} JSON, plus {"model", "proposed",
     /// "dropped", "verification_status"} when a model ran.
@@ -555,7 +567,7 @@ impl DejaDB {
     #[pyo3(signature = (content, facts_json = None, observer = "python".to_string(), ns = None,
                         model = None, llm_cmd = None, ground_model = None, ground_cmd = None,
                         extract_hint = None, min_confidence = None, session_id = None,
-                        role = None))]
+                        role = None, run_id = None))]
     fn remember(
         &self,
         py: Python<'_>,
@@ -571,6 +583,7 @@ impl DejaDB {
         min_confidence: Option<f64>,
         session_id: Option<String>,
         role: Option<String>,
+        run_id: Option<String>,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         // Held across a network round trip when a model is attached — the
@@ -592,6 +605,7 @@ impl DejaDB {
                 observer: Some(observer.as_str()),
                 session_id: session_id.as_deref(),
                 role: role.as_deref(),
+                run_id: run_id.as_deref(),
             };
             let event = self
                 .facade

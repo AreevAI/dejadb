@@ -400,6 +400,33 @@ def test_reindex_text_returns_count(tmp_path):
     assert isinstance(m.reindex_text(), int)
 
 
+def test_reindex_links_rebuilds_the_join_indexes(tmp_path):
+    # The counterpart of reindex_text: without it a Python-only user had no way
+    # to backfill a file whose provenance and run indexes predate this build.
+    m = make_db(tmp_path)
+    m.remember("the caller asked about refunds", run_id="run-a")
+    rows = m.reindex_links()
+    assert isinstance(rows, int)
+    # Idempotent: the tables are cleared and rebuilt, never appended to.
+    assert m.reindex_links() == rows
+    assert len(json.loads(m.run_trace("run-a"))["trace"]) == 1
+
+
+def test_remember_can_place_a_turn_in_a_run(tmp_path):
+    # run_trace/run_yield/runs_touching shipped without any way to *write* a
+    # run_id, so from Python they could only ever answer "nothing".
+    m = make_db(tmp_path)
+    m.remember("the caller asked about refunds", run_id="run-a")
+    m.remember("the agent quoted the 30-day policy", run_id="run-a")
+    m.remember("unrelated turn", run_id="run-b")
+
+    trace = json.loads(m.run_trace("run-a"))
+    assert trace["run_id"] == "run-a"
+    assert len(trace["trace"]) == 2
+    assert len(json.loads(m.run_trace("run-b"))["trace"]) == 1
+    assert json.loads(m.run_trace("no-such-run"))["trace"] == []
+
+
 def test_passphrase_roundtrip_and_wrong_key(tmp_path):
     path = str(tmp_path / "enc.db")
     m = dejadb.DejaDB(path, ns="caller", passphrase="correct horse battery staple")

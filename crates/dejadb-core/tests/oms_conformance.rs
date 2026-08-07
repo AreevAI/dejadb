@@ -504,6 +504,45 @@ fn state_context_is_not_clobbered_by_common_context() {
         ctx.get("source").is_none(),
         "common.context leaked into the State snapshot: {ctx}"
     );
+
+    // Yielding `ctx` is not the same as being discarded. The common context
+    // moves to `cctx`, because it is where `merge_heads` records merge parents
+    // and the importers record provenance — losing it at the blob boundary
+    // would lose that record with no error.
+    let common = back
+        .fields
+        .get("common_context")
+        .expect("common.context must survive under its own key");
+    assert_eq!(common["source"], "unit-test");
+
+    // And it comes back on the typed side as the common context, not as the
+    // snapshot — reading the wrong one hands the caller agent state as metadata.
+    let st2 = back.to_state().unwrap();
+    assert_eq!(st2.context_data["label"], "planning_phase");
+    assert_eq!(
+        st2.common.context.as_ref().unwrap()["source"],
+        "unit-test",
+        "to_state must restore the common context from `cctx`"
+    );
+}
+
+/// Every other grain type keeps the §6.1 common context in `ctx` — only State
+/// collides, so only State pays for the move. A Fact must not sprout `cctx`.
+#[test]
+fn only_a_colliding_type_uses_the_alternate_context_key() {
+    let mut f = Fact::new("alice", "prefers", "rust");
+    f.common.context = Some(serde_json::json!({ "source": "unit-test" }));
+    f.common.created_at = Some(FIXED_AT);
+
+    let (blob, _hash) = serialize_grain(&f).unwrap();
+    let back = deserialize_blob(&blob).unwrap();
+
+    assert_eq!(back.fields["context"]["source"], "unit-test");
+    assert!(
+        !back.fields.contains_key("common_context"),
+        "a non-colliding type must keep the common context in `ctx`: {:?}",
+        back.fields
+    );
 }
 
 /// `related_to` serializes its entries with compacted keys (`h`/`rl`/`w`), and

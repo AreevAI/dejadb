@@ -411,12 +411,33 @@ const ADD_JSON_KNOWN_FIELDS: &[&str] = &[
         "derived_from",
     ];
 
+/// The §6.1 common context built from input keys no builder consumes.
+///
+/// Disjoint from [`collect_extra_fields`] by construction, and that is the
+/// point: the two used to overlap, so any key neither list claimed was written
+/// **twice** — once verbatim at top level and once inside `ctx`. The `ctx` copy
+/// was the harmful one: `common.context` compacts its keys on write and the
+/// reader only reverses the restricted `int:*` profile set, so it came back as
+/// an unreadable short code — `priority` as `pri`, `name` as `skname`, `status`
+/// as `ast`. Nothing could read those, and every grain paid the bytes.
+///
+/// A key now lands in exactly one place: the typed field or `extra_fields` if a
+/// builder claims it, `ctx` only for the common-field names that no builder
+/// consumes (validity bounds, ref lists, and the like), which is where they
+/// already were.
 fn collect_context_extras(
     fields: &serde_json::Map<String, serde_json::Value>,
+    grain_type: &str,
 ) -> Option<serde_json::Value> {
+    let type_known = type_known_fields(grain_type);
     let extras: serde_json::Map<String, serde_json::Value> = fields
         .iter()
-        .filter(|(k, v)| !ADD_JSON_KNOWN_FIELDS.contains(&k.as_str()) && !v.is_null())
+        .filter(|(k, v)| {
+            !v.is_null()
+                && COMMON_KNOWN_FIELDS.contains(&k.as_str())
+                && !ADD_JSON_KNOWN_FIELDS.contains(&k.as_str())
+                && !type_known.contains(&k.as_str())
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     if extras.is_empty() {
@@ -495,7 +516,7 @@ pub fn build_grain_from_json<S: GrainSink>(
                         g = g.tags(tag_strs);
                     }
                 }
-                if let Some(extra) = collect_context_extras(fields) {
+                if let Some(extra) = collect_context_extras(fields, grain_type) {
                     let mut ctx = match g.common().context.clone() {
                         Some(serde_json::Value::Object(m)) => m,
                         _ => serde_json::Map::new(),

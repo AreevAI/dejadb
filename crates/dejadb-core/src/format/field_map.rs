@@ -19,6 +19,10 @@ static FIELD_MAP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
     m.insert("system_valid_from", "svf");
     m.insert("system_valid_to", "svt");
     m.insert("context", "ctx");
+    // Where the §6.1 common context goes when the type-specific `context` field
+    // already owns `ctx` — State (§8.3) is the only such type. Written only in
+    // that collision, so no other grain type's blob gains a key.
+    m.insert("common_context", "cctx");
     m.insert("superseded_by", "sb");
     m.insert("importance", "im");
     m.insert("author_did", "adid");

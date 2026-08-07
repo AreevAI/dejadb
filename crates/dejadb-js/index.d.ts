@@ -33,6 +33,15 @@ export declare class DejaDb {
    */
   reindexText(): Promise<number>
   /**
+   * Rebuild the link indexes: reverse provenance, run correlation, and
+   * `related_to` cross-links. Returns index rows written.
+   *
+   * `open()` heals a file that predates these indexes, so this is for
+   * rebuilding on demand — the counterpart of `reindexText()`, and what
+   * `deja reindex` runs.
+   */
+  reindexLinks(): Promise<number>
+  /**
    * Anthropic memory-tool command (view/create/str_replace/insert/delete/
    * rename over /memories): pass the tool-call object as JSON; returns the
    * tool result text. Wire this as your memory-tool backend.
@@ -84,7 +93,7 @@ export declare class DejaDb {
    * Returns {"event", "facts"} JSON, plus {"model", "proposed",
    * "dropped", "verification_status"} when a model ran.
    */
-  remember(content: string, factsJson?: string | undefined | null, observer?: string | undefined | null, ns?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, extractHint?: string | undefined | null, minConfidence?: number | undefined | null, sessionId?: string | undefined | null, role?: string | undefined | null): Promise<string>
+  remember(content: string, factsJson?: string | undefined | null, observer?: string | undefined | null, ns?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, extractHint?: string | undefined | null, minConfidence?: number | undefined | null, sessionId?: string | undefined | null, role?: string | undefined | null, runId?: string | undefined | null): Promise<string>
   /** Execute CAL. Returns the wire-format payload as a JSON string. */
   cal(query: string): Promise<string>
   /** Supersession-chain history for (subject, relation), newest first. */

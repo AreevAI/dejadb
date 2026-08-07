@@ -126,6 +126,7 @@ and are the source of truth. Ranges:
 | `CAL-E117`–`E119` | Template limits and inheritance (OMS CAL §10.7–§10.8) |
 | `CAL-E120` | Invalid JSON+CAL |
 | `CAL-W001`–`W012` | Warnings (unknown relation, deprecated operator, `{{#each}}` cap, bounded `CONTRADICTIONS` scan, …) |
+| `CAL-W013` | `WITH auto_relate` accepted but not implemented — no relations are inferred |
 
 `CAL-E116` is the "needs an external LLM, not implemented" error for
 `WITH hyde` / `WITH llm_rerank` — DejaDB takes no LLM dependency by policy.

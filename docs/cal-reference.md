@@ -276,7 +276,7 @@ Omitting `SET namespace = ...` stores the grain in the session namespace.
 
 `ADD` intelligence options: `WITH extract_memories` (decompose content into
 atomic facts), `WITH extract_event_date`, `WITH sync`. `WITH auto_relate`
-parses but is **not implemented** — it infers no relations and emits CAL-W004.
+parses but is **not implemented** — it infers no relations and emits CAL-W013.
 Link grains explicitly via `related_to`, or widen at read time with
 `WITH multi_hop(n)`.
 There is also an `ADD workflow "name" ... graph ... BIND ... REASON "..."`

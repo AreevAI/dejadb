@@ -475,6 +475,15 @@ pub struct Capture<'a> {
     /// `user` | `assistant` | `system` | `tool`. Unrecognized values are
     /// dropped rather than rejected.
     pub role: Option<&'a str>,
+    /// OMS §8.2 `run_id` — the correlation key `run_trace`, `run_yield` and
+    /// `runs_touching` read back.
+    ///
+    /// Without this on the capture path, `run_id` was writable only by
+    /// constructing an `Event` in Rust, so the run-history reads were
+    /// unreachable by construction from the CLI, MCP and both bindings: they
+    /// could ask which grains belong to a run, but nothing they could call ever
+    /// put a grain in one.
+    pub run_id: Option<&'a str>,
 }
 
 /// Result of `DejaDB::remember`.
@@ -578,6 +587,21 @@ const LEGACY_MAX_GRAIN_BYTE: u8 = 0x0B;
 /// that shipped before the check existed — for those the only safe posture is
 /// not to sync a file containing new grain types.
 const MIN_READER_VERSION_KEY: &str = "min_reader_version";
+
+/// File-truth: the link indexes (`prov_idx`, `run_idx`, `related_to`
+/// cross-links) are built and current for every grain in this file.
+///
+/// Its absence — not the tables being empty — is what marks a file written
+/// before those indexes existed. A file can legitimately have zero rows in all
+/// three (no grain carries `derived_from`, `run_id` or `related_to`), so
+/// emptiness cannot tell "never indexed" from "nothing to index", and guessing
+/// wrong either re-scans the corpus on every open or answers provenance
+/// questions with silence forever.
+const LINK_INDEX_KEY: &str = "link_index";
+
+/// Bumped when a change to what the link indexes contain requires a rebuild of
+/// files stamped with an earlier value.
+const LINK_INDEX_VERSION: &str = "1";
 
 /// Open options.
 pub struct DejaDbOptions {
@@ -1279,7 +1303,17 @@ impl DejaDB {
         })?;
 
         // Load dictionary + counters.
-        let (dict, next_term, next_seq, next_op, hlc_last, fts_docs, fts_total_len, indexed_text) =
+        let (
+            dict,
+            next_term,
+            next_seq,
+            next_op,
+            hlc_last,
+            fts_docs,
+            fts_total_len,
+            indexed_text,
+            grain_count,
+        ) =
             rt.block_on(async {
             let mut dict = HashMap::new();
             let mut next_term = 1i64;
@@ -1310,8 +1344,10 @@ impl DejaDB {
             let fts_docs = one("SELECT COUNT(*) FROM fts_doc").await?;
             let fts_total_len = one("SELECT COALESCE(SUM(len),0) FROM fts_doc").await?;
             let indexed_text = one("SELECT COUNT(*) FROM grains WHERE text IS NOT NULL").await?;
+            let grain_count = one("SELECT COUNT(*) FROM grains").await?;
             Ok::<_, DejaDbError>((
                 dict, next_term, next_seq, next_op, hlc_last, fts_docs, fts_total_len, indexed_text,
+                grain_count,
             ))
         })?;
 
@@ -1392,6 +1428,32 @@ impl DejaDB {
                  BM25 leg used Turso's experimental FTS index, which is no longer used. \
                  One-time; later opens skip it"
             ));
+        }
+
+        // Same reasoning for the link indexes (`prov_idx`, `run_idx`, and the
+        // `related_to` cross-link triples). A file written before they existed
+        // answers every provenance and run question with an empty result, which
+        // is indistinguishable from an honest "nothing derived from this" — so
+        // heal on open rather than leaving it to a `deja reindex` the caller has
+        // no way to know they need.
+        //
+        // The stamp is what makes this decidable: emptiness alone cannot
+        // distinguish "never indexed" from "nothing to index". A stamp that
+        // does not match the current version heals too, so widening what the
+        // indexes hold is a constant bump rather than a migration.
+        if meta.get(LINK_INDEX_KEY).map(String::as_str) != Some(LINK_INDEX_VERSION) {
+            if grain_count > 0 {
+                let rows = store.rebuild_link_indexes()?;
+                store.warnings.push(format!(
+                    "link indexes rebuilt on open ({rows} rows across {grain_count} grains): this \
+                     file was written before reverse provenance, run correlation and related_to \
+                     cross-links were indexed. One-time; later opens skip it"
+                ));
+            } else {
+                // Nothing to build, but stamp anyway so the next open of a file
+                // that has since been written to does not re-scan it.
+                store.meta_put(LINK_INDEX_KEY, LINK_INDEX_VERSION)?;
+            }
         }
 
         Ok(store)
@@ -2152,6 +2214,8 @@ impl DejaDB {
             conn.execute("COMMIT", ()).await.map_err(db_err)?;
             Ok::<_, DejaDbError>(n)
         })?;
+        // Declare the file current, so open() stops re-scanning it.
+        self.meta_put(LINK_INDEX_KEY, LINK_INDEX_VERSION)?;
         Ok(written)
     }
 
@@ -2273,9 +2337,17 @@ impl DejaDB {
                         runs.push(r.to_string());
                     }
                 }
-                // Up: the grain this one was derived from.
+                // Up: the grain this one was derived from. Namespace-filtered
+                // like the downward leg — a lineage walk that stays in `ns` in
+                // one direction and leaves it in the other reports runs the
+                // caller did not ask about.
                 if let Some(p) = g.get_str("derived_from").and_then(|p| Hash::from_hex(p).ok()) {
-                    if visited.insert(p) {
+                    if !visited.contains(&p)
+                        && self
+                            .get(&p)
+                            .is_ok_and(|pg| pg.get_str("namespace") == Some(ns))
+                    {
+                        visited.insert(p);
                         next.push(p);
                     }
                 }
@@ -2753,6 +2825,17 @@ impl DejaDB {
                 conn.execute("DELETE FROM thread_idx WHERE seq=?1", (pi(seq),))
                     .await
                     .map_err(db_err)?;
+                // The join's two indexes, for the same reason every other index
+                // is reconciled here. `seq` is re-derived as MAX(seq)+1 on open,
+                // so forgetting the newest grain hands its seq to the next write
+                // — a surviving row would then re-attach a stranger to this
+                // grain's parent or run.
+                conn.execute("DELETE FROM prov_idx WHERE seq=?1", (pi(seq),))
+                    .await
+                    .map_err(db_err)?;
+                conn.execute("DELETE FROM run_idx WHERE seq=?1", (pi(seq),))
+                    .await
+                    .map_err(db_err)?;
                 // Postings too, or a forgotten grain's words keep answering
                 // free-text recall — a tombstone that leaves the text findable
                 // is not a tombstone.
@@ -2967,31 +3050,40 @@ impl DejaDB {
         // The OSP index is keyed (ns, o, s) — the link's object is the workflow
         // hash, so this reads the reverse direction directly.
         let rows = self.rt.block_on(async {
-            let mut out: Vec<(i64, i64)> = Vec::new();
+            let mut out: Vec<(i64, i64, i64)> = Vec::new();
             for p in &pred_ids {
                 let mut r = conn
                     .query(
-                        "SELECT s, p FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1
+                        "SELECT seq, s, p FROM osp WHERE ns=?1 AND o=?2 AND p=?3 AND cur=1
                          ORDER BY seq DESC LIMIT ?4",
                         (pi(ns_id), pi(target_id), pi(*p), pi(limit as i64)),
                     )
                     .await
                     .map_err(db_err)?;
                 while let Some(row) = r.next().await.map_err(db_err)? {
-                    let (Some(s), Some(p)) = (
+                    let (Some(seq), Some(s), Some(p)) = (
                         v_i64(&row.get_value(0).map_err(db_err)?),
                         v_i64(&row.get_value(1).map_err(db_err)?),
+                        v_i64(&row.get_value(2).map_err(db_err)?),
                     ) else {
                         continue;
                     };
-                    out.push((s, p));
+                    out.push((seq, s, p));
                 }
             }
             Ok::<_, DejaDbError>(out)
         })?;
 
+        // Each predicate was queried and capped separately, and with no
+        // `node_id` the predicate set comes from a dictionary scan whose order
+        // is a HashMap's — i.e. no order at all. Sort by seq before truncating,
+        // or "newest first" is false across nodes and *which* records survive
+        // the cap changes from one process to the next.
+        let mut rows = rows;
+        rows.sort_unstable_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
+
         let mut result = Vec::with_capacity(rows.len());
-        for (s, p) in rows {
+        for (_, s, p) in rows {
             let (Some(subj), Some(rel)) = (self.term_str(s), self.term_str(p)) else {
                 continue;
             };
@@ -3015,6 +3107,46 @@ impl DejaDB {
             .filter(|(term, _)| term.starts_with(prefix))
             .map(|(term, id)| (*id, term.clone()))
             .collect()
+    }
+
+    /// Grains that name `object` in their object position, newest first.
+    ///
+    /// The mirror of an anchored `recall_hybrid(ns, Some(subject), …)`: that
+    /// answers "what does X point at", this answers "what points at X". Reads
+    /// the OSP reverse index, so — like `related(Direction::In)` and for the
+    /// same reason — it sees only relations the file declares as entity
+    /// relations (`DejaDbOptions::entity_relations`). Reverse lookup over every
+    /// relation would need a third full permutation of `triples`, which is the
+    /// index the "2½ permutations" design exists to avoid.
+    pub fn grains_by_object(
+        &mut self,
+        ns: &str,
+        object: &str,
+        limit: usize,
+    ) -> Result<Vec<DeserializedGrain>> {
+        let (Some(ns_id), Some(obj_id)) = (self.term_lookup(ns), self.term_lookup(object)) else {
+            return Ok(Vec::new());
+        };
+        let limit = limit.min(1024) as i64;
+        let conn = &self.conn;
+        let blobs = self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT g.blob FROM osp o JOIN grains g ON g.seq = o.seq
+                     WHERE o.ns = ?1 AND o.o = ?2 AND o.cur = 1 ORDER BY o.seq DESC LIMIT ?3",
+                    (pi(ns_id), pi(obj_id), pi(limit)),
+                )
+                .await
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.map_err(db_err)? {
+                if let Some(b) = v_blob(&row.get_value(0).map_err(db_err)?) {
+                    out.push(b);
+                }
+            }
+            Ok::<_, DejaDbError>(out)
+        })?;
+        blobs.iter().map(|b| deserialize_blob(b)).collect()
     }
 
     /// Bounded k-hop traversal over the given relations.
@@ -4108,6 +4240,7 @@ impl DejaDB {
         e.common.namespace = Some(ns.to_string());
         e.session_id = meta.session_id.map(str::to_string);
         e.role = meta.role.and_then(Role::from_str);
+        e.run_id = meta.run_id.filter(|r| !r.is_empty()).map(str::to_string);
         // Event has no observer field (it models a transcript turn, where
         // `role` is the author). Who *captured* the turn is still worth
         // keeping, so it rides in extra_fields, which round-trips through the

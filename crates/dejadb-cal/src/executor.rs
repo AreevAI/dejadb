@@ -4187,8 +4187,12 @@ fn build_add_options(opts: &[AddWithOption], warnings: &mut Vec<String>) -> AddO
                 // It stays in the grammar (it is documented, and removing it
                 // would turn working queries into parse errors) but now says so
                 // instead of pretending.
+                // CAL-W013, not W004: W004 is UnknownExtensionOption, and a code
+                // has to locate exactly one variant to be worth reporting.
                 warnings.push(
-                    "CAL-W004: WITH auto_relate is accepted but not implemented —                      no relations are inferred. Link grains explicitly with                      related_to, or use WITH multi_hop(n) on recall to widen                      through the entity graph."
+                    "CAL-W013: WITH auto_relate is accepted but not implemented — no relations \
+                     are inferred. Link grains explicitly with related_to, or use WITH \
+                     multi_hop(n) on recall to widen through the entity graph."
                         .to_string(),
                 );
                 options.auto_relate = Some(true);

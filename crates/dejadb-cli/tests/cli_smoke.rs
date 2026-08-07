@@ -459,3 +459,43 @@ fn cli_run_join_verbs() {
     assert!(!ok, "a malformed hash must fail");
     assert!(!err.is_empty());
 }
+
+/// `deja remember --run-id` closes the loop on the run/memory join: before it,
+/// no CLI verb could put a grain in a run, so `run-trace` could only ever print
+/// "no grains recorded" and the index behind it was unreachable from the shell.
+#[test]
+fn remember_run_id_is_readable_by_run_trace() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("runid.db");
+    let db = db.to_str().unwrap();
+
+    for text in ["caller asked about refunds", "agent quoted the 30-day policy"] {
+        let (ok, _, err) = deja(&[
+            "remember", "--db", db, "--ns", "ops", "--content", text, "--run-id", "run-a",
+        ]);
+        assert!(ok, "remember --run-id failed: {err}");
+    }
+    let (ok, _, err) = deja(&[
+        "remember", "--db", db, "--ns", "ops", "--content", "different run", "--run-id", "run-b",
+    ]);
+    assert!(ok, "remember failed: {err}");
+
+    let (ok, out, err) = deja(&["run-trace", "--db", db, "--ns", "ops", "--run-id", "run-a"]);
+    assert!(ok, "run-trace failed: {err}");
+    assert!(
+        out.contains("recorded during run-a: 2 grain(s)"),
+        "both of run-a's turns must appear, and only those: {out}"
+    );
+
+    let (ok, out_b, err) = deja(&["run-trace", "--db", db, "--ns", "ops", "--run-id", "run-b"]);
+    assert!(ok, "run-trace failed: {err}");
+    assert!(
+        out_b.contains("recorded during run-b: 1 grain(s)"),
+        "runs must not bleed into each other: {out_b}"
+    );
+
+    // An unknown run still answers cleanly rather than erroring.
+    let (ok, out, _) = deja(&["run-trace", "--db", db, "--ns", "ops", "--run-id", "nope"]);
+    assert!(ok);
+    assert!(out.contains("no grains recorded"), "{out}");
+}

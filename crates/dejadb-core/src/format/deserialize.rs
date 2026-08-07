@@ -436,7 +436,10 @@ fn msgpack_to_json(value: &Value, mode: KeyMode) -> Result<serde_json::Value> {
                         // Only the `context` field's immediate keys carry the
                         // restricted int:* reversal; everything else is verbatim.
                         let child = match expanded.as_str() {
-                            "context" => KeyMode::ContextTop,
+                            // `common_context` holds a §6.1 common context that
+                            // yielded `ctx` to a type-specific field, so its keys
+                            // were compacted the same way and reverse the same way.
+                            "context" | "common_context" => KeyMode::ContextTop,
                             "edges" => KeyMode::WorkflowEdgeArray,
                             "related_to" => KeyMode::RelatedToArray,
                             _ => KeyMode::Verbatim,
@@ -1197,13 +1200,22 @@ impl DeserializedGrain {
         if let Some(et) = self.get_str("embedding_text") {
             common.embedding_text = Some(et.to_string());
         }
+        // The §6.1 common context. For a State it rides in `cctx`, because the
+        // §8.3 snapshot owns `ctx`; for every other type `ctx` *is* the common
+        // context. Reading the wrong one for a State would hand the caller the
+        // agent's snapshot as if it were grain metadata.
+        common.context = match self.fields.get("common_context") {
+            Some(c) => Some(c.clone()),
+            None if self.grain_type != GrainType::State => self.fields.get("context").cloned(),
+            None => None,
+        };
     }
 
     /// Reconstruct a [`State`] (OMS §8.3).
     ///
     /// `context` is the snapshot; its inner keys were never compacted, so they
-    /// come back verbatim. Note this does NOT restore `common.context` — for a
-    /// State the two share the wire key `ctx` and the snapshot owns it.
+    /// come back verbatim. For a State the snapshot owns the `ctx` wire key, so
+    /// the §6.1 common context rides in `cctx` and is restored from there.
     pub fn to_state(&self) -> Result<State> {
         if self.grain_type != GrainType::State {
             return Err(DejaDbError::Validation("not a State grain".into()));

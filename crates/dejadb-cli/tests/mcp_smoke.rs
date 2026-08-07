@@ -35,13 +35,19 @@ fn mcp_round_trip() {
             "fields": {"subject": "alice", "relation": "prefers", "object": "tea", "confidence": 0.95}}})),
         rpc(4, "tools/call", serde_json::json!({"name": "dejadb_recall", "arguments": {"subject": "alice"}})),
         rpc(5, "tools/call", serde_json::json!({"name": "dejadb_remember", "arguments": {
-            "content": "caller asked about refunds", "session_id": "call-1", "role": "user"}})),
+            "content": "caller asked about refunds", "session_id": "call-1", "role": "user",
+            "run_id": "run-a"}})),
         rpc(6, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
             "query": "RECALL facts WHERE subject = \"alice\" | COUNT"}})),
         rpc(7, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
             "query": "DELETE sha256:abc"}})),
         rpc(8, "tools/call", serde_json::json!({"name": "dejadb_waiser", "arguments": {}})),
         rpc(9, "ping", serde_json::json!({})),
+        // The remembered turn must be readable back through the run join —
+        // dejadb_remember had no run_id, so dejadb_run_trace could only ever
+        // answer empty over MCP.
+        rpc(10, "tools/call", serde_json::json!({"name": "dejadb_run_trace", "arguments": {
+            "run_id": "run-a"}})),
     ];
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -56,8 +62,8 @@ fn mcp_round_trip() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 9 requests (the notification gets no response)
-    assert_eq!(lines.len(), 9, "one response per request");
+    // 10 requests (the notification gets no response)
+    assert_eq!(lines.len(), 10, "one response per request");
 
     let by_id = |id: u64| lines.iter().find(|v| v["id"] == id).unwrap();
 
@@ -96,6 +102,16 @@ fn mcp_round_trip() {
     assert!(waiser["pending"].is_array());
 
     assert!(by_id(9)["result"].is_object());
+
+    // The turn remembered under run-a comes back through the run join.
+    let trace_text = by_id(10)["result"]["content"][0]["text"].as_str().unwrap();
+    let trace: serde_json::Value = serde_json::from_str(trace_text).unwrap();
+    assert_eq!(trace["run_id"], "run-a");
+    assert_eq!(
+        trace["trace"].as_array().map(Vec::len),
+        Some(1),
+        "the remembered turn must be in its run: {trace}"
+    );
 }
 
 /// `--lock-ns` pins the session: a caller-supplied `namespace` in tool

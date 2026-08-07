@@ -685,6 +685,14 @@ impl CalStoreFacade for DejaDbFacade {
         // object terms), anchor a fresh recall on each, and add what comes back
         // to the candidate pool. Repeat `n` times, following the graph outward.
         //
+        // Both directions: an entity is followed as a subject (what does X point
+        // at) *and* as an object (what points at X). Forward-only expansion made
+        // "who else works here" — the archetypal one-hop question — return
+        // nothing, since entities are harvested from the `object` field but were
+        // only ever re-anchored as subjects. The reverse leg reads the OSP index,
+        // so it sees the relations the file declares as entity relations; that is
+        // the same rule every other reverse traversal in the engine follows.
+        //
         // Expansion happens here, before the post-filters and the `LIMIT` below,
         // so hops *compete* for the k slots the caller asked for rather than
         // extending past them. Appended after the first pass, so a direct match
@@ -719,17 +727,20 @@ impl CalStoreFacade for DejaDbFacade {
                     if raw.len() >= budget {
                         break 'hops;
                     }
-                    let Ok(found) = m.recall_hybrid(
-                        ns,
-                        Some(&entity),
-                        None,
-                        params.query.as_deref(),
-                        Self::MULTI_HOP_FANOUT,
-                        None,
-                    ) else {
-                        continue;
-                    };
-                    for g in found {
+                    let forward = m
+                        .recall_hybrid(
+                            ns,
+                            Some(&entity),
+                            None,
+                            params.query.as_deref(),
+                            Self::MULTI_HOP_FANOUT,
+                            None,
+                        )
+                        .unwrap_or_default();
+                    let reverse = m
+                        .grains_by_object(ns, &entity, Self::MULTI_HOP_FANOUT)
+                        .unwrap_or_default();
+                    for g in forward.into_iter().chain(reverse) {
                         if seen.insert(g.hash) {
                             push_entities(&g, &mut visited, &mut next);
                             raw.push(g);
