@@ -66,6 +66,15 @@ pub(crate) trait Db: Send {
     fn begin(&self) -> Result<()>;
     fn commit(&self) -> Result<()>;
     fn rollback(&self) -> Result<()>;
+    /// Whether multi-id reads should batch into one statement (`IN`/`ANY`)
+    /// rather than loop indexed point reads. In-process engines answer false
+    /// — a cached point probe is ~µs and Turso does not optimize a
+    /// parameterized IN on the PK into probes (measured: a table scan per
+    /// call, ~8x on the voice frame path). Networked backends answer true —
+    /// there, the round trip dominates and one batch beats k probes.
+    fn prefers_batched_reads(&self) -> bool {
+        false
+    }
 }
 
 /// Run `f` atomically: BEGIN, then COMMIT on Ok / best-effort ROLLBACK on Err.

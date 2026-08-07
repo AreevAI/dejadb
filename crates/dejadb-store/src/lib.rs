@@ -2228,34 +2228,26 @@ impl DejaDB {
             },
             None => None,
         };
-        let seqs: Vec<i64> = match p_id {
-            Some(p) => self
-                .db
-                .query_hot(
-                    "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND p=?3 AND cur=1 ORDER BY seq DESC LIMIT ?4",
-                    vec![pi(ns_id), pi(s_id), pi(p), pi(k as i64)],
-                )?
-                .iter()
-                .filter_map(|row| row.i64(0))
-                .collect(),
-            None => self
-                .db
-                .query_hot(
-                    "SELECT seq FROM triples WHERE ns=?1 AND s=?2 AND cur=1 ORDER BY seq DESC LIMIT ?3",
-                    vec![pi(ns_id), pi(s_id), pi(k as i64)],
-                )?
-                .iter()
-                .filter_map(|row| row.i64(0))
-                .collect(),
+        // Probe + blob fetch in ONE statement: the join replaces the old
+        // per-seq fetch loop (1 + k round trips), which matters on any
+        // backend where a statement is not a function call.
+        let rows = match p_id {
+            Some(p) => self.db.query_hot(
+                "SELECT g.blob FROM triples t JOIN grains g ON g.seq = t.seq
+                  WHERE t.ns=?1 AND t.s=?2 AND t.p=?3 AND t.cur=1
+                  ORDER BY t.seq DESC LIMIT ?4",
+                vec![pi(ns_id), pi(s_id), pi(p), pi(k as i64)],
+            )?,
+            None => self.db.query_hot(
+                "SELECT g.blob FROM triples t JOIN grains g ON g.seq = t.seq
+                  WHERE t.ns=?1 AND t.s=?2 AND t.cur=1
+                  ORDER BY t.seq DESC LIMIT ?3",
+                vec![pi(ns_id), pi(s_id), pi(k as i64)],
+            )?,
         };
-        let mut out = Vec::with_capacity(seqs.len());
-        for seq in seqs {
-            if let Some(b) = self
-                .db
-                .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
-                .first()
-                .and_then(|row| row.blob(0))
-            {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(b) = row.blob(0) {
                 out.push(deserialize_blob(&b)?);
             }
         }
@@ -2298,23 +2290,14 @@ impl DejaDB {
             (Some(a), Some(b)) => (a, b),
             _ => return Ok(Vec::new()),
         };
-        let seqs: Vec<i64> = self
-            .db
-            .query(
-                "SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2 ORDER BY seq DESC LIMIT ?3",
-                vec![pi(ns_id), pi(sess_id), pi(n as i64)],
-            )?
-            .iter()
-            .filter_map(|row| row.i64(0))
-            .collect();
-        let mut out = Vec::with_capacity(seqs.len());
-        for seq in seqs.into_iter().rev() {
-            if let Some(b) = self
-                .db
-                .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
-                .first()
-                .and_then(|row| row.blob(0))
-            {
+        let rows = self.db.query(
+            "SELECT g.blob FROM thread_idx ti JOIN grains g ON g.seq = ti.seq
+              WHERE ti.ns=?1 AND ti.session=?2 ORDER BY ti.seq DESC LIMIT ?3",
+            vec![pi(ns_id), pi(sess_id), pi(n as i64)],
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            if let Some(b) = row.blob(0) {
                 out.push(deserialize_blob(&b)?);
             }
         }
@@ -2999,39 +2982,72 @@ impl DejaDB {
             1.0
         };
 
-        let mut scores: HashMap<i64, f64> = HashMap::new();
-        for term in terms {
-            // Document length comes back with the posting, so scoring a term
-            // is one query regardless of how many documents contain it.
-            let postings: Vec<(i64, i64, i64)> = self
-                .db
-                .query_hot(
-                    "SELECT p.seq, p.tf, d.len FROM fts_post p
+        // One postings pull for ALL distinct tokens (document length comes
+        // back with the posting). Scoring still iterates the query's tokens
+        // per OCCURRENCE below, so a repeated token contributes twice exactly
+        // as it did when each occurrence was its own query.
+        let mut distinct: Vec<&String> = Vec::new();
+        {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for t in &terms {
+                if seen.insert(t.as_str()) {
+                    distinct.push(t);
+                }
+            }
+        }
+        let mut by_term: HashMap<String, Vec<(i64, i64, i64)>> = HashMap::new();
+        if distinct.len() == 1 || !self.db.prefers_batched_reads() {
+            // In-process: one cached indexed probe per distinct token.
+            for t in &distinct {
+                for row in &self.db.query_hot(
+                    "SELECT v.term, p.seq, p.tf, d.len FROM fts_post p
                       JOIN fts_vocab v ON v.id = p.term
                       JOIN fts_doc d ON d.seq = p.seq
                      WHERE v.term = ?1 AND p.ns = ?2",
-                    vec![pt(&term), pi(ns_id)],
-                )?
-                .iter()
-                .map(|row| {
-                    (
-                        row.i64(0).unwrap_or(0),
-                        row.i64(1).unwrap_or(0),
-                        row.i64(2).unwrap_or(1).max(1),
-                    )
-                })
-                .collect();
-            if postings.is_empty() {
-                continue;
+                    vec![pt(t), pi(ns_id)],
+                )? {
+                    if let (Some(t), Some(seq), Some(tf), Some(dl)) =
+                        (row.text(0), row.i64(1), row.i64(2), row.i64(3))
+                    {
+                        by_term.entry(t.to_string()).or_default().push((seq, tf, dl.max(1)));
+                    }
+                }
             }
+        } else {
+            // Networked backend: all tokens in one round trip.
+            let placeholders: Vec<String> =
+                (2..distinct.len() + 2).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT v.term, p.seq, p.tf, d.len FROM fts_post p
+                  JOIN fts_vocab v ON v.id = p.term
+                  JOIN fts_doc d ON d.seq = p.seq
+                 WHERE p.ns = ?1 AND v.term IN ({})",
+                placeholders.join(",")
+            );
+            let mut params = vec![pi(ns_id)];
+            params.extend(distinct.iter().map(|t| pt(t)));
+            for row in &self.db.query(&sql, params)? {
+                if let (Some(t), Some(seq), Some(tf), Some(dl)) =
+                    (row.text(0), row.i64(1), row.i64(2), row.i64(3))
+                {
+                    by_term.entry(t.to_string()).or_default().push((seq, tf, dl.max(1)));
+                }
+            }
+        }
+
+        let mut scores: HashMap<i64, f64> = HashMap::new();
+        for term in terms {
+            let Some(postings) = by_term.get(&term) else {
+                continue;
+            };
             let df = postings.len() as f64;
             // Robertson/Sparck-Jones idf, +1 inside the log so a term present
             // in every document scores 0 rather than negative.
             let idf = (1.0 + (n_docs - df + 0.5) / (df + 0.5)).ln();
             for (seq, tf, dl) in postings {
-                let tf = tf as f64;
-                let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (dl as f64 / avgdl));
-                *scores.entry(seq).or_insert(0.0) += idf * (tf * (BM25_K1 + 1.0)) / (tf + norm);
+                let tf = *tf as f64;
+                let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (*dl as f64 / avgdl));
+                *scores.entry(*seq).or_insert(0.0) += idf * (tf * (BM25_K1 + 1.0)) / (tf + norm);
             }
         }
         if scores.is_empty() {
@@ -3096,18 +3112,38 @@ impl DejaDB {
         if hashes.is_empty() {
             return Ok(out);
         }
-        for h in hashes {
-            if let Some(sup) = self
-                .db
-                .query_hot(
-                    "SELECT superseded_by FROM grains WHERE hash = ?1",
-                    vec![pb(h.as_bytes().to_vec())],
-                )?
-                .first()
-                .and_then(|row| row.blob(0))
-                .and_then(|b| Hash::try_from_bytes(&b).ok())
-            {
-                out.insert(*h, sup);
+        if !self.db.prefers_batched_reads() {
+            // In-process: indexed point reads on the cached statement.
+            for h in hashes {
+                if let Some(sup) = self
+                    .db
+                    .query_hot(
+                        "SELECT superseded_by FROM grains WHERE hash = ?1",
+                        vec![pb(h.as_bytes().to_vec())],
+                    )?
+                    .first()
+                    .and_then(|row| row.blob(0))
+                    .and_then(|b| Hash::try_from_bytes(&b).ok())
+                {
+                    out.insert(*h, sup);
+                }
+            }
+            return Ok(out);
+        }
+        // Networked backend: the whole candidate set in one round trip.
+        let placeholders: Vec<String> = (1..hashes.len() + 1).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT hash, superseded_by FROM grains
+              WHERE superseded_by IS NOT NULL AND hash IN ({})",
+            placeholders.join(",")
+        );
+        let params: Vec<Value> = hashes.iter().map(|h| pb(h.as_bytes().to_vec())).collect();
+        for row in &self.db.query(&sql, params)? {
+            if let (Some(h), Some(sup)) = (
+                row.blob(0).and_then(|b| Hash::try_from_bytes(&b).ok()),
+                row.blob(1).and_then(|b| Hash::try_from_bytes(&b).ok()),
+            ) {
+                out.insert(h, sup);
             }
         }
         Ok(out)
@@ -3380,12 +3416,27 @@ impl DejaDB {
         };
 
         let mut out = Vec::new();
-        for seq in ordered {
-            if over(&start) {
-                break; // fail-open: partial results beat a blown budget
+        if self.db.prefers_batched_reads() && !ordered.is_empty() && !over(&start) {
+            // Networked backend: one batched blob pull for the whole ranked
+            // set; the deadline still bounds per-candidate deserialization,
+            // so partial results beat a blown budget exactly as before.
+            let blobs = self.blobs_by_seqs(&ordered)?;
+            for seq in ordered {
+                if over(&start) {
+                    break;
+                }
+                if let Some(b) = blobs.get(&seq) {
+                    out.push(deserialize_blob(b)?);
+                }
             }
-            if let Some(b) = self.blob_by_seq(seq)? {
-                out.push(deserialize_blob(&b)?);
+        } else {
+            for seq in ordered {
+                if over(&start) {
+                    break; // fail-open: partial results beat a blown budget
+                }
+                if let Some(b) = self.blob_by_seq(seq)? {
+                    out.push(deserialize_blob(&b)?);
+                }
             }
         }
 
@@ -3644,6 +3695,25 @@ impl DejaDB {
             .query_hot("SELECT blob FROM grains WHERE seq = ?1", vec![pi(seq)])?
             .first()
             .and_then(|row| row.blob(0)))
+    }
+
+    /// Batched blob fetch for a candidate set — one round trip via an inline
+    /// id list (engine-internal seq ids, same rationale as `live_seqs`).
+    /// Only for backends that `prefers_batched_reads`: on the embedded engine
+    /// a parameterized IN over the PK is a table scan (measured ~8x on the
+    /// voice frame path), so the in-process path keeps its point-read loop.
+    fn blobs_by_seqs(&mut self, seqs: &[i64]) -> Result<HashMap<i64, Vec<u8>>> {
+        let mut out = HashMap::new();
+        if seqs.is_empty() {
+            return Ok(out);
+        }
+        let sql = format!("SELECT seq, blob FROM grains WHERE seq IN ({})", seq_csv(seqs));
+        for row in &self.db.query(&sql, vec![])? {
+            if let (Some(s), Some(b)) = (row.i64(0), row.blob(1)) {
+                out.insert(s, b);
+            }
+        }
+        Ok(out)
     }
 
     /// Distinct subjects holding `relation` in `ns` (POS-index scan).
