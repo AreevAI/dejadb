@@ -44,6 +44,55 @@ fn status_from_str(s: &str) -> Option<RecStatus> {
     }
 }
 
+/// Open on the server-tier postgres backend from a
+/// `postgres://…?schema=<name>` DSN, mirroring the file branches (explicit
+/// `index_text` re-stamps; telemetry rides the memory's schema). A
+/// passphrase never applies here — the page cipher and `.kdf` sidecar are
+/// file-backend capabilities.
+#[cfg(feature = "postgres")]
+fn open_postgres_from_dsn(
+    dsn: &str,
+    tel: TelemetryMode,
+    index_text: Option<bool>,
+    has_passphrase: bool,
+) -> dejadb_core::error::Result<RustDejaDB> {
+    if has_passphrase {
+        return Err(DejaDbError::Validation(
+            "passphrase applies to file-backed memories (page cipher + .kdf sidecar); on the \
+             postgres backend use TDE/pgcrypto at the deployment layer"
+                .into(),
+        ));
+    }
+    let (url, schema) = dejadb_store::pg::split_schema_url(dsn)?;
+    match index_text {
+        Some(want_text) => RustDejaDB::open_postgres_with(
+            &url,
+            &schema,
+            dejadb_store::DejaDbOptions {
+                index_text: want_text,
+                telemetry: tel,
+                ..dejadb_store::DejaDbOptions::default()
+            },
+        ),
+        None if tel != TelemetryMode::Off => {
+            RustDejaDB::open_postgres_with_telemetry(&url, &schema, tel)
+        }
+        None => RustDejaDB::open_postgres(&url, &schema),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_from_dsn(
+    _dsn: &str,
+    _tel: TelemetryMode,
+    _index_text: Option<bool>,
+    _has_passphrase: bool,
+) -> dejadb_core::error::Result<RustDejaDB> {
+    Err(DejaDbError::Validation(
+        "this build lacks the postgres backend (rebuild with the `postgres` feature)".into(),
+    ))
+}
+
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
@@ -189,23 +238,30 @@ impl DejaDB {
         // latency — with the index on, every write pays a cost that grows with
         // the file (tursodatabase/turso#8170).
         let store = py
-            .detach(|| match (index_text, passphrase) {
-                (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
-                (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
-                (Some(want_text), pass) => {
-                    let key = match pass {
-                        Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
-                        None => None,
-                    };
-                    RustDejaDB::open_with(
-                        &path,
-                        dejadb_store::DejaDbOptions {
-                            index_text: want_text,
-                            encryption_key: key,
-                            telemetry: tel,
-                            ..dejadb_store::DejaDbOptions::default()
-                        },
-                    )
+            .detach(|| {
+                // A postgres://…?schema=<name> DSN selects the server-tier
+                // backend — same API, the memory lives in a Postgres schema.
+                if path.starts_with("postgres://") || path.starts_with("postgresql://") {
+                    return open_postgres_from_dsn(&path, tel, index_text, passphrase.is_some());
+                }
+                match (index_text, passphrase) {
+                    (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
+                    (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
+                    (Some(want_text), pass) => {
+                        let key = match pass {
+                            Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
+                            None => None,
+                        };
+                        RustDejaDB::open_with(
+                            &path,
+                            dejadb_store::DejaDbOptions {
+                                index_text: want_text,
+                                encryption_key: key,
+                                telemetry: tel,
+                                ..dejadb_store::DejaDbOptions::default()
+                            },
+                        )
+                    }
                 }
             })
             .map_err(err)?;
@@ -1143,9 +1199,27 @@ impl DejaDB {
     }
 }
 
+/// Drop a memory schema entirely — the postgres backend's memory-level
+/// erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
+/// memory file. Destroys the memory AND its telemetry/blobs. Admin surface:
+/// gate it like any destructive operation in your host.
+#[cfg(feature = "postgres")]
+#[pyfunction]
+fn drop_postgres_schema(py: Python<'_>, url: String, schema: String) -> PyResult<()> {
+    py.detach(|| dejadb_store::pg::drop_postgres_schema(&url, &schema))
+        .map_err(err)
+}
+
+#[cfg(not(feature = "postgres"))]
+#[pyfunction]
+fn drop_postgres_schema(_py: Python<'_>, _url: String, _schema: String) -> PyResult<()> {
+    Err(err("this build lacks the postgres backend (rebuild with the `postgres` feature)"))
+}
+
 #[pymodule]
 fn dejadb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DejaDB>()?;
+    m.add_function(pyo3::wrap_pyfunction!(drop_postgres_schema, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

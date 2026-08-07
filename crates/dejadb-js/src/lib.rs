@@ -17,6 +17,15 @@ use napi_derive::napi;
 use serde_json::json;
 use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
+/// Drop a memory schema entirely — the postgres backend's memory-level
+/// erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
+/// memory file. Destroys the memory AND its telemetry/blobs. Admin surface:
+/// gate it like any destructive operation in your host.
+#[napi]
+pub fn drop_postgres_schema(url: String, schema: String) -> napi::Result<()> {
+    dejadb_store::pg::drop_postgres_schema(&url, &schema).map_err(err)
+}
+
 fn err<E: std::fmt::Display>(e: E) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
@@ -207,9 +216,32 @@ impl DejaDb {
         // Encryption at rest: a passphrase derives an AES-256 key (Argon2id;
         // non-secret salt in a <path>.kdf sidecar). Host-supplied, never
         // stored in the file — same rules as the CLI's --passphrase-env.
-        let store = match passphrase {
-            Some(p) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?,
-            None => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
+        //
+        // A postgres://…?schema=<name> DSN selects the server-tier backend —
+        // same API, the memory lives in a Postgres schema (stateless-host
+        // deployments; multiple concurrent writers per memory). The page
+        // cipher is file-backend-only, so a passphrase with a DSN is an error.
+        let is_pg = path.starts_with("postgres://") || path.starts_with("postgresql://");
+        let store = match (is_pg, passphrase) {
+            (true, Some(_)) => {
+                return Err(err(
+                    "passphrase applies to file-backed memories (page cipher + .kdf sidecar); \
+                     on the postgres backend use TDE/pgcrypto at the deployment layer",
+                ))
+            }
+            (true, None) => {
+                let (url, schema) =
+                    dejadb_store::pg::split_schema_url(&path).map_err(err)?;
+                if tel != TelemetryMode::Off {
+                    RustDejaDB::open_postgres_with_telemetry(&url, &schema, tel).map_err(err)?
+                } else {
+                    RustDejaDB::open_postgres(&url, &schema).map_err(err)?
+                }
+            }
+            (false, Some(p)) => {
+                RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?
+            }
+            (false, None) => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
         };
         let facade = std::sync::Arc::new(DejaDbFacade::with_session(store, Some(ns.clone()), None));
         Ok(DejaDb { facade, ns, actor })

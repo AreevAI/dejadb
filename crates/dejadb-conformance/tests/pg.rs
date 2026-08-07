@@ -132,6 +132,41 @@ fn concurrent_supersede_one_wins() {
     assert_eq!(m.count().unwrap(), 2, "loser's grain rolled back with its transaction");
 }
 
+/// The recall-telemetry sidecar on Postgres: tables ride the memory's own
+/// schema, rollups accumulate across flushes, and a forgotten grain is
+/// scrubbed from them.
+#[test]
+fn telemetry_rollups_on_pg() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let mut m = dejadb_store::DejaDB::open_postgres_with_telemetry(
+        &url,
+        &b.schema_for("telem"),
+        dejadb_store::TelemetryMode::Aggregate,
+    )
+    .unwrap();
+    assert_eq!(m.telemetry_mode(), dejadb_store::TelemetryMode::Aggregate);
+    let h = m.add(&dejadb_conformance::fact("ns", "ana", "prefers", "quiet peaceful rooms")).unwrap();
+    m.recall("ns", "ana", Some("prefers"), 4).unwrap();
+    m.recall("ns", "ana", Some("prefers"), 4).unwrap();
+    m.recall_hybrid("ns", None, None, Some("nonexistent topic"), 4, None).unwrap();
+    m.telemetry_flush().unwrap();
+    let access = m.telemetry_access_stats(Some("ns")).unwrap();
+    assert_eq!(access.len(), 1, "one grain accessed");
+    assert_eq!(access[0].recall_count, 2, "two structural recalls counted");
+    assert_eq!(access[0].hash, h.to_hex());
+    let queries = m.telemetry_query_stats(Some("ns")).unwrap();
+    assert_eq!(queries.len(), 1, "one free-text question recorded");
+    assert_eq!(queries[0].empty_count, 1, "the coverage-gap signal");
+    m.telemetry_note_budget(true).unwrap();
+    m.telemetry_note_budget(false).unwrap();
+    let budget = m.telemetry_budget_stats().unwrap();
+    assert_eq!((budget.sample_count, budget.overflow_count), (2, 1));
+    // forget scrubs the sidecar so it never outlives an erased grain
+    m.forget(&h).unwrap();
+    assert!(m.telemetry_access_stats(Some("ns")).unwrap().is_empty(), "scrubbed on forget");
+}
+
 /// One instance holding several memories at once (the schema-per-org
 /// shape): handles to distinct schemas coexist in one process and stay
 /// strictly isolated.

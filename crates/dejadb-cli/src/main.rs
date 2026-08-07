@@ -151,30 +151,28 @@ fn need(args: &HashMap<String, String>, k: &str) -> Result<String, String> {
 /// an unauthenticated HTTP console — risks exposing or mutating the wrong file,
 /// so those commands must name their memory explicitly.
 /// Open a memory on the postgres backend from a `postgres://…?schema=<name>`
-/// DSN. Encryption keys don't apply here (the `--passphrase-env` path derives
-/// them from a `.kdf` sidecar next to a FILE, so a DSN never reaches it) and
-/// the telemetry sidecar is not yet supported on this backend.
+/// DSN, mirroring the file-backend branches (explicit options re-stamp;
+/// telemetry rides the memory's schema). Encryption keys don't apply here —
+/// the `--passphrase-env` path derives them from a `.kdf` sidecar next to a
+/// FILE, so a DSN is rejected before derivation.
 #[cfg(feature = "postgres")]
 fn open_postgres_store(
     db: &str,
-    explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    tel_mode: dejadb_store::TelemetryMode,
     explicit_index: Option<&str>,
 ) -> Result<DejaDB, String> {
-    if matches!(explicit_telemetry, Some(m) if m != dejadb_store::TelemetryMode::Off) {
-        return Err(
-            "the recall-telemetry sidecar is not yet supported on the postgres backend".into()
-        );
-    }
     let (url, schema) = dejadb_store::pg::split_schema_url(db).map_err(|e| e.to_string())?;
-    match explicit_index {
-        Some(v) => {
-            let o = dejadb_store::DejaDbOptions {
-                index_text: !matches!(v, "false" | "0" | "off" | "no"),
-                ..Default::default()
-            };
-            DejaDB::open_postgres_with(&url, &schema, o)
-        }
-        None => DejaDB::open_postgres(&url, &schema),
+    if let Some(v) = explicit_index {
+        let o = dejadb_store::DejaDbOptions {
+            index_text: !matches!(v, "false" | "0" | "off" | "no"),
+            telemetry: tel_mode,
+            ..Default::default()
+        };
+        DejaDB::open_postgres_with(&url, &schema, o)
+    } else if tel_mode != dejadb_store::TelemetryMode::Off {
+        DejaDB::open_postgres_with_telemetry(&url, &schema, tel_mode)
+    } else {
+        DejaDB::open_postgres(&url, &schema)
     }
     .map_err(|e| e.to_string())
 }
@@ -182,7 +180,7 @@ fn open_postgres_store(
 #[cfg(not(feature = "postgres"))]
 fn open_postgres_store(
     _db: &str,
-    _explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    _tel_mode: dejadb_store::TelemetryMode,
     _explicit_index: Option<&str>,
 ) -> Result<DejaDB, String> {
     Err("this build lacks the postgres backend — reinstall with \
@@ -608,19 +606,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     // host-supplied capability that also requires open_with.
     let explicit_index = flag(&flags, "index-text");
     let mut m = if is_pg_url {
-        // The CLI's telemetry default is `aggregate` for files; the sidecar
-        // is not supported on this backend yet, so only an EXPLICIT
-        // --telemetry request is an error — the default drops to off WITH a
-        // warning (waiser's telemetry-fed analyzers would otherwise report
-        // an all-clear from silently empty stats).
-        let explicit_telemetry = flag(&flags, "telemetry").map(|_| tel_mode);
-        if explicit_telemetry.is_none() {
-            eprintln!(
-                "deja: warning: recall telemetry is not yet supported on the postgres \
-                 backend; running with telemetry off"
-            );
-        }
-        open_postgres_store(&db, explicit_telemetry, explicit_index.as_deref())?
+        open_postgres_store(&db, tel_mode, explicit_index.as_deref())?
     } else {
         if explicit_index.is_some() || enc_key.is_some() {
             let mut o = dejadb_store::DejaDbOptions::default();

@@ -13,6 +13,14 @@ keywords = ["memory", "python", "ai-agents", "llm", "bindings"]
 categories = ["api-bindings"]
 publish = false
 
+[features]
+# The postgres backend ships ON in the binding: it is a server-side surface,
+# and `DejaDB("postgres://…?schema=<name>")` must work from a stock
+# `pip install dejadb`. The dependency-light default stays with the `deja`
+# CLI and the store crate.
+default = ["postgres"]
+postgres = ["dejadb-store/postgres"]
+
 [lib]
 name = "dejadb"
 crate-type = ["cdylib"]

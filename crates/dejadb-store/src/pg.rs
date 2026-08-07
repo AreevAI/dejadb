@@ -27,6 +27,20 @@ use turso::Value;
 use crate::db::{db_err, Db, Row, WriteIds};
 use crate::{pi, pt};
 
+/// tokio-postgres's `Display` is just "db error" — the server's message and
+/// SQLSTATE live in the source chain. Surface them, or every failure is
+/// undiagnosable.
+fn pg_err(e: tokio_postgres::Error) -> DejaDbError {
+    match e.as_db_error() {
+        Some(db) => DejaDbError::Storage(format!(
+            "postgres error {}: {}",
+            db.code().code(),
+            db.message()
+        )),
+        None => db_err(e),
+    }
+}
+
 /// Schema DDL — the Turso `SCHEMA` with Postgres types: every integer is
 /// `bigint` (an `int4`/`numeric` arriving where the store expects Integer
 /// silently zeroes counters), hashes/blobs are `bytea`, and `fts_vocab.id`
@@ -134,7 +148,7 @@ impl PgDb {
             .map_err(db_err)?;
         let (client, connection) = rt
             .block_on(tokio_postgres::connect(url, tokio_postgres::NoTls))
-            .map_err(db_err)?;
+            .map_err(pg_err)?;
         // The connection future must be driven for the client to make
         // progress; the current-thread runtime polls it inside every
         // block_on below.
@@ -145,11 +159,11 @@ impl PgDb {
             client
                 .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
                 .await
-                .map_err(db_err)?;
+                .map_err(pg_err)?;
             client
                 .batch_execute(&format!("SET search_path TO \"{schema}\", public, ext"))
                 .await
-                .map_err(db_err)?;
+                .map_err(pg_err)?;
             Ok::<_, DejaDbError>(())
         })?;
         Ok(Self { rt, client, cache: RefCell::new(HashMap::new()) })
@@ -185,7 +199,7 @@ impl PgDb {
             let translated = translate(sql)?;
             self.rt.block_on(self.client.query(translated.as_str(), &refs))
         }
-        .map_err(db_err)?;
+        .map_err(pg_err)?;
         rows.iter().map(row_to_row).collect()
     }
 
@@ -195,12 +209,12 @@ impl PgDb {
             vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
         if hot {
             let st = self.prepared(sql)?;
-            self.rt.block_on(self.client.execute(&st, &refs)).map_err(db_err)
+            self.rt.block_on(self.client.execute(&st, &refs)).map_err(pg_err)
         } else {
             let translated = translate(sql)?;
             self.rt
                 .block_on(self.client.execute(translated.as_str(), &refs))
-                .map_err(db_err)
+                .map_err(pg_err)
         }
     }
 }
@@ -223,15 +237,15 @@ impl Db for PgDb {
     }
 
     fn begin(&self) -> Result<()> {
-        self.rt.block_on(self.client.batch_execute("BEGIN")).map_err(db_err)
+        self.rt.block_on(self.client.batch_execute("BEGIN")).map_err(pg_err)
     }
 
     fn commit(&self) -> Result<()> {
-        self.rt.block_on(self.client.batch_execute("COMMIT")).map_err(db_err)
+        self.rt.block_on(self.client.batch_execute("COMMIT")).map_err(pg_err)
     }
 
     fn rollback(&self) -> Result<()> {
-        self.rt.block_on(self.client.batch_execute("ROLLBACK")).map_err(db_err)
+        self.rt.block_on(self.client.batch_execute("ROLLBACK")).map_err(pg_err)
     }
 
     fn prefers_batched_reads(&self) -> bool {
@@ -366,7 +380,7 @@ impl Db for PgDb {
                     &[],
                 )
                 .await
-                .map_err(db_err)?;
+                .map_err(pg_err)?;
             let existing = row.get::<_, i32>(0);
             if existing > 0 && existing as usize != dim {
                 return Err(DejaDbError::Validation(format!(
@@ -459,7 +473,7 @@ fn row_to_row(row: &tokio_postgres::Row) -> Result<Row> {
                 )))
             }
         }
-        .map_err(db_err)?;
+        .map_err(pg_err)?;
         vals.push(v);
     }
     Ok(Row(vals))
@@ -475,6 +489,26 @@ fn replace_suffix(table: &str) -> Option<(&'static str, &'static str)> {
             Some(("(ns,s,p)", "o = EXCLUDED.o, seq = EXCLUDED.seq, hash = EXCLUDED.hash"))
         }
         "heads" => Some(("(ns,s,p,seq)", "hash = EXCLUDED.hash, created_at = EXCLUDED.created_at")),
+        // Telemetry rollups. Their correlated COALESCE((SELECT …)) reads
+        // evaluate against the pre-conflict row in both dialects (before
+        // REPLACE's delete on SQLite, before conflict resolution on Pg), so
+        // EXCLUDED carries the already-accumulated values.
+        "telem_meta" => Some(("(k)", "v = EXCLUDED.v")),
+        "telem_grain_access" => Some((
+            "(hash)",
+            "ns = EXCLUDED.ns, recall_count = EXCLUDED.recall_count, \
+             first_ms = EXCLUDED.first_ms, last_ms = EXCLUDED.last_ms",
+        )),
+        "telem_query_stat" => Some((
+            "(qkey)",
+            "ns = EXCLUDED.ns, sample = EXCLUDED.sample, run_count = EXCLUDED.run_count, \
+             last_ms = EXCLUDED.last_ms, empty_count = EXCLUDED.empty_count, \
+             sum_results = EXCLUDED.sum_results",
+        )),
+        "telem_budget_stat" => Some((
+            "(id)",
+            "sample_count = EXCLUDED.sample_count, overflow_count = EXCLUDED.overflow_count",
+        )),
         _ => None,
     }
 }
@@ -656,12 +690,12 @@ pub fn drop_postgres_schema(url: &str, schema: &str) -> Result<()> {
         .build()
         .map_err(db_err)?;
     let (client, connection) =
-        rt.block_on(tokio_postgres::connect(url, tokio_postgres::NoTls)).map_err(db_err)?;
+        rt.block_on(tokio_postgres::connect(url, tokio_postgres::NoTls)).map_err(pg_err)?;
     rt.spawn(async move {
         let _ = connection.await;
     });
     rt.block_on(client.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")))
-        .map_err(db_err)
+        .map_err(pg_err)
 }
 
 #[cfg(test)]

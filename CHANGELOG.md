@@ -23,7 +23,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SupersessionConflict`/`NotFound` via in-transaction `FOR UPDATE`
   rechecks. (The **`STO-E002` StoreBusy** code is registered but currently
   unraised — reserved for exclusive-access arbitration.) One process can
-  hold handles to many memories at once. Erasure/portability map to
+  hold handles to many memories at once. The **Python and Node bindings
+  ship the backend built in** — the same `DejaDB`/`DejaDb` class takes a
+  `postgres://…?schema=<name>` DSN wherever it takes a path, and
+  `drop_postgres_schema` exposes memory-level erasure. The **recall
+  telemetry sidecar works on this backend** (tables ride the memory's
+  schema; on the file backend the sidecar tables gained a `telem_` prefix —
+  existing sidecars start fresh, telemetry is disposable evidence).
+  `pg_bench` publishes the server-tier latency table (RESULTS.md §7).
+  Erasure/portability map to
   `DROP SCHEMA … CASCADE` / `pg_dump -n`; the page cipher and the telemetry
   sidecar remain file-backend capabilities and are rejected with clear
   errors. Parity is pinned by the new **`dejadb-conformance`** crate: one

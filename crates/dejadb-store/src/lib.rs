@@ -1213,7 +1213,7 @@ impl DejaDB {
     /// telemetry sidecar are file-backend capabilities and are rejected here.
     #[cfg(feature = "postgres")]
     pub fn open_postgres(url: &str, schema: &str) -> Result<Self> {
-        Self::open_postgres_internal(url, schema, None)
+        Self::open_postgres_internal(url, schema, None, TelemetryMode::Off)
     }
 
     /// Explicit-options variant of [`open_postgres`](Self::open_postgres) —
@@ -1221,7 +1221,21 @@ impl DejaDB {
     /// [`open_warnings`](Self::open_warnings), mirroring [`open_with`](Self::open_with).
     #[cfg(feature = "postgres")]
     pub fn open_postgres_with(url: &str, schema: &str, opts: DejaDbOptions) -> Result<Self> {
-        Self::open_postgres_internal(url, schema, Some(opts))
+        let telemetry = opts.telemetry;
+        Self::open_postgres_internal(url, schema, Some(opts), telemetry)
+    }
+
+    /// Declaration-honoring open with the recall-telemetry sidecar attached
+    /// — the postgres analogue of [`open_with_telemetry`](Self::open_with_telemetry).
+    /// Telemetry tables live inside the memory's schema (their own
+    /// connection), so erasure/export cover them with the memory.
+    #[cfg(feature = "postgres")]
+    pub fn open_postgres_with_telemetry(
+        url: &str,
+        schema: &str,
+        telemetry: TelemetryMode,
+    ) -> Result<Self> {
+        Self::open_postgres_internal(url, schema, None, telemetry)
     }
 
     #[cfg(feature = "postgres")]
@@ -1229,18 +1243,13 @@ impl DejaDB {
         url: &str,
         schema: &str,
         explicit: Option<DejaDbOptions>,
+        telemetry_mode: TelemetryMode,
     ) -> Result<Self> {
         if let Some(o) = &explicit {
             if o.encryption_key.is_some() {
                 return Err(DejaDbError::Validation(
                     "encryption_key is a file-backend capability (page cipher); on the postgres \
                      backend use TDE/pgcrypto at the deployment layer"
-                        .into(),
-                ));
-            }
-            if !matches!(o.telemetry, TelemetryMode::Off) {
-                return Err(DejaDbError::Validation(
-                    "the recall-telemetry sidecar is not yet supported on the postgres backend"
                         .into(),
                 ));
             }
@@ -1252,7 +1261,11 @@ impl DejaDB {
         for sql in pg::PG_SEED {
             dbh.execute(sql, vec![])?;
         }
-        Self::finish_open(dbh, explicit, BlobStore::Table, None, Vec::new())
+        let telemetry = match telemetry_mode {
+            TelemetryMode::Off => None,
+            mode => Some(Telemetry::open_pg(url, schema, mode)?),
+        };
+        Self::finish_open(dbh, explicit, BlobStore::Table, telemetry, Vec::new())
     }
 
     /// Backend-independent tail of every open: meta reconciliation and

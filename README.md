@@ -355,6 +355,19 @@ deja add luis prefers window_seat --db 'postgres://user:pass@host/db?schema=memo
 deja recall --db 'postgres://user:pass@host/db?schema=memory_luis' --subject luis
 ```
 
+The bindings ship with the backend built in — the same class takes a DSN
+where it takes a path:
+
+```python
+m = dejadb.DejaDB("postgres://user:pass@host/db?schema=memory_luis")
+dejadb.drop_postgres_schema(url, "memory_luis")   # memory-level erasure
+```
+
+```js
+const m = new DejaDb('postgres://user:pass@host/db?schema=memory_luis')
+dropPostgresSchema(url, 'memory_luis')            // memory-level erasure
+```
+
 ```rust
 let mut m = DejaDB::open_postgres("postgres://user:pass@host/db", "memory_luis")?;
 ```
@@ -377,9 +390,10 @@ differences are deliberate and explicit:
   `vector(dim)` column is created when the first embedder is installed, and a
   dimension mismatch is a hard refusal rather than a degraded leg.
 - **Erasure and portability** map to schema operations: `pg_dump -n <schema>`
-  exports a memory, `DROP SCHEMA … CASCADE` erases one. The page-level
-  crypto-erasure and the telemetry sidecar are file-backend capabilities;
-  encrypt at the deployment layer (TDE/pgcrypto) instead.
+  exports a memory, `DROP SCHEMA … CASCADE` erases one (exposed as
+  `drop_postgres_schema`). Recall telemetry rides the memory's schema too.
+  Page-level crypto-erasure remains a file-backend capability; encrypt at
+  the deployment layer (TDE/pgcrypto) instead.
 - **HA is inherited**: run it on a regionally-replicated Postgres and the
   memory inherits the failover, PITR, and backup story your ops team already
   drilled.

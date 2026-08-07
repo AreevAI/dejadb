@@ -192,3 +192,11 @@ export declare class DejaDb {
    */
   waiserOutcomes(): Promise<string>
 }
+
+/**
+ * Drop a memory schema entirely — the postgres backend's memory-level
+ * erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
+ * memory file. Destroys the memory AND its telemetry/blobs. Admin surface:
+ * gate it like any destructive operation in your host.
+ */
+export declare function dropPostgresSchema(url: string, schema: string): void

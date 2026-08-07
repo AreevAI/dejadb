@@ -701,3 +701,4 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.DejaDb = nativeBinding.DejaDb
+module.exports.dropPostgresSchema = nativeBinding.dropPostgresSchema
