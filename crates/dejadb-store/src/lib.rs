@@ -2160,8 +2160,9 @@ impl DejaDB {
 
         let conn = &self.conn;
         let written = self.rt.block_on(async {
-            let mut n = 0usize;
             conn.execute("BEGIN", ()).await.map_err(db_err)?;
+            let body = async {
+            let mut n = 0usize;
             for r in &plan {
                 if let Some(run) = r.run {
                     conn.execute(
@@ -2211,8 +2212,19 @@ impl DejaDB {
                     n += 1;
                 }
             }
-            conn.execute("COMMIT", ()).await.map_err(db_err)?;
             Ok::<_, DejaDbError>(n)
+            }
+            .await;
+            match body {
+                Ok(n) => {
+                    conn.execute("COMMIT", ()).await.map_err(db_err)?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            }
         })?;
         // Declare the file current, so open() stops re-scanning it.
         self.meta_put(LINK_INDEX_KEY, LINK_INDEX_VERSION)?;
@@ -2723,10 +2735,14 @@ impl DejaDB {
                     )
                     .await
                     .map_err(db_err)?;
+                    // Key the join on (ns,s,p), not seq alone: a link-bearing
+                    // grain has extra triples rows for the same seq, and an
+                    // unkeyed join lets the engine pick a link target as t.o.
                     let mut rows = conn
                         .query(
                             "SELECT t.o, h.seq, h.hash, h.created_at
-                             FROM heads h JOIN triples t ON t.seq=h.seq
+                             FROM heads h JOIN triples t
+                               ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
                              WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
                              ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
                             (pi(ns), pi(s), pi(p)),
@@ -2870,10 +2886,14 @@ impl DejaDB {
                     // the SAME (created_at, hash) rule as heads()/insert_blob —
                     // was `ORDER BY seq DESC`, which can disagree with the
                     // provisional-head rule in a 3+-way fork after a forget.
+                    // Key the join on (ns,s,p), not seq alone: a link-bearing
+                    // grain has extra triples rows for the same seq, and an
+                    // unkeyed join lets the engine pick a link target as t.o.
                     let mut rows = conn
                         .query(
                             "SELECT t.o, h.seq, h.hash, h.created_at
-                             FROM heads h JOIN triples t ON t.seq=h.seq
+                             FROM heads h JOIN triples t
+                               ON t.seq=h.seq AND t.ns=h.ns AND t.s=h.s AND t.p=h.p
                              WHERE h.ns=?1 AND h.s=?2 AND h.p=?3
                              ORDER BY h.created_at DESC, h.hash DESC LIMIT 1",
                             (pi(ns), pi(s), pi(p)),
@@ -3867,7 +3887,11 @@ impl DejaDB {
             *scores.entry(*seq).or_insert(0.0) += 1.0 / (RRF_K0 + rank as f64);
         }
         let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(b.0.cmp(&a.0)));
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.0.cmp(&a.0))
+        });
 
         // Refinement stage: rerank wins over diversity when both are asked for.
         let ordered: Vec<i64> = if let Some(q) =
@@ -5005,7 +5029,7 @@ impl DejaDB {
             let old_row = {
                 let mut rows = conn
                     .query(
-                        "SELECT seq, svt FROM grains WHERE hash = ?1",
+                        "SELECT seq, svt, ns, s, p FROM grains WHERE hash = ?1",
                         (pb(old.as_bytes().to_vec()),),
                     )
                     .await
@@ -5014,11 +5038,14 @@ impl DejaDB {
                     Some(row) => Some((
                         v_i64(&row.get_value(0).map_err(db_err)?).unwrap_or(0),
                         v_i64(&row.get_value(1).map_err(db_err)?),
+                        v_i64(&row.get_value(2).map_err(db_err)?).unwrap_or(0),
+                        v_i64(&row.get_value(3).map_err(db_err)?),
+                        v_i64(&row.get_value(4).map_err(db_err)?),
                     )),
                     None => None,
                 }
             };
-            let (old_seq, old_svt) = match old_row {
+            let (old_seq, old_svt, old_ns, old_s, old_p) = match old_row {
                 Some(x) => x,
                 None => return Ok(false), // partial history — fast-forward tolerates
             };
@@ -5122,9 +5149,14 @@ impl DejaDB {
             conn.execute("UPDATE osp SET cur=0 WHERE seq=?1", (pi(old_seq),))
                 .await
                 .map_err(db_err)?;
-            conn.execute("DELETE FROM heads WHERE seq=?1", (pi(old_seq),))
+            if let (Some(s), Some(p)) = (old_s, old_p) {
+                conn.execute(
+                    "DELETE FROM heads WHERE ns=?1 AND s=?2 AND p=?3 AND seq=?4",
+                    (pi(old_ns), pi(s), pi(p), pi(old_seq)),
+                )
                 .await
                 .map_err(db_err)?;
+            }
             Ok::<bool, DejaDbError>(true)
         })
     }
@@ -5715,7 +5747,11 @@ mod tests {
             }
         }
         let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(b.0.cmp(&a.0)));
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.0.cmp(&a.0))
+        });
         ranked
     }
 

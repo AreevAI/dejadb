@@ -232,3 +232,70 @@ fn vector_dim_mismatch_fails_open() {
     // structural leg still answers
     assert!(!m.recall_hybrid("caller", Some("john"), None, Some("peanuts"), 10, None).unwrap().is_empty());
 }
+
+// 2026-08-07 — head re-election must key the heads↔triples join on (ns,s,p).
+// A link-bearing tip has extra triples rows for its own seq (the related_to
+// edges, subject-ed on the grain's hash); an unkeyed `ON t.seq=h.seq` join
+// lets the engine elect a LINK TARGET as entity_latest.o, which breaks the
+// add_if_novel value probe for the key. Two tests, one per fixed site.
+
+/// Two-tip fork on (ns, john, plan) where the surviving tip carries a
+/// related_to link. Returns (store, dir, link-bearing tip, other tip).
+fn build_linked_fork() -> (DejaDB, TempDir, Hash, Hash) {
+    let d = TempDir::new().unwrap();
+    let (pa, pb) = (d.path().join("a.db"), d.path().join("b.db"));
+    let (bv1, bb) = (d.path().join("v1.mgb"), d.path().join("b.mgb"));
+    let mut a = DejaDB::open(pa.to_str().unwrap()).unwrap();
+    let anchor = a.add(&fact("ns", "acct", "kind", "profile")).unwrap();
+    let v1 = a.add(&fact("ns", "john", "plan", "basic")).unwrap();
+    let st = a.bundle_since(0, bv1.to_str().unwrap()).unwrap();
+    let mut b = DejaDB::open(pb.to_str().unwrap()).unwrap();
+    b.import_bundle(bv1.to_str().unwrap()).unwrap();
+    // tip A carries the link; fixed created_at makes it LOSE the provisional
+    // election so it is the one re-elections have to pick correctly.
+    let mut v2a = fact("ns", "john", "plan", "pro").related_to_link(
+        &anchor.to_hex(),
+        "mentions",
+        1.0,
+    );
+    v2a.common.created_at = Some(1_800_000_000_000);
+    let h2a = a.supersede(&v1, &mut v2a).unwrap();
+    let mut v2b = fact("ns", "john", "plan", "enterprise");
+    v2b.common.created_at = Some(1_800_000_000_500);
+    let h2b = b.supersede(&v1, &mut v2b).unwrap();
+    b.bundle_since(st.last_op_seq, bb.to_str().unwrap()).unwrap();
+    a.import_bundle(bb.to_str().unwrap()).unwrap();
+    assert_eq!(a.heads("ns", "john", "plan").unwrap().len(), 2, "setup: fork");
+    (a, d, h2a, h2b)
+}
+
+#[test]
+fn forget_tip_reelection_ignores_link_rows() {
+    let (mut a, _d, h2a, h2b) = build_linked_fork();
+    // h2b is the provisional head (newer created_at); forgetting it runs
+    // re-election over the surviving link-bearing tip.
+    a.forget(&h2b).unwrap();
+    assert_eq!(
+        a.latest("ns", "john", "plan").unwrap().unwrap().get_str("object"),
+        Some("pro")
+    );
+    let (h, inserted) = a.add_if_novel(&fact("ns", "john", "plan", "pro")).unwrap();
+    assert!(!inserted, "value probe must match the re-elected head's true object");
+    assert_eq!(h, h2a);
+}
+
+#[test]
+fn supersede_changed_key_reelection_ignores_link_rows() {
+    let (mut a, _d, h2a, h2b) = build_linked_fork();
+    // Supersede the provisional head with a DIFFERENT relation: the old key's
+    // head row for h2b is removed and re-election runs over surviving h2a.
+    let mut moved = fact("ns", "john", "tier", "gold");
+    a.supersede(&h2b, &mut moved).unwrap();
+    assert_eq!(
+        a.latest("ns", "john", "plan").unwrap().unwrap().get_str("object"),
+        Some("pro")
+    );
+    let (h, inserted) = a.add_if_novel(&fact("ns", "john", "plan", "pro")).unwrap();
+    assert!(!inserted, "value probe must match the re-elected head's true object");
+    assert_eq!(h, h2a);
+}
