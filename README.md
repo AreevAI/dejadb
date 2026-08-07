@@ -15,9 +15,13 @@ memory is for: recognizing what it has encountered before.*
 
 Embed it in-process, store memories as immutable content-addressed grains, query
 them with CAL (the Context Assembly Language), and hand the results straight to a
-model — no server, no sidecars, no network hop in the recall path. **Recall in
-microseconds** — fast enough to run inside a real-time **voice agent's** turn,
-where a network memory call can't. **Your agent's memory is a file you own.**
+model — on the default embedded backend: no server, no sidecars, no network hop
+in the recall path. **Recall in microseconds** — fast enough to run inside a
+real-time **voice agent's** turn, where a network memory call can't. **Your
+agent's memory is a file you own.** And when the deployment has nowhere to put
+a file — stateless containers, multi-instance services — the same engine runs
+over a [PostgreSQL schema](#postgresql-backend-server-tier) instead, same
+semantics, millisecond-class recall.
 
 > git for your agent's memory: log, diff, time-travel, forks with explicit
 > merges, and encrypted incremental sync — built into the data model, because
@@ -337,6 +341,44 @@ Every method returns a promise — store calls run on libuv's thread pool rather
 than blocking the event loop. The constructor is the exception, so opening a
 file still fails at the line that opened it. **Await your writes**: promises
 settle in completion order, not call order.
+
+### PostgreSQL backend (server tier)
+
+One memory = one file is the edge story. In stateless deployments (Cloud Run,
+autoscaled containers) there is no durable disk — so the same store runs over
+**one PostgreSQL schema per memory** instead, behind the non-default
+`postgres` cargo feature:
+
+```bash
+cargo install dejadb --features postgres
+deja add luis prefers window_seat --db 'postgres://user:pass@host/db?schema=memory_luis'
+deja recall --db 'postgres://user:pass@host/db?schema=memory_luis' --subject luis
+```
+
+```rust
+let mut m = DejaDB::open_postgres("postgres://user:pass@host/db", "memory_luis")?;
+```
+
+Identical semantics by construction — the same store logic (fork election,
+supersession, op-log, BM25, hybrid recall) runs over either backend, pinned by
+a conformance suite that executes the same case list against both. The
+differences are deliberate and explicit:
+
+- **Latency class**: point reads are microseconds embedded, milliseconds over
+  a network. The voice frame path stays on the embedded backend by design.
+- **Single writer is enforced**, not assumed: a second writer on the same
+  schema gets a clean `STO-E002` (session advisory lock), instead of the
+  undefined behavior two file handles produce.
+- **Vectors** use [pgvector](https://github.com/pgvector/pgvector); the
+  `vector(dim)` column is created when the first embedder is installed, and a
+  dimension mismatch is a hard refusal rather than a degraded leg.
+- **Erasure and portability** map to schema operations: `pg_dump -n <schema>`
+  exports a memory, `DROP SCHEMA … CASCADE` erases one. The page-level
+  crypto-erasure and the telemetry sidecar are file-backend capabilities;
+  encrypt at the deployment layer (TDE/pgcrypto) instead.
+- **HA is inherited**: run it on a regionally-replicated Postgres and the
+  memory inherits the failover, PITR, and backup story your ops team already
+  drilled.
 
 ### Encryption at rest
 

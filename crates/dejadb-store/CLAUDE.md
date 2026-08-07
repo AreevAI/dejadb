@@ -1,11 +1,28 @@
 # dejadb-store
 
-The Turso-backed store: one memory = one Turso database file. `DejaDB`
-(src/lib.rs) is a **sync** facade over the async `turso` crate — it owns a
-tokio current-thread `Runtime` and wraps every call in `rt.block_on`. Single
-`Connection`, in-memory counters (`next_seq/next_op/next_term/hlc_last`)
-loaded on open → **single-writer-per-file assumption**; hot statements are
-lazily prepared and cached (`ensure_stmt`).
+The store: backend-agnostic store logic (src/lib.rs) over an internal sync
+`Db` seam (src/db.rs — `execute/query/query_hot/begin/commit/rollback`, plus
+the `prefers_batched_reads`/`ensure_embeddings` capability hooks). Two
+transports implement it:
+
+- **`TursoDb`** (default; embedded): one memory = one Turso database file.
+  Owns a tokio current-thread `Runtime`, a single `Connection`, and the
+  SQL-keyed prepared-statement cache (the `_hot` calls). Point reads are
+  µs-class; `prefers_batched_reads = false` because a parameterized `IN` on
+  the PK is a table scan on this engine — measured ~8x on the voice frame.
+- **`PgDb`** (src/pg.rs, `feature = "postgres"`): one memory = one Postgres
+  schema. Session advisory lock ENFORCES single-writer (`STO-E002`), an
+  explicit statement translator handles the divergent dialect (per-table
+  `ON CONFLICT` upserts, pgvector `<=>`/casts, `?N`→`$N`) and FAILS FAST on
+  anything unmapped, the `vector(dim)` column is added at the first
+  `set_embedder` (dim mismatch = hard refusal), CAS blobs live in an
+  in-schema table, and `prefers_batched_reads = true`. Page cipher and the
+  telemetry sidecar are file-backend-only and rejected at open.
+
+In-memory counters (`next_seq/next_op/next_term/hlc_last`, BM25 stats)
+loaded on open → **single-writer-per-memory assumption** on both backends.
+Cross-backend parity is pinned by `crates/dejadb-conformance` — the same
+case list runs against both; extend it whenever store semantics change.
 
 ## Schema (SCHEMA const, lib.rs ~160)
 

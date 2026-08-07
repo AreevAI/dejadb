@@ -150,6 +150,46 @@ fn need(args: &HashMap<String, String>, k: &str) -> Result<String, String> {
 /// `ui`) pass this: silently serving the personal default memory — over MCP or
 /// an unauthenticated HTTP console — risks exposing or mutating the wrong file,
 /// so those commands must name their memory explicitly.
+/// Open a memory on the postgres backend from a `postgres://…?schema=<name>`
+/// DSN. Encryption keys don't apply here (the `--passphrase-env` path derives
+/// them from a `.kdf` sidecar next to a FILE, so a DSN never reaches it) and
+/// the telemetry sidecar is not yet supported on this backend.
+#[cfg(feature = "postgres")]
+fn open_postgres_store(
+    db: &str,
+    explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    explicit_index: Option<&str>,
+) -> Result<DejaDB, String> {
+    if matches!(explicit_telemetry, Some(m) if m != dejadb_store::TelemetryMode::Off) {
+        return Err(
+            "the recall-telemetry sidecar is not yet supported on the postgres backend".into()
+        );
+    }
+    let (url, schema) = dejadb_store::pg::split_schema_url(db).map_err(|e| e.to_string())?;
+    match explicit_index {
+        Some(v) => {
+            let o = dejadb_store::DejaDbOptions {
+                index_text: !matches!(v, "false" | "0" | "off" | "no"),
+                ..Default::default()
+            };
+            DejaDB::open_postgres_with(&url, &schema, o)
+        }
+        None => DejaDB::open_postgres(&url, &schema),
+    }
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_store(
+    _db: &str,
+    _explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    _explicit_index: Option<&str>,
+) -> Result<DejaDB, String> {
+    Err("this build lacks the postgres backend — reinstall with \
+         `cargo install dejadb --features postgres` (or build with --features postgres)"
+        .into())
+}
+
 fn resolve_db(args: &HashMap<String, String>, require_explicit: bool) -> Result<String, String> {
     if let Some(p) = flag(args, "db") {
         return Ok(p);
@@ -533,7 +573,15 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     // (Argon2id; salt in a <db>.kdf sidecar). The passphrase and the derived
     // key are held in zeroizing buffers; note the storage engine keeps the key
     // resident in memory while the database is open.
+    let is_pg_url = db.starts_with("postgres://") || db.starts_with("postgresql://");
     let enc_key = match flag(&flags, "passphrase-env") {
+        Some(_) if is_pg_url => {
+            return Err(
+                "--passphrase-env applies to file-backed memories (page cipher + .kdf \
+                 sidecar); on the postgres backend use TDE/pgcrypto at the deployment layer"
+                    .into(),
+            );
+        }
         Some(var) => {
             let pass = zeroize::Zeroizing::new(std::env::var(&var).map_err(|_| {
                 format!("--passphrase-env {var}: environment variable is not set")
@@ -559,33 +607,41 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     // them. --index-text is an explicit, deliberate re-stamp; encryption is a
     // host-supplied capability that also requires open_with.
     let explicit_index = flag(&flags, "index-text");
-    let mut m = if explicit_index.is_some() || enc_key.is_some() {
-        let mut o = dejadb_store::DejaDbOptions::default();
-        if let Some(v) = &explicit_index {
-            o.index_text = !matches!(v.as_str(), "false" | "0" | "off" | "no");
-        }
-        if let Some(key) = &enc_key {
-            o.encryption_key = Some(**key);
-        }
-        o.telemetry = tel_mode;
-        DejaDB::open_with(&db, o)
-    } else if tel_mode != dejadb_store::TelemetryMode::Off {
-        // Honor the file's declarations AND attach the telemetry sidecar.
-        DejaDB::open_with_telemetry(&db, tel_mode)
+    let mut m = if is_pg_url {
+        // The CLI's telemetry default is `aggregate` for files; the sidecar
+        // is not supported on this backend yet, so only an EXPLICIT
+        // --telemetry request is an error — the default quietly stays off.
+        let explicit_telemetry = flag(&flags, "telemetry").map(|_| tel_mode);
+        open_postgres_store(&db, explicit_telemetry, explicit_index.as_deref())?
     } else {
-        DejaDB::open(&db)
-    }
-    .map_err(|e| {
-        let mut msg = e.to_string();
-        // A .kdf sidecar means the file was created encrypted; opening it
-        // without a key fails with an unhelpful "not a database" — say why.
-        if enc_key.is_none() && std::path::Path::new(&format!("{db}.kdf")).exists() {
-            msg.push_str(&format!(
-                " — {db}.kdf exists, so this memory is encrypted; pass --passphrase-env <VAR>"
-            ));
+        if explicit_index.is_some() || enc_key.is_some() {
+            let mut o = dejadb_store::DejaDbOptions::default();
+            if let Some(v) = &explicit_index {
+                o.index_text = !matches!(v.as_str(), "false" | "0" | "off" | "no");
+            }
+            if let Some(key) = &enc_key {
+                o.encryption_key = Some(**key);
+            }
+            o.telemetry = tel_mode;
+            DejaDB::open_with(&db, o)
+        } else if tel_mode != dejadb_store::TelemetryMode::Off {
+            // Honor the file's declarations AND attach the telemetry sidecar.
+            DejaDB::open_with_telemetry(&db, tel_mode)
+        } else {
+            DejaDB::open(&db)
         }
-        msg
-    })?;
+        .map_err(|e| {
+            let mut msg = e.to_string();
+            // A .kdf sidecar means the file was created encrypted; opening it
+            // without a key fails with an unhelpful "not a database" — say why.
+            if enc_key.is_none() && std::path::Path::new(&format!("{db}.kdf")).exists() {
+                msg.push_str(&format!(
+                    " — {db}.kdf exists, so this memory is encrypted; pass --passphrase-env <VAR>"
+                ));
+            }
+            msg
+        })?
+    };
     for w in m.open_warnings() {
         eprintln!("deja: warning: {w}");
     }

@@ -730,12 +730,24 @@ DejaDB has no platform dependency. Three tiers cover a multi-channel fleet:
 1. **Embedded** — voice and interactive edges run DejaDB in-process for
    microsecond recall, with per-caller working files and the op-log streaming
    out.
-2. **Hub (`dejad`)** — an optional self-hosted daemon that owns a directory of
+2. **Server tier (`feature = "postgres"`)** — the same store logic over one
+   PostgreSQL schema per memory, for stateless deployments (autoscaled
+   containers with no durable disk) and for inheriting an existing Postgres
+   HA/PITR/backup story. The backend plugs in at an internal `Db` transport
+   seam inside the store, so fork/head/oplog semantics are identical by
+   construction and pinned by a two-backend conformance suite. Point reads
+   are millisecond-class over a network — the voice frame path stays
+   embedded by design. Single-writer-per-memory is enforced with a session
+   advisory lock (`STO-E002` on contention); erasure and export map to
+   `DROP SCHEMA … CASCADE` and `pg_dump -n`. The op-log/bundle wire format
+   is backend-independent, so edge files sync into a Postgres-backed memory
+   with the same `MGB1` bundles.
+3. **Hub (`dejad`)** — an optional self-hosted daemon that owns a directory of
    memory files (one writer queue each), serves HTTP/MCP recall/add for
    latency-tolerant channels, serves subscriptions, and handles bundle
    push/pull. It shards by hashing the memory key; with no cross-file
    transactions, scaling is adding shards.
-3. **Object storage** — the segment archive and restore source.
+4. **Object storage** — the segment archive and restore source.
 
 Organization/category knowledge fans out read-only to every edge via pull
 subscriptions, which is what keeps a session's `ASSEMBLE` local: a session opens

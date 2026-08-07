@@ -1,6 +1,21 @@
 # Postgres Backend — Implementation Plan (Option B)
 
-**Status: plan (2026-08-07). Companion to [`postgres-backend-proposal.md`](postgres-backend-proposal.md), which holds the why; this holds the how.**
+**Status: stage 1 BUILT (2026-08-07). Companion to [`postgres-backend-proposal.md`](postgres-backend-proposal.md), which holds the why; this holds the how.**
+
+> **Implementation record.** Phases 0.1–0.4, 2 (stage 1) and 3 landed on main
+> 2026-08-07 (commits `c72b076`…): the `Db` seam + `TursoDb`, the
+> `dejadb-conformance` crate (one case list, both backends), the fidelity
+> fixes, backend-shaped read batching (`prefers_batched_reads` — a
+> parameterized `IN` on the PK is a table scan on the embedded engine, so
+> Turso keeps point-read loops and Pg batches), `PgDb` behind
+> `feature = "postgres"` with the fail-fast statement translator, advisory-
+> lock single-writer (`STO-E002`), lazy `vector(dim)` column, in-schema CAS
+> blobs, `deja --db postgres://…?schema=…`, and the `pgvector/pgvector:pg16`
+> CI job. Phase 1 (facade trait promotion) is deferred — with the Db-seam
+> design every surface works on a Pg-backed `DejaDB` unchanged. Phase 4
+> (stage-2 multi-writer + gated subject-scoped erasure) remains open and
+> gated on the pilot + the OMS destruction decision. Bindings openers
+> (py/js `open_postgres`) are follow-up work.
 
 Decision taken: PostgreSQL as a **second** storage backend behind `CalStoreFacade`,
 feature-flagged, never the default. Turso remains the embedded backend and keeps

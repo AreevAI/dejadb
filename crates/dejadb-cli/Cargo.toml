@@ -16,6 +16,11 @@ categories = ["command-line-utilities", "database-implementations"]
 name = "deja"
 path = "src/main.rs"
 
+[features]
+# `deja --db postgres://…?schema=<name>` — the server-tier backend. Non-
+# default: the published edge binary stays dependency-light.
+postgres = ["dejadb-store/postgres"]
+
 [dependencies]
 dejadb-core = { path = "../dejadb-core", version = "1.0.0" }
 dejadb-store = { path = "../dejadb-store", version = "1.0.0" }

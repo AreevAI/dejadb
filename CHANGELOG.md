@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **PostgreSQL backend** (non-default cargo feature `postgres`): the same
+  store logic runs over one Postgres schema per memory — for stateless
+  deployments where a file has nowhere durable to live. `DejaDB::open_postgres
+  / open_postgres_with`, `deja --db postgres://…?schema=<name>` (CLI built
+  with the feature), pgvector-backed vector recall (the `vector(dim)` column
+  is created at the first `set_embedder`; a dim mismatch is a hard refusal),
+  CAS blobs in an in-schema table, and ENFORCED single-writer-per-memory via
+  a session advisory lock — a second writer gets the new **`STO-E002`
+  StoreBusy** error instead of undefined behavior. Erasure/portability map to
+  `DROP SCHEMA … CASCADE` / `pg_dump -n`; the page cipher and the telemetry
+  sidecar remain file-backend capabilities and are rejected with clear
+  errors. Parity is pinned by the new **`dejadb-conformance`** crate: one
+  case list (forks, two-hop replication, tombstones, PITR, BM25, vectors,
+  CAS, CAL end-to-end) executed against both backends, plus a Postgres CI
+  job on `pgvector/pgvector:pg16`.
+- Internal `Db` backend seam in `dejadb-store`: the store logic is
+  backend-agnostic; the embedded Turso engine and the Postgres transport are
+  interchangeable implementations behind it. By construction this also fixed
+  three latent issues: `apply_supersede_flip` now runs in a transaction,
+  `rebuild_link_indexes` rolls back on error, and the write path's per-add
+  statement preparation is now cached.
+
+### Fixed
+
+- Head re-election after `forget`/changed-key `supersede` keys the
+  heads↔triples join on `(ns,s,p)` — an unkeyed join could elect a
+  `related_to` link target as `entity_latest.o` for a link-bearing tip,
+  breaking `add_if_novel`'s value probe.
+- The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
+  blobs in the probe statement itself (join) instead of one query per hit.
+
 ### Changed
 
 - **BREAKING: some grains now hash differently, so re-ingestion writes

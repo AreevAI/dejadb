@@ -451,6 +451,37 @@ fn split_two_args(s: &str) -> Option<(&str, &str, usize)> {
     None
 }
 
+/// Split a `postgres://…?schema=<name>` URL into (connection URL, schema).
+/// The `schema` query parameter is ours, not the driver's, so it is removed
+/// from the URL handed to the connector. Hosts use this to accept one DSN
+/// string wherever a file path is accepted today.
+pub fn split_schema_url(url: &str) -> Result<(String, String)> {
+    let Some((base, query)) = url.split_once('?') else {
+        return Err(DejaDbError::Validation(
+            "postgres URL needs ?schema=<name> — one memory = one schema, so the schema \
+             must be named explicitly"
+                .into(),
+        ));
+    };
+    let mut schema = None;
+    let mut rest: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("schema", v)) if !v.is_empty() => schema = Some(v.to_string()),
+            _ => rest.push(pair),
+        }
+    }
+    let schema = schema.ok_or_else(|| {
+        DejaDbError::Validation("postgres URL needs ?schema=<name>".into())
+    })?;
+    let url = if rest.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", rest.join("&"))
+    };
+    Ok((url, schema))
+}
+
 /// Drop a memory schema entirely — the Postgres backend's memory-level
 /// erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
 /// memory file. Admin-surface only: not reachable from CAL, and hosts must
@@ -555,6 +586,22 @@ mod tests {
             // through untouched (no placeholders, no divergent constructs).
             assert_eq!(&translate(sql).unwrap(), sql);
         }
+    }
+
+    #[test]
+    fn splits_schema_urls() {
+        let (u, s) =
+            split_schema_url("postgres://u:p@h:5432/db?schema=org_7").unwrap();
+        assert_eq!(u, "postgres://u:p@h:5432/db");
+        assert_eq!(s, "org_7");
+        let (u, s) = split_schema_url(
+            "postgres://u:p@h/db?sslmode=disable&schema=m1&connect_timeout=5",
+        )
+        .unwrap();
+        assert_eq!(u, "postgres://u:p@h/db?sslmode=disable&connect_timeout=5");
+        assert_eq!(s, "m1");
+        assert!(split_schema_url("postgres://u:p@h/db").is_err());
+        assert!(split_schema_url("postgres://u:p@h/db?schema=").is_err());
     }
 
     #[test]

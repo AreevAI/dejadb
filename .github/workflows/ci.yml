@@ -32,6 +32,44 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+  postgres:
+    name: postgres backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dejadb_test
+        ports: ["5432:5432"]
+        # Mandatory: the service starts concurrently with the job and the
+        # first connection races it without a health gate.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/dejadb_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The conformance runner hard-fails (rather than skipping) when
+      # CI=true and DATABASE_URL is missing, so a broken service can never
+      # masquerade as a skipped suite.
+      - name: Conformance + CAL smoke (postgres)
+        run: cargo test -p dejadb-conformance --features postgres
+      - name: Store unit tests with the postgres feature
+        run: cargo test -p dejadb-store --features postgres --lib
+      # The workspace clippy job lints default features only; without this
+      # the feature-gated backend would accumulate warnings invisibly (and
+      # docs.rs builds all-features, so it must at least compile clean).
+      - name: Clippy with the postgres feature
+        run: cargo clippy -p dejadb-store -p dejadb-conformance --features postgres --all-targets -- -D warnings
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

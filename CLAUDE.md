@@ -48,7 +48,8 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
 | Crate | What | CLAUDE.md |
 |---|---|---|
 | `dejadb-core` | `.mg` format, canonical serialization, content addressing, 12 grain types, tool-schema rendering | yes |
-| `dejadb-store` | Turso store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs, memory-tool adapter, migration importers | yes |
+| `dejadb-store` | The store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs, memory-tool adapter, migration importers. Backend-agnostic logic over an internal `Db` seam — embedded Turso (default) or PostgreSQL (`feature = "postgres"`, one memory = one schema, advisory-locked single writer, pgvector) | yes |
+| `dejadb-conformance` | Backend-parameterized conformance suite (`publish = false`) — one case list (forks, replication, tombstones, PITR, BM25, vectors, CAS, CAL smoke) run against BOTH backends; the Pg runner needs `DATABASE_URL`/`DEJADB_PG_URL` and hard-fails when `CI=true` without one | — |
 | `dejadb-cal` | CAL lexer/parser/executor, ASSEMBLE, `DejaDbFacade` + mounts | yes |
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |
 | `waiser` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/waiser.md` | — |
@@ -81,8 +82,11 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
    PURGE, user/scope erasure) without a design + OMS-conformance decision.
 4. **CAL syntax is an OMS conformance contract** — no new CAL syntax
    without a spec-level decision.
-5. **One memory = one file** — the unit of erasure, sync, portability, and
-   write parallelism. Single writer per file; cross-file queries go through
+5. **One memory = one isolation unit** — a file on the embedded backend, a
+   Postgres schema on the `postgres` backend; either way it is the unit of
+   erasure, sync, portability, and write parallelism. Single writer per
+   memory (advisory-lock-ENFORCED on Postgres, `STO-E002` on contention);
+   cross-memory queries go through
    ASSEMBLE with facade mounts, not shared connections. Files are
    self-describing: the `meta` table carries file-truths (`text_index`,
    `entity_relations`, embedding provenance) and CAL host metadata — saved
