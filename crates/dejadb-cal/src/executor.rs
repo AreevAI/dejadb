@@ -275,6 +275,10 @@ pub struct CalGrainResult {
     /// Human-readable ranking explanation. Present when `WITH explanation`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
+    /// Coarse age label ("3 hours ago"). Present when
+    /// `WITH annotate_relative_time`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_time: Option<String>,
     /// True when this grain came from a RECALL source with no ABOUT clause —
     /// i.e. no semantic comparison was performed and `score` is a structural
     /// sentinel, not a relevance signal. Such grains must bypass score-based
@@ -370,6 +374,27 @@ pub struct LetScope {
 }
 
 impl LetScope {
+    /// Flatten the bindings into the string lists a `WHERE ... IN $var` needs.
+    ///
+    /// A `SUBJECTS`/`OBJECTS`/`HASHES` extractor already produces strings. A
+    /// binding with no extractor holds whole grains, so its members are their
+    /// content addresses — the only identity every grain type shares, and the
+    /// one `WHERE hash IN $var` can match on.
+    fn to_values(&self) -> HashMap<String, Vec<String>> {
+        self.bindings
+            .iter()
+            .map(|(name, value)| {
+                let values = match value {
+                    LetValue::Extracted(v) => v.clone(),
+                    LetValue::Grains(g) => g.iter().map(|r| r.hash.clone()).collect(),
+                };
+                (name.clone(), values)
+            })
+            .collect()
+    }
+}
+
+impl LetScope {
     /// Evaluate all LET bindings in declaration order.
     ///
     /// # Limits
@@ -412,6 +437,7 @@ impl LetScope {
                 with_options: Vec::new(),
                 format: None,
                 let_bindings: Vec::new(),
+                let_values: scope.to_values(),
                 user_vars: HashMap::new(),
                 warnings: Vec::new(),
             };
@@ -574,23 +600,25 @@ impl CalExecutor {
         // 2. Compute query hash (C-4: SHA-256 of normalized / trimmed input).
         let query_hash = compute_query_hash(input);
 
-        // 2b. Evaluate LET bindings (Phase 2).
+        // 2b. Evaluate LET bindings, then bind the results into the query.
         //
-        // Bindings are evaluated sequentially in declaration order.  The
-        // resulting LetScope is currently used for validation (S-06, C2-04)
-        // and will be threaded through WHERE clause resolution in Phase 3.
+        // Bindings are evaluated sequentially in declaration order. The scope
+        // used to be evaluated and dropped — the comment here said WHERE
+        // resolution was "Phase 3" — so `$friends` never reached the WHERE
+        // clause at all, and the documented two-step pattern quietly matched
+        // nothing it was supposed to scope by.
+        let mut query = query;
         let mut exec_warnings: Vec<String> = Vec::new();
-        let _scope = if !query.let_bindings.is_empty() {
-            Some(LetScope::evaluate(
+        if !query.let_bindings.is_empty() {
+            let scope = LetScope::evaluate(
                 &query.let_bindings,
                 self,
                 store,
                 &query,
                 &mut exec_warnings,
-            )?)
-        } else {
-            None
-        };
+            )?;
+            query.let_values = scope.to_values();
+        }
 
         // Validate pipeline-stage field references against the closed field
         // set before execution.
@@ -656,19 +684,20 @@ impl CalExecutor {
         // Compute query hash (C-4).
         let query_hash = compute_query_hash(original_text);
 
-        // Evaluate LET bindings.
+        // Evaluate LET bindings and bind them into the query (mirror of
+        // `execute()` — the two entry points have to stay in step).
+        let mut query = query;
         let mut exec_warnings: Vec<String> = Vec::new();
-        let _scope = if !query.let_bindings.is_empty() {
-            Some(LetScope::evaluate(
+        if !query.let_bindings.is_empty() {
+            let scope = LetScope::evaluate(
                 &query.let_bindings,
                 self,
                 store,
                 &query,
                 &mut exec_warnings,
-            )?)
-        } else {
-            None
-        };
+            )?;
+            query.let_values = scope.to_values();
+        }
 
         // Validate pipeline-stage field references (mirror of execute()).
         if let CalStatement::Recall(ref r) = query.statement {
@@ -769,8 +798,12 @@ impl CalExecutor {
             CalStatement::Recall(recall) => {
                 self.execute_recall(recall, store, query, exec_warnings)
             }
-            CalStatement::Exists(exists) => self.execute_exists(exists, store, exec_warnings),
-            CalStatement::History(history) => self.execute_history(history, store, exec_warnings),
+            CalStatement::Exists(exists) => {
+                self.execute_exists(exists, store, exec_warnings, &query.let_values)
+            }
+            CalStatement::History(history) => {
+                self.execute_history(history, store, exec_warnings, &query.let_values)
+            }
             CalStatement::Describe(describe) => self.execute_describe(describe, store),
             CalStatement::Explain(explain) => self.execute_explain(explain, store, query),
             CalStatement::Batch(batch) => self.execute_batch(batch, store, exec_warnings),
@@ -1565,7 +1598,7 @@ impl CalExecutor {
 
         // WHERE clause → structured filter fields.
         if let Some(ref where_clause) = recall.where_clause {
-            self.apply_where_clause(&where_clause.condition, &mut params, exec_warnings)?;
+            self.apply_where_clause(&where_clause.condition, &mut params, exec_warnings, &query.let_values)?;
         }
 
         // Consent grains index subject_did in the hexastore, so when the user
@@ -1742,6 +1775,48 @@ impl CalExecutor {
             }
         }
 
+        // ── WITH dedup(<field>) on RECALL ────────────────────────────────
+        //
+        // §5 introduces the WITH table with "WITH options tune recall
+        // behavior", but `dedup` was only ever implemented on the ASSEMBLE
+        // merge path — on a RECALL it parsed, ran, and changed nothing. Keep
+        // the first grain per distinct value of the field, which is the same
+        // rule ASSEMBLE applies, and preserves recall order (so the
+        // highest-ranked representative of each value survives).
+        for opt in &query.with_options {
+            // `WITH dedup` with no field is the similarity-based form; only the
+            // per-field spelling is meaningful on a single recall's grains.
+            if let WithOption::Dedup { field: Some(field) } = opt {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                grains.retain(|g| match json_field(&g.fields, field) {
+                    Some(v) => seen.insert(value_dedup_key(v)),
+                    // A grain that does not carry the field cannot be a
+                    // duplicate on it; dropping those would silently narrow the
+                    // result to whichever grain types happen to have it.
+                    None => true,
+                });
+            }
+        }
+
+        // `WITH score_breakdown` asks for per-leg scoring detail this recall
+        // path does not produce: the facade returns grains, not per-leg scores,
+        // so every structural hit carries the sentinel 1.0. §5's own rule is
+        // that an option needing an unavailable backend "returns an honest
+        // error rather than silently degrading" — a warning is the
+        // non-breaking form of honest, since the option has shipped for
+        // several releases and callers pass it today.
+        if params.score_breakdown == Some(true) {
+            exec_warnings.push(
+                super::errors::CalWarning::WithOptionInert {
+                    option: "score_breakdown",
+                    statement: "RECALL",
+                    why: "this recall path returns fused grains, not per-leg scores, so \
+                          structural hits all carry the sentinel score 1.0",
+                }
+                .to_string(),
+            );
+        }
+
         // ── CONTRADICTIONS — restrict to grains that are contested ───────
         //
         // A fork is `(ns, subject, relation)` with more than one live head, which
@@ -1845,6 +1920,10 @@ impl CalExecutor {
         condition: &Condition,
         params: &mut RecallParams,
         warnings: &mut Vec<String>,
+        // Resolved LET bindings, so `IN $var` can expand. Empty for statements
+        // that carry no LET clause, which is every statement but the two-step
+        // pattern.
+        let_values: &HashMap<String, Vec<String>>,
     ) -> std::result::Result<(), CalError> {
         match condition {
             Condition::Comparison {
@@ -1895,6 +1974,14 @@ impl CalExecutor {
                     ("entity", Comparator::Eq) => {
                         params.entity = Some(value_to_string(value)?);
                     }
+                    // `hash` is on the grain envelope, not in `fields`, so it
+                    // reached neither the structural filters nor the
+                    // post-filter's `fields` lookup: `WHERE hash = "<real>"`
+                    // returned the whole result set with a CAL-W010, and
+                    // `hash IN (...)` returned nothing. Both are handled as
+                    // post-filters now (see `grain_matches_condition`); listing
+                    // the field here is what stops the spurious warning.
+                    ("hash", Comparator::Eq) | ("hash", Comparator::NotEq) => {}
                     ("scope_path", Comparator::Eq) | ("scope", Comparator::Eq) => {
                         params.scope_path = Some(value_to_string(value)?);
                     }
@@ -1914,19 +2001,46 @@ impl CalExecutor {
             }
 
             Condition::And { left, right, .. } => {
-                self.apply_where_clause(left, params, warnings)?;
-                self.apply_where_clause(right, params, warnings)?;
+                self.apply_where_clause(left, params, warnings, let_values)?;
+                self.apply_where_clause(right, params, warnings, let_values)?;
                 Ok(())
             }
 
-            Condition::In { field, values, .. } => {
-                let str_values: Vec<String> = values
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::String { value } => Some(value.clone()),
-                        _ => None,
-                    })
-                    .collect();
+            Condition::In { field, values, span } => {
+                // `IN $var` arrives as a single `Value::Parameter`. Expanding it
+                // is what makes `LET $friends = SUBJECTS OF (…)` mean anything;
+                // a `filter_map` over string literals dropped it, leaving an
+                // empty set that nothing downstream read, so the query returned
+                // the whole table. An unbound name is an error rather than an
+                // empty set: silently scoping to nothing is as wrong as
+                // silently scoping to everything, and the caller can tell the
+                // difference only if we say so.
+                let mut str_values: Vec<String> = Vec::new();
+                for v in values {
+                    match v {
+                        Value::String { value } | Value::Hash { value } => {
+                            str_values.push(value.clone())
+                        }
+                        Value::Number { value } => str_values.push(value.to_string()),
+                        Value::Parameter { name } => match let_values.get(name.as_str()) {
+                            Some(bound) => str_values.extend(bound.iter().cloned()),
+                            None => {
+                                return Err(CalError::UnboundParameter {
+                                    name: name.clone(),
+                                    span: *span,
+                                })
+                            }
+                        },
+                        Value::Array { values: inner } => {
+                            for iv in inner {
+                                if let Value::String { value } = iv {
+                                    str_values.push(value.clone());
+                                }
+                            }
+                        }
+                        Value::Boolean { value } => str_values.push(value.to_string()),
+                    }
+                }
                 match field.as_str() {
                     "subject" => params.subject_in = Some(str_values),
                     "relation" => params.relation_in = Some(str_values),
@@ -1982,7 +2096,7 @@ impl CalExecutor {
             Condition::Or { left, .. } => {
                 // OR is not directly representable in RecallParams.
                 // Apply the left branch only and emit a warning.
-                self.apply_where_clause(left, params, warnings)?;
+                self.apply_where_clause(left, params, warnings, let_values)?;
                 warnings.push(
                     "OR conditions are partially supported in Phase 1: only the left branch is applied. Use separate queries with UNION for full OR semantics.".to_string()
                 );
@@ -2298,10 +2412,19 @@ impl CalExecutor {
                 // Cross-source near-duplicate removal.  The AssembleEngine
                 // already does hash-based dedup; this applies the softer
                 // threshold-based dedup from WITH dedup (similarity threshold).
-                WithOption::Dedup { field: _ } => {
-                    // Bug 5: argument is now a field name; per-field dedup is
-                    // not yet implemented at this layer. Fall back to the
-                    // similarity-based dedup with the previous default.
+                // `WITH dedup(<field>)` keeps one grain per distinct value of
+                // that field — the same rule the RECALL path applies, so the
+                // option means the same thing wherever it is written. Without
+                // a field it falls back to the similarity-based form.
+                WithOption::Dedup { field: Some(field) } => {
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    grains.retain(|grain| match json_field(&grain.fields, field) {
+                        Some(v) => seen.insert(value_dedup_key(v)),
+                        None => true,
+                    });
+                }
+                WithOption::Dedup { field: None } => {
                     let threshold = 0.85_f64;
                     let mut seen_texts: Vec<String> = Vec::new();
                     grains.retain(|grain| {
@@ -2440,6 +2563,7 @@ impl CalExecutor {
         exists: &ExistsStmt,
         store: &dyn CalStoreFacade,
         exec_warnings: &mut Vec<String>,
+        let_values: &HashMap<String, Vec<String>>,
     ) -> std::result::Result<CalResultPayload, CalError> {
         // EXISTS by grain type and WHERE clause: recall with limit=1 and check count.
         let mut params = RecallParams::default();
@@ -2453,7 +2577,7 @@ impl CalExecutor {
         }
 
         if let Some(ref where_clause) = exists.where_clause {
-            self.apply_where_clause(&where_clause.condition, &mut params, exec_warnings)?;
+            self.apply_where_clause(&where_clause.condition, &mut params, exec_warnings, let_values)?;
         }
 
         // Special case: if WHERE contains a hash comparison, look up directly.
@@ -2506,6 +2630,7 @@ impl CalExecutor {
         history: &HistoryStmt,
         store: &dyn CalStoreFacade,
         exec_warnings: &mut Vec<String>,
+        let_values: &HashMap<String, Vec<String>>,
     ) -> std::result::Result<CalResultPayload, CalError> {
         // ── HISTORY DIFF path ──────────────────────────────────────────
         //
@@ -2582,7 +2707,7 @@ impl CalExecutor {
         if history.hash.is_empty() {
             if let Some(ref wc) = history.where_clause {
                 let mut params = RecallParams::default();
-                self.apply_where_clause(&wc.condition, &mut params, exec_warnings)?;
+                self.apply_where_clause(&wc.condition, &mut params, exec_warnings, let_values)?;
 
                 // Apply capability overrides.
                 if let Some(ref ns) = self.config.namespace_override {
@@ -2715,9 +2840,16 @@ impl CalExecutor {
                     "SELECT", "ORDER BY", "LIMIT", "OFFSET", "COUNT",
                     "FIRST", "SUBJECTS", "OBJECTS", "HASHES", "GROUP BY", "PROJECT"
                 ],
+                // What actually changes the result on a RECALL. The list used
+                // to advertise `score_breakdown`, which is inert here (there
+                // are no per-leg scores to break down) — DESCRIBE naming an
+                // option that does nothing is worse than not naming it, since
+                // it is what a client introspects to decide what to send.
                 "with_options": [
-                    "superseded", "score_breakdown", "explanation",
-                    "contradiction_detection", "diversity"
+                    "superseded", "explanation", "annotate_relative_time",
+                    "conflict_resolution", "dedup", "contradiction_detection",
+                    "diversity", "multi_hop", "provenance", "query_expansion",
+                    "rerank"
                 ]
             }),
             DescribeTarget::GrainType(gt) => {
@@ -3315,6 +3447,7 @@ impl CalExecutor {
             with_options: entry.with_options.clone(),
             format: entry.format.clone(),
             let_bindings: Vec::new(),
+            let_values: HashMap::new(),
             user_vars: entry.user_vars.clone(),
             warnings: Vec::new(),
         };
@@ -3372,6 +3505,7 @@ impl CalExecutor {
                     with_options: query.with_options.clone(),
                     format: None,
                     let_bindings: Vec::new(),
+                    let_values: query.let_values.clone(),
                     user_vars: HashMap::new(),
                     warnings: Vec::new(),
                 };
@@ -3408,6 +3542,7 @@ impl CalExecutor {
                     with_options: query.with_options.clone(),
                     format: None,
                     let_bindings: Vec::new(),
+                    let_values: query.let_values.clone(),
                     user_vars: HashMap::new(),
                     warnings: Vec::new(),
                 };
@@ -3483,6 +3618,7 @@ impl CalExecutor {
                 with_options: query.with_options.clone(),
                 format: None,
                 let_bindings: Vec::new(),
+                let_values: query.let_values.clone(),
                 user_vars: HashMap::new(),
                 warnings: Vec::new(),
             };
@@ -3620,6 +3756,7 @@ impl CalExecutor {
                     with_options: query.with_options.clone(),
                     format: None,
                     let_bindings: Vec::new(),
+                    let_values: query.let_values.clone(),
                     user_vars: HashMap::new(),
                     warnings: Vec::new(),
                 };
@@ -3646,6 +3783,7 @@ impl CalExecutor {
                                     ),
                                     score_breakdown: None,
                                     explanation: None,
+                                    relative_time: None,
                                     is_deterministic: true,
                                     contested_by: None,
                                 });
@@ -3966,6 +4104,7 @@ impl CalExecutor {
                                 fields: serde_json::json!({ "value": v }),
                                 score_breakdown: None,
                                 explanation: None,
+                                relative_time: None,
                                 is_deterministic: true,
                                 contested_by: None,
                             })
@@ -3990,6 +4129,7 @@ impl CalExecutor {
                                 fields: serde_json::json!({ "value": v }),
                                 score_breakdown: None,
                                 explanation: None,
+                                relative_time: None,
                                 is_deterministic: true,
                                 contested_by: None,
                             })
@@ -4013,6 +4153,7 @@ impl CalExecutor {
                             fields: serde_json::json!({ "value": g.hash }),
                             score_breakdown: None,
                             explanation: None,
+                            relative_time: None,
                             is_deterministic: true,
                             contested_by: None,
                         })
@@ -4415,6 +4556,7 @@ fn hits_to_grain_results(hits: &[crate::store_types::SearchHit]) -> Vec<CalGrain
                 .as_ref()
                 .map(|sb| serde_json::to_value(sb).unwrap_or(serde_json::Value::Null)),
             explanation: hit.explanation.clone(),
+            relative_time: hit.relative_time.clone(),
             is_deterministic: false,
             contested_by: None,
         })
@@ -5920,7 +6062,13 @@ fn extract_type_specific_conditions_inner(
             comparator,
             value,
             ..
-        } if !COMMON_FIELDS.contains(&field.as_str()) => {
+            // `hash` is listed in COMMON_FIELDS but no structural filter
+            // consumes it — it lives on the envelope, not in `RecallParams`.
+            // Skipping it here meant `WHERE hash = "<a real address>"` matched
+            // nothing structurally and filtered nothing afterwards, so it
+            // returned the entire result set. Route it to the post-filter,
+            // which resolves envelope fields.
+        } if !COMMON_FIELDS.contains(&field.as_str()) || field == "hash" => {
             result.push((field.clone(), *comparator, value.clone()));
         }
         Condition::And { left, right, .. } => {
@@ -6016,7 +6164,26 @@ fn grain_matches_condition(
     comparator: &Comparator,
     value: &Value,
 ) -> bool {
-    let grain_value = json_field(&grain.fields, field);
+    // Envelope fields are not in `fields` — a grain's content address is a
+    // property *of* the blob, so it cannot be inside it. Looking `hash` up in
+    // `fields` therefore always missed, which is why `hash IN ("<real hash>")`
+    // matched nothing. A `sha256:` prefix is accepted because that is how the
+    // rest of CAL spells an address.
+    let envelope: Option<serde_json::Value> = match field {
+        "hash" => Some(serde_json::Value::String(grain.hash.clone())),
+        "grain_type" => Some(serde_json::Value::String(grain.grain_type.clone())),
+        _ => None,
+    };
+    let grain_value = match &envelope {
+        Some(v) => Some(v),
+        None => json_field(&grain.fields, field),
+    };
+    let value = &match (field, value) {
+        ("hash", Value::String { value: v }) => Value::String {
+            value: v.strip_prefix("sha256:").unwrap_or(v).to_string(),
+        },
+        _ => value.clone(),
+    };
 
     match comparator {
         Comparator::Eq => match value {
@@ -6179,6 +6346,16 @@ fn collect_filter_names(condition: &Condition, names: &mut Vec<String>) {
 }
 
 /// Get a field value from a grain's JSON fields object.
+/// Collapse a JSON field value to the string key `WITH dedup(<field>)` groups
+/// on. Strings compare as themselves; anything else by its canonical JSON, so
+/// `1` and `"1"` stay distinct rather than colliding through `to_string`.
+fn value_dedup_key(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn json_field<'a>(fields: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
     if let serde_json::Value::Object(map) = fields {
         map.get(field)
@@ -7346,6 +7523,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -7386,6 +7564,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -7440,6 +7619,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -7474,6 +7654,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -7502,6 +7683,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -7975,6 +8157,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: vec![binding.clone()],
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -8043,6 +8226,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: bindings.clone(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -8091,6 +8275,7 @@ mod tests {
                 fields: serde_json::json!({}),
                 score_breakdown: None,
                 explanation: None,
+                relative_time: None,
                 is_deterministic: false,
                 contested_by: None,
             }],
@@ -8373,6 +8558,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -8459,6 +8645,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -8512,6 +8699,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -8660,6 +8848,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -8694,6 +8883,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -8744,6 +8934,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -8773,6 +8964,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -8804,6 +8996,7 @@ mod tests {
             fields: serde_json::json!({}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9019,6 +9212,7 @@ mod tests {
             fields: serde_json::json!({"goal_state": "active", "subject": "alice"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9050,6 +9244,7 @@ mod tests {
             fields: serde_json::json!({"session_id": "sess-001", "subject": "alice"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9100,6 +9295,7 @@ mod tests {
             fields: serde_json::json!({"role": "user", "content": "hi"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9148,6 +9344,7 @@ mod tests {
             fields: serde_json::json!({"role": "user"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9158,6 +9355,7 @@ mod tests {
             fields: serde_json::json!({"role": "tool"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9175,6 +9373,7 @@ mod tests {
             fields: serde_json::json!({"parent_message_id": "deadbeef"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -9270,6 +9469,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9334,6 +9534,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9399,6 +9600,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9483,6 +9685,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9565,6 +9768,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9629,6 +9833,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9701,6 +9906,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9779,6 +9985,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -9854,6 +10061,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -10374,6 +10582,7 @@ mod tests {
             fields: serde_json::Value::Object(fields),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -10391,6 +10600,7 @@ mod tests {
             fields: serde_json::Value::Object(fields),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -10542,6 +10752,7 @@ mod tests {
             fields: serde_json::to_value(&grain.fields).unwrap(),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -10742,6 +10953,7 @@ mod tests {
             fields: serde_json::json!({"subject": "a", "relation": "r", "object": "o"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -10752,6 +10964,7 @@ mod tests {
             fields: serde_json::json!({"subject": "b", "relation": "r", "object": "o"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
@@ -10762,6 +10975,7 @@ mod tests {
             fields: serde_json::json!({"name": "boot", "status": "active"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: true,
             contested_by: None,
         };
@@ -10854,6 +11068,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };
@@ -10906,6 +11121,7 @@ mod tests {
             with_options: Vec::new(),
             format: None,
             let_bindings: Vec::new(),
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: Vec::new(),
         };

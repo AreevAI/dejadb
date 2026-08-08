@@ -961,6 +961,8 @@ impl Parser {
         }
 
         Ok(CalQuery {
+            // Execution state — the executor fills this once LET has run.
+            let_values: Default::default(),
             version,
             statement,
             pipeline: inline_pipeline,

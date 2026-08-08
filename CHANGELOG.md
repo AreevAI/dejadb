@@ -157,6 +157,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   empty result** — the re-stamp turns indexing on for future writes, so grains
   written while it was off stay invisible; it now names `reindex_text()` as the
   second step. `rebuild_text_index` no longer names a CLI flag either.
+- **CAL clauses that parsed, ran, and did nothing** (#47, #53). Each of these
+  failed *open* — no error, no warning, and the result feeds a model's
+  context:
+  - `WHERE <field> IN (...)` was never applied. The executor set
+    `RecallParams::subject_in`/`relation_in`/`object_in` and nothing
+    downstream read them, so the filter was dropped and every row the rest of
+    the `WHERE` matched came back. `subject IN` now anchors the structural leg
+    once per value (a union, not a filtered recent-scan, so a named subject
+    older than `default_limit` is still found); all three are re-applied as
+    membership tests.
+  - **An empty `IN` set now selects nothing rather than everything.** This was
+    the sharp edge: `LET $friends = …` binding to the empty set is the natural
+    "no friends yet" outcome, and anyone using `LET` to scope a recall to a
+    tenant, session, or user was over-fetching with no signal. An **unbound**
+    `$var` is now `CAL-E008` rather than a silently dropped condition.
+  - **`LET` bindings reach the `WHERE` clause at all.** The scope was
+    evaluated and then dropped, so the documented two-step pattern —
+    `LET $friends = SUBJECTS OF (…); RECALL facts WHERE subject IN $friends` —
+    answered with everybody's preferences. Bindings resolve in declaration
+    order and are inherited by `ASSEMBLE` sources.
+  - `WHERE hash = "<address>"` matched nothing structurally and filtered
+    nothing afterwards, so it returned the whole result set with a spurious
+    `CAL-W010`; `hash IN (...)` took the other branch and returned none. Both
+    resolve the envelope now, with or without the `sha256:` prefix.
+  - `WITH conflict_resolution` and `WITH dedup(<field>)` were implemented on
+    the `ASSEMBLE` post-merge path only, which a `RECALL` payload never
+    reaches. Both work on `RECALL` now, and `dedup(<field>)` honours the field
+    on `ASSEMBLE` too — so clause order no longer decides whether the option
+    applies.
+  - `WITH annotate_relative_time` and `WITH explanation` returned output
+    byte-identical to the same query without them; both populate now.
+  - `WITH score_breakdown` is inert on `RECALL` (that path returns fused
+    grains, not per-leg scores) and says so with the new **`CAL-W014`** rather
+    than degrading in silence. `DESCRIBE`'s `with_options` no longer
+    advertises it, and lists the options that do change a recall.
 
 ### Changed
 
