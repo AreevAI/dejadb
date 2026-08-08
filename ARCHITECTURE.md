@@ -698,6 +698,20 @@ requiring callers to jitter their payloads would mean corrupting the record to
 satisfy the store. A skipped duplicate consumes no sequence number and writes no
 op-log row — nothing changed, so nothing replicates.
 
+**One handle per file, shared across threads.** The rule is enforced in both
+directions: across processes by an OS file lock, and within a process by a
+registry of open paths — a second `open()` on a file this process already holds
+fails at open with `STO-E002`. It has to be enforced, not merely documented,
+because a handle caches its own `next_seq`/`next_term` allocators and BM25
+statistics; two handles drift apart silently and then collide on a write, which
+surfaces as a bare `UNIQUE constraint failed` attributed to whichever handle
+wrote next rather than to the one that should not exist. Sharing one handle
+across threads is fully supported, so opening per request or per agent turn —
+the natural move if you think of the file as a database connection — is never
+necessary. Rust and Python release the claim on drop; Node has no
+deterministic drop, so its binding exposes `close()` — otherwise a handle that
+had gone out of JS scope would keep the file locked until GC got to it.
+
 ### Host config is never persisted in the file
 
 A memory file declares *what it physically is* — its text-index and

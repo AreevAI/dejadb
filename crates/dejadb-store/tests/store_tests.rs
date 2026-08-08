@@ -345,3 +345,58 @@ fn a_batch_containing_the_same_grain_twice_writes_it_once() {
     assert_ne!(c, hashes[0]);
     assert_eq!(m.count().unwrap(), 3);
 }
+
+// ── One handle per file per process (#50) ───────────────────────────────────
+
+/// A second handle on one file, in one process, used to open silently and then
+/// poison the FIRST handle's writes.
+///
+/// Both handles load `next_seq`/`next_term` into memory at open and allocate
+/// from them independently, so they drift until a write collides — surfacing as
+/// `UNIQUE constraint failed: terms.id` on a handle that did nothing wrong,
+/// long after the mistake. The cross-process path refuses this correctly at
+/// open; inside one process the OS lock is already held, so nothing caught it.
+#[test]
+fn a_second_handle_on_one_file_is_refused_at_open() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let p = path.to_str().unwrap();
+
+    let mut a = DejaDB::open(p).unwrap();
+    a.add(&Fact::new("a1", "rel", "v").namespace("caller")).unwrap();
+
+    let err = match DejaDB::open(p) {
+        Ok(_) => panic!("the second handle must be refused"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "STO-E002", "unexpected error: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already open in this process") && msg.contains("share the handle"),
+        "the message must name the cause and the fix: {msg}"
+    );
+
+    // The first handle keeps working — the whole point is that the refusal
+    // lands on the newcomer, not on the incumbent's next write.
+    a.add(&Fact::new("a2", "rel", "v").namespace("caller")).unwrap();
+    assert_eq!(a.count().unwrap(), 2);
+
+    // Dropping it releases the claim, so a genuine reopen still works.
+    drop(a);
+    let mut b = DejaDB::open(p).expect("reopen after close must succeed");
+    b.add(&Fact::new("b1", "rel", "v").namespace("caller")).unwrap();
+    assert_eq!(b.count().unwrap(), 3);
+}
+
+/// Different files are independent — the guard keys on the path, not on "a
+/// memory is open".
+#[test]
+fn two_handles_on_different_files_coexist() {
+    let dir = TempDir::new().unwrap();
+    let mut a = DejaDB::open(dir.path().join("a.db").to_str().unwrap()).unwrap();
+    let mut b = DejaDB::open(dir.path().join("b.db").to_str().unwrap()).unwrap();
+    a.add(&Fact::new("x", "r", "v").namespace("caller")).unwrap();
+    b.add(&Fact::new("y", "r", "v").namespace("caller")).unwrap();
+    assert_eq!(a.count().unwrap(), 1);
+    assert_eq!(b.count().unwrap(), 1);
+}
