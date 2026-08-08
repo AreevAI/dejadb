@@ -100,12 +100,21 @@ RECALL facts LIKE "window"
 ```
 
 `RECALL *` is the explicit spelling of "any grain type" and means exactly the
-same as omitting the type. It is still subject to the anchoring rule below: a
-`*` recall must carry a subject filter or a free-text query, because `*` is not
-a *specific* grain type and `LIMIT`/`RECENT` alone cannot bound an untyped scan.
+same as omitting the type.
 
-Every `RECALL` needs a subject filter or a free-text query (`LIKE`/`ABOUT`) —
-a bare type/namespace/RECENT scan is rejected with `VAL-E001`.
+**The anchoring rule applies to *untyped* recalls only.** An untyped `RECALL`
+(`*` / `grains` / `all`) must carry a subject filter or a free-text query
+(`LIKE`/`ABOUT`), because `*` is not a *specific* grain type and
+`LIMIT`/`RECENT` alone cannot bound an untyped scan; without one it is rejected
+with `VAL-E001`. A **typed** recall (`RECALL facts`, `RECALL events RECENT 5`)
+needs no anchor — it is bounded by `default_limit` (50) and `max_limit` (1000)
+instead, which is what makes `RECALL facts WHERE namespace = "caller" | COUNT`
+and the "reflect over recent experience" scans below legal.
+
+This is a *bounding* rule, not an authorization one. If you accept model- or
+user-authored CAL, a typed full-type scan up to `max_limit` is reachable —
+tune `default_limit`/`max_limit` on the executor config rather than relying on
+the anchoring rule to stop it.
 
 - `ABOUT "..."` runs semantic/free-text search (requires a full-text and/or
   vector leg; without them it returns a clear "unsupported" result rather than
@@ -410,13 +419,17 @@ Pipeline stages post-process a statement's result set, chained with `|` (up to
 | `\| SUBJECTS` / `\| OBJECTS` | Extract the `subject`/`object` of each Fact |
 | `\| HASHES` | Extract the content hash of each grain |
 | `\| GROUP BY field` | Group results |
-| `\| WHERE <condition>` | Post-pipeline filter |
 
 ```sql
 RECALL facts WHERE subject = "john" | SELECT relation, object | LIMIT 5
 RECALL facts WHERE namespace = "caller" | COUNT
 RECALL facts WHERE relation = "knows" | OBJECTS
 ```
+
+There is **no `| WHERE` stage** — filtering is a statement clause, not a
+pipeline stage. Write `RECALL … WHERE a = … AND b = …` instead. The parser
+rejects `| WHERE` with `CAL-E002` and lists the stages it does accept, which is
+the same list as the table above and as `DESCRIBE`'s `pipeline_stages`.
 
 ---
 
@@ -645,8 +658,9 @@ RECALL facts WHERE subject IN $friends AND relation = "prefers" | LIMIT 20
 ASSEMBLE "session" FROM
   profile: (RECALL facts  WHERE subject = "john"),
   recent:  (RECALL events WHERE session_id = "call-42" RECENT 10)
+BUDGET 1200 tokens
 PRIORITY profile: 0.6, recent: 0.4
-BUDGET 1200 tokens FORMAT sml
+FORMAT sml
 
 -- Existence check (boolean)
 EXISTS facts WHERE subject = "john" AND relation = "allergic_to"

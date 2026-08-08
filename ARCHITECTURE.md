@@ -167,24 +167,37 @@ conformance. They are treated as frozen unless the spec itself moves.
 OMS 1.5 defines 12 grain types, each with a stable header byte. The type byte, the
 canonical name, and the fields are part of the format contract.
 
+Fields in **bold** are *required* — the write path rejects a grain without them
+(`VAL-E001`). The rest are the type's other characteristic fields.
+
 | Byte | Type | Purpose | Key fields |
 |---|---|---|---|
-| `0x01` | **Fact** | A subject–relation–object triple: durable structured knowledge | `subject`, `relation`, `object`, `confidence` |
-| `0x02` | **Event** | A conversational or system event; the transcript unit | `role`, `session_id`, `content`, `created_at` |
+| `0x01` | **Fact** | A subject–relation–object triple: durable structured knowledge | **`subject`**, **`relation`**, **`object`**, `confidence` |
+| `0x02` | **Event** | A conversational or system event; the transcript unit | **`content`**, `role`, `session_id`, `created_at` |
 | `0x03` | **State** | An agent state snapshot / checkpoint | `context`, `plan`, `history` |
 | `0x04` | **Workflow** | A DAG of steps bound to tool definitions | `nodes`, `edges`, `bindings`, `retries`, `trigger` |
-| `0x05` | **Tool** | A tool definition, call, or result across its lifecycle | `tool_name`, `tool_phase`, `input`, `is_error` |
-| `0x06` | **Observation** | A raw observation from a sensor or observer | `observer_id`, `observer_type`, `value`, `unit` |
-| `0x07` | **Goal** | A goal or task with state and dependencies | `description`, `goal_state`, `deadline`, `depends_on` |
+| `0x05` | **Tool** | A tool definition, call, or result across its lifecycle | **`tool_name`**, `tool_phase`, `input`, `is_error` |
+| `0x06` | **Observation** | A raw observation from a sensor or observer | **`content`**, `observer_id`, `observer_type`, `value`, `unit` |
+| `0x07` | **Goal** | A goal or task with state and dependencies | **`description`** (or `object`), `goal_state`, `deadline`, `depends_on` |
 | `0x08` | **Reasoning** | A recorded inference (premises → conclusion) | `reasoning_type`, `premises`, `conclusion` |
 | `0x09` | **Consensus** | An agreement across multiple observers | `threshold`, `agreement_count`, `participating_observers` |
-| `0x0A` | **Consent** | A consent / authorization record (DID-scoped) | `consent_action`, `purpose`, `grantor_did`, `grantee_did` |
-| `0x0B` | **Skill** | A packaged, reusable agent capability with learned proficiency | `name`, `domain`, `proficiency`, `transferable` |
+| `0x0A` | **Consent** | A consent / authorization record (DID-scoped) | **`subject_did`**, **`user_id`**, `consent_action`, `purpose`, `grantor_did`, `grantee_did` |
+| `0x0B` | **Skill** | A packaged, reusable agent capability with learned proficiency | **`name`**, **`description`**, `domain`, `proficiency`, `transferable` |
 | `0x0C` | **Recommendation** | A governed, auditable proposal to change memory or agent config | `target_ref`, `analyzer`, `summary`, `dedup_key`, one `proposal_*` |
 
 All 12 types share a common envelope (`namespace`, timestamps, provenance,
 supersession links, optional content/embedding references). The type-specific
 fields above are what each type adds on top.
+
+`State`, `Workflow`, `Reasoning` and `Consensus` deliberately require nothing:
+they are container types whose payload shape is the host's, so an empty one is
+a legal (if useless) grain rather than a validation error. Everything else has
+at least one required field, and `Recommendation` is engine-emitted — there is
+no `ADD recommendation`.
+
+The required set is not only prose: `DESCRIBE <type>` reports it as
+`required_fields`, so a client can ask the engine instead of reading this
+table, and a test pins the two together.
 
 > **Tool grains are data, never executables.** DejaDB stores, correlates, and
 > renders tool definitions/calls/results — it never runs them. A Tool grain's
