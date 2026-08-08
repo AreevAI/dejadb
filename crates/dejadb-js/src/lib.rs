@@ -209,11 +209,35 @@ job_types! {
 /// and concurrent calls contend for one lock inside the store. Firing
 /// `addFact` and `recall` without awaiting leaves which one lands first up to
 /// the thread pool.
+/// A closable slot holding the store.
+///
+/// Node has no deterministic drop — a `DejaDb` that has gone out of JS scope is
+/// released whenever GC gets to it — so a handle cannot be closed by letting it
+/// fall out of scope the way Rust and Python can. That matters now that a
+/// second handle on one file is refused: without an explicit `close()`, a
+/// perfectly ordinary open → use → reopen sequence would hit STO-E002 against a
+/// handle the caller had already finished with and had no way to release.
+///
+/// `None` means closed; every method then fails with a message saying so
+/// rather than panicking or silently reopening.
+type FacadeSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<DejaDbFacade>>>>;
+
+fn take_facade(slot: &FacadeSlot) -> napi::Result<std::sync::Arc<DejaDbFacade>> {
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or_else(|| {
+            err(DejaDbError::Validation(
+                "this handle is closed — open a new DejaDb for further calls".into(),
+            ))
+        })
+}
+
 #[napi]
 pub struct DejaDb {
     /// Shared so a queued job can hold the store open independently of the JS
     /// object that started it.
-    facade: std::sync::Arc<DejaDbFacade>,
+    facade: FacadeSlot,
     ns: String,
     /// Host-asserted actor label stamped on every waiser audit grain (§6.6).
     actor: String,
@@ -267,16 +291,31 @@ impl DejaDb {
             }
             (false, None) => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
         };
-        let facade = std::sync::Arc::new(DejaDbFacade::with_session(store, Some(ns.clone()), None));
+        let facade = std::sync::Arc::new(std::sync::Mutex::new(Some(std::sync::Arc::new(
+            DejaDbFacade::with_session(store, Some(ns.clone()), None),
+        ))));
         Ok(DejaDb { facade, ns, actor })
+    }
+
+    /// Release this handle's claim on the memory file.
+    ///
+    /// One memory is one writer: a second handle on the same file is refused at
+    /// open. Rust and Python release on drop, but Node's is whenever GC runs —
+    /// so without this there is no way to say "I am done with this file" and
+    /// reopen it in the same process. Calling a method afterwards is an error,
+    /// not a silent reopen. Idempotent; in-flight async calls finish first.
+    #[napi]
+    pub fn close(&self) {
+        *self.facade.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Reconciliation warnings from open (file-vs-host declaration changes,
     /// embedding-model mismatches). JSON list string.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn open_warnings(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let w = facade.with_store(|m| m.open_warnings().to_vec());
             serde_json::to_string(&w).map_err(err)
         })
@@ -294,8 +333,9 @@ impl DejaDb {
         cmd: String,
         model: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<UnitJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         UnitJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             // Probing the command spawns a child process — worth keeping off
             // the event loop even though it only happens once.
             let ce = CommandEmbed::new(&cmd, model.as_deref()).map_err(err)?;
@@ -308,8 +348,9 @@ impl DejaDb {
     /// a file that flipped text indexing on later). Returns rows backfilled.
     #[napi(ts_return_type = "Promise<number>")]
     pub fn reindex_text(&self) -> napi::bindgen_prelude::AsyncTask<U32Job> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         U32Job::spawn(move || {
+            let facade = take_facade(&slot)?;
             facade
                 .with_store(|m| m.rebuild_text_index())
                 .map(|n| n as u32)
@@ -325,8 +366,9 @@ impl DejaDb {
     /// `deja reindex` runs.
     #[napi(ts_return_type = "Promise<number>")]
     pub fn reindex_links(&self) -> napi::bindgen_prelude::AsyncTask<U32Job> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         U32Job::spawn(move || {
+            let facade = take_facade(&slot)?;
             facade
                 .with_store(|m| m.rebuild_link_indexes())
                 .map(|n| n as u32)
@@ -343,9 +385,10 @@ impl DejaDb {
         command_json: String,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let cmd: serde_json::Value = serde_json::from_str(&command_json).map_err(err)?;
             facade
                 .with_store(|m| {
@@ -370,9 +413,10 @@ impl DejaDb {
         history: Option<String>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let rep = facade
                 .with_store(|m| {
                     dejadb_store::migrate::migrate_payload(
@@ -402,7 +446,7 @@ impl DejaDb {
         ns: Option<String>,
         idempotent: Option<bool>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let mut fields = serde_json::Map::new();
         fields.insert("subject".into(), json!(subject));
         fields.insert("relation".into(), json!(relation));
@@ -414,6 +458,7 @@ impl DejaDb {
         );
         let idempotent = idempotent.unwrap_or(false);
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             if idempotent {
                 Ok(facade.cal_add_if_novel("fact", &fields).map_err(err)?.0.to_hex())
             } else {
@@ -430,9 +475,10 @@ impl DejaDb {
         fields_json: String,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let default_ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let mut fields: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&fields_json).map_err(err)?;
             fields
@@ -451,10 +497,11 @@ impl DejaDb {
         k: Option<u32>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let k = k.unwrap_or(16) as usize;
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let grains = facade
                 .with_store(|m| m.recall(&ns, &subject, relation.as_deref(), k))
                 .map_err(err)?;
@@ -480,9 +527,10 @@ impl DejaDb {
         relation: String,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<MaybeStringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         MaybeStringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let head = facade
                 .with_store(|m| m.latest(&ns, &subject, &relation))
                 .map_err(err)?;
@@ -505,9 +553,10 @@ impl DejaDb {
         fields_json: String,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let default_ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let old = parse_hash(&old_hash)?;
             let mut fields: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&fields_json).map_err(err)?;
@@ -524,8 +573,9 @@ impl DejaDb {
     /// Erase a grain from the hot store (tombstoned). Host-level op.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn forget(&self, hash: String) -> napi::bindgen_prelude::AsyncTask<UnitJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         UnitJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let h = parse_hash(&hash)?;
             facade.with_store(|m| m.forget(&h)).map_err(err)
         })
@@ -551,10 +601,11 @@ impl DejaDb {
         ns: Option<String>,
         text_mentions: Option<bool>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let rep =
                 facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)).map_err(err)?;
             Ok(serde_json::json!({
@@ -578,9 +629,10 @@ impl DejaDb {
         ns: Option<String>,
         grain_type: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let gt = match &grain_type {
                 Some(s) => Some(
                     dejadb_core::types::GrainType::from_str(s)
@@ -638,13 +690,14 @@ impl DejaDb {
         role: Option<String>,
         run_id: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let observer = observer.unwrap_or_else(|| "node".to_string());
         // Runs on the worker pool: a model call is a network round trip, and
         // blocking the event loop across it was the worst case of the old
         // synchronous surface.
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let explicit = match facts_json {
                 Some(j) => Some(FactDraft::from_json_array(&j).map_err(err)?),
                 None => None,
@@ -706,8 +759,9 @@ impl DejaDb {
     /// Execute CAL. Returns the wire-format payload as a JSON string.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn cal(&self, query: String) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let ex = CalExecutor::new(CalExecutorConfig::default());
             let res = ex.execute(&query, &*facade).map_err(err)?;
             serde_json::to_string(&res.result).map_err(err)
@@ -722,9 +776,10 @@ impl DejaDb {
         relation: String,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let versions = facade
                 .with_store(|m| m.history(&ns, &subject, &relation))
                 .map_err(err)?;
@@ -746,8 +801,9 @@ impl DejaDb {
     /// `derived_from`), newest first, as a JSON list string.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn provenance(&self, source_hash: String) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let h = source_hash.strip_prefix("sha256:").unwrap_or(&source_hash);
             let parent = parse_hash(h)?;
             let kids = facade
@@ -781,10 +837,11 @@ impl DejaDb {
         k: Option<u32>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let k = k.unwrap_or(5) as usize;
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let matches = facade
                 .with_store(|m| {
                     m.nearest_semantic(&ns, subject.as_deref(), relation.as_deref(), &text, k)
@@ -801,8 +858,9 @@ impl DejaDb {
     /// Store statistics as JSON.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn stats(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let s = facade.with_store(|m| m.stats()).map_err(err)?;
             Ok(json!({
                 "grains": s.grains, "current": s.current, "triples": s.triples,
@@ -819,8 +877,9 @@ impl DejaDb {
         path: String,
         since: Option<i64>,
     ) -> napi::bindgen_prelude::AsyncTask<I64Job> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         I64Job::spawn(move || {
+            let facade = take_facade(&slot)?;
             let st = facade
                 .with_store(|m| m.bundle_since(since.unwrap_or(0), &path))
                 .map_err(err)?;
@@ -831,8 +890,9 @@ impl DejaDb {
     /// Apply a bundle (fast-forward, idempotent). Returns ops applied.
     #[napi(ts_return_type = "Promise<number>")]
     pub fn import_bundle(&self, path: String) -> napi::bindgen_prelude::AsyncTask<U32Job> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         U32Job::spawn(move || {
+            let facade = take_facade(&slot)?;
             let st = facade.with_store(|m| m.import_bundle(&path)).map_err(err)?;
             Ok(st.applied as u32)
         })
@@ -841,8 +901,9 @@ impl DejaDb {
     /// Integrity + content-address verification. Throws on failure.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn verify(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let r = facade.with_store(|m| m.verify()).map_err(err)?;
             if r.integrity != "ok" || r.hash_mismatches > 0 || r.undecodable > 0 {
                 return Err(err(DejaDbError::Storage(format!(
@@ -874,11 +935,12 @@ impl DejaDb {
         limit: Option<u32>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let depth = depth.unwrap_or(2) as usize;
         let limit = limit.unwrap_or(64) as usize;
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let rels = parse_relations(&relations);
             if rels.is_empty() {
                 return Err(napi::Error::from_reason(
@@ -907,9 +969,10 @@ impl DejaDb {
         axis: Option<String>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let ax = Axis::parse(axis.as_deref().unwrap_or("world"))
                 .ok_or_else(|| napi::Error::from_reason("axis must be one of: world, knowledge"))?;
             let found = facade
@@ -936,11 +999,12 @@ impl DejaDb {
         include_yield: Option<bool>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let limit = limit.unwrap_or(64) as usize;
         let want_yield = include_yield.unwrap_or(true);
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let (trace, produced) = facade
                 .with_store(|m| {
                     let t = m.run_trace(&ns, &run_id, limit)?;
@@ -967,10 +1031,11 @@ impl DejaDb {
         depth: Option<u32>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let depth = depth.unwrap_or(4) as usize;
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let h = parse_hash(&hash)?;
             let runs = facade
                 .with_store(|m| m.runs_touching(&ns, &h, depth))
@@ -991,10 +1056,11 @@ impl DejaDb {
         limit: Option<u32>,
         ns: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let limit = limit.unwrap_or(64) as usize;
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let wf = parse_hash(&workflow)?;
             let rows = facade
                 .with_store(|m| m.step_actions(&ns, &wf, node.as_deref(), limit))
@@ -1018,7 +1084,7 @@ impl DejaDb {
         is_error: Option<bool>,
         thread: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let mut fields = serde_json::Map::new();
         fields.insert("tool_name".into(), json!(name));
         fields.insert("content".into(), json!(result));
@@ -1027,7 +1093,10 @@ impl DejaDb {
         if let Some(t) = thread {
             fields.insert("session_id".into(), json!(t));
         }
-        StringJob::spawn(move || Ok(facade.cal_add("tool", &fields).map_err(err)?.to_hex()))
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            Ok(facade.cal_add("tool", &fields).map_err(err)?.to_hex())
+        })
     }
 
     /// Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
@@ -1049,7 +1118,7 @@ impl DejaDb {
         full_sweep: Option<bool>,
         policy: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let opts = RunOptions {
             min_new: min_new.map(|n| n as u64),
             min_new_errors: min_new_errors.map(|n| n as u64),
@@ -1061,6 +1130,7 @@ impl DejaDb {
         // LLM round trips. Blocking the event loop across that was the worst
         // case of the old synchronous surface.
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             // Optional verified LLM reflection: `model` ("claude-sonnet", key from
             // the env) attaches a built-in HTTP backend; `llmCmd` a subprocess.
             let mut engine = Engine::with_builtins();
@@ -1102,7 +1172,7 @@ impl DejaDb {
         &self,
         filter: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         // `{"status":"all"}` clears the filter; a named status selects it;
         // anything else (including no filter) defaults to pending.
         //
@@ -1130,6 +1200,7 @@ impl DejaDb {
             None => Some(RecStatus::Pending),
         };
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
         let sub = BorrowedSubstrate::new(&facade);
         let recs = Engine::with_builtins().recommendations(&sub, status).map_err(err)?;
         let rows: Vec<_> = recs
@@ -1164,9 +1235,10 @@ impl DejaDb {
         allow_destructive: Option<bool>,
         scopes: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let actor = self.actor.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let mut sub = BorrowedSubstrate::new(&facade);
             let engine = Engine::with_builtins();
             let now = now_ms();
@@ -1199,9 +1271,10 @@ impl DejaDb {
         because: String,
         scopes: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let actor = self.actor.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let mut sub = BorrowedSubstrate::new(&facade);
             let scopes = parse_scopes(scopes.as_deref())?;
             Engine::with_builtins()
@@ -1216,8 +1289,9 @@ impl DejaDb {
     /// `deja waiser` and `GET /api/waiser/health`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn waiser_health(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let sub = BorrowedSubstrate::new(&facade);
             let health = Engine::with_builtins().health(&sub, now_ms()).map_err(err)?;
             serde_json::to_string(&health).map_err(err)
@@ -1227,8 +1301,9 @@ impl DejaDb {
     /// The analyzer roster: id, whether it is enabled, and its settings.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn waiser_analyzers(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let sub = BorrowedSubstrate::new(&facade);
             let list = Engine::with_builtins().analyzer_settings(&sub).map_err(err)?;
             serde_json::to_string(&list).map_err(err)
@@ -1245,8 +1320,9 @@ impl DejaDb {
         enabled: Option<bool>,
         params_json: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let params = match params_json {
                 Some(ref s) => serde_json::from_str(s).map_err(err)?,
                 None => None,
@@ -1268,9 +1344,10 @@ impl DejaDb {
         why: String,
         scopes: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let actor = self.actor.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let mut sub = BorrowedSubstrate::new(&facade);
             let scopes = parse_scopes(scopes.as_deref())?;
             Engine::with_builtins()
@@ -1289,9 +1366,10 @@ impl DejaDb {
         hash: String,
         because: String,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         let actor = self.actor.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let mut sub = BorrowedSubstrate::new(&facade);
             Engine::with_builtins()
                 .rollback(&mut sub, &hash, &actor, ObserverType::Human, &ScopeSet::all(), &because, now_ms())
@@ -1305,8 +1383,9 @@ impl DejaDb {
     /// `deja waiser outcomes`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn waiser_outcomes(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
-        let facade = self.facade.clone();
+        let slot = self.facade.clone();
         StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
             let sub = BorrowedSubstrate::new(&facade);
             let outs = Engine::with_builtins().outcomes(&sub).map_err(err)?;
             serde_json::to_string(&outs).map_err(err)
