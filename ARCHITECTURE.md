@@ -675,6 +675,16 @@ voice edge never blocks on a lock. Multi-writer conflict is handled honestly by
 the [heads/forks model](#4-versioning-heads-forks-supersession-tombstones)
 rather than by hidden last-writer-wins.
 
+
+**Adding a grain that is already stored is a no-op.** A content address *is*
+the content, so two byte-identical grains are one grain; re-adding returns the
+existing address rather than failing on the `grains.hash` unique index. This
+matters for event ingest: `created_at` has millisecond resolution, so two
+identical tool calls in the same millisecond genuinely are the same grain, and
+requiring callers to jitter their payloads would mean corrupting the record to
+satisfy the store. A skipped duplicate consumes no sequence number and writes no
+op-log row — nothing changed, so nothing replicates.
+
 **One handle per file, shared across threads.** The rule is enforced in both
 directions: across processes by an OS file lock, and within a process by a
 registry of open paths — a second `open()` on a file this process already holds
@@ -688,7 +698,6 @@ the natural move if you think of the file as a database connection — is never
 necessary. Rust and Python release the claim on drop; Node has no
 deterministic drop, so its binding exposes `close()` — otherwise a handle that
 had gone out of JS scope would keep the file locked until GC got to it.
-
 
 ### Host config is never persisted in the file
 

@@ -2185,7 +2185,40 @@ impl DejaDB {
     }
 
     fn add_batch_inner(&mut self, grains: &[&dyn AddableDyn]) -> Result<Vec<Hash>> {
-        let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(grains)?;
+        // Adding a grain that is already stored is a no-op, not an error.
+        //
+        // A content address IS the content: two byte-identical grains are one
+        // grain, and it is already here. Before this, the second insert hit
+        // `UNIQUE constraint failed: grains.hash` — reachable whenever two
+        // identical events land in the same millisecond, since `created_at` is
+        // the only thing distinguishing them and it has ms resolution. An agent
+        // retrying a failing tool in a tight loop is exactly that workload, and
+        // it is the flagship analyzer's ingest path. Callers had to jitter their
+        // payloads to avoid a storage error, which corrupts the data to satisfy
+        // the store.
+        //
+        // The probe runs before the counters are reserved, so a skipped grain
+        // consumes no seq/op/hlc and writes no op-log row — nothing changed, so
+        // nothing replicates.
+        let mut prepped: Vec<Option<GrainPrep>> = Vec::with_capacity(grains.len());
+        let mut hashes: Vec<Hash> = Vec::with_capacity(grains.len());
+        let mut seen_in_batch: HashSet<Hash> = HashSet::new();
+        for g in grains {
+            let (blob, hash) = g.serialize_dyn()?;
+            hashes.push(hash);
+            // `seen_in_batch` also covers duplicates *within* one batch, which
+            // the `has` probe cannot see — neither is committed yet.
+            if !seen_in_batch.insert(hash) || self.has(&hash)? {
+                prepped.push(None);
+                continue;
+            }
+            prepped.push(Some(self.prep_from_blob(blob, hash)?));
+        }
+        let preps: Vec<GrainPrep> = prepped.into_iter().flatten().collect();
+        if preps.is_empty() {
+            return Ok(hashes);
+        }
+        let (preps, first_seq, first_op, hlc0) = self.reserve_for(preps);
         // A grain type newer than any pre-1.5 build could decode makes this file
         // unreadable to those builds — `deserialize_blob` errors on an unknown
         // type byte rather than skipping it. Record that requirement in the file
@@ -2199,7 +2232,6 @@ impl DejaDB {
             self.meta_put(MIN_READER_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
             self.needs_min_reader_stamp = false;
         }
-        let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         let (d_docs, d_len) = fts_delta(&preps);
         let n = preps.len() as i64;
         let dbr = self.db.as_ref();
@@ -2233,13 +2265,22 @@ impl DejaDB {
             let (blob, hash) = g.serialize_dyn()?;
             preps.push(self.prep_from_blob(blob, hash)?);
         }
+        Ok(self.reserve_for(preps))
+    }
+
+    /// Reserve the seq/op/hlc block for already-prepped grains.
+    ///
+    /// Split out of [`prep_and_reserve`] so the add path can drop grains that
+    /// are already stored *before* consuming counters — a skipped duplicate
+    /// must not burn a sequence number.
+    fn reserve_for(&mut self, preps: Vec<GrainPrep>) -> (Vec<GrainPrep>, i64, i64, i64) {
         let first_seq = self.next_seq;
         self.next_seq += preps.len() as i64;
         let first_op = self.next_op;
         self.next_op += preps.len() as i64;
         let hlc0 = self.next_hlc();
         self.hlc_last = hlc0 + preps.len() as i64 - 1;
-        Ok((preps, first_seq, first_op, hlc0))
+        (preps, first_seq, first_op, hlc0)
     }
 
     // ----- read path -----
