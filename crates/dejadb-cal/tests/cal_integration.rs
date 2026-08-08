@@ -368,30 +368,36 @@ fn saved_query_round_trips_through_the_file() {
         );
     }
 
-    // A new process over the same file must still see it, and be able to run it.
-    let facade = facade_at(&path);
-    let saved = facade
-        .get_query("john brief")
-        .expect("saved query must survive reopen");
-    assert_eq!(saved.description, "what we know");
-    assert!(!saved.builtin);
+    // A new process over the same file must still see it, and be able to run
+    // it. Each reopen is scoped: one memory is one handle, so the previous one
+    // has to be dropped first — which is also what "a new process" means.
+    {
+        let facade = facade_at(&path);
+        let saved = facade
+            .get_query("john brief")
+            .expect("saved query must survive reopen");
+        assert_eq!(saved.description, "what we know");
+        assert!(!saved.builtin);
 
-    let run = ex.execute(r#"RUN "john brief""#, &facade).expect("RUN must work");
-    match run.result {
-        CalResultPayload::Grains { grains, .. } => assert_eq!(grains.len(), 1),
-        other => panic!("expected Grains from RUN, got: {other:?}"),
+        let run = ex.execute(r#"RUN "john brief""#, &facade).expect("RUN must work");
+        match run.result {
+            CalResultPayload::Grains { grains, .. } => assert_eq!(grains.len(), 1),
+            other => panic!("expected Grains from RUN, got: {other:?}"),
+        }
     }
 
     // RUN records last_run_at, and that too is persisted.
-    let after = facade_at(&path).get_query("john brief").unwrap();
     assert!(
-        after.last_run_at.is_some(),
+        facade_at(&path).get_query("john brief").unwrap().last_run_at.is_some(),
         "RUN should have recorded last_run_at on disk"
     );
 
     // DROP removes it from the file, not just from memory.
-    ex.execute(r#"DROP QUERY "john brief""#, &facade)
-        .expect("DROP QUERY must succeed");
+    {
+        let facade = facade_at(&path);
+        ex.execute(r#"DROP QUERY "john brief""#, &facade)
+            .expect("DROP QUERY must succeed");
+    }
     assert!(facade_at(&path).get_query("john brief").is_none());
 }
 
@@ -547,9 +553,11 @@ fn an_invalid_saved_query_name_is_not_persisted() {
     use dejadb_cal::facade::CalStoreFacade;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("m.db");
-    let facade = facade_at(&path);
-    // Leading digit violates the name rule.
-    assert!(facade.define_query("9bad", "RECALL facts", None, &[]).is_err());
+    {
+        let facade = facade_at(&path);
+        // Leading digit violates the name rule.
+        assert!(facade.define_query("9bad", "RECALL facts", None, &[]).is_err());
+    }
     assert!(facade_at(&path).get_query("9bad").is_none());
 }
 
