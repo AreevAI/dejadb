@@ -14,7 +14,11 @@ before you change code and before you commit.
 1. **Grains are immutable and content-addressed** — the hash is SHA-256 over the
    whole `.mg` blob. Never mutate a stored blob. Every edit is a *supersession*,
    every removal a *tombstone* (`forget`) or crypto-erasure. Only the index layer
-   is mutated.
+   is mutated. **Corollary: re-adding a byte-identical grain is a no-op, not an
+   error** — the address *is* the content, so it is already stored; `add`
+   returns the existing hash, consumes no seq/op/hlc, and writes no op-log row.
+   (Until 1.1.0 it raised `UNIQUE constraint failed: grains.hash`, which forced
+   callers to jitter payloads — corrupting the record to satisfy the store.)
 2. **Canonical serialization is frozen** — NFC normalization, sorted keys, compact
    keys, omit-defaults. Any byte change alters every content address and breaks
    OMS conformance. If you touch `dejadb-core/src/format/{serialize,deserialize,
@@ -32,10 +36,20 @@ before you change code and before you commit.
 4. **Error codes are append-only** — every user-facing error carries a stable
    `DOMAIN-Ennn` code (see `ERROR_CODES.md`). Never renumber or reuse one; add new
    codes at the end. Format/uniqueness are test-enforced.
-5. **One memory = one file** — single writer per file; cross-file queries go
-   through `ASSEMBLE` with facade mounts, not shared connections. Host config
-   (embedder, executor limits, encryption key) is per-process and never persisted
-   in the file.
+5. **One memory = one file, and one open handle** — single writer per file.
+   Enforced in both directions: across processes by an OS file lock, and
+   *within* a process by a registry of open paths, so a second `open()` fails
+   at open with **`STO-E002`**. It has to be enforced rather than documented:
+   each handle caches its own `next_seq`/`next_term` allocators and BM25 stats,
+   so two handles drift and then collide on a write — surfacing as a bare
+   `UNIQUE constraint failed: terms.id` against *the handle that did nothing
+   wrong*. Sharing one handle across threads is fully supported. Rust and
+   Python release the claim on drop; **Node must call `close()`** (no
+   deterministic drop — see the `dejadb-bindings` skill). The Postgres backend
+   is exempt: it admits multiple concurrent writers per memory by design.
+   Cross-file queries go through `ASSEMBLE` with facade mounts, not shared
+   connections. Host config (embedder, executor limits, encryption key) is
+   per-process and never persisted in the file.
 6. **Dependency-light by policy** — no clap, no HTTP framework, no MCP SDK, no
    workspace-wide async runtime. Justify any new dependency in the PR.
 

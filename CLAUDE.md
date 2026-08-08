@@ -91,8 +91,13 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
 5. **One memory = one isolation unit** — a file on the embedded backend, a
    Postgres schema on the `postgres` backend; either way it is the unit of
    erasure, sync, portability, and write parallelism. Single writer per
-   memory (advisory-lock-ENFORCED on Postgres, `STO-E002` on contention);
-   cross-memory queries go through
+   memory — enforced on BOTH backends: an advisory lock on Postgres, and on
+   the embedded backend a process-wide open-path registry so a second handle
+   on one file fails at open (`STO-E002`) instead of silently drifting its
+   cached allocators and corrupting the first handle's writes. Rust/Python
+   release on drop; Node calls `close()`. Adding a grain that is already
+   stored is a no-op returning the existing hash, not an error.
+   Cross-memory queries go through
    ASSEMBLE with facade mounts, not shared connections. Files are
    self-describing: the `meta` table carries file-truths (`text_index`,
    `entity_relations`, embedding provenance) and CAL host metadata — saved

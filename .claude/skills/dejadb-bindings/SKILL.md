@@ -52,9 +52,55 @@ without a Python lib present (extension-module resolves symbols at load time).
 **Node** (napi-rs, native addon — **not** wasm):
 ```bash
 cd crates/dejadb-js
-napi build --release       # produces dejadb.<platform>.node + index.js/.d.ts
+npx napi build --platform --release   # dejadb.<platform>.node + index.js/.d.ts
 node --test __test__/smoke.mjs
 ```
+
+> **`--platform` is not optional.** Without it napi writes `dejadb.node`, but
+> `index.js` only ever `require`s the platform-suffixed
+> `./dejadb.<triple>.node`. So a build that omits the flag leaves the OLD addon
+> in place, `node --test` runs green against **stale native code**, and your
+> Rust change appears to have no effect — or a test asserts a pre-fix error
+> string and passes. `package.json`'s `build` script and CI both pass
+> `--platform`; match them, never call bare `napi build --release` by hand.
+
+## Node has no deterministic drop — the facade slot and `close()`
+
+Rust and Python release a handle when the last reference goes; **Node releases
+it whenever GC runs**. That matters because the store refuses a second handle
+on a file this process already has open (`STO-E002`, single-writer-per-file):
+without an explicit release, an ordinary open → use → reopen fails against a
+handle the caller had already finished with and had no way to let go of.
+
+So `dejadb-js` holds the facade in a *closable slot* rather than directly:
+
+```rust
+type FacadeSlot = Arc<Mutex<Option<Arc<DejaDbFacade>>>>;
+
+fn take_facade(slot: &FacadeSlot) -> napi::Result<Arc<DejaDbFacade>> { … }
+```
+
+Every method clones the **slot**, not the facade, and fetches inside the
+spawned job:
+
+```rust
+pub fn some_method(&self) -> AsyncTask<StringJob> {
+    let slot = self.facade.clone();          // NOT self.facade.clone() -> facade
+    StringJob::spawn(move || {
+        let facade = take_facade(&slot)?;    // errors if the handle is closed
+        …
+    })
+}
+```
+
+**A new napi method written the old way (`let facade = self.facade.clone();`)
+compiles fine and silently keeps working after `close()`** — it captured the
+facade instead of the slot. Route every method through `take_facade`. Python
+needs none of this (refcounting drops the handle), which is why the two
+bindings legitimately differ here.
+
+Tests that reopen a file must call `m.close()` first; a JS block scope does
+not release it.
 
 ## The standalone-JS gotcha (read this)
 
@@ -65,7 +111,7 @@ time and need their own build). Consequences:
 - `cargo test --workspace` and `cargo build --workspace` **skip it entirely** —
   a change to `dejadb-core`/`dejadb-store`/`dejadb-cal` can break the JS binding
   and the workspace suite stays green. CI's separate **`node` job** is what
-  catches it (`napi build --release` + `node --test`); run that locally after
+  catches it (`napi build --platform --release` + `node --test`); run that locally after
   any core API change that the JS binding surfaces.
 - The Python binding **is** a workspace member (`dejadb-py`, `publish = false`),
   so `cargo build -p dejadb-py` compiles with the workspace, but its Python

@@ -180,6 +180,50 @@ missing test — write the test that decides which. Prefer a failing test that
 pins the *correct* behavior; if behavior is genuinely undecided, raise it rather
 than freezing an accident into a golden file.
 
+## Two failure shapes this suite kept missing
+
+Both surfaced only when someone black-box-tested a published wheel against the
+docs (issues #47–#55), which means the suite could not see them.
+
+### 1. A filter that is ignored — assert what it EXCLUDES
+
+```rust
+// Passes even if the filter is dropped entirely. Useless.
+assert!(subjects(q).contains("jane"));
+
+// Fails if the filter is dropped. This is the test.
+assert_eq!(subjects(q), vec!["jane"]);          // john and bob must be gone
+assert!(subjects(empty_binding_q).is_empty());  // and empty selects NOTHING
+```
+
+Anything that narrows a result set — `WHERE`, `IN`, `WITH dedup`,
+`conflict_resolution` — needs a negative assertion. Failing to apply such a
+clause fails **open**, and the over-broad answer goes into a model's context
+with no error.
+
+Also assert byte-inequality for options that are supposed to change output:
+`assert_ne!(m.cal(q), m.cal(q_with_option))`. Several `WITH` options shipped
+returning output byte-identical to the query without them.
+
+### 2. Documentation that describes a different engine
+
+Prose is untested by default. `crates/dejadb-cal/tests/docs_examples.rs`
+extracts every ```sql fence from `docs/cal-reference.md` and parses it, and
+cross-checks the §4 stage table against the parser's own error message. Three
+separate bug reports were one root cause: the reference documented shapes the
+grammar does not have.
+
+When you pin a doc claim, verify the test fails against the *old* doc — check
+out the previous version under the new test. The stage-table check initially
+false-passed because the parser's error ends with `…, found WHERE`, so a
+substring search over the whole message matched the very stage it had just
+rejected; it has to compare against the parenthesized accept-list only.
+
+The same applies to a hand-maintained list mirroring code: `DESCRIBE`'s
+`required_fields` is pinned to the `require_str` calls it mirrors by
+`required_fields_match_the_validator`, which both directions — every declared
+requirement is enforced, and nothing beyond the declared set is.
+
 ## Adding a test — quick recipes
 
 - **Store behavior**: new `#[test]` in the matching `dejadb-store/tests/*.rs`;

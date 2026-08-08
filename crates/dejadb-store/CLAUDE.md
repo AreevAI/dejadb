@@ -27,7 +27,19 @@ transports implement it:
 In-memory counters (`next_seq/next_op/next_term/hlc_last`, BM25 stats)
 loaded on open are authoritative only on the embedded backend
 (**single-writer-per-FILE**); on Postgres they are a fallback the
-multi-writer hooks override. Cross-backend parity is pinned by
+multi-writer hooks override. Because those counters are per-handle, a second
+handle on one file would drift and then collide — so `open_internal` claims the
+absolute path in a process-wide `OPEN_FILES` registry and a second open fails
+with **`STO-E002`** (`OpenFileGuard`, released on drop; `None` on Postgres,
+which is genuinely multi-writer). The cross-process OS lock never caught this
+because within one process that lock is already held. Node has no
+deterministic drop, so its binding exposes `close()`.
+
+`add` is **idempotent on the content address**: `add_batch_inner` probes `has`
+before reserving counters and skips grains already stored (and duplicates
+within the batch), returning the existing hash. Byte-identical grains are one
+grain; the old behaviour raised `UNIQUE constraint failed: grains.hash` for two
+identical events in the same millisecond. Cross-backend parity is pinned by
 `crates/dejadb-conformance` — the same case list runs against both (plus
 Pg-only multi-writer race cases); extend it whenever store semantics change.
 

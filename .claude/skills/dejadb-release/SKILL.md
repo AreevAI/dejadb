@@ -52,9 +52,11 @@ must publish bottom-up.
 
 ## 3. Publish crates.io (bottom-up dependency order)
 
-Each crate currently has `publish = false` — flip it to publish the intended
-crates, then publish in this order (a crate can only publish after its path
-dependencies are on crates.io):
+`publish = false` is set on exactly four crates and they should **stay** that
+way: `dejadb-bench` and `dejadb-conformance` (internal harnesses),
+`dejadb-js` (ships to npm) and `dejadb-py` (ships to PyPI). Everything else
+publishes, in this order — a crate can only publish once its path dependencies
+are on crates.io:
 
 ```
 dejadb-core, waiser          (no internal deps)

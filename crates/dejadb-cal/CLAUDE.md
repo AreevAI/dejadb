@@ -15,8 +15,14 @@ recursive-descent parse → `CalQuery` AST → `CalExecutor::execute`
 (executor.rs): LET eval → `execute_statement` (big match) → `apply_pipeline`
 → `apply_format_clause` → `CalResultPayload`.
 
+**LET eval writes its results onto `CalQuery::let_values`** (`#[serde(skip)]` —
+execution state, not query text); `apply_where_clause` expands `IN $var` from
+it, and surrogate/nested queries plus ASSEMBLE sources inherit it. The scope
+used to be evaluated and dropped, so `$var` never reached any WHERE clause.
+
 Two entry points must stay in sync: `execute` (text) and `execute_parsed`
-(JSON-CAL AST) duplicate the LET/pipeline/format sequence.
+(JSON-CAL AST) duplicate the LET/pipeline/format sequence — including filling
+`let_values`.
 
 ## The safety pillar: destruction is narrow and gated
 
@@ -99,4 +105,12 @@ json.rs (wire form) → store_types.rs (if the store contract grows) → tests �
 `cargo test -p dejadb-cal` (~700 inline unit tests in parser/executor/lexer/
 assemble). `tests/cal_integration.rs` = text → executor → facade → real store
 end-to-end incl. destructive-reject; `tests/assemble_mount_tests.rs` =
-multi-source ASSEMBLE across a mounted org replica.
+multi-source ASSEMBLE across a mounted org replica;
+`tests/docs_examples.rs` parses **every** ```sql fence in
+`docs/cal-reference.md` and cross-checks §4's pipeline-stage table against the
+parser's own error list — the reference is executable, so a documented query
+that does not parse fails CI instead of a user's first session.
+
+Filter tests must assert what a clause **excludes**. A test that only checks
+"the expected row is present" passes against a filter that is ignored
+entirely — which is how `WHERE … IN` reached a release doing nothing.
