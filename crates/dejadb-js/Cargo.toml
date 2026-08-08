@@ -21,13 +21,13 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-dejadb-core = { path = "../dejadb-core", version = "1.0.0" }
+dejadb-core = { path = "../dejadb-core", version = "1.1.0" }
 # The postgres backend ships ON in the binding: it is a server-side surface,
 # and `new DejaDb("postgres://…?schema=<name>")` must work from a stock
 # `npm install dejadb`. The dependency-light default stays with the CLI/store.
-dejadb-store = { path = "../dejadb-store", version = "1.0.0", features = ["postgres"] }
-dejadb-cal = { path = "../dejadb-cal", version = "1.0.0" }
-dejadb-context = { path = "../dejadb-context", version = "1.0.0" }
+dejadb-store = { path = "../dejadb-store", version = "1.1.0", features = ["postgres"] }
+dejadb-cal = { path = "../dejadb-cal", version = "1.1.0" }
+dejadb-context = { path = "../dejadb-context", version = "1.1.0" }
 waiser = { path = "../waiser" }
 dejadb-waiser = { path = "../dejadb-waiser" }
 dejadb-llm = { path = "../dejadb-llm" }
