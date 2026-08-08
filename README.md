@@ -314,7 +314,11 @@ import dejadb, json
 m = dejadb.DejaDB("john.db", ns="caller")
 m.add_fact("john", "prefers", "tea", confidence=0.95)
 m.recall("john")                     # JSON string, newest-first — needs a subject
-m.search("hot drinks", k=5)          # free text, when you don't have one
+m.search("tea", k=5)                 # free text, when you don't have a subject.
+                                     # BM25-only out of the box, so it matches
+                                     # words that are present; install an
+                                     # embedder (below) for semantic hits like
+                                     # "hot drinks".
 m.cal('RECALL facts WHERE subject = "john"')
 m.memory_tool(json.dumps({"command": "view", "path": "/memories"}))  # Anthropic memory-tool backend
 ```

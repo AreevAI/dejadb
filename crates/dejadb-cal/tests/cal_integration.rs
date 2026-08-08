@@ -1617,3 +1617,74 @@ fn with_superseded_widens_the_anchored_legs_and_labels_the_history() {
     assert_eq!(grains(r#"RECALL facts ABOUT "tea""#).len(), 0);
     assert_eq!(grains(r#"RECALL facts ABOUT "tea" WITH superseded"#).len(), 1);
 }
+
+// ── Fields that were set and then silently dropped (#36) ────────────────────
+
+/// `valid_to` (and its three siblings) are first-class common fields, but no
+/// builder arm claimed them, so they were swept into `common.context` — which
+/// compacts its keys on write, turning `valid_to` into `{"context": {"vt": …}}`.
+/// Nothing reads that: `waiser.staleness` looks for a top-level `valid_to`, and
+/// so does the store's world-time projection. A bindings user setting expiry
+/// the documented way got a fact that silently never expires.
+#[test]
+fn temporal_validity_bounds_land_in_the_typed_field_exactly_once() {
+    use dejadb_cal::facade::CalStoreFacade;
+    let (_ex, facade, _d) = setup();
+
+    let fields = serde_json::json!({
+        "subject": "promo",
+        "relation": "code",
+        "object": "SAVE20",
+        "namespace": "caller",
+        "valid_from": 1_500_000_000_000i64,
+        "valid_to": 1_600_000_000_000i64,
+        "system_valid_from": 1_500_000_000_001i64,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let hash = facade.cal_add("fact", &fields).unwrap();
+
+    let g = facade.get(&hash).unwrap();
+    assert_eq!(g.get_i64("valid_to"), Some(1_600_000_000_000));
+    assert_eq!(g.get_i64("valid_from"), Some(1_500_000_000_000));
+    assert_eq!(g.get_i64("system_valid_from"), Some(1_500_000_000_001));
+
+    // Exactly once: not also inside `context` under a compacted key, which is
+    // where it used to land and where nothing could read it.
+    let json = serde_json::to_value(&g.fields).unwrap();
+    let ctx = json.get("context").cloned().unwrap_or(serde_json::Value::Null);
+    for compact in ["vt", "vf", "svf", "svt"] {
+        assert!(
+            ctx.get(compact).is_none(),
+            "`{compact}` must not also be stored in context: {ctx}"
+        );
+    }
+}
+
+/// Every number in the CAL AST is an f64, and `serde_json::Number::from_f64`
+/// always produces a JSON *float* — so `as_i64()` returned None for all of
+/// them and every i64-typed field set from CAL text was discarded on the way
+/// to the grain builder. Found while checking the above through the CAL
+/// surface: `SET created_at = …` had no effect at all.
+#[test]
+fn integer_literals_set_from_cal_reach_the_grain() {
+    let (ex, facade, _d) = setup();
+    use dejadb_cal::facade::CalStoreFacade;
+
+    let payload = ex
+        .execute(
+            r#"ADD fact SET subject = "promo" SET relation = "code" SET object = "SAVE20"
+               SET namespace = "caller" SET created_at = 1700000000000
+               SET valid_to = 1600000000000 SET confidence = 0.75 BECAUSE "seed""#,
+            &facade,
+        )
+        .unwrap();
+    let hash = dejadb_core::error::Hash::from_hex(&added_hash(&payload.result)).unwrap();
+
+    let g = facade.get(&hash).unwrap();
+    assert_eq!(g.get_i64("created_at"), Some(1_700_000_000_000));
+    assert_eq!(g.get_i64("valid_to"), Some(1_600_000_000_000));
+    // Fractional values keep working — this is about integral literals only.
+    assert_eq!(g.get_f64("confidence"), Some(0.75));
+}

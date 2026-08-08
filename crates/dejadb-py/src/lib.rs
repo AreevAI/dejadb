@@ -484,10 +484,19 @@ impl DejaDB {
                 .with_store(|m| (m.index_text_enabled(), m.embedder_dim().is_some()))
         });
         if !has_text && !has_vec {
+            // Reopening with index_text=True is only half the remedy: the
+            // re-stamp turns indexing on for *future* writes, so grains written
+            // while it was off stay invisible and `search()` returns [] with no
+            // error at all. Going from a loud, actionable error to a silent
+            // empty list reads as "there is nothing stored", not "the index
+            // needs rebuilding" — so name the second step here, where the user
+            // is actually looking.
             return Err(err(
                 "search() needs a text or vector leg: this file has the BM25 index off \
                  (index_text=False) and no embedder installed — reopen with \
-                 index_text=True, or call set_embedder()/set_embedder_command()",
+                 index_text=True and then call reindex_text() to index the grains \
+                 written while it was off, or call \
+                 set_embedder()/set_embedder_command()",
             ));
         }
         let grains = py
@@ -856,7 +865,20 @@ impl DejaDB {
                     m.nearest_semantic(&ns, subject.as_deref(), relation.as_deref(), &text, k)
                 })
             })
-            .map_err(err)?;
+            // The remedy has to name the API the caller is holding. This error
+            // used to arrive from the store naming `--embed-cmd`, a CLI flag
+            // that does not exist in Python — and `pip install dejadb` ships no
+            // `deja` binary, so the advice was unactionable as written.
+            .map_err(|e| match e {
+                DejaDbError::Validation(msg) if msg.contains("requires an installed embedder") => {
+                    err(DejaDbError::Validation(
+                        "nearest() requires an embedder; install one with set_embedder(fn) \
+                         or set_embedder_command(cmd)"
+                            .to_string(),
+                    ))
+                }
+                other => err(other),
+            })?;
         let out: Vec<serde_json::Value> = matches
             .iter()
             .map(|(h, sim)| json!({"hash": h.to_hex(), "similarity": sim}))

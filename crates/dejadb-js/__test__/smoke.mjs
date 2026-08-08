@@ -450,3 +450,35 @@ test('remember can place a turn in a run that runTrace reads back', async () => 
   assert.equal(JSON.parse(await m.runTrace('run-b')).trace.length, 1)
   assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
 })
+
+test('nearest without an embedder names the Node remedy, not a CLI flag', async () => {
+  // The store's message used to name `--embed-cmd`, a `deja` CLI flag that
+  // does not exist here — npm ships no binary — and called this a "novelty
+  // check" when the caller had reached it through nearest().
+  const m = makeDb()
+  await m.addFact('john', 'prefers', 'tea')
+  await assert.rejects(
+    () => m.nearest('tea', null, null, 3),
+    (e) => {
+      const msg = String(e.message ?? e)
+      assert.match(msg, /nearest\(\)/)
+      assert.match(msg, /setEmbedderCommand/)
+      assert.ok(!msg.includes('--embed-cmd'), msg)
+      assert.ok(!msg.includes('novelty check'), msg)
+      return true
+    },
+  )
+})
+
+test('valid_to set at top level is stored as the typed field', async () => {
+  // It used to be swallowed into context as the compacted key "vt", where
+  // waiser.staleness and the world-time projection cannot see it.
+  const m = makeDb()
+  const past = 1600000000000
+  await m.add('fact', JSON.stringify({
+    subject: 'promo', relation: 'code', object: 'SAVE20', valid_to: past,
+  }))
+  const fields = JSON.parse(await m.recall('promo'))[0].fields
+  assert.equal(fields.valid_to, past)
+  assert.ok(!JSON.stringify(fields.context ?? {}).includes('vt'), JSON.stringify(fields))
+})

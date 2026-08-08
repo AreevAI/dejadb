@@ -69,6 +69,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   breaking `add_if_novel`'s value probe.
 - The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
   blobs in the probe statement itself (join) instead of one query per hit.
+- **`valid_to` set at the top level is stored as the typed field** (#36). The
+  four bi-temporal validity bounds (`valid_from`, `valid_to`,
+  `system_valid_from`, `system_valid_to`) are first-class common fields, but no
+  builder arm claimed them, so they were swept into `common.context` — which
+  compacts its keys on write, so `valid_to` came back as
+  `{"context": {"vt": …}}`. Nothing reads that: `waiser.staleness` looks for a
+  top-level `valid_to`, and so does the store's world-time (`vf`/`vt`) column
+  projection. Any bindings user setting expiry the documented way got a fact
+  that silently never expires and never participates in an as-of query. The
+  value now lands in exactly one place.
+- **Integer literals set from CAL reach the grain** (found while fixing #36).
+  Every number in the CAL AST is an `f64` and `serde_json::Number::from_f64`
+  always produces a JSON *float*, so `as_i64()` returned `None` for all of them
+  and every `i64`-typed field set from CAL text — `SET created_at = …`,
+  `SET valid_to = …`, `SET duration_ms = …` — was discarded on the way to the
+  grain builder. Fractional values are unaffected.
+- **Errors name the API the caller is holding** (#52, #55). `nearest()` failed
+  with "novelty check requires an embedder (e.g. `--embed-cmd`)" — a `deja` CLI
+  flag that does not exist in Python or Node, and `pip install dejadb` /
+  `npm i dejadb` ship no binary, so the advice was unactionable as written; the
+  noun was also the CLI's `deja novelty` verb rather than the method called. It
+  now reads "nearest() requires an embedder; install one with `set_embedder(fn)`
+  or `set_embedder_command(cmd)`" (`setEmbedderCommand` on Node). `search()`'s
+  error told you to reopen with `index_text=True`, which alone leaves a **silent
+  empty result** — the re-stamp turns indexing on for future writes, so grains
+  written while it was off stay invisible; it now names `reindex_text()` as the
+  second step. `rebuild_text_index` no longer names a CLI flag either.
 
 ### Changed
 

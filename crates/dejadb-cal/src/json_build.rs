@@ -364,6 +364,14 @@ const ADD_JSON_KNOWN_FIELDS: &[&str] = &[
         "confidence",
         "source_type",
         "created_at",
+        // The validity bounds now have builder arms in `apply_common!`, so they
+        // must leave the `ctx` sweep — a field that lands in a typed slot AND in
+        // `common.context` is stored twice, and the `ctx` copy comes back under
+        // a compacted key nothing reads.
+        "valid_from",
+        "valid_to",
+        "system_valid_from",
+        "system_valid_to",
         "importance",
         "embedding_text",
         "tags",
@@ -466,7 +474,15 @@ pub fn build_grain_from_json<S: GrainSink>(
                 })
         };
         let get_f64 = |key: &str| -> Option<f64> { fields.get(key).and_then(|v| v.as_f64()) };
-        let get_i64 = |key: &str| -> Option<i64> { fields.get(key).and_then(|v| v.as_i64()) };
+        // Accept an integral float too: JSON has one number type, so a caller
+        // sending `1700000000000.0` (or any JS number, which is always a
+        // double) means the same timestamp as `1700000000000`.
+        let get_i64 = |key: &str| -> Option<i64> {
+            fields.get(key).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+            })
+        };
 
         macro_rules! apply_common {
             ($grain:expr) => {{
@@ -491,6 +507,28 @@ pub fn build_grain_from_json<S: GrainSink>(
                 }
                 if let Some(ts) = get_i64("created_at") {
                     g = g.created_at(ts);
+                }
+                // Bi-temporal validity bounds are first-class common fields
+                // (`GrainCommon::valid_from/valid_to/...`), but no builder arm
+                // claimed them, so `collect_context_extras` swept them into
+                // `common.context` — where the write path compacts the key, and
+                // `valid_to` came back as `{"context": {"vt": …}}`. Nothing
+                // reads that: `waiser.staleness` looks for a top-level
+                // `valid_to`, and so does the store's world-time (`vf`/`vt`)
+                // column projection. So a bindings user setting expiry the
+                // documented way got a fact that silently never expires and
+                // never participates in an as-of query.
+                if let Some(ts) = get_i64("valid_from") {
+                    g.common_mut().valid_from = Some(ts);
+                }
+                if let Some(ts) = get_i64("valid_to") {
+                    g.common_mut().valid_to = Some(ts);
+                }
+                if let Some(ts) = get_i64("system_valid_from") {
+                    g.common_mut().system_valid_from = Some(ts);
+                }
+                if let Some(ts) = get_i64("system_valid_to") {
+                    g.common_mut().system_valid_to = Some(ts);
                 }
                 if let Some(imp) = get_f64("importance") {
                     g = g.importance(imp);
