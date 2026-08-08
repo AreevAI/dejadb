@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-08
+
+A minor rather than a patch: this release removes and renames public
+items in `dejadb-core`/`dejadb-cal`, adds a `GrainType` variant (so an
+exhaustive match downstream needs a new arm), and changes what
+`remember()` writes. See **Changed — breaking** below before upgrading a
+Rust dependency; CLI and bindings users are affected by the `remember()`
+and State-JSON changes only.
+
 ### Added
 
 - **Bulk erasure for compliance** (both backends): `forget_subject(ns,
@@ -1249,7 +1258,10 @@ and OMS-conformant; content addresses and error codes are contracts from here._
 - Argon2id key derivation with zeroization of key material.
 - `cargo-deny` supply-chain gate and a pinned encryption dependency.
 
-[Unreleased]: https://github.com/AreevAI/dejadb/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/AreevAI/dejadb/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/AreevAI/dejadb/compare/v1.0.5...v1.1.0
+[1.0.5]: https://github.com/AreevAI/dejadb/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/AreevAI/dejadb/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/AreevAI/dejadb/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/AreevAI/dejadb/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/AreevAI/dejadb/compare/v1.0.0...v1.0.1

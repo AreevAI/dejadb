@@ -27,7 +27,7 @@ semantics, millisecond-class recall.
 > merges, and encrypted incremental sync — built into the data model, because
 > grains *are* content-addressed immutable objects.
 
-*Status: `1.0.1` — the `.mg` format and CAL are stable and documented (conformant
+*Status: `1.1.0` — the `.mg` format and CAL are stable and documented (conformant
 with the Open Memory Spec, OMS).*
 
 ## Watch the 2½-minute overview
@@ -125,7 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/AreevAI/dejadb/main/scripts/install
 ```
 
 It installs to `~/.local/bin` (`/usr/local/bin` as root; override with
-`DEJA_INSTALL`), pins with `DEJA_VERSION=v1.0.5`, and verifies the download
+`DEJA_INSTALL`), pins with `DEJA_VERSION=v1.1.0`, and verifies the download
 against the release's `SHA256SUMS`. Or grab an archive straight from the
 [Releases page](https://github.com/AreevAI/dejadb/releases) — handy in a
 notebook, where the wheel covers the memory and Waiser loop but `deja ui` (the
