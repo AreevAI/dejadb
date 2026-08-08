@@ -183,6 +183,7 @@ macro_rules! for_each_conformance_case {
         $per_case!(vector_leg_roundtrip);
         // bulk erasure (right-to-erasure + retention)
         $per_case!(subject_erasure_is_complete);
+        $per_case!(partition_keys_and_text_mentions_erase);
         $per_case!(subject_erasure_replicates);
         $per_case!(retention_erases_only_older);
     };

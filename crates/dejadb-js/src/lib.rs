@@ -515,16 +515,24 @@ impl DejaDb {
     /// report as JSON (counts only, no identity material). Host-level
     /// destructive op: gate it like your other compliance endpoints. See
     /// docs/erasure.md for the scope contract.
+    /// Identity matching always covers partition-style keys (`pat`,
+    /// `pat#visit1` — never `patricia`); pass `textMentions=true` to ALSO
+    /// erase grains whose indexed text mentions the identity's tokens
+    /// (search symmetry — opt-in because token matching over-reaches for
+    /// common-word identifiers).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn forget_subject(
         &self,
         subject: String,
         ns: Option<String>,
+        text_mentions: Option<bool>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let facade = self.facade.clone();
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
         StringJob::spawn(move || {
-            let rep = facade.with_store(|m| m.forget_subject(&ns, &subject)).map_err(err)?;
+            let rep =
+                facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)).map_err(err)?;
             Ok(serde_json::json!({
                 "grains_erased": rep.grains_erased,
                 "terms_removed": rep.terms_removed,

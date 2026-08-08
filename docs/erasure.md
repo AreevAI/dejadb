@@ -46,7 +46,24 @@ they deviate from OMS.
   `FORGET USER`/`FORGET SCOPE`/`PURGE` remain refused by the parser, and the
   facade stubs (`cal_forget_user`, `cal_forget_scope`) remain unwired. Bulk
   erasure is a host-level library/CLI capability, gated by the host (the
-  CLI demands an explicit `--yes`).
+  CLI demands an explicit `--yes` and honors `--no-destructive-ops`).
+- **REQ-ERASE-7 (partition keys).** Hosts model composite records as
+  identity-prefixed keys (`pat#visit1`, `pat:thread-2`). Identity matching
+  MUST cover them: any dictionary term equal to the identity or starting
+  with it followed by a non-alphanumeric separator, case-exactly and
+  identically on every backend — and never a longer word (`patricia` is
+  not `pat`). Applies to subject/object positions, sessions, and run ids
+  alike, and the matched key strings are tombstoned with the identity.
+- **REQ-ERASE-8 (search symmetry, opt-in).** Whatever the engine can FIND
+  by the identity's tokens, it can ERASE by them: with `text_mentions`
+  enabled, grains whose indexed text contains every token of the identity
+  join the erasure set (the BM25 inverted index is the mechanism, so this
+  needs text indexing on — requesting it with indexing off is an error,
+  not a silent partial erasure). Opt-in, never default: token matching
+  over-reaches for identifiers that are ordinary words ("may", "mark"),
+  and erasing every grain containing a common word is the wrong failure
+  mode. For distinctive identifiers (contact codes, record numbers) it
+  closes the prose-mention gap.
 
 ## The OMS deviation, stated plainly
 
@@ -67,14 +84,20 @@ The deviation is deliberately shaped to be conformance-neutral:
 ## Scope contract (what "about a subject" means)
 
 `forget_subject` erases grains found through **dictionary-indexed
-references** in the namespace:
+references** in the namespace — for the identity itself AND every
+partition-style key carrying it as a boundary-guarded prefix
+(REQ-ERASE-7):
 
 - triple **subject** position (the grain is about the identity),
 - triple **object** position (the grain points at the identity —
   over-deletion is the safe direction for erasure),
-- **thread events** whose session id is the identity,
+- **thread events** whose session id is the identity (or an
+  identity-prefixed key),
 - **run records** whose run id is the identity (`run_trace` /
-  `runs_touching` must go empty for an erased identity).
+  `runs_touching` must go empty for an erased identity),
+- and, with `text_mentions` enabled (REQ-ERASE-8), grains whose **indexed
+  text** contains every token of the identity — search symmetry through
+  the engine's own inverted index.
 
 Dictionary hygiene rides the same transaction: every term the erased
 grains touched (their subject/relation/object VALUES, session and run
@@ -93,13 +116,14 @@ concurrent upload of byte-identical content in the erasure instant; and
 `gc_blobs`, the explicit full-store sweep, still requires quiescent
 writers — both documented on the APIs.)
 
-Not findable, by construction: a free-text mention of the identity inside
-another subject's prose (no index exists that maps text back to grains
-without the identity also appearing in a structured position). **Hosts that
-need erasure must keep identity references in structured fields** — subject,
-object, or session — which is also what makes them recallable. `user_id`
-inside a grain body is likewise not an index; use subject/session for
-erasable identity scoping.
+Residual limits, stated honestly: text-mention matching reaches exactly
+what the index reaches — grains whose text was never indexed (`index_text`
+off, or written before indexing) and identity forms the tokenizer splits
+differently (a phone number renders as its digit runs) are matched only
+through their structured references. `user_id` inside a grain body is not
+an index; use subject/session/run for erasable identity scoping.
+**Distinctive identifiers in structured fields remain the contract**;
+partition keys and text mentions are the widening, not a substitute.
 
 ## Backend notes
 

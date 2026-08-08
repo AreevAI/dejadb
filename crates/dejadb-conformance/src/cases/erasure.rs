@@ -4,7 +4,7 @@
 //! backend, INCLUDING replication through ordinary tombstones.
 
 use crate::{fact, fact_at, Backend};
-use dejadb_store::Capture;
+use dejadb_store::{Capture, ErasureOptions};
 
 pub fn subject_erasure_is_complete(b: &dyn Backend) {
     let mut m = b.open();
@@ -68,6 +68,48 @@ pub fn subject_erasure_is_complete(b: &dyn Backend) {
     // The store keeps working for the same identity afterwards (fresh intern).
     m.add(&fact("ns", "pat", "condition", "new record")).unwrap();
     assert_eq!(m.recall("ns", "pat", None, 8).unwrap().len(), 1);
+}
+
+pub fn partition_keys_and_text_mentions_erase(b: &dyn Backend) {
+    let mut m = b.open();
+    // Partition-style composite keys carrying the identity as prefix…
+    let hp1 = m.add(&fact("ns", "pat#visit1", "note", "first checkup")).unwrap();
+    let hp2 = m.add(&fact("ns", "pat:thread-2", "note", "follow up")).unwrap();
+    // …a session keyed the same way…
+    let hev = m
+        .capture("ns", "voicemail", &Capture { session_id: Some("pat#calls"), ..Capture::default() })
+        .unwrap();
+    // …the exact identity…
+    let hex = m.add(&fact("ns", "pat", "condition", "stable")).unwrap();
+    // …a LONGER WORD that must never match the prefix…
+    let hpatricia = m.add(&fact("ns", "patricia", "prefers", "tea")).unwrap();
+    // …and another subject's grain whose INDEXED TEXT mentions the identity.
+    let hmention = m
+        .add(&fact("ns", "kim", "note", "spoke about pat during rounds"))
+        .unwrap();
+
+    // Default scope: exact + partition keys + sessions; text mentions stay.
+    let rep = m.forget_subject("ns", "pat").unwrap();
+    assert_eq!(rep.grains_erased, 4, "exact + two partition keys + session event: {rep:?}");
+    for h in [hp1, hp2, hev, hex] {
+        assert!(m.get(&h).is_err(), "partition-keyed grain must be erased");
+    }
+    assert!(m.get(&hpatricia).is_ok(), "a longer word is NOT the identity");
+    assert!(m.get(&hmention).is_ok(), "text mentions survive the default scope");
+    assert!(m.recall("ns", "pat#visit1", None, 8).unwrap().is_empty());
+    assert_eq!(m.recall("ns", "patricia", None, 8).unwrap().len(), 1);
+
+    // Opt-in text-mention scope: search symmetry — the mention was findable
+    // by token, so it is erasable by token.
+    assert!(!m.recall_hybrid("ns", None, None, Some("pat"), 8, None).unwrap().is_empty());
+    let rep2 = m
+        .forget_subject_with("ns", "pat", ErasureOptions { text_mentions: true })
+        .unwrap();
+    assert_eq!(rep2.grains_erased, 1, "the mentioning grain: {rep2:?}");
+    assert!(m.get(&hmention).is_err());
+    assert!(m.recall_hybrid("ns", None, None, Some("pat"), 8, None).unwrap().is_empty());
+    // The bystander with her own tea preference is still untouched.
+    assert!(m.get(&hpatricia).is_ok());
 }
 
 pub fn subject_erasure_replicates(b: &dyn Backend) {

@@ -135,10 +135,25 @@ fn cas_hexes(view: &DeserializedGrain) -> Vec<String> {
 
 /// What a bulk erasure targets (internal to the erasure core).
 enum ErasureSelector {
-    /// Every structured reference to one dictionary term in one namespace.
-    Identity { ns_id: i64, term: i64 },
+    /// Every structured reference to one identity in one namespace. The
+    /// identity's dictionary ids (exact + partition-prefixed keys) are
+    /// resolved INSIDE the erasure transaction, after the serialization
+    /// point.
+    Identity { ns_id: i64, subject: String, text_mentions: bool },
     /// Everything older than the cutoff, optionally scoped.
     OlderThan { ns_id: Option<i64>, cutoff_ms: i64, gtype: Option<i64> },
+}
+
+/// Options for [`DejaDB::forget_subject_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ErasureOptions {
+    /// Also erase grains whose INDEXED TEXT mentions the identity — search
+    /// symmetry: whatever the BM25 leg can find by these tokens, erasure
+    /// removes. Opt-in because token matching over-reaches for identifiers
+    /// that are common words ("may", "mark"); safe and thorough for
+    /// distinctive ids (contact codes, phone fragments). Requires text
+    /// indexing to be on.
+    pub text_mentions: bool,
 }
 
 /// Result of a bulk erasure ([`DejaDB::forget_subject`] /
@@ -2881,13 +2896,38 @@ impl DejaDB {
     /// host-level extension beyond the OMS single-grain tombstone; it is
     /// not reachable from CAL text (REQ-ERASE in docs/erasure.md).
     pub fn forget_subject(&mut self, ns: &str, subject: &str) -> Result<ErasureReport> {
-        let (Some(ns_id), Some(s_id)) = (self.term_lookup(ns)?, self.term_lookup(subject)?)
-        else {
+        self.forget_subject_with(ns, subject, ErasureOptions::default())
+    }
+
+    /// [`forget_subject`](Self::forget_subject) with options — see
+    /// [`ErasureOptions`] for the text-mention mode. Identity matching
+    /// always covers PARTITION-STYLE KEYS too: any dictionary term equal to
+    /// `subject` or starting with `subject` followed by a non-alphanumeric
+    /// separator (`pat`, `pat#visit1`, `pat:thread-2` — but never
+    /// `patricia`), case-exact on every backend.
+    pub fn forget_subject_with(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        opts: ErasureOptions,
+    ) -> Result<ErasureReport> {
+        let Some(ns_id) = self.term_lookup(ns)? else {
             return Ok(ErasureReport::default());
         };
+        if opts.text_mentions && !self.index_text {
+            return Err(DejaDbError::Validation(
+                "text-mention erasure needs text indexing on for this memory \
+                 (the BM25 index is what makes prose mentions findable)"
+                    .into(),
+            ));
+        }
         self.erase_where(
-            ErasureSelector::Identity { ns_id, term: s_id },
-            Some((subject.to_string(), s_id)),
+            ErasureSelector::Identity {
+                ns_id,
+                subject: subject.to_string(),
+                text_mentions: opts.text_mentions,
+            },
+            Some(subject.to_string()),
         )
     }
 
@@ -2919,7 +2959,7 @@ impl DejaDB {
     fn erase_where(
         &mut self,
         selector: ErasureSelector,
-        identity: Option<(String, i64)>,
+        identity: Option<String>,
     ) -> Result<ErasureReport> {
         struct Target {
             seq: i64,
@@ -2955,13 +2995,90 @@ impl DejaDB {
             };
             // Serialize with concurrent writers before enumerating.
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
-            let seq_rows = match &selector {
-                ErasureSelector::Identity { ns_id, term } => self.db.query(
-                    "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND (s=?2 OR o=?2) \
-                     UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session=?2 \
-                     UNION SELECT seq FROM run_idx WHERE ns=?1 AND run=?2",
-                    vec![pi(*ns_id), pi(*term)],
-                )?,
+            let mut identity_ids: Vec<i64> = Vec::new();
+            let mut seqs: Vec<i64> = match &selector {
+                ErasureSelector::Identity { ns_id, subject, text_mentions } => {
+                    // Resolve the identity's dictionary ids in-txn: the exact
+                    // term plus every PARTITION-STYLE key — `subject` followed
+                    // by a non-alphanumeric separator (`pat#visit1`,
+                    // `pat:thread-2`), never a longer word (`patricia`). The
+                    // LIKE is a coarse prefilter (case-insensitive on the
+                    // embedded engine); the Rust boundary check decides,
+                    // case-exactly, identically on every backend.
+                    let escaped = subject
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_");
+                    let like = format!("{escaped}%");
+                    for row in self.db.query(
+                        "SELECT id, term FROM terms WHERE term LIKE ?1 ESCAPE '\\'",
+                        vec![pt(&like)],
+                    )? {
+                        let (Some(id), Some(term)) = (row.i64(0), row.text(1)) else {
+                            continue;
+                        };
+                        let matched = term == subject
+                            || (term.starts_with(subject.as_str())
+                                && term[subject.len()..]
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| !c.is_alphanumeric()));
+                        if matched {
+                            identity_ids.push(id);
+                        }
+                    }
+                    let mut seqs: Vec<i64> = Vec::new();
+                    if !identity_ids.is_empty() {
+                        let idcsv = seq_csv(&identity_ids);
+                        seqs.extend(
+                            self.db
+                                .query(
+                                    &format!(
+                                        "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND \
+                                           (s IN ({idcsv}) OR o IN ({idcsv})) \
+                                         UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session IN ({idcsv}) \
+                                         UNION SELECT seq FROM run_idx WHERE ns=?1 AND run IN ({idcsv})"
+                                    ),
+                                    vec![pi(*ns_id)],
+                                )?
+                                .iter()
+                                .filter_map(|r| r.i64(0)),
+                        );
+                    }
+                    // Search symmetry, opt-in: whatever the BM25 leg can find
+                    // by the identity's tokens, erasure removes — a grain
+                    // whose INDEXED TEXT mentions the identity is a candidate
+                    // when every token of the identity occurs in it.
+                    if *text_mentions {
+                        let tokens = tokenize(subject);
+                        let mut inter: Option<HashSet<i64>> = None;
+                        for t in &tokens {
+                            let set: HashSet<i64> = match self.fts_term_lookup(t)? {
+                                Some(vid) => self
+                                    .db
+                                    .query(
+                                        "SELECT seq FROM fts_post WHERE term=?1 AND ns=?2",
+                                        vec![pi(vid), pi(*ns_id)],
+                                    )?
+                                    .iter()
+                                    .filter_map(|r| r.i64(0))
+                                    .collect(),
+                                None => HashSet::new(),
+                            };
+                            inter = Some(match inter {
+                                None => set,
+                                Some(p) => p.intersection(&set).copied().collect(),
+                            });
+                            if inter.as_ref().is_some_and(|s| s.is_empty()) {
+                                break;
+                            }
+                        }
+                        if let Some(set) = inter {
+                            seqs.extend(set);
+                        }
+                    }
+                    seqs
+                }
                 ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype } => {
                     let mut sql = String::from("SELECT seq FROM grains WHERE created_at < ?1");
                     let mut params = vec![pi(*cutoff_ms)];
@@ -2973,20 +3090,20 @@ impl DejaDB {
                         sql.push_str(if ns_id.is_some() { " AND gtype = ?3" } else { " AND gtype = ?2" });
                         params.push(pi(*g));
                     }
-                    self.db.query(&sql, params)?
+                    self.db.query(&sql, params)?.iter().filter_map(|r| r.i64(0)).collect()
                 }
             };
-            let mut seqs: Vec<i64> = seq_rows.iter().filter_map(|r| r.i64(0)).collect();
             seqs.sort_unstable();
+            seqs.dedup();
             if seqs.is_empty() {
-                // Nothing matched — but the IDENTIFIER may still exist in the
-                // dictionary (its grains were forgotten one by one earlier).
-                // Erasure of the string must still be possible.
-                if let Some((_, term)) = &identity {
-                    let gone = self.scrub_term_if_unreferenced(*term)?;
+                // Nothing matched — but the IDENTIFIER (and its partition
+                // keys) may still exist in the dictionary after per-grain
+                // forgets. Erasure of the strings must still be possible.
+                for id in &identity_ids {
+                    let gone = self.scrub_term_if_unreferenced(*id)?;
                     out.report.terms_removed += gone as usize;
                     if gone > 0 {
-                        out.scrubbed_terms.push(*term);
+                        out.scrubbed_terms.push(*id);
                     }
                 }
                 return Ok(out);
@@ -3028,9 +3145,7 @@ impl DejaDB {
                     }
                 }
             }
-            if let Some((_, term)) = &identity {
-                term_candidates.push(*term);
-            }
+            term_candidates.extend(identity_ids.iter().copied());
             let mut targets: Vec<Target> = Vec::with_capacity(seqs.len());
             for row in self.db.query(
                 &format!(
@@ -3225,7 +3340,7 @@ impl DejaDB {
                         for h in &hashes {
                             let _ = tel.scrub(h);
                         }
-                        if let Some((name, _)) = &identity {
+                        if let Some(name) = &identity {
                             // Query stats and the recall log key on the
                             // SUBJECT STRING, not grain hashes — they must
                             // not outlive the identity either.

@@ -49,9 +49,13 @@ COMMANDS:
   provenance <source-hash>            grains distilled from a source (reverse)
   forks                               open forks (>1 head for a subject+relation)
   merge    --subject S --relation R --object O   close a fork with a resolved value
-  forget-subject <subject> [--ns NS] --yes   erase EVERY grain referencing an
-                                      identity (history included) + its
-                                      dictionary entry; replicates as tombstones
+  forget-subject <subject> [--ns NS] [--text-mentions] --yes   erase EVERY
+                                      grain referencing an identity — exact +
+                                      partition keys (pat, pat#visit1), history
+                                      included, + its dictionary entries;
+                                      --text-mentions also erases grains whose
+                                      indexed text mentions the identity;
+                                      replicates as tombstones
   purge-older-than <days> [--ns NS] [--type event] --yes   retention sweep:
                                       erase grains older than N days
                                       (--ns \"\" sweeps every namespace)
@@ -1574,7 +1578,10 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                      Re-run with --yes to proceed."
                 ));
             }
-            let rep = m.forget_subject(&ns, &subject).map_err(|e| e.to_string())?;
+            let opts = dejadb_store::ErasureOptions {
+                text_mentions: flags.contains_key("text-mentions"),
+            };
+            let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
             println!(
                 "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
                 rep.grains_erased, rep.terms_removed, rep.vocab_removed, rep.blobs_reclaimed

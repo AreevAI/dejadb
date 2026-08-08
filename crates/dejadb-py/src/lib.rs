@@ -608,11 +608,23 @@ impl DejaDB {
     /// as JSON (counts only, no identity material). Host-level destructive
     /// op: gate it like your other compliance endpoints. See docs/erasure.md
     /// for the scope contract (only structured references are findable).
-    #[pyo3(signature = (subject, ns = None))]
-    fn forget_subject(&self, py: Python<'_>, subject: String, ns: Option<String>) -> PyResult<String> {
+    /// Identity matching always covers partition-style keys (`pat`,
+    /// `pat#visit1`, `pat:thread-2` — never `patricia`); pass
+    /// `text_mentions=True` to ALSO erase grains whose indexed text mentions
+    /// the identity's tokens (search symmetry — opt-in because token
+    /// matching over-reaches for common-word identifiers).
+    #[pyo3(signature = (subject, ns = None, text_mentions = false))]
+    fn forget_subject(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions };
         let rep = py
-            .detach(|| self.facade.with_store(|m| m.forget_subject(&ns, &subject)))
+            .detach(|| self.facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)))
             .map_err(err)?;
         Ok(json!({
             "grains_erased": rep.grains_erased,

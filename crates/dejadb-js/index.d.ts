@@ -82,8 +82,13 @@ export declare class DejaDb {
    * report as JSON (counts only, no identity material). Host-level
    * destructive op: gate it like your other compliance endpoints. See
    * docs/erasure.md for the scope contract.
+   * Identity matching always covers partition-style keys (`pat`,
+   * `pat#visit1` — never `patricia`); pass `textMentions=true` to ALSO
+   * erase grains whose indexed text mentions the identity's tokens
+   * (search symmetry — opt-in because token matching over-reaches for
+   * common-word identifiers).
    */
-  forgetSubject(subject: string, ns?: string | undefined | null): Promise<string>
+  forgetSubject(subject: string, ns?: string | undefined | null, textMentions?: boolean | undefined | null): Promise<string>
   /**
    * Retention sweep: erase every grain with `created_at` older than
    * `cutoffMs` (epoch milliseconds), optionally limited to one grain type
