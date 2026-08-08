@@ -182,6 +182,12 @@ impl EmbedBackend for PyEmbed {
 
 /// One memory = one file. Open with `dejadb.DejaDB("caller.db", ns="caller")`.
 ///
+/// **One handle per file per process — share it across threads.** The embedded
+/// backend is single-writer per file, and a second handle would keep its own
+/// sequence and dictionary allocators; opening one raises `STO-E002`. Sharing
+/// a single handle across threads is fully supported (see the detach note
+/// below), so opening per request or per agent turn is never necessary.
+///
 /// Every method that reaches the store runs it inside `py.detach(...)`, so the
 /// interpreter lock is released for the duration of the storage call. This is
 /// not an optimization — it is what makes the type usable from more than one

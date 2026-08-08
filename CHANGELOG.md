@@ -69,6 +69,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   breaking `add_if_novel`'s value probe.
 - The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
   blobs in the probe statement itself (join) instead of one query per hit.
+- **A second handle on one file, in one process, is refused at open** (#50).
+  The embedded backend is single-writer per file and enforces that across
+  processes with an OS file lock; inside one process that lock is already held,
+  so a second `open()` succeeded silently. The two handles then allocated from
+  their own cached `next_seq`/`next_term` until a write collided — surfacing as
+  `UNIQUE constraint failed: terms.id` on **the first handle**, long after the
+  mistake, in a message naming neither handles nor writers. It is now `STO-E002`
+  at open, naming the cause and the fix. Opening a handle per request or per
+  agent turn is the natural move if you think of a memory file as a database
+  connection; sharing one handle across threads is fully supported, and is
+  documented on the Python class, in `ARCHITECTURE.md`, and in the error
+  registry. The Postgres backend is unaffected — it admits multiple concurrent
+  writers per memory by design. Node gains **`close()`**: Rust and Python
+  release the claim on drop, but Node's drop waits for GC, so without it a
+  handle that had gone out of JS scope would hold the file until then. Calling
+  a method on a closed handle is an error, not a silent reopen.
 
 ### Changed
 

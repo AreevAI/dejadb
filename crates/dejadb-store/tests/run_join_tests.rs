@@ -295,18 +295,20 @@ fn open_heals_a_file_written_before_the_link_indexes_existed() {
         m.meta_put("link_index", "0").unwrap();
     }
 
-    let m = DejaDB::open(path).unwrap();
-    assert!(
-        m.open_warnings().iter().any(|w| w.contains("link indexes rebuilt")),
-        "the rebuild must announce itself: {:?}",
-        m.open_warnings()
-    );
-    let mut m = m;
-    assert_eq!(m.run_trace("ops", "run-a", 100).unwrap().len(), 2);
-    assert_eq!(m.grains_derived_from(&e1).unwrap().len(), 1);
-    assert_eq!(m.runs_touching("ops", &fact, 4).unwrap(), vec!["run-a"]);
+    {
+        let mut m = DejaDB::open(path).unwrap();
+        assert!(
+            m.open_warnings().iter().any(|w| w.contains("link indexes rebuilt")),
+            "the rebuild must announce itself: {:?}",
+            m.open_warnings()
+        );
+        assert_eq!(m.run_trace("ops", "run-a", 100).unwrap().len(), 2);
+        assert_eq!(m.grains_derived_from(&e1).unwrap().len(), 1);
+        assert_eq!(m.runs_touching("ops", &fact, 4).unwrap(), vec!["run-a"]);
+    }
 
-    // Stamped, so the next open does not re-scan the corpus.
+    // Stamped, so the next open does not re-scan the corpus. Scoped, because
+    // one memory is one handle — the reopen has to be a *re*open.
     let m2 = DejaDB::open(path).unwrap();
     assert!(
         !m2.open_warnings().iter().any(|w| w.contains("link indexes rebuilt")),
