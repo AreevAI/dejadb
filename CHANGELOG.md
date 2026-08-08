@@ -54,6 +54,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   case list (forks, two-hop replication, tombstones, PITR, BM25, vectors,
   CAS, CAL end-to-end) executed against both backends, plus a Postgres CI
   job on `pgvector/pgvector:pg16`.
+- **Prebuilt `deja` binaries on every GitHub Release** (#38). Releases
+  v1.0.0–v1.0.5 carried no binary assets, so the only way to get the CLI was
+  `cargo install dejadb` — a full Rust build. `release-cli.yml` now builds
+  Linux x86_64/aarch64, macOS x86_64/arm64 and Windows x86_64, smoke-tests each
+  one (`--version`, then a real add/recall round trip) before packaging, and
+  attaches the archives plus a `SHA256SUMS` file. Linux aarch64 builds on a
+  native arm64 runner for the same reason `release-pypi.yml` does — cross-gcc
+  cannot compile turso's mimalloc/zstd deps. `scripts/install.sh` is the
+  matching `curl | sh` installer: it resolves the latest tag, verifies the
+  download against `SHA256SUMS`, and installs to `~/.local/bin`. This is what
+  makes `deja ui` — the console, including the Waiser review queue — reachable
+  from a notebook or a scratch container, where the wheel covers the memory
+  loop but the console lives in the binary.
 - Internal `Db` backend seam in `dejadb-store`: the store logic is
   backend-agnostic; the embedded Turso engine and the Postgres transport are
   interchangeable implementations behind it. By construction this also fixed
