@@ -316,7 +316,48 @@ benchmarks routinely mislead:
   reports the governor's *request*; it read a flat 1200 MHz across 412 samples
   of a phase the firmware was actually running at 600 MHz.
 
-## Findings for the tree (from building this)
+## 7. Server tier — the postgres backend
+
+*Run: 2026-08-07 · Apple M4 Max → `pgvector/pgvector:pg16` in local Docker
+(loopback TCP; ~0.1–0.3 ms per round trip) · `pg_bench` (`cargo run --release
+-p dejadb-bench --features postgres --bin pg_bench`) · same dataset shape as
+§5: 10k facts / 800 subjects, seeded xorshift, `index_text` on, 2,000 queries
++ 300 warmup.*
+
+**These are a different latency class by design and must never be quoted next
+to the §1/§5 embedded numbers without the topology.** The server tier exists
+for deployments with no durable disk; its contract is millisecond-class
+turn-level recall with multi-writer HA, not the embedded microsecond class.
+Numbers scale with the network: same-VPC managed Postgres adds ~0.2–0.5 ms per
+round trip over this table; cross-AZ more.
+
+| pg_bench (postgres backend, loopback Docker) | p50 µs | p95 µs | p99 µs | sanity bound | verdict |
+|---|---|---|---|---|---|
+| recall about subject (k<=16, deserialize) | 240 | 391 | 477 | 5000 | PASS |
+| entity_latest head (full grain) | 564 | 907 | 1188 | 3000 | PASS |
+| hybrid free-text recall (k=8) | 12766 | 14788 | 15855 | 20000 | PASS |
+| add single grain (full txn) | 3671 | 4429 | 5642 | 20000 | PASS |
+| bulk load (add_batch 500/grain, FTS on) | ~3.3 ms/grain | — | — | — | — |
+
+Readings:
+
+- **Structural recall is ONE round trip** on this backend (the probe+blob
+  join from the backend-shaped read work), which is why it lands at 240µs —
+  ~8x the embedded 30µs, not the ~17x a per-blob fetch loop would cost.
+  `entity_latest` pays two sequential round trips (probe, then fetch by
+  hash), which is why the "cheaper" read is slower here — a batching
+  candidate if it ever matters at this tier.
+- **The hybrid number is a worst-ish case on purpose**: every document in
+  this corpus shares the token "value", so the BM25 leg drags a ~10k-row
+  posting list across the wire per query. Distinctive queries run far
+  closer to the structural number.
+- **Writes carry the serialization point**: the ~3.7ms single-add includes
+  the `counters` claim that makes concurrent writers safe, ~16 statements,
+  and live FTS postings. The same corpus loads at ~3.3ms/grain batched —
+  compare the embedded engine's §5 finding that FTS-on single adds cost
+  ~300ms there (fsync-bound): the write tax lives in different places.
+- The sanity bounds are deliberately loose (they gate the harness, not the
+  product): topology dominates, so publishable claims must name theirs.
 
 1. **FTS write tax is per-row, not per-txn as documented.** Loading 10k
    facts through `add_batch` (500/batch) with default options

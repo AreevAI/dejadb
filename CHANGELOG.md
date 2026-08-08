@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Bulk erasure for compliance** (both backends): `forget_subject(ns,
+  subject)` — right-to-erasure for one identity: every grain holding a
+  structured reference (full supersession history, object-position
+  references, thread events), the identity's dictionary entry, and
+  erased-only vocabulary tokens, all in one transaction with one
+  replicating op-log tombstone per grain; and `forget_older_than(ns,
+  cutoff, grain_type)` — the age-based retention sweep. Exposed in the
+  bindings (`forget_subject`/`forgetSubject`, `forget_older_than`/
+  `forgetOlderThan`) and the CLI (`deja forget-subject … --yes`,
+  `deja purge-older-than <days> … --yes`); returns an `ErasureReport` of
+  counts only. Deliberately NOT reachable from CAL text — the grammar and
+  the `cal_forget_user`/`cal_forget_scope` stubs are unchanged. This is a
+  documented OMS deviation; requirements, scope contract ("about a
+  subject" = dictionary-indexed references), and backend caveats live in
+  `docs/erasure.md`.
+
 - **PostgreSQL backend** (non-default cargo feature `postgres`): the same
   store logic runs over one Postgres schema per memory — for stateless
   deployments where a file has nowhere durable to live. `DejaDB::open_postgres
@@ -23,7 +39,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SupersessionConflict`/`NotFound` via in-transaction `FOR UPDATE`
   rechecks. (The **`STO-E002` StoreBusy** code is registered but currently
   unraised — reserved for exclusive-access arbitration.) One process can
-  hold handles to many memories at once. Erasure/portability map to
+  hold handles to many memories at once. The **Python and Node bindings
+  ship the backend built in** — the same `DejaDB`/`DejaDb` class takes a
+  `postgres://…?schema=<name>` DSN wherever it takes a path, and
+  `drop_postgres_schema` exposes memory-level erasure. The **recall
+  telemetry sidecar works on this backend** (tables ride the memory's
+  schema; on the file backend the sidecar tables gained a `telem_` prefix —
+  existing sidecars start fresh, telemetry is disposable evidence).
+  `pg_bench` publishes the server-tier latency table (RESULTS.md §7).
+  Erasure/portability map to
   `DROP SCHEMA … CASCADE` / `pg_dump -n`; the page cipher and the telemetry
   sidecar remain file-backend capabilities and are rejected with clear
   errors. Parity is pinned by the new **`dejadb-conformance`** crate: one

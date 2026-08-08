@@ -92,6 +92,31 @@ fn concurrent_writers_all_land() {
     assert_eq!(m.recall("ns", "b7", Some("writes"), 4).unwrap().len(), 1);
 }
 
+/// Two processes opening a BRAND-NEW memory simultaneously: the schema
+/// bootstrap (DDL + seeding) runs under an advisory lock, so both succeed —
+/// Postgres's IF NOT EXISTS DDL alone is racy and the loser would otherwise
+/// fail open with a spurious 23505.
+#[test]
+fn concurrent_first_open_bootstraps_once() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let schema = b.schema_for("boot");
+    let opener = || {
+        let url = url.clone();
+        let schema = schema.clone();
+        std::thread::spawn(move || {
+            dejadb_store::DejaDB::open_postgres(&url, &schema).map(|mut m| m.count().unwrap())
+        })
+    };
+    let (t1, t2) = (opener(), opener());
+    let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "both concurrent first-openers must succeed: {r1:?} / {r2:?}"
+    );
+    drop(b.open_named("boot")); // register the schema for cleanup
+}
+
 /// Two instances racing to supersede the SAME head: exactly one winner and
 /// one clean SupersessionConflict — the single-writer contract, kept under
 /// concurrency by the in-transaction FOR UPDATE recheck.
@@ -130,6 +155,41 @@ fn concurrent_supersede_one_wins() {
     assert_eq!(m.heads("ns", "j", "plan").unwrap().len(), 1, "one head, no fork");
     assert_eq!(m.latest("ns", "j", "plan").unwrap().unwrap().get_str("object"), Some(winner));
     assert_eq!(m.count().unwrap(), 2, "loser's grain rolled back with its transaction");
+}
+
+/// The recall-telemetry sidecar on Postgres: tables ride the memory's own
+/// schema, rollups accumulate across flushes, and a forgotten grain is
+/// scrubbed from them.
+#[test]
+fn telemetry_rollups_on_pg() {
+    let Some(b) = backend() else { return };
+    let url = pg_url().unwrap();
+    let mut m = dejadb_store::DejaDB::open_postgres_with_telemetry(
+        &url,
+        &b.schema_for("telem"),
+        dejadb_store::TelemetryMode::Aggregate,
+    )
+    .unwrap();
+    assert_eq!(m.telemetry_mode(), dejadb_store::TelemetryMode::Aggregate);
+    let h = m.add(&dejadb_conformance::fact("ns", "ana", "prefers", "quiet peaceful rooms")).unwrap();
+    m.recall("ns", "ana", Some("prefers"), 4).unwrap();
+    m.recall("ns", "ana", Some("prefers"), 4).unwrap();
+    m.recall_hybrid("ns", None, None, Some("nonexistent topic"), 4, None).unwrap();
+    m.telemetry_flush().unwrap();
+    let access = m.telemetry_access_stats(Some("ns")).unwrap();
+    assert_eq!(access.len(), 1, "one grain accessed");
+    assert_eq!(access[0].recall_count, 2, "two structural recalls counted");
+    assert_eq!(access[0].hash, h.to_hex());
+    let queries = m.telemetry_query_stats(Some("ns")).unwrap();
+    assert_eq!(queries.len(), 1, "one free-text question recorded");
+    assert_eq!(queries[0].empty_count, 1, "the coverage-gap signal");
+    m.telemetry_note_budget(true).unwrap();
+    m.telemetry_note_budget(false).unwrap();
+    let budget = m.telemetry_budget_stats().unwrap();
+    assert_eq!((budget.sample_count, budget.overflow_count), (2, 1));
+    // forget scrubs the sidecar so it never outlives an erased grain
+    m.forget(&h).unwrap();
+    assert!(m.telemetry_access_stats(Some("ns")).unwrap().is_empty(), "scrubbed on forget");
 }
 
 /// One instance holding several memories at once (the schema-per-org

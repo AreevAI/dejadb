@@ -49,6 +49,16 @@ COMMANDS:
   provenance <source-hash>            grains distilled from a source (reverse)
   forks                               open forks (>1 head for a subject+relation)
   merge    --subject S --relation R --object O   close a fork with a resolved value
+  forget-subject <subject> [--ns NS] [--text-mentions] --yes   erase EVERY
+                                      grain referencing an identity — exact +
+                                      partition keys (pat, pat#visit1), history
+                                      included, + its dictionary entries;
+                                      --text-mentions also erases grains whose
+                                      indexed text mentions the identity;
+                                      replicates as tombstones
+  purge-older-than <days> [--ns NS] [--type event] --yes   retention sweep:
+                                      erase grains older than N days
+                                      (--ns \"\" sweeps every namespace)
   novelty  --text T [--subject S] [--relation R] [-k N]   nearest existing grains
                                       (paraphrase check; needs --embed-cmd)
   log      [--since OP] [--limit N]   op-log (change feed)
@@ -151,30 +161,28 @@ fn need(args: &HashMap<String, String>, k: &str) -> Result<String, String> {
 /// an unauthenticated HTTP console — risks exposing or mutating the wrong file,
 /// so those commands must name their memory explicitly.
 /// Open a memory on the postgres backend from a `postgres://…?schema=<name>`
-/// DSN. Encryption keys don't apply here (the `--passphrase-env` path derives
-/// them from a `.kdf` sidecar next to a FILE, so a DSN never reaches it) and
-/// the telemetry sidecar is not yet supported on this backend.
+/// DSN, mirroring the file-backend branches (explicit options re-stamp;
+/// telemetry rides the memory's schema). Encryption keys don't apply here —
+/// the `--passphrase-env` path derives them from a `.kdf` sidecar next to a
+/// FILE, so a DSN is rejected before derivation.
 #[cfg(feature = "postgres")]
 fn open_postgres_store(
     db: &str,
-    explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    tel_mode: dejadb_store::TelemetryMode,
     explicit_index: Option<&str>,
 ) -> Result<DejaDB, String> {
-    if matches!(explicit_telemetry, Some(m) if m != dejadb_store::TelemetryMode::Off) {
-        return Err(
-            "the recall-telemetry sidecar is not yet supported on the postgres backend".into()
-        );
-    }
     let (url, schema) = dejadb_store::pg::split_schema_url(db).map_err(|e| e.to_string())?;
-    match explicit_index {
-        Some(v) => {
-            let o = dejadb_store::DejaDbOptions {
-                index_text: !matches!(v, "false" | "0" | "off" | "no"),
-                ..Default::default()
-            };
-            DejaDB::open_postgres_with(&url, &schema, o)
-        }
-        None => DejaDB::open_postgres(&url, &schema),
+    if let Some(v) = explicit_index {
+        let o = dejadb_store::DejaDbOptions {
+            index_text: !matches!(v, "false" | "0" | "off" | "no"),
+            telemetry: tel_mode,
+            ..Default::default()
+        };
+        DejaDB::open_postgres_with(&url, &schema, o)
+    } else if tel_mode != dejadb_store::TelemetryMode::Off {
+        DejaDB::open_postgres_with_telemetry(&url, &schema, tel_mode)
+    } else {
+        DejaDB::open_postgres(&url, &schema)
     }
     .map_err(|e| e.to_string())
 }
@@ -182,7 +190,7 @@ fn open_postgres_store(
 #[cfg(not(feature = "postgres"))]
 fn open_postgres_store(
     _db: &str,
-    _explicit_telemetry: Option<dejadb_store::TelemetryMode>,
+    _tel_mode: dejadb_store::TelemetryMode,
     _explicit_index: Option<&str>,
 ) -> Result<DejaDB, String> {
     Err("this build lacks the postgres backend — reinstall with \
@@ -608,19 +616,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     // host-supplied capability that also requires open_with.
     let explicit_index = flag(&flags, "index-text");
     let mut m = if is_pg_url {
-        // The CLI's telemetry default is `aggregate` for files; the sidecar
-        // is not supported on this backend yet, so only an EXPLICIT
-        // --telemetry request is an error — the default drops to off WITH a
-        // warning (waiser's telemetry-fed analyzers would otherwise report
-        // an all-clear from silently empty stats).
-        let explicit_telemetry = flag(&flags, "telemetry").map(|_| tel_mode);
-        if explicit_telemetry.is_none() {
-            eprintln!(
-                "deja: warning: recall telemetry is not yet supported on the postgres \
-                 backend; running with telemetry off"
-            );
-        }
-        open_postgres_store(&db, explicit_telemetry, explicit_index.as_deref())?
+        open_postgres_store(&db, tel_mode, explicit_index.as_deref())?
     } else {
         if explicit_index.is_some() || enc_key.is_some() {
             let mut o = dejadb_store::DejaDbOptions::default();
@@ -1558,6 +1554,91 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     })
                 );
             }
+        }
+        "forget-subject" => {
+            // Right-to-erasure for one identity: erase every grain holding a
+            // structured reference to the subject (history included), its
+            // thread events, its dictionary entry, and erased-only
+            // vocabulary — with replicating tombstones. Destructive and
+            // bulk, so it demands an explicit --yes.
+            let subject = positional.first().cloned().or_else(|| flag(&flags, "subject")).ok_or(
+                "usage: deja forget-subject <subject> [--ns NS] [--text-mentions] --yes"
+                    .to_string(),
+            )?;
+            if flags.contains_key("no-destructive-ops") {
+                return Err(
+                    "destructive operations are disabled for this invocation \
+                     (--no-destructive-ops)"
+                        .into(),
+                );
+            }
+            if !flags.contains_key("yes") {
+                return Err(format!(
+                    "forget-subject erases EVERY grain referencing '{subject}' in namespace \
+                     '{ns}' (history included) and replicates the erasure to peers. \
+                     Re-run with --yes to proceed."
+                ));
+            }
+            // Same truthiness idiom as --index-text: bare presence enables,
+            // an explicit falsy value disables — "--text-mentions false"
+            // must not silently widen the erasure.
+            let opts = dejadb_store::ErasureOptions {
+                text_mentions: flag(&flags, "text-mentions")
+                    .map(|v| !matches!(v.as_str(), "false" | "0" | "off" | "no"))
+                    .unwrap_or(false),
+            };
+            let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
+            println!(
+                "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
+                rep.grains_erased, rep.terms_removed, rep.vocab_removed, rep.blobs_reclaimed
+            );
+        }
+        "purge-older-than" => {
+            // Retention sweep: erase grains older than N days (created_at),
+            // optionally limited to one grain type. --ns "" sweeps every
+            // namespace. Destructive and bulk: demands --yes.
+            let days: i64 = positional
+                .first()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| flag(&flags, "days").and_then(|v| v.parse().ok()))
+                .ok_or("usage: deja purge-older-than <days> [--ns NS] [--type event] --yes".to_string())?;
+            let gt = match flag(&flags, "type") {
+                Some(t) => Some(
+                    dejadb_core::types::GrainType::from_str(&t)
+                        .ok_or_else(|| format!("unknown grain type '{t}'"))?,
+                ),
+                None => None,
+            };
+            if flags.contains_key("no-destructive-ops") {
+                return Err(
+                    "destructive operations are disabled for this invocation \
+                     (--no-destructive-ops)"
+                        .into(),
+                );
+            }
+            if !flags.contains_key("yes") {
+                let scope = if ns.is_empty() {
+                    "across EVERY namespace".to_string()
+                } else {
+                    format!("in namespace '{ns}'")
+                };
+                return Err(format!(
+                    "purge-older-than erases every{} grain older than {days} days {scope} \
+                     and replicates the erasure to peers. Re-run with --yes to proceed.",
+                    gt.map(|g| format!(" {g:?}")).unwrap_or_default()
+                ));
+            }
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+                - days * 24 * 3600 * 1000;
+            let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+            let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
+            println!(
+                "erased {} grains ({} vocabulary tokens, {} blobs reclaimed)",
+                rep.grains_erased, rep.vocab_removed, rep.blobs_reclaimed
+            );
         }
         "merge" => {
             // Close an open fork by writing a resolved value that supersedes

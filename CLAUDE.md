@@ -78,8 +78,14 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
    MCP `dejadb_forget` tool). `DELETE`/`ERASE`/`TRUNCATE`/… remain lexer-blocked
    non-tokens, `PURGE` stays out of the text grammar, `DROP` accepts only
    TEMPLATE/QUERY, saved-query bodies stay read-only, and the server path still
-   requires the `admin` scope. Don't widen the destructive surface (e.g. bulk
-   PURGE, user/scope erasure) without a design + OMS-conformance decision.
+   requires the `admin` scope. Don't widen the destructive surface without a
+   design + OMS-conformance decision. **One such decision exists** (2026-08,
+   [`docs/erasure.md`](docs/erasure.md)): subject-scoped and age-scoped bulk
+   erasure (`forget_subject` / `forget_older_than`) are host-level
+   store/binding/CLI operations for right-to-erasure and retention
+   compliance — a documented OMS deviation that deliberately stays OUT of
+   the CAL grammar (the parser still refuses FORGET USER/SCOPE/PURGE and
+   the facade stubs stay unwired).
 4. **CAL syntax is an OMS conformance contract** — no new CAL syntax
    without a spec-level decision.
 5. **One memory = one isolation unit** — a file on the embedded backend, a

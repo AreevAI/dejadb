@@ -44,6 +44,55 @@ fn status_from_str(s: &str) -> Option<RecStatus> {
     }
 }
 
+/// Open on the server-tier postgres backend from a
+/// `postgres://…?schema=<name>` DSN, mirroring the file branches (explicit
+/// `index_text` re-stamps; telemetry rides the memory's schema). A
+/// passphrase never applies here — the page cipher and `.kdf` sidecar are
+/// file-backend capabilities.
+#[cfg(feature = "postgres")]
+fn open_postgres_from_dsn(
+    dsn: &str,
+    tel: TelemetryMode,
+    index_text: Option<bool>,
+    has_passphrase: bool,
+) -> dejadb_core::error::Result<RustDejaDB> {
+    if has_passphrase {
+        return Err(DejaDbError::Validation(
+            "passphrase applies to file-backed memories (page cipher + .kdf sidecar); on the \
+             postgres backend use TDE/pgcrypto at the deployment layer"
+                .into(),
+        ));
+    }
+    let (url, schema) = dejadb_store::pg::split_schema_url(dsn)?;
+    match index_text {
+        Some(want_text) => RustDejaDB::open_postgres_with(
+            &url,
+            &schema,
+            dejadb_store::DejaDbOptions {
+                index_text: want_text,
+                telemetry: tel,
+                ..dejadb_store::DejaDbOptions::default()
+            },
+        ),
+        None if tel != TelemetryMode::Off => {
+            RustDejaDB::open_postgres_with_telemetry(&url, &schema, tel)
+        }
+        None => RustDejaDB::open_postgres(&url, &schema),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_from_dsn(
+    _dsn: &str,
+    _tel: TelemetryMode,
+    _index_text: Option<bool>,
+    _has_passphrase: bool,
+) -> dejadb_core::error::Result<RustDejaDB> {
+    Err(DejaDbError::Validation(
+        "this build lacks the postgres backend (rebuild with the `postgres` feature)".into(),
+    ))
+}
+
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
@@ -189,23 +238,30 @@ impl DejaDB {
         // latency — with the index on, every write pays a cost that grows with
         // the file (tursodatabase/turso#8170).
         let store = py
-            .detach(|| match (index_text, passphrase) {
-                (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
-                (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
-                (Some(want_text), pass) => {
-                    let key = match pass {
-                        Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
-                        None => None,
-                    };
-                    RustDejaDB::open_with(
-                        &path,
-                        dejadb_store::DejaDbOptions {
-                            index_text: want_text,
-                            encryption_key: key,
-                            telemetry: tel,
-                            ..dejadb_store::DejaDbOptions::default()
-                        },
-                    )
+            .detach(|| {
+                // A postgres://…?schema=<name> DSN selects the server-tier
+                // backend — same API, the memory lives in a Postgres schema.
+                if path.starts_with("postgres://") || path.starts_with("postgresql://") {
+                    return open_postgres_from_dsn(&path, tel, index_text, passphrase.is_some());
+                }
+                match (index_text, passphrase) {
+                    (None, Some(p)) => RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel),
+                    (None, None) => RustDejaDB::open_with_telemetry(&path, tel),
+                    (Some(want_text), pass) => {
+                        let key = match pass {
+                            Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p)?),
+                            None => None,
+                        };
+                        RustDejaDB::open_with(
+                            &path,
+                            dejadb_store::DejaDbOptions {
+                                index_text: want_text,
+                                encryption_key: key,
+                                telemetry: tel,
+                                ..dejadb_store::DejaDbOptions::default()
+                            },
+                        )
+                    }
                 }
             })
             .map_err(err)?;
@@ -542,6 +598,78 @@ impl DejaDB {
         let h = parse_hash(&hash)?;
         py.detach(|| self.facade.with_store(|m| m.forget(&h)))
             .map_err(err)
+    }
+
+    /// Right-to-erasure for one identity: erase every grain holding a
+    /// STRUCTURED reference to `subject` in the session namespace (or `ns`) —
+    /// the full supersession history, grains referencing it in object
+    /// position, its thread events, its dictionary entry, and erased-only
+    /// vocabulary — with replicating tombstones. Returns the erasure report
+    /// as JSON (counts only, no identity material). Host-level destructive
+    /// op: gate it like your other compliance endpoints. See docs/erasure.md
+    /// for the scope contract (only structured references are findable).
+    /// Identity matching always covers partition-style keys (`pat`,
+    /// `pat#visit1`, `pat:thread-2` — never `patricia`); pass
+    /// `text_mentions=True` to ALSO erase grains whose indexed text mentions
+    /// the identity's tokens (search symmetry — opt-in because token
+    /// matching over-reaches for common-word identifiers).
+    #[pyo3(signature = (subject, ns = None, text_mentions = false))]
+    fn forget_subject(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions };
+        let rep = py
+            .detach(|| self.facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)))
+            .map_err(err)?;
+        Ok(json!({
+            "grains_erased": rep.grains_erased,
+            "terms_removed": rep.terms_removed,
+            "vocab_removed": rep.vocab_removed,
+            "blobs_reclaimed": rep.blobs_reclaimed,
+        })
+        .to_string())
+    }
+
+    /// Retention sweep: erase every grain with `created_at` older than
+    /// `cutoff_ms` (epoch milliseconds), optionally limited to one grain
+    /// type (e.g. "event") and scoped to the session namespace (or `ns`;
+    /// pass ns="" to sweep every namespace). Same erasure semantics as
+    /// `forget_subject` minus the identity sweep. Returns the report JSON.
+    #[pyo3(signature = (cutoff_ms, ns = None, grain_type = None))]
+    fn forget_older_than(
+        &self,
+        py: Python<'_>,
+        cutoff_ms: i64,
+        ns: Option<String>,
+        grain_type: Option<String>,
+    ) -> PyResult<String> {
+        let gt = match &grain_type {
+            Some(s) => Some(
+                dejadb_core::types::GrainType::from_str(s)
+                    .ok_or_else(|| err(format!("unknown grain type '{s}'")))?,
+            ),
+            None => None,
+        };
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let ns_opt = if ns.is_empty() { None } else { Some(ns) };
+        let rep = py
+            .detach(|| {
+                self.facade
+                    .with_store(|m| m.forget_older_than(ns_opt.as_deref(), cutoff_ms, gt))
+            })
+            .map_err(err)?;
+        Ok(json!({
+            "grains_erased": rep.grains_erased,
+            "terms_removed": rep.terms_removed,
+            "vocab_removed": rep.vocab_removed,
+            "blobs_reclaimed": rep.blobs_reclaimed,
+        })
+        .to_string())
     }
 
     /// remember(): store content as an Event, then attach the facts
@@ -1143,9 +1271,27 @@ impl DejaDB {
     }
 }
 
+/// Drop a memory schema entirely — the postgres backend's memory-level
+/// erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
+/// memory file. Destroys the memory AND its telemetry/blobs. Admin surface:
+/// gate it like any destructive operation in your host.
+#[cfg(feature = "postgres")]
+#[pyfunction]
+fn drop_postgres_schema(py: Python<'_>, url: String, schema: String) -> PyResult<()> {
+    py.detach(|| dejadb_store::pg::drop_postgres_schema(&url, &schema))
+        .map_err(err)
+}
+
+#[cfg(not(feature = "postgres"))]
+#[pyfunction]
+fn drop_postgres_schema(_py: Python<'_>, _url: String, _schema: String) -> PyResult<()> {
+    Err(err("this build lacks the postgres backend (rebuild with the `postgres` feature)"))
+}
+
 #[pymodule]
 fn dejadb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DejaDB>()?;
+    m.add_function(pyo3::wrap_pyfunction!(drop_postgres_schema, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

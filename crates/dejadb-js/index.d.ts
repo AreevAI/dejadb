@@ -74,6 +74,29 @@ export declare class DejaDb {
   /** Erase a grain from the hot store (tombstoned). Host-level op. */
   forget(hash: string): Promise<void>
   /**
+   * Right-to-erasure for one identity: erase every grain holding a
+   * STRUCTURED reference to `subject` in the session namespace (or `ns`) —
+   * the full supersession history, grains referencing it in object
+   * position, its thread events, its dictionary entry, and erased-only
+   * vocabulary — with replicating tombstones. Resolves to the erasure
+   * report as JSON (counts only, no identity material). Host-level
+   * destructive op: gate it like your other compliance endpoints. See
+   * docs/erasure.md for the scope contract.
+   * Identity matching always covers partition-style keys (`pat`,
+   * `pat#visit1` — never `patricia`); pass `textMentions=true` to ALSO
+   * erase grains whose indexed text mentions the identity's tokens
+   * (search symmetry — opt-in because token matching over-reaches for
+   * common-word identifiers).
+   */
+  forgetSubject(subject: string, ns?: string | undefined | null, textMentions?: boolean | undefined | null): Promise<string>
+  /**
+   * Retention sweep: erase every grain with `created_at` older than
+   * `cutoffMs` (epoch milliseconds), optionally limited to one grain type
+   * (e.g. "event") and scoped to the session namespace (or `ns`; pass
+   * ns="" to sweep every namespace). Resolves to the report JSON.
+   */
+  forgetOlderThan(cutoffMs: number, ns?: string | undefined | null, grainType?: string | undefined | null): Promise<string>
+  /**
    * remember(): store content as an Event, then attach the facts
    * distilled from it. Three routes to those facts, in precedence order:
    * `factsJson` (pre-extracted by the host — a JSON list of
@@ -192,3 +215,11 @@ export declare class DejaDb {
    */
   waiserOutcomes(): Promise<string>
 }
+
+/**
+ * Drop a memory schema entirely — the postgres backend's memory-level
+ * erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
+ * memory file. Destroys the memory AND its telemetry/blobs. Admin surface:
+ * gate it like any destructive operation in your host.
+ */
+export declare function dropPostgresSchema(url: string, schema: string): void
