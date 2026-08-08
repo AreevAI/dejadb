@@ -1661,6 +1661,52 @@ fn re_recording_an_identical_tool_call_is_idempotent() {
     assert_eq!(facade.count().unwrap(), 1, "stored exactly once");
 }
 
+/// docs/cal-reference §3.1 claimed *every* `RECALL` needs a subject filter or a
+/// free-text query. It doesn't — the rule only binds untyped recalls, and the
+/// doc's own `RECALL facts WHERE namespace = "caller" | COUNT` example relies
+/// on that. #48 was someone hardening a deployment on the stronger reading.
+/// Pin what the engine actually does so prose and behavior cannot drift again.
+#[test]
+fn the_anchoring_rule_binds_untyped_recalls_only() {
+    let (ex, facade, _d) = setup();
+    ex.execute(
+        r#"ADD fact SET subject = "john" SET relation = "prefers" SET object = "tea" SET namespace = "caller" REASON "seed""#,
+        &facade,
+    )
+    .unwrap();
+
+    let count = |q: &str| -> usize {
+        match ex.execute(q, &facade).unwrap().result {
+            CalResultPayload::Grains { grains, .. } => grains.len(),
+            CalResultPayload::Count { count, .. } => count,
+            other => panic!("expected grains/count, got: {other:?}"),
+        }
+    };
+
+    // Typed: unanchored is legal, bounded by default_limit rather than a filter.
+    for q in [
+        "RECALL facts",
+        "RECALL facts RECENT 5",
+        "RECALL facts LIMIT 10",
+        r#"RECALL facts WHERE namespace = "caller""#,
+    ] {
+        assert_eq!(count(q), 1, "typed unanchored recall `{q}` should run");
+    }
+    // The doc's own copy-pasteable example.
+    assert_eq!(
+        count(r#"RECALL facts WHERE namespace = "caller" | COUNT"#),
+        1
+    );
+
+    // Untyped: rejected, because `*` has no type to bound the scan with.
+    for q in ["RECALL *", "RECALL grains", "RECALL all"] {
+        assert!(
+            ex.execute(q, &facade).is_err(),
+            "untyped unanchored recall `{q}` must be rejected"
+        );
+    }
+}
+
 // ── Fields that were set and then silently dropped (#36) ────────────────────
 
 /// `valid_to` (and its three siblings) are first-class common fields, but no

@@ -41,6 +41,31 @@ const COMMON_KNOWN_FIELDS: &[&str] = &[
     "grain_type",
 ];
 
+/// The fields [`build_grain_from_json`] refuses to build a grain without.
+///
+/// This is the *declaration* of what the builder arms below enforce, exposed so
+/// `DESCRIBE <type>` can answer "what does this type need" without a caller
+/// discovering it one `VAL-E001` at a time. The two are pinned together by
+/// `required_fields_match_the_validator` — add a `require_str` and the test
+/// fails until this table agrees.
+///
+/// `goal` is the one inexact row: it accepts `object` as a fallback for
+/// `description`, so the entry names the primary spelling.
+/// `state`/`workflow`/`reasoning`/`consensus` require nothing by design — they
+/// are host-shaped containers, so an empty one is legal.
+pub fn required_fields(grain_type: &str) -> &'static [&'static str] {
+    match grain_type {
+        "fact" => &["subject", "relation", "object"],
+        "event" => &["content"],
+        "tool" => &["tool_name"],
+        "observation" => &["content"],
+        "goal" => &["description"],
+        "consent" => &["subject_did", "user_id"],
+        "skill" => &["name", "description"],
+        _ => &[],
+    }
+}
+
 /// Per-grain-type known fields (type-specific, not in common).
 fn type_known_fields(grain_type: &str) -> &'static [&'static str] {
     match grain_type {
@@ -758,3 +783,87 @@ pub fn build_grain_from_json<S: GrainSink>(
             ))),
         }
     }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A sink that throws the grain away — these tests only care whether the
+    /// builder accepted or rejected the input.
+    struct NullSink;
+    impl GrainSink for NullSink {
+        type Out = ();
+        fn consume<G: Grain + Clone + 'static>(self, _grain: &G) -> Result<Self::Out> {
+            Ok(())
+        }
+    }
+
+    /// A payload that satisfies every builder arm, so removing exactly one key
+    /// isolates that key's requirement.
+    fn full_payload() -> serde_json::Map<String, serde_json::Value> {
+        json!({
+            "subject": "john", "relation": "prefers", "object": "tea",
+            "content": "some content",
+            "tool_name": "crm_lookup",
+            "description": "what it does",
+            "name": "refund",
+            "subject_did": "did:x:1", "user_id": "u1",
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    const ALL_TYPES: &[&str] = &[
+        "fact", "event", "state", "workflow", "tool", "observation", "goal",
+        "reasoning", "consensus", "consent", "skill",
+    ];
+
+    /// `required_fields` is what `DESCRIBE` publishes and what ARCHITECTURE
+    /// §2.3 bolds. It is a hand-maintained mirror of the `require_str` calls in
+    /// the builder arms, so pin it: every listed field must actually be
+    /// enforced, and no unlisted field may be.
+    #[test]
+    fn required_fields_match_the_validator() {
+        for gt in ALL_TYPES {
+            // Every declared requirement really is enforced.
+            for missing in required_fields(gt) {
+                let mut fields = full_payload();
+                fields.remove(*missing);
+                // `goal` accepts `object` in place of `description`, so drop the
+                // fallback too or the requirement can't be observed.
+                if *gt == "goal" {
+                    fields.remove("object");
+                }
+                let got = build_grain_from_json(gt, &fields, NullSink);
+                assert!(
+                    got.is_err(),
+                    "{gt}: required_fields lists '{missing}', but the builder \
+                     accepted a payload without it"
+                );
+            }
+            // And the full payload is accepted, so nothing beyond the declared
+            // set is silently required.
+            assert!(
+                build_grain_from_json(gt, &full_payload(), NullSink).is_ok(),
+                "{gt}: rejected a payload carrying every declared required field"
+            );
+        }
+    }
+
+    /// The four container types accept an empty payload. Documented in
+    /// ARCHITECTURE §2.3 as deliberate, so a change here is a decision, not a
+    /// drift.
+    #[test]
+    fn container_types_accept_an_empty_payload() {
+        let empty = serde_json::Map::new();
+        for gt in ["state", "workflow", "reasoning", "consensus"] {
+            assert!(
+                build_grain_from_json(gt, &empty, NullSink).is_ok(),
+                "{gt} should accept {{}}"
+            );
+            assert!(required_fields(gt).is_empty());
+        }
+    }
+}
