@@ -265,7 +265,13 @@ print(m.memory_tool(json.dumps({"command": "view", "path": "/memories"})))
 ```
 
 The bindings follow **scalars in, JSON strings out**; errors raise
-`ValueError`. Encryption at rest is currently CLI-only.
+`ValueError`. Encryption at rest is available from both bindings, not just the
+CLI — pass a `passphrase` to the constructor
+(`dejadb.DejaDB("john.db", ns="caller", passphrase=os.environ["DEJA_PASS"])` in
+Python, `new DejaDb("john.db", "caller", pass)` in Node). It derives an
+AES-256 key with Argon2id exactly as the CLI's `--passphrase-env` does; the key
+is host-supplied and never stored in the file, and the `.blobs` CAS sidecar is
+**not** covered (see `open_warnings()`).
 
 ---
 
