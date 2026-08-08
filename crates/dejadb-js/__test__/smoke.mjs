@@ -450,3 +450,80 @@ test('remember can place a turn in a run that runTrace reads back', async () => 
   assert.equal(JSON.parse(await m.runTrace('run-b')).trace.length, 1)
   assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
 })
+
+// ── Waiser: the review queue and its gates (#34, #35, #39) ──────────────────
+
+async function aDestructiveRec() {
+  // waiser.staleness on an expired fact. `vt` is the compact spelling of
+  // valid_to; both reach common.valid_to, and this one keeps the fixture
+  // independent of the top-level routing fix (#36), which lands separately.
+  const m = makeDb()
+  await m.add('fact', JSON.stringify({
+    subject: 'promo', relation: 'code', object: 'SAVE20', vt: 1600000000000,
+  }))
+  await m.waiserRun()
+  const recs = JSON.parse(await m.recommendations())
+  assert.ok(recs.length && recs[0].destructive, JSON.stringify(recs))
+  return { m, hash: recs[0].hash }
+}
+
+test('recommendations status "all" spans every state', async () => {
+  // `"all"` used to filter itself to None and then have the pending default
+  // re-applied, so it behaved as `"pending"`.
+  const { m, hash } = await aDestructiveRec()
+  await m.dismissRecommendation(hash, 'not now')
+
+  const statuses = (f) => JSON.parse(f).map((r) => r.status)
+  assert.deepEqual(statuses(await m.recommendations('{"status":"all"}')), ['rejected'])
+  assert.deepEqual(statuses(await m.recommendations('{"status":"rejected"}')), ['rejected'])
+  assert.deepEqual(statuses(await m.recommendations()), [])
+  await assert.rejects(() => m.recommendations('{"status":"nonsense"}'), /unknown status/)
+})
+
+test('a refused destructive apply leaves the rec dismissable', async () => {
+  // The fused approve+apply recorded the approval FIRST, then hit the
+  // destructive gate — stranding the rec in `approved`, which has no exit but
+  // `applied` or `expired`, so it could no longer be rejected.
+  const { m, hash } = await aDestructiveRec()
+  await assert.rejects(() => m.applyRecommendation(hash, 'looks right'), /WSR-E023/)
+
+  const after = JSON.parse(await m.recommendations('{"status":"all"}')).map((r) => r.status)
+  assert.deepEqual(after, ['pending'], 'a refused apply must not record the approval')
+  assert.equal(JSON.parse(await m.dismissRecommendation(hash, 'legal hold')).status, 'rejected')
+})
+
+test('approve without apply, and scopes enforce separation of duties', async () => {
+  const { m, hash } = await aDestructiveRec()
+  await assert.rejects(
+    () => m.applyRecommendation(hash, 'no apply scope', false, 'review'),
+    /WSR-E022/,
+  )
+  await assert.rejects(() => m.approveRecommendation(hash, 'wrong scope', 'apply'), /WSR-E022/)
+  await assert.rejects(() => m.approveRecommendation(hash, 'typo', 'reviewer'), /unknown scope/)
+
+  const out = JSON.parse(await m.approveRecommendation(hash, 'evidence checks out', 'review'))
+  assert.equal(out.status, 'approved')
+  assert.deepEqual(
+    JSON.parse(await m.recommendations('{"status":"all"}')).map((r) => r.status),
+    ['approved'],
+  )
+})
+
+test('waiser health and per-analyzer config are reachable', async () => {
+  const { m } = await aDestructiveRec()
+  const health = JSON.parse(await m.waiserHealth())
+  assert.equal(health.pending, 1)
+  assert.equal(health.applied, 0)
+  assert.equal(health.stale, false)
+
+  // The roster is how a caller learns the id, which carries a version suffix.
+  const ids = JSON.parse(await m.waiserAnalyzers()).map((a) => a.id)
+  assert.ok(ids.includes('waiser.staleness/1'), JSON.stringify(ids))
+
+  await m.setAnalyzerConfig('waiser.staleness/1', false)
+  const off = Object.fromEntries(
+    JSON.parse(await m.waiserAnalyzers()).map((a) => [a.id, a.enabled]),
+  )
+  assert.equal(off['waiser.staleness/1'], false)
+  await m.setAnalyzerConfig('waiser.staleness/1', true)
+})

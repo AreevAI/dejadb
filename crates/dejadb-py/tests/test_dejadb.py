@@ -788,3 +788,101 @@ def test_runs_touching_rejects_a_bad_hash(tmp_path):
     m = make_db(tmp_path, ns="ops")
     with pytest.raises(ValueError):
         m.runs_touching("not-a-hash")
+
+
+# ── Waiser: the review queue and its gates (#34, #35, #39) ──────────────────
+
+def _a_destructive_rec(tmp_path, name="w.db"):
+    """A pending destructive recommendation: waiser.staleness on an expired fact."""
+    m = dejadb.DejaDB(str(tmp_path / name), ns="caller")
+    # The compact spelling `vt` — both spellings reach `common.valid_to`, and
+    # this one keeps the fixture independent of the top-level `valid_to`
+    # routing fix (#36), which lands separately.
+    m.add("fact", json.dumps({
+        "subject": "promo", "relation": "code", "object": "SAVE20",
+        "vt": 1_600_000_000_000,
+    }))
+    m.waiser_run(full_sweep=True)
+    recs = json.loads(m.recommendations())
+    assert recs and recs[0]["destructive"], recs
+    return m, recs[0]["hash"]
+
+
+def test_recommendations_status_all_spans_every_state(tmp_path):
+    # `"all"` used to filter itself to None and then have the pending default
+    # re-applied, so it behaved as `"pending"` — and an applied or rejected
+    # recommendation was missing from a list documented as "every status".
+    m, h = _a_destructive_rec(tmp_path)
+    m.dismiss_recommendation(h, "not now")
+
+    assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["rejected"]
+    assert [r["status"] for r in json.loads(m.recommendations('{"status":"rejected"}'))] == ["rejected"]
+    assert json.loads(m.recommendations('{"status":"pending"}')) == []
+    # Omitting the filter still defaults to pending.
+    assert json.loads(m.recommendations()) == []
+    with pytest.raises(ValueError, match="unknown status"):
+        m.recommendations('{"status":"nonsense"}')
+
+
+def test_a_refused_destructive_apply_leaves_the_rec_dismissable(tmp_path):
+    # The fused approve+apply recorded the approval FIRST, then hit the
+    # destructive gate — stranding the rec in `approved`, which has no exit but
+    # `applied` or `expired` (`approved -> rejected` is not a legal transition).
+    # The reviewer could then neither apply nor dismiss it.
+    m, h = _a_destructive_rec(tmp_path)
+
+    with pytest.raises(ValueError, match="WSR-E023"):
+        m.apply_recommendation(h, because="looks right to me")
+
+    assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["pending"], \
+        "a refused apply must not have recorded the approval"
+    # The whole point: it can still be dismissed.
+    assert json.loads(m.dismiss_recommendation(h, "under legal hold"))["status"] == "rejected"
+
+
+def test_approve_without_apply_enables_a_two_person_flow(tmp_path):
+    # The bindings only had the fused call, so a supervising agent could not
+    # approve for a human to apply later.
+    m, h = _a_destructive_rec(tmp_path)
+    assert json.loads(m.approve_recommendation(h, "evidence checks out"))["status"] == "approved"
+    assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["approved"]
+
+
+def test_scoped_actors_enforce_separation_of_duties(tmp_path):
+    # ScopeSet::all() was hardcoded, so the write != review != apply gate could
+    # not be enforced from Python even though the engine implements it.
+    m, h = _a_destructive_rec(tmp_path)
+
+    with pytest.raises(ValueError, match="WSR-E022"):
+        m.apply_recommendation(h, because="no apply scope", scopes="review")
+    with pytest.raises(ValueError, match="WSR-E022"):
+        m.approve_recommendation(h, "no review scope", scopes="apply")
+    with pytest.raises(ValueError, match="unknown scope"):
+        m.approve_recommendation(h, "typo", scopes="reviewer")
+
+    # A review-scoped actor can approve, and the rec is still not applied.
+    m.approve_recommendation(h, "evidence checks out", scopes="review")
+    assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["approved"]
+
+
+def test_waiser_health_reports_the_loop_state(tmp_path):
+    m, _h = _a_destructive_rec(tmp_path)
+    health = json.loads(m.waiser_health())
+    assert health["pending"] == 1
+    assert health["applied"] == 0
+    assert health["last_run_ms"] is not None
+    assert health["stale"] is False
+
+
+def test_per_analyzer_config_round_trips(tmp_path):
+    m, _h = _a_destructive_rec(tmp_path)
+    roster = json.loads(m.waiser_analyzers())
+    # The roster is how a caller discovers the id — which carries a version
+    # suffix (`waiser.staleness/1`), so guessing it is not viable.
+    ids = [a["id"] for a in roster]
+    assert "waiser.staleness/1" in ids, ids
+
+    m.set_analyzer_config("waiser.staleness/1", enabled=False)
+    assert {a["id"]: a["enabled"] for a in json.loads(m.waiser_analyzers())}["waiser.staleness/1"] is False
+    m.set_analyzer_config("waiser.staleness/1", enabled=True)
+    assert {a["id"]: a["enabled"] for a in json.loads(m.waiser_analyzers())}["waiser.staleness/1"] is True

@@ -32,6 +32,33 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     Some(n * mult)
 }
 
+/// Parse a comma-separated scope list (`"review,apply"`) into a [`ScopeSet`].
+///
+/// `None` means all scopes, which is what the bindings always used — the
+/// console is one principal and so was the binding. Hardcoding it meant the
+/// separation-of-duties gate (write ≠ review ≠ apply) could not be demonstrated
+/// or enforced from Python at all, even though the engine implements it.
+fn parse_scopes(spec: Option<&str>) -> PyResult<ScopeSet> {
+    let Some(spec) = spec else { return Ok(ScopeSet::all()) };
+    let mut out = Vec::new();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(match name {
+            "read" => waiser::Scope::Read,
+            "write" => waiser::Scope::Write,
+            "review" => waiser::Scope::Review,
+            "apply" => waiser::Scope::Apply,
+            "admin" => waiser::Scope::Admin,
+            other => {
+                return Err(err(format!(
+                    "unknown scope {other:?} — expected a comma-separated subset of: \
+                     read, write, review, apply, admin"
+                )))
+            }
+        });
+    }
+    Ok(ScopeSet::of(&out))
+}
+
 fn status_from_str(s: &str) -> Option<RecStatus> {
     match s {
         "pending" => Some(RecStatus::Pending),
@@ -1173,13 +1200,26 @@ impl DejaDB {
     /// "pending"}`; omit or `{"status":"all"}` for every status. JSON list.
     #[pyo3(signature = (filter = None))]
     fn recommendations(&self, py: Python<'_>, filter: Option<String>) -> PyResult<String> {
-        let status = filter
+        // `{"status":"all"}` clears the filter; a named status selects it;
+        // anything else (including no filter at all) defaults to pending.
+        //
+        // This used to be one chain ending in `.or(Some(Pending))`, so `"all"`
+        // filtered itself to `None` and then had the pending default put
+        // straight back — `"all"` behaved as `"pending"`, and an applied
+        // recommendation was missing from a list that promised every status.
+        let requested = filter
             .and_then(|f| serde_json::from_str::<serde_json::Value>(&f).ok())
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
-            .filter(|s| s != "all")
-            .and_then(|s| status_from_str(&s))
-            .or(Some(RecStatus::Pending)); // default: pending
-        // `{"status":"all"}` clears the filter; anything else defaults to pending.
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+        let status = match requested.as_deref() {
+            Some("all") => None,
+            Some(s) => Some(status_from_str(s).ok_or_else(|| {
+                err(format!(
+                    "unknown status {s:?} — expected one of: all, pending, approved, \
+                     applied, rejected, rolled_back, expired"
+                ))
+            })?),
+            None => Some(RecStatus::Pending),
+        };
         let recs = py
             .detach(|| {
                 let sub = BorrowedSubstrate::new(&self.facade);
@@ -1205,21 +1245,34 @@ impl DejaDB {
 
     /// Approve and apply a recommendation in one audited step (§6.6). The
     /// `because` reason is mandatory. Non-rollbackable (destructive) payloads
-    /// are rejected unless `allow_destructive=True`.
-    #[pyo3(signature = (hash, because, allow_destructive = false))]
+    /// are rejected unless `allow_destructive=True` — and a refused apply
+    /// leaves the recommendation **pending**, so it can still be dismissed.
+    ///
+    /// `scopes` is a comma-separated subset of
+    /// `read,write,review,apply,admin`; omit it for all scopes. Pass a narrow
+    /// set to enforce separation of duties from the host.
+    #[pyo3(signature = (hash, because, allow_destructive = false, scopes = None))]
     fn apply_recommendation(
         &self,
         py: Python<'_>,
         hash: String,
         because: String,
         allow_destructive: bool,
+        scopes: Option<String>,
     ) -> PyResult<String> {
+        let scopes = parse_scopes(scopes.as_deref())?;
         let applied = py
             .detach(|| {
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 let engine = Engine::with_builtins();
                 let now = now_ms();
-                let scopes = ScopeSet::all();
+                // Ask before approving. The approval is a real state
+                // transition, and `approved` has no exit but `applied` or
+                // `expired` — so recording it first and then hitting the
+                // destructive gate stranded the recommendation somewhere the
+                // reviewer could no longer reject it. The CLI's separate
+                // approve/apply verbs never had this trap; the fused call did.
+                engine.preflight_apply(&sub, &hash, &scopes, allow_destructive)?;
                 engine.review(&mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human, &scopes, &because, now)?;
                 engine.apply(&mut sub, &hash, &self.actor, ObserverType::Human, &scopes, &because, allow_destructive, now)
             })
@@ -1227,13 +1280,105 @@ impl DejaDB {
         Ok(json!({"hash": hash, "rollbackable": applied.rollbackable}).to_string())
     }
 
+    /// Approve a recommendation **without** applying it — the two-person flow
+    /// the CLI's separate `approve` verb enables, so a supervising agent can
+    /// approve for a human to apply later. Parity with `deja waiser approve`.
+    #[pyo3(signature = (hash, because, scopes = None))]
+    fn approve_recommendation(
+        &self,
+        py: Python<'_>,
+        hash: String,
+        because: String,
+        scopes: Option<String>,
+    ) -> PyResult<String> {
+        let scopes = parse_scopes(scopes.as_deref())?;
+        py.detach(|| {
+            let mut sub = BorrowedSubstrate::new(&self.facade);
+            Engine::with_builtins().review(
+                &mut sub, &hash, Decision::Approve, &self.actor, ObserverType::Human,
+                &scopes, &because, now_ms(),
+            )
+        })
+        .map_err(err)?;
+        Ok(json!({"hash": hash, "status": "approved"}).to_string())
+    }
+
+    /// Health snapshot of the loop: when it last ran, how much is un-analyzed
+    /// since, the queue counts, and whether it looks stalled. Parity with bare
+    /// `deja waiser` and `GET /api/waiser/health` — a host that wires the run
+    /// to a hook or cron needs this to notice the trigger came unwired.
+    fn waiser_health(&self, py: Python<'_>) -> PyResult<String> {
+        let health = py
+            .detach(|| {
+                let sub = BorrowedSubstrate::new(&self.facade);
+                Engine::with_builtins().health(&sub, now_ms())
+            })
+            .map_err(err)?;
+        serde_json::to_string(&health).map_err(err)
+    }
+
+    /// The analyzer roster: id, whether it is enabled, and its parameters.
+    /// JSON list, parity with `deja waiser analyzers`.
+    fn waiser_analyzers(&self, py: Python<'_>) -> PyResult<String> {
+        let list = py
+            .detach(|| {
+                let sub = BorrowedSubstrate::new(&self.facade);
+                Engine::with_builtins().analyzer_settings(&sub)
+            })
+            .map_err(err)?;
+        serde_json::to_string(&list).map_err(err)
+    }
+
+    /// Enable/disable one analyzer, or set its parameters — reachable from the
+    /// console's Setup tab (`POST /api/waiser/config`) but not, until now, from
+    /// the bindings. `params_json` is an optional JSON object of parameter
+    /// overrides. Returns the analyzer's resulting config.
+    #[pyo3(signature = (analyzer_id, enabled = None, params_json = None))]
+    fn set_analyzer_config(
+        &self,
+        py: Python<'_>,
+        analyzer_id: String,
+        enabled: Option<bool>,
+        params_json: Option<String>,
+    ) -> PyResult<String> {
+        let params = match params_json {
+            Some(ref s) => serde_json::from_str(s).map_err(err)?,
+            None => None,
+        };
+        let update = waiser::AnalyzerConfigUpdate {
+            enabled,
+            params,
+            ..Default::default()
+        };
+        let cfg = py
+            .detach(|| {
+                let mut sub = BorrowedSubstrate::new(&self.facade);
+                Engine::with_builtins().set_analyzer_config(
+                    &mut sub,
+                    &analyzer_id,
+                    update,
+                    &ScopeSet::all(),
+                )
+            })
+            .map_err(err)?;
+        serde_json::to_string(&cfg).map_err(err)
+    }
+
     /// Reject a recommendation with a reason (the library-friendly name for
     /// `deja waiser reject`).
-    fn dismiss_recommendation(&self, py: Python<'_>, hash: String, why: String) -> PyResult<String> {
+    #[pyo3(signature = (hash, why, scopes = None))]
+    fn dismiss_recommendation(
+        &self,
+        py: Python<'_>,
+        hash: String,
+        why: String,
+        scopes: Option<String>,
+    ) -> PyResult<String> {
+        let scopes = parse_scopes(scopes.as_deref())?;
         py.detach(|| {
             let mut sub = BorrowedSubstrate::new(&self.facade);
             Engine::with_builtins()
-                .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
+                .review(&mut sub, &hash, Decision::Reject, &self.actor, ObserverType::Human, &scopes, &why, now_ms())
         })
         .map_err(err)?;
         Ok(json!({"hash": hash, "status": "rejected"}).to_string())

@@ -54,6 +54,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   case list (forks, two-hop replication, tombstones, PITR, BM25, vectors,
   CAS, CAL end-to-end) executed against both backends, plus a Postgres CI
   job on `pgvector/pgvector:pg16`.
+- **Waiser bindings parity** (#39). Four capabilities the CLI and HTTP
+  surfaces had and the bindings did not: `waiser_health()` / `waiserHealth()`
+  (the loop's staleness snapshot — how a host notices a SessionEnd hook or cron
+  came unwired), `approve_recommendation()` / `approveRecommendation()` (approve
+  **without** applying, so a supervising agent can approve for a human to apply
+  later), `waiser_analyzers()` + `set_analyzer_config()` (the roster and the
+  per-analyzer enable/disable behind the console's Setup tab), and an optional
+  `scopes` argument on the review/apply calls. The bindings previously
+  hardcoded `ScopeSet::all()`, so the separation-of-duties gate
+  (write ≠ review ≠ apply) could not be enforced or even demonstrated from
+  Python or Node although the engine implements it.
 - Internal `Db` backend seam in `dejadb-store`: the store logic is
   backend-agnostic; the embedded Turso engine and the Postgres transport are
   interchangeable implementations behind it. By construction this also fixed
@@ -69,6 +80,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   breaking `add_if_novel`'s value probe.
 - The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
   blobs in the probe statement itself (join) instead of one query per hit.
+- **`recommendations({"status":"all"})` returns every status** (#34). Both
+  bindings filtered `"all"` out of the chain and then re-applied the pending
+  default, so `"all"` behaved as `"pending"` and an applied or rejected
+  recommendation was simply missing from a list both docstrings promised would
+  span every state. An unrecognized status is now an error rather than a
+  silent fall-back to pending.
+- **A refused destructive apply no longer strands the recommendation** (#35).
+  The bindings' fused `apply_recommendation` recorded the **approval first**
+  and hit the destructive gate on the apply step — leaving the rec in
+  `approved`, which has no exit but `applied` or `expired` (`approved →
+  rejected` is not a legal transition). The reviewer could then neither apply
+  nor dismiss it; the only ways out were performing the destructive change or
+  waiting for expiry. `Engine::preflight_apply` now runs the scope and
+  destructive checks read-only *before* the approval is recorded, so a refused
+  apply leaves it `pending`. The CLI's separate verbs never had this trap.
 
 ### Changed
 
