@@ -196,11 +196,35 @@ export declare class DejaDb {
   recommendations(filter?: string | undefined | null): Promise<string>
   /**
    * Approve and apply a recommendation in one audited step (§6.6). The
-   * `because` reason is mandatory.
+   * `because` reason is mandatory. A refused apply leaves the recommendation
+   * **pending**, so it can still be dismissed.
+   *
+   * `scopes` is a comma-separated subset of `read,write,review,apply,admin`;
+   * omit it for all scopes.
    */
-  applyRecommendation(hash: string, because: string, allowDestructive?: boolean | undefined | null): Promise<string>
+  applyRecommendation(hash: string, because: string, allowDestructive?: boolean | undefined | null, scopes?: string | undefined | null): Promise<string>
+  /**
+   * Approve a recommendation **without** applying it — the two-person flow
+   * the CLI's separate `approve` verb enables, so a supervising agent can
+   * approve for a human to apply later.
+   */
+  approveRecommendation(hash: string, because: string, scopes?: string | undefined | null): Promise<string>
+  /**
+   * Health snapshot of the loop: when it last ran, how much is un-analyzed
+   * since, the queue counts, and whether it looks stalled. Parity with bare
+   * `deja waiser` and `GET /api/waiser/health`.
+   */
+  waiserHealth(): Promise<string>
+  /** The analyzer roster: id, whether it is enabled, and its settings. */
+  waiserAnalyzers(): Promise<string>
+  /**
+   * Enable/disable one analyzer, or set its parameters — reachable from the
+   * console's Setup tab (`POST /api/waiser/config`) but not, until now, from
+   * the bindings. `paramsJson` is an optional JSON object of overrides.
+   */
+  setAnalyzerConfig(analyzerId: string, enabled?: boolean | undefined | null, paramsJson?: string | undefined | null): Promise<string>
   /** Reject a recommendation with a reason (library-friendly `reject`). */
-  dismissRecommendation(hash: string, why: string): Promise<string>
+  dismissRecommendation(hash: string, why: string, scopes?: string | undefined | null): Promise<string>
   /**
    * Roll back an applied recommendation (retracts the grains it created).
    * Mandatory reason; fails for non-rollbackable applies (FORGET has no

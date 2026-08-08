@@ -897,6 +897,37 @@ impl Engine {
         Ok(())
     }
 
+    /// Check everything [`apply`](Self::apply) would refuse on, without writing
+    /// anything.
+    ///
+    /// This exists for the fused approve-and-apply callers (the bindings'
+    /// `apply_recommendation`). Recording the approval first and *then* hitting
+    /// the destructive gate strands the recommendation in `approved`, which has
+    /// no exit but `applied` or `expired` — `approved → rejected` is not a
+    /// legal transition — so a refused apply left the reviewer unable to
+    /// dismiss it. Ask first, then approve.
+    ///
+    /// Deliberately does not check the lifecycle transition: the caller is
+    /// about to make it legal by approving.
+    pub fn preflight_apply<S: OmsSubstrate>(
+        &self,
+        sub: &S,
+        rec_hash: &str,
+        scopes: &ScopeSet,
+        allow_destructive: bool,
+    ) -> Result<()> {
+        if !scopes.has(Scope::Apply) {
+            return Err(Error::ScopeDenied("apply".into()));
+        }
+        let rec = load_rec(sub, rec_hash)?;
+        if rec.destructive && (!scopes.has(Scope::Admin) || !allow_destructive) {
+            return Err(Error::DestructiveGated(
+                "destructive apply requires admin scope + allow_destructive".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply an approved recommendation. Requires `apply`; destructive payloads
     /// additionally require `admin` + `allow_destructive`. Records the applied
     /// info (inverse plan) for rollback.

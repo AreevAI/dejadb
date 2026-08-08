@@ -91,6 +91,30 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     Some(n * mult)
 }
 
+/// Parse a comma-separated scope list (`"review,apply"`) into a [`ScopeSet`].
+/// `None` means all scopes — which is what the bindings always hardcoded, so
+/// the separation-of-duties gate could not be enforced from Node at all.
+fn parse_scopes(spec: Option<&str>) -> napi::Result<ScopeSet> {
+    let Some(spec) = spec else { return Ok(ScopeSet::all()) };
+    let mut out = Vec::new();
+    for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(match name {
+            "read" => waiser::Scope::Read,
+            "write" => waiser::Scope::Write,
+            "review" => waiser::Scope::Review,
+            "apply" => waiser::Scope::Apply,
+            "admin" => waiser::Scope::Admin,
+            other => {
+                return Err(err(DejaDbError::Validation(format!(
+                    "unknown scope {other:?} — expected a comma-separated subset of: \
+                     read, write, review, apply, admin"
+                ))))
+            }
+        });
+    }
+    Ok(ScopeSet::of(&out))
+}
+
 fn status_from_str(s: &str) -> Option<RecStatus> {
     match s {
         "pending" => Some(RecStatus::Pending),
@@ -1162,12 +1186,32 @@ impl DejaDb {
         filter: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
-        let status = filter
+        // `{"status":"all"}` clears the filter; a named status selects it;
+        // anything else (including no filter) defaults to pending.
+        //
+        // This was one chain ending in `.or(Some(Pending))`, so `"all"`
+        // filtered itself to `None` and the pending default was put straight
+        // back — `"all"` behaved as `"pending"`, and an applied recommendation
+        // was missing from a list that promised every status.
+        let requested = filter
             .and_then(|f| serde_json::from_str::<serde_json::Value>(&f).ok())
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
-            .filter(|s| s != "all")
-            .and_then(|s| status_from_str(&s))
-            .or(Some(RecStatus::Pending));
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+        let status = match requested.as_deref() {
+            Some("all") => None,
+            Some(s) => match status_from_str(s) {
+                Some(st) => Some(st),
+                None => {
+                    let bad = s.to_string();
+                    return StringJob::spawn(move || {
+                        Err(err(DejaDbError::Validation(format!(
+                            "unknown status {bad:?} — expected one of: all, pending, \
+                             approved, applied, rejected, rolled_back, expired"
+                        ))))
+                    });
+                }
+            },
+            None => Some(RecStatus::Pending),
+        };
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
         let sub = BorrowedSubstrate::new(&facade);
@@ -1191,13 +1235,18 @@ impl DejaDb {
     }
 
     /// Approve and apply a recommendation in one audited step (§6.6). The
-    /// `because` reason is mandatory.
+    /// `because` reason is mandatory. A refused apply leaves the recommendation
+    /// **pending**, so it can still be dismissed.
+    ///
+    /// `scopes` is a comma-separated subset of `read,write,review,apply,admin`;
+    /// omit it for all scopes.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn apply_recommendation(
         &self,
         hash: String,
         because: String,
         allow_destructive: Option<bool>,
+        scopes: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         let actor = self.actor.clone();
@@ -1206,14 +1255,97 @@ impl DejaDb {
             let mut sub = BorrowedSubstrate::new(&facade);
             let engine = Engine::with_builtins();
             let now = now_ms();
-            let scopes = ScopeSet::all();
+            let scopes = parse_scopes(scopes.as_deref())?;
+            let allow_destructive = allow_destructive.unwrap_or(false);
+            // Ask before approving. The approval is a real state transition and
+            // `approved` has no exit but `applied` or `expired`, so recording it
+            // first and then hitting the destructive gate stranded the
+            // recommendation where the reviewer could no longer reject it.
+            engine
+                .preflight_apply(&sub, &hash, &scopes, allow_destructive)
+                .map_err(err)?;
             engine
                 .review(&mut sub, &hash, Decision::Approve, &actor, ObserverType::Human, &scopes, &because, now)
                 .map_err(err)?;
             let applied = engine
-                .apply(&mut sub, &hash, &actor, ObserverType::Human, &scopes, &because, allow_destructive.unwrap_or(false), now)
+                .apply(&mut sub, &hash, &actor, ObserverType::Human, &scopes, &because, allow_destructive, now)
                 .map_err(err)?;
             Ok(json!({"hash": hash, "rollbackable": applied.rollbackable}).to_string())
+        })
+    }
+
+    /// Approve a recommendation **without** applying it — the two-person flow
+    /// the CLI's separate `approve` verb enables, so a supervising agent can
+    /// approve for a human to apply later.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn approve_recommendation(
+        &self,
+        hash: String,
+        because: String,
+        scopes: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        let actor = self.actor.clone();
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let mut sub = BorrowedSubstrate::new(&facade);
+            let scopes = parse_scopes(scopes.as_deref())?;
+            Engine::with_builtins()
+                .review(&mut sub, &hash, Decision::Approve, &actor, ObserverType::Human, &scopes, &because, now_ms())
+                .map_err(err)?;
+            Ok(json!({"hash": hash, "status": "approved"}).to_string())
+        })
+    }
+
+    /// Health snapshot of the loop: when it last ran, how much is un-analyzed
+    /// since, the queue counts, and whether it looks stalled. Parity with bare
+    /// `deja waiser` and `GET /api/waiser/health`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn waiser_health(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let sub = BorrowedSubstrate::new(&facade);
+            let health = Engine::with_builtins().health(&sub, now_ms()).map_err(err)?;
+            serde_json::to_string(&health).map_err(err)
+        })
+    }
+
+    /// The analyzer roster: id, whether it is enabled, and its settings.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn waiser_analyzers(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let sub = BorrowedSubstrate::new(&facade);
+            let list = Engine::with_builtins().analyzer_settings(&sub).map_err(err)?;
+            serde_json::to_string(&list).map_err(err)
+        })
+    }
+
+    /// Enable/disable one analyzer, or set its parameters — reachable from the
+    /// console's Setup tab (`POST /api/waiser/config`) but not, until now, from
+    /// the bindings. `paramsJson` is an optional JSON object of overrides.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_analyzer_config(
+        &self,
+        analyzer_id: String,
+        enabled: Option<bool>,
+        params_json: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let params = match params_json {
+                Some(ref s) => serde_json::from_str(s).map_err(err)?,
+                None => None,
+            };
+            let update = waiser::AnalyzerConfigUpdate { enabled, params, ..Default::default() };
+            let mut sub = BorrowedSubstrate::new(&facade);
+            let cfg = Engine::with_builtins()
+                .set_analyzer_config(&mut sub, &analyzer_id, update, &ScopeSet::all())
+                .map_err(err)?;
+            serde_json::to_string(&cfg).map_err(err)
         })
     }
 
@@ -1223,14 +1355,16 @@ impl DejaDb {
         &self,
         hash: String,
         why: String,
+        scopes: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         let actor = self.actor.clone();
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
             let mut sub = BorrowedSubstrate::new(&facade);
+            let scopes = parse_scopes(scopes.as_deref())?;
             Engine::with_builtins()
-                .review(&mut sub, &hash, Decision::Reject, &actor, ObserverType::Human, &ScopeSet::all(), &why, now_ms())
+                .review(&mut sub, &hash, Decision::Reject, &actor, ObserverType::Human, &scopes, &why, now_ms())
                 .map_err(err)?;
             Ok(json!({"hash": hash, "status": "rejected"}).to_string())
         })
