@@ -46,7 +46,9 @@ they deviate from OMS.
   `FORGET USER`/`FORGET SCOPE`/`PURGE` remain refused by the parser, and the
   facade stubs (`cal_forget_user`, `cal_forget_scope`) remain unwired. Bulk
   erasure is a host-level library/CLI capability, gated by the host (the
-  CLI demands an explicit `--yes` and honors `--no-destructive-ops`).
+  CLI demands an explicit `--yes` and honors `--no-destructive-ops`). An
+  empty subject is refused outright — with prefix matching it would select
+  everything, and an unset variable must never read as "erase all".
 - **REQ-ERASE-7 (partition keys).** Hosts model composite records as
   identity-prefixed keys (`pat#visit1`, `pat:thread-2`). Identity matching
   MUST cover them: any dictionary term equal to the identity or starting
@@ -58,8 +60,8 @@ they deviate from OMS.
   by the identity's tokens, it can ERASE by them: with `text_mentions`
   enabled, grains whose indexed text contains every token of the identity
   join the erasure set (the BM25 inverted index is the mechanism, so this
-  needs text indexing on — requesting it with indexing off is an error,
-  not a silent partial erasure). Opt-in, never default: token matching
+  needs text indexing on and fully built — requesting it with indexing off
+  or a deferred/unrebuilt index is an error, not a silent partial erasure). Opt-in, never default: token matching
   over-reaches for identifiers that are ordinary words ("may", "mark"),
   and erasing every grain containing a common word is the wrong failure
   mode. For distinctive identifiers (contact codes, record numbers) it
@@ -107,8 +109,9 @@ deleting is deliberate: under concurrent writers another instance may
 hold the id in its cache, and a dangling id would silently corrupt its
 next write, while a tombstoned id stays referentially valid and merely
 makes the old name unfindable. `fts_vocab` tokens left with no postings
-are removed, telemetry rows keyed on the identity string (query rollups,
-the recall ring log) are scrubbed, and CAS attachments are reclaimed
+are removed, telemetry rows keyed on any matched identity string —
+partition keys included — (query rollups, the recall ring log) are
+scrubbed, and CAS attachments are reclaimed
 **targeted** — only the erased grains' own references, checked for
 surviving users under the write serialization, never a store-wide gc
 that could race another writer's in-flight upload. (Residual window: a

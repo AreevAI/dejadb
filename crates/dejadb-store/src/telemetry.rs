@@ -383,8 +383,7 @@ impl Telemetry {
             ev.subject.as_deref() != Some(subject)
                 && !ev.query.as_deref().is_some_and(|q| q.contains(subject))
         });
-        let escaped = subject.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        let like = format!("%{escaped}%");
+        let like = format!("%{}%", crate::like_escape(subject));
         self.db.execute(
             "DELETE FROM telem_recall_log WHERE subject = ?1 OR query LIKE ?2 ESCAPE '\\'",
             vec![pt(subject), pt(&like)],

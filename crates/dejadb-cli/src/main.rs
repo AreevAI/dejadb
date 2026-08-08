@@ -1562,7 +1562,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             // vocabulary — with replicating tombstones. Destructive and
             // bulk, so it demands an explicit --yes.
             let subject = positional.first().cloned().or_else(|| flag(&flags, "subject")).ok_or(
-                "usage: deja forget-subject <subject> [--ns NS] --yes".to_string(),
+                "usage: deja forget-subject <subject> [--ns NS] [--text-mentions] --yes"
+                    .to_string(),
             )?;
             if flags.contains_key("no-destructive-ops") {
                 return Err(
@@ -1578,8 +1579,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                      Re-run with --yes to proceed."
                 ));
             }
+            // Same truthiness idiom as --index-text: bare presence enables,
+            // an explicit falsy value disables — "--text-mentions false"
+            // must not silently widen the erasure.
             let opts = dejadb_store::ErasureOptions {
-                text_mentions: flags.contains_key("text-mentions"),
+                text_mentions: flag(&flags, "text-mentions")
+                    .map(|v| !matches!(v.as_str(), "false" | "0" | "off" | "no"))
+                    .unwrap_or(false),
             };
             let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
             println!(

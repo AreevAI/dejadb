@@ -118,3 +118,37 @@ fn memory_tool_file_bodies_are_searchable() {
     let hits = m.search_text("main", "roast coffee", 16).unwrap();
     assert_eq!(hits.len(), 1, "memory-tool file body reaches the BM25 leg");
 }
+
+#[test]
+fn text_mention_erasure_needs_a_complete_index() {
+    use dejadb_store::ErasureOptions;
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // Indexing off: requesting text mentions is an error — and it must fire
+    // even when the namespace does not exist yet (a mistyped ns must not
+    // turn the capability error into a silent zero-count success).
+    let path = dir.path().join("noidx.db");
+    let mut m = DejaDB::open_with(
+        path.to_str().unwrap(),
+        DejaDbOptions { index_text: false, ..DejaDbOptions::default() },
+    )
+    .unwrap();
+    let mentions = ErasureOptions { text_mentions: true };
+    assert!(m.forget_subject_with("no-such-ns", "pat", mentions).is_err());
+    m.add(&fact("main", "pat", "condition", "stable", 1_700_000_000_000)).unwrap();
+    assert!(m.forget_subject_with("main", "pat", mentions).is_err());
+    // Without the opt-in the structured erasure still works.
+    assert_eq!(m.forget_subject("main", "pat").unwrap().grains_erased, 1);
+    drop(m);
+
+    // Index on but DEFERRED: grains written now have no postings, so a
+    // text-mention erasure would silently miss them — refuse until rebuilt.
+    let path = dir.path().join("deferred.db");
+    let mut m = DejaDB::open_with(path.to_str().unwrap(), opts()).unwrap();
+    m.defer_text_index().unwrap();
+    m.add(&fact("main", "kim", "note", "spoke about pat", 1_700_000_000_000)).unwrap();
+    assert!(m.forget_subject_with("main", "pat", mentions).is_err());
+    m.rebuild_text_index().unwrap();
+    let rep = m.forget_subject_with("main", "pat", mentions).unwrap();
+    assert_eq!(rep.grains_erased, 1, "after rebuild the mention is reachable again");
+}

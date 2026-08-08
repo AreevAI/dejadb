@@ -115,6 +115,12 @@ pub struct ImportStats {
     pub skipped: usize,
 }
 
+/// Escape `\`, `%` and `_` for a `LIKE ?N ESCAPE '\'` pattern — the one
+/// escaping rule every prefix/contains scan in this crate must share.
+pub(crate) fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// The `cas://sha256:` hex digests a grain's `content_refs` name (compact
 /// key `u` or expanded `uri`).
 fn cas_hexes(view: &DeserializedGrain) -> Vec<String> {
@@ -1627,11 +1633,7 @@ impl DejaDB {
         // `%` and `_` are LIKE wildcards, so a prefix containing either would
         // silently widen the scan. Escape them and say so with ESCAPE; the
         // `strip_prefix` check below is the backstop, not the mechanism.
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
+        let pattern = format!("{}%", like_escape(prefix));
         let mut out = Vec::new();
         for row in self.db.query(
             "SELECT k, v FROM meta WHERE k LIKE ?1 ESCAPE '\\'",
@@ -2875,19 +2877,24 @@ impl DejaDB {
     }
 
     /// Erase every grain holding a STRUCTURED reference to `subject` in `ns`
-    /// — the right-to-erasure primitive for one identity. In one transaction
-    /// this removes:
+    /// — the right-to-erasure primitive for one identity. Matching covers
+    /// the exact identity AND every partition-style key (`subject` followed
+    /// by a non-alphanumeric separator: `pat`, `pat#visit1` — never
+    /// `patricia`). In one transaction this removes:
     ///
-    /// - every grain (live AND superseded — the whole history, not just the
-    ///   heads) whose triple subject or object is `subject`;
-    /// - every thread event of the session named `subject`;
-    /// - the dictionary entry for `subject` itself once nothing references
-    ///   it (the identifier string is erasable data), and vocabulary tokens
-    ///   that occurred only in the erased text;
+    /// - every matched grain (live AND superseded — the whole history, not
+    ///   just the heads) referenced in triple subject/object position, as a
+    ///   thread session, or as a run id;
+    /// - the matched dictionary strings themselves once nothing references
+    ///   them (identifier and key strings are erasable data), and vocabulary
+    ///   tokens that occurred only in the erased text;
     ///
     /// then reclaims CAS blobs only those grains referenced and scrubs the
-    /// telemetry sidecar. Every erased grain gets its own op-log tombstone,
-    /// so the erasure REPLICATES to peers exactly like individual forgets.
+    /// telemetry sidecar for every matched identity string. Every erased
+    /// grain gets its own op-log tombstone, so the erasure REPLICATES to
+    /// peers exactly like individual forgets. See
+    /// [`forget_subject_with`](Self::forget_subject_with) for the opt-in
+    /// text-mention scope.
     ///
     /// Scope contract (see docs/erasure.md): only dictionary-indexed
     /// references are findable. A free-text mention of the identity inside
@@ -2911,16 +2918,32 @@ impl DejaDB {
         subject: &str,
         opts: ErasureOptions,
     ) -> Result<ErasureReport> {
-        let Some(ns_id) = self.term_lookup(ns)? else {
-            return Ok(ErasureReport::default());
-        };
-        if opts.text_mentions && !self.index_text {
+        // An empty identity is a caller bug (an unset variable), and with
+        // prefix matching it would otherwise select EVERY punctuation-
+        // prefixed term. Refuse loudly — a silent mass-erasure is the worst
+        // possible reading of "".
+        if subject.trim().is_empty() {
             return Err(DejaDbError::Validation(
-                "text-mention erasure needs text indexing on for this memory \
-                 (the BM25 index is what makes prose mentions findable)"
+                "forget_subject needs a non-empty subject".into(),
+            ));
+        }
+        // Capability errors before scope shortcuts: a mistyped namespace
+        // must not turn the documented Validation error into a silent
+        // zero-count success. `fts_deferred` counts as indexing-off — a
+        // deferred bulk load has grains with no postings yet, and erasing
+        // through a partial index is the silent partial erasure REQ-ERASE-8
+        // forbids.
+        if opts.text_mentions && (!self.index_text || self.fts_deferred) {
+            return Err(DejaDbError::Validation(
+                "text-mention erasure needs the text index on and fully built for this \
+                 memory (the BM25 index is what makes prose mentions findable; finish the \
+                 deferred rebuild first)"
                     .into(),
             ));
         }
+        let Some(ns_id) = self.term_lookup(ns)? else {
+            return Ok(ErasureReport::default());
+        };
         self.erase_where(
             ErasureSelector::Identity {
                 ns_id,
@@ -2982,6 +3005,10 @@ impl DejaDB {
             /// Term ids whose strings were tombstoned — evicted from the
             /// local dictionary cache post-commit.
             scrubbed_terms: Vec<i64>,
+            /// Every matched identity STRING (exact + partition keys) — the
+            /// telemetry sidecar keys rows on these, so each one is
+            /// scrubbed post-commit, not just the bare subject.
+            identity_names: Vec<String>,
         }
         self.db.begin()?;
         let r = (|| -> Result<EraseOut> {
@@ -2992,6 +3019,7 @@ impl DejaDB {
                 len_sum: 0,
                 fs_blobs: Vec::new(),
                 scrubbed_terms: Vec::new(),
+                identity_names: Vec::new(),
             };
             // Serialize with concurrent writers before enumerating.
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
@@ -3005,11 +3033,7 @@ impl DejaDB {
                     // LIKE is a coarse prefilter (case-insensitive on the
                     // embedded engine); the Rust boundary check decides,
                     // case-exactly, identically on every backend.
-                    let escaped = subject
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    let like = format!("{escaped}%");
+                    let like = format!("{}%", like_escape(subject));
                     for row in self.db.query(
                         "SELECT id, term FROM terms WHERE term LIKE ?1 ESCAPE '\\'",
                         vec![pt(&like)],
@@ -3025,7 +3049,14 @@ impl DejaDB {
                                     .is_some_and(|c| !c.is_alphanumeric()));
                         if matched {
                             identity_ids.push(id);
+                            out.identity_names.push(term.to_string());
                         }
+                    }
+                    // Telemetry keys on the subject STRING even when the
+                    // dictionary never interned it (ring-log query text), so
+                    // the bare subject always joins the post-commit scrub.
+                    if !out.identity_names.iter().any(|n| n == subject) {
+                        out.identity_names.push(subject.clone());
                     }
                     let mut seqs: Vec<i64> = Vec::new();
                     if !identity_ids.is_empty() {
@@ -3050,7 +3081,9 @@ impl DejaDB {
                     // whose INDEXED TEXT mentions the identity is a candidate
                     // when every token of the identity occurs in it.
                     if *text_mentions {
-                        let tokens = tokenize(subject);
+                        let mut tokens = tokenize(subject);
+                        tokens.sort_unstable();
+                        tokens.dedup();
                         let mut inter: Option<HashSet<i64>> = None;
                         for t in &tokens {
                             let set: HashSet<i64> = match self.fts_term_lookup(t)? {
@@ -3340,11 +3373,16 @@ impl DejaDB {
                         for h in &hashes {
                             let _ = tel.scrub(h);
                         }
-                        if let Some(name) = &identity {
-                            // Query stats and the recall log key on the
-                            // SUBJECT STRING, not grain hashes — they must
-                            // not outlive the identity either.
-                            let _ = tel.scrub_subject(name);
+                        if identity.is_some() {
+                            // Query stats and the recall log key on IDENTITY
+                            // STRINGS, not grain hashes — and a ring-log row
+                            // recorded against a partition key (subject =
+                            // "pat#visit1", query NULL) is only reachable by
+                            // that exact string, so EVERY matched name is
+                            // scrubbed, not just the bare subject.
+                            for name in &out.identity_names {
+                                let _ = tel.scrub_subject(name);
+                            }
                         }
                     }
                 }

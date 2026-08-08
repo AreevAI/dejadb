@@ -88,9 +88,18 @@ pub fn partition_keys_and_text_mentions_erase(b: &dyn Backend) {
         .add(&fact("ns", "kim", "note", "spoke about pat during rounds"))
         .unwrap();
 
+    // An empty identity would prefix-match EVERYTHING — it must be refused
+    // before any matching happens, on every backend.
+    assert!(m.forget_subject("ns", "").is_err(), "empty subject must error, not mass-erase");
+    assert!(m.forget_subject("ns", "  ").is_err());
+    assert_eq!(m.count().unwrap(), 6, "the refusal must not have erased anything");
+
     // Default scope: exact + partition keys + sessions; text mentions stay.
     let rep = m.forget_subject("ns", "pat").unwrap();
     assert_eq!(rep.grains_erased, 4, "exact + two partition keys + session event: {rep:?}");
+    // REQ-ERASE-7: the matched KEY STRINGS are erasable data too — pat,
+    // pat#visit1, pat:thread-2 and pat#calls must all be tombstoned.
+    assert!(rep.terms_removed >= 4, "identity + partition-key strings must go: {rep:?}");
     for h in [hp1, hp2, hev, hex] {
         assert!(m.get(&h).is_err(), "partition-keyed grain must be erased");
     }
