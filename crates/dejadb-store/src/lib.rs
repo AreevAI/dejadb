@@ -1142,6 +1142,62 @@ fn fs_blob_path(dir: &std::path::Path, hex: &str) -> std::path::PathBuf {
     dir.join(&hex[..2]).join(&hex[2..])
 }
 
+/// Files this process currently holds open, so a second handle on one file is
+/// refused rather than admitted.
+///
+/// The embedded backend is **single-writer per file**, and it enforces that
+/// across processes with an OS file lock. Inside one process that lock is
+/// already held, so a second `open()` succeeded — and then the two handles'
+/// independent in-memory allocators (`next_seq`, `next_term`, the BM25 stats)
+/// drifted apart until a write collided, surfacing as
+/// `UNIQUE constraint failed: terms.id` attributed to *the other* handle. That
+/// message names neither handles nor writers, and the failure arrives long
+/// after the mistake.
+///
+/// Opening a handle per request or per agent turn is the obvious thing to do if
+/// you think of the file as a database connection, so this needs to be decided
+/// at open, with a message that names the real cause.
+static OPEN_FILES: std::sync::Mutex<Option<HashSet<std::path::PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// Releases this process's claim on a memory file when the handle drops.
+struct OpenFileGuard(std::path::PathBuf);
+
+impl OpenFileGuard {
+    /// Claim `path` for this process, or report who holds it.
+    ///
+    /// The key is the absolute path rather than the canonical one: a file that
+    /// does not exist yet cannot be canonicalized, and `open()` creates. Two
+    /// spellings that resolve to the same file through a symlink are therefore
+    /// not caught here — the cross-process lock still is the backstop for that.
+    fn claim(path: &str) -> Result<Self> {
+        let key = std::path::absolute(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let mut held = OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let set = held.get_or_insert_with(HashSet::new);
+        if !set.insert(key.clone()) {
+            return Err(DejaDbError::StoreBusy(format!(
+                "{} is already open in this process. One memory is one writer: \
+                 share the handle (it is safe across threads) instead of opening \
+                 a second one — a second handle keeps its own sequence and \
+                 dictionary allocators, and their first collision fails the \
+                 OTHER handle's write",
+                key.display()
+            )));
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for OpenFileGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = OPEN_FILES.lock() {
+            if let Some(set) = held.as_mut() {
+                set.remove(&self.0);
+            }
+        }
+    }
+}
+
 /// The embedded DejaDB store handle — one file per memory.
 pub struct DejaDB {
     db: Box<dyn Db>,
@@ -1185,6 +1241,10 @@ pub struct DejaDB {
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
     telemetry: Option<Telemetry>,
+    /// This process's claim on the memory file, released on drop. `None` on
+    /// the Postgres backend, which admits multiple concurrent writers per
+    /// memory by design and arbitrates them with an in-schema counters row.
+    _file_guard: Option<OpenFileGuard>,
 }
 
 impl DejaDB {
@@ -1239,6 +1299,10 @@ impl DejaDB {
             .as_ref()
             .and_then(|o| o.encryption_key)
             .map(zeroize::Zeroizing::new);
+        // Claim the file before touching it, so the refusal happens at open —
+        // where the caller can act on it — rather than as a constraint
+        // violation on some later write by a different handle.
+        let guard = OpenFileGuard::claim(path)?;
         let dbh: Box<dyn Db> = Box::new(TursoDb::open(path, enc_key.as_deref())?);
         for sql in SCHEMA {
             dbh.execute(sql, vec![])?;
@@ -1264,7 +1328,7 @@ impl DejaDB {
             TelemetryMode::Off => None,
             mode => Some(Telemetry::open(path, enc_key.as_deref(), mode)?),
         };
-        Self::finish_open(dbh, explicit, BlobStore::Fs(blob_dir), telemetry, warnings)
+        Self::finish_open(dbh, explicit, BlobStore::Fs(blob_dir), telemetry, warnings, Some(guard))
     }
 
     /// Open (or create) a memory in a PostgreSQL schema, honoring the
@@ -1335,7 +1399,7 @@ impl DejaDB {
             TelemetryMode::Off => None,
             mode => Some(Telemetry::open_pg(url, schema, mode)?),
         };
-        Self::finish_open(dbh, explicit, BlobStore::Table, telemetry, Vec::new())
+        Self::finish_open(dbh, explicit, BlobStore::Table, telemetry, Vec::new(), None)
     }
 
     /// Backend-independent tail of every open: meta reconciliation and
@@ -1346,6 +1410,7 @@ impl DejaDB {
         blob_store: BlobStore,
         telemetry: Option<Telemetry>,
         mut warnings: Vec<String>,
+        file_guard: Option<OpenFileGuard>,
     ) -> Result<Self> {
         // ---- file-carried declarations (meta k/v) --------------------
         let meta: HashMap<String, String> = {
@@ -1468,6 +1533,7 @@ impl DejaDB {
             needs_min_reader_stamp: !meta.contains_key(MIN_READER_VERSION_KEY),
             blob_store,
             telemetry,
+            _file_guard: file_guard,
         };
 
         // The file may declare that it needs a newer reader than this build (a
@@ -2120,7 +2186,40 @@ impl DejaDB {
     }
 
     fn add_batch_inner(&mut self, grains: &[&dyn AddableDyn]) -> Result<Vec<Hash>> {
-        let (preps, first_seq, first_op, hlc0) = self.prep_and_reserve(grains)?;
+        // Adding a grain that is already stored is a no-op, not an error.
+        //
+        // A content address IS the content: two byte-identical grains are one
+        // grain, and it is already here. Before this, the second insert hit
+        // `UNIQUE constraint failed: grains.hash` — reachable whenever two
+        // identical events land in the same millisecond, since `created_at` is
+        // the only thing distinguishing them and it has ms resolution. An agent
+        // retrying a failing tool in a tight loop is exactly that workload, and
+        // it is the flagship analyzer's ingest path. Callers had to jitter their
+        // payloads to avoid a storage error, which corrupts the data to satisfy
+        // the store.
+        //
+        // The probe runs before the counters are reserved, so a skipped grain
+        // consumes no seq/op/hlc and writes no op-log row — nothing changed, so
+        // nothing replicates.
+        let mut prepped: Vec<Option<GrainPrep>> = Vec::with_capacity(grains.len());
+        let mut hashes: Vec<Hash> = Vec::with_capacity(grains.len());
+        let mut seen_in_batch: HashSet<Hash> = HashSet::new();
+        for g in grains {
+            let (blob, hash) = g.serialize_dyn()?;
+            hashes.push(hash);
+            // `seen_in_batch` also covers duplicates *within* one batch, which
+            // the `has` probe cannot see — neither is committed yet.
+            if !seen_in_batch.insert(hash) || self.has(&hash)? {
+                prepped.push(None);
+                continue;
+            }
+            prepped.push(Some(self.prep_from_blob(blob, hash)?));
+        }
+        let preps: Vec<GrainPrep> = prepped.into_iter().flatten().collect();
+        if preps.is_empty() {
+            return Ok(hashes);
+        }
+        let (preps, first_seq, first_op, hlc0) = self.reserve_for(preps);
         // A grain type newer than any pre-1.5 build could decode makes this file
         // unreadable to those builds — `deserialize_blob` errors on an unknown
         // type byte rather than skipping it. Record that requirement in the file
@@ -2134,7 +2233,6 @@ impl DejaDB {
             self.meta_put(MIN_READER_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
             self.needs_min_reader_stamp = false;
         }
-        let hashes: Vec<Hash> = preps.iter().map(|p| p.hash).collect();
         let (d_docs, d_len) = fts_delta(&preps);
         let n = preps.len() as i64;
         let dbr = self.db.as_ref();
@@ -2168,13 +2266,22 @@ impl DejaDB {
             let (blob, hash) = g.serialize_dyn()?;
             preps.push(self.prep_from_blob(blob, hash)?);
         }
+        Ok(self.reserve_for(preps))
+    }
+
+    /// Reserve the seq/op/hlc block for already-prepped grains.
+    ///
+    /// Split out of [`prep_and_reserve`] so the add path can drop grains that
+    /// are already stored *before* consuming counters — a skipped duplicate
+    /// must not burn a sequence number.
+    fn reserve_for(&mut self, preps: Vec<GrainPrep>) -> (Vec<GrainPrep>, i64, i64, i64) {
         let first_seq = self.next_seq;
         self.next_seq += preps.len() as i64;
         let first_op = self.next_op;
         self.next_op += preps.len() as i64;
         let hlc0 = self.next_hlc();
         self.hlc_last = hlc0 + preps.len() as i64 - 1;
-        Ok((preps, first_seq, first_op, hlc0))
+        (preps, first_seq, first_op, hlc0)
     }
 
     // ----- read path -----

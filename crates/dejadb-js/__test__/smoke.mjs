@@ -302,6 +302,9 @@ test('passphrase constructor rejects a wrong key on reopen', async () => {
   {
     const m = new DejaDb(path, 'caller', 'correct horse battery staple')
     await m.addFact('john', 'prefers', 'tea')
+    // One memory is one writer, and Node has no deterministic drop — leaving
+    // scope does not release the file, so say so explicitly before reopening.
+    m.close()
   }
   // wrong passphrase or no passphrase must not open the file. The constructor
   // stays synchronous, so these still throw rather than reject.
@@ -449,6 +452,31 @@ test('remember can place a turn in a run that runTrace reads back', async () => 
   assert.equal(a.trace.length, 2)
   assert.equal(JSON.parse(await m.runTrace('run-b')).trace.length, 1)
   assert.deepEqual(JSON.parse(await m.runTrace('no-such-run')).trace, [])
+})
+
+test('one handle per file: a second open is refused, close() releases it', async () => {
+  // Two handles on one file used to open silently and then collide on a write,
+  // failing whichever handle wrote next rather than the one that should not
+  // exist. Now it is decided at open.
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-js-one-'))
+  const path = join(dir, 'm.db')
+
+  const a = new DejaDb(path, 'caller')
+  await a.addFact('a1', 'rel', 'v')
+  assert.throws(() => new DejaDb(path, 'caller'), /STO-E002/)
+
+  // The refusal lands on the newcomer; the incumbent keeps working.
+  await a.addFact('a2', 'rel', 'v')
+  assert.equal(JSON.parse(await a.recall('a2')).length, 1)
+
+  a.close()
+  const b = new DejaDb(path, 'caller')
+  assert.equal(JSON.parse(await b.recall('a1')).length, 1)
+
+  // A closed handle reports that plainly rather than reopening behind your back.
+  await assert.rejects(() => a.recall('a1'), /closed/)
+  a.close() // idempotent
+  b.close()
 })
 
 test('nearest without an embedder names the Node remedy, not a CLI flag', async () => {

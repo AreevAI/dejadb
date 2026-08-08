@@ -276,3 +276,127 @@ fn now_ms_test() -> i64 {
         .unwrap()
         .as_millis() as i64
 }
+
+// ── Duplicate adds (#40) ────────────────────────────────────────────────────
+
+/// Re-adding a byte-identical grain is a no-op, not `UNIQUE constraint failed:
+/// grains.hash`.
+///
+/// `created_at` has millisecond resolution, so two identical events in the same
+/// millisecond serialize to the same bytes and therefore the same content
+/// address. An agent retrying a failing tool in a tight loop is exactly that
+/// workload — and `record_tool_call` is the flagship analyzer's ingest path, so
+/// the workaround was to corrupt the payload (jitter the result string) to
+/// satisfy the store.
+#[test]
+fn adding_the_same_grain_twice_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let mut m = DejaDB::open(dir.path().join("m.db").to_str().unwrap()).unwrap();
+
+    // Fixed created_at makes the two grains byte-identical without racing a
+    // clock — same thing the same-millisecond case produces, deterministically.
+    let grain = || {
+        Fact::new("crm_lookup", "returned", "timeout after 30s")
+            .namespace("caller")
+            .created_at(1_700_000_000_000)
+    };
+
+    let first = m.add(&grain()).unwrap();
+    let second = m.add(&grain()).expect("re-adding a stored grain must not error");
+    assert_eq!(first, second, "the same content is the same address");
+    assert_eq!(m.count().unwrap(), 1, "and it is stored exactly once");
+
+    // A skipped duplicate must not consume a sequence number or emit an op-log
+    // row — nothing changed, so nothing replicates.
+    let ops = m.changes_since(0, 100).unwrap();
+    assert_eq!(ops.len(), 1, "one add, one op-log record: {ops:?}");
+
+    // Five in a row, the shape of the retry loop in the report.
+    for _ in 0..5 {
+        assert_eq!(m.add(&grain()).unwrap(), first);
+    }
+    assert_eq!(m.count().unwrap(), 1);
+
+    // A genuinely different grain still writes.
+    let other = m
+        .add(&Fact::new("crm_lookup", "returned", "ok").namespace("caller").created_at(1_700_000_000_000))
+        .unwrap();
+    assert_ne!(other, first);
+    assert_eq!(m.count().unwrap(), 2);
+}
+
+/// The same rule inside one batch, where the `has` probe cannot help: neither
+/// copy is committed yet.
+#[test]
+fn a_batch_containing_the_same_grain_twice_writes_it_once() {
+    let dir = TempDir::new().unwrap();
+    let mut m = DejaDB::open(dir.path().join("m.db").to_str().unwrap()).unwrap();
+
+    let a = Fact::new("john", "prefers", "tea").namespace("caller").created_at(1_700_000_000_000);
+    let dup = Fact::new("john", "prefers", "tea").namespace("caller").created_at(1_700_000_000_000);
+    let b = Fact::new("jane", "prefers", "coffee").namespace("caller").created_at(1_700_000_000_000);
+
+    let hashes = m.add_batch(&[&a as &dyn dejadb_store::AddableDyn, &dup, &b]).unwrap();
+    assert_eq!(hashes.len(), 3, "every input gets an address back, in order");
+    assert_eq!(hashes[0], hashes[1], "the duplicate resolves to the same address");
+    assert_eq!(m.count().unwrap(), 2, "but only two grains are stored");
+    // Sequence numbers are not burned by the skip: the next add must land.
+    let c = m.add(&Fact::new("bob", "prefers", "water").namespace("caller")).unwrap();
+    assert_ne!(c, hashes[0]);
+    assert_eq!(m.count().unwrap(), 3);
+}
+
+// ── One handle per file per process (#50) ───────────────────────────────────
+
+/// A second handle on one file, in one process, used to open silently and then
+/// poison the FIRST handle's writes.
+///
+/// Both handles load `next_seq`/`next_term` into memory at open and allocate
+/// from them independently, so they drift until a write collides — surfacing as
+/// `UNIQUE constraint failed: terms.id` on a handle that did nothing wrong,
+/// long after the mistake. The cross-process path refuses this correctly at
+/// open; inside one process the OS lock is already held, so nothing caught it.
+#[test]
+fn a_second_handle_on_one_file_is_refused_at_open() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let p = path.to_str().unwrap();
+
+    let mut a = DejaDB::open(p).unwrap();
+    a.add(&Fact::new("a1", "rel", "v").namespace("caller")).unwrap();
+
+    let err = match DejaDB::open(p) {
+        Ok(_) => panic!("the second handle must be refused"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "STO-E002", "unexpected error: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already open in this process") && msg.contains("share the handle"),
+        "the message must name the cause and the fix: {msg}"
+    );
+
+    // The first handle keeps working — the whole point is that the refusal
+    // lands on the newcomer, not on the incumbent's next write.
+    a.add(&Fact::new("a2", "rel", "v").namespace("caller")).unwrap();
+    assert_eq!(a.count().unwrap(), 2);
+
+    // Dropping it releases the claim, so a genuine reopen still works.
+    drop(a);
+    let mut b = DejaDB::open(p).expect("reopen after close must succeed");
+    b.add(&Fact::new("b1", "rel", "v").namespace("caller")).unwrap();
+    assert_eq!(b.count().unwrap(), 3);
+}
+
+/// Different files are independent — the guard keys on the path, not on "a
+/// memory is open".
+#[test]
+fn two_handles_on_different_files_coexist() {
+    let dir = TempDir::new().unwrap();
+    let mut a = DejaDB::open(dir.path().join("a.db").to_str().unwrap()).unwrap();
+    let mut b = DejaDB::open(dir.path().join("b.db").to_str().unwrap()).unwrap();
+    a.add(&Fact::new("x", "r", "v").namespace("caller")).unwrap();
+    b.add(&Fact::new("y", "r", "v").namespace("caller")).unwrap();
+    assert_eq!(a.count().unwrap(), 1);
+    assert_eq!(b.count().unwrap(), 1);
+}
