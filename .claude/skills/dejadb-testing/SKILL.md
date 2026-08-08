@@ -62,8 +62,8 @@ that passes locally and fails in CI (or vice versa):
    the value is observed or when it decides an ordering. Fork/head election is
    `max (created_at, hash)` — `fork_merge_tests.rs` sets explicit `created_at`
    so the tiebreak is testable; copy that pattern.
-3. **Pin waiser's clock** with the `WAISER_NOW_MS` env seam (epoch ms). The
-   golden helpers `deja_at(now_ms, …)` set it and scrub ambient `WAISER_POLICY`
+3. **Pin the loop's clock** with the `DEJA_LOOP_NOW_MS` env seam (epoch ms). The
+   golden helpers `deja_at(now_ms, …)` set it and scrub ambient `DEJA_LOOP_POLICY`
    / `DEJADB_DB` so a dev's environment can't leak into output.
 4. **Property-test strings must be NFC-stable.** `proptest_roundtrip.rs` draws
    from a curated non-combining code-point pool so the serializer's `nfc()` pass
@@ -82,9 +82,9 @@ output. When you **intentionally** change the dataset or a render, re-bless:
 # CLI goldens (dataset → bundle + manifest, then renders):
 cargo test -p dejadb --test golden_tests -- --ignored bless
 GOLDEN_BLESS=1 cargo test -p dejadb --test golden_tests render
-# Waiser goldens:
-cargo test -p dejadb --test golden_waiser_tests -- --ignored bless
-GOLDEN_BLESS=1 cargo test -p dejadb --test golden_waiser_tests
+# Deja Loop goldens:
+cargo test -p dejadb --test golden_loop_tests -- --ignored bless
+GOLDEN_BLESS=1 cargo test -p dejadb --test golden_loop_tests
 ```
 
 Then **review the diff** and commit it. An *unintended* diff in

@@ -44,7 +44,7 @@ numbers and confirmed the rest:
 | Proposal said | Verified reality |
 |---|---|
 | `CalStoreFacade` has 67 methods | **31 methods** (`dejadb-cal/src/facade.rs:56-307`), 24 with defaults, all typed DTOs (no JSON strings on the trait — that convention is binding-layer only) |
-| `with_store` called ~107 times | **87 production call sites** outside dejadb-cal (py 26, js 23, waiser 17, server 10, mcp 8, cli 3) + 8 in dejadb-cal tests. The 107 double-counted internal/doc uses. |
+| `with_store` called ~107 times | **87 production call sites** outside dejadb-cal (py 26, js 23, deja-loop 17, server 10, mcp 8, cli 3) + 8 in dejadb-cal tests. The 107 double-counted internal/doc uses. |
 | — (not known) | The CLI is worse than its 3 `with_store` sites: **31 direct `m.*` calls** bypass the facade entirely (`dejadb-cli/src/main.rs:571-587` opens a raw `DejaDB`; only 5 verb arms build a facade). The CLI needs its own routing pass. |
 | — | **Prior art is richer than expected**: the ancestor codebase shipped Pg as a `pg-store` cargo **feature** with recall as **one RRF CTE** in `engine/recall_pg.rs` (per-leg top-k `$3`, final `LIMIT $6`), plus a recursive-SQL graph module. `RecallParams.hybrid: Option<HybridParams>` (`store_types.rs:1059`) is **already threaded through CAL and ignored by the Turso facade** — a pre-wired tuning channel `PgStore::recall` can consume with zero parser/executor changes. |
 | — | Key facts that make this tractable: SQL confined to 2 files; 62 `block_on` sites of only 6 shapes; row decoding 100% uniform through 3 helpers (zero typed getters); **no error-string matching anywhere** (everything funnels to `STO-E001` via `db_err`); `turso::Statement` owns its connection (no lifetimes); transactions are string `BEGIN/COMMIT`, all within one call. |
@@ -231,7 +231,7 @@ order — this is a ranking-parity risk, test first):
   one `= ANY($1)` fetch (17 → 1–2 round trips).
 - `search_text_inner`: one query for all tokens (`v.term = ANY($1)`), group in
   Rust; BM25 math stays in Rust untouched.
-- `supersession_map` / waiser's `get`-per-op scan: `get_many` batch.
+- `supersession_map` / the loop's `get`-per-op scan: `get_many` batch.
 - `related` / `path` / `entity_at(Knowledge)` / `history`: acceptable per-level
   batching now; recursive CTEs are the Pg-side design (prior art: the ancestor's
   "recursive-SQL graph module"), can be Pg-only.
@@ -248,12 +248,12 @@ Full per-site absorption table lives in the audit; summary of the 28 additions:
 
 | Group | Methods |
 |---|---|
-| Read (5) | `entity_latest`, `recent(ns, type, limit, live_only)`, `provenance_children`, `nearest_semantic`, `get_many` (default = loop over `get`; de-N+1s waiser/server/facade labelling) |
+| Read (5) | `entity_latest`, `recent(ns, type, limit, live_only)`, `provenance_children`, `nearest_semantic`, `get_many` (default = loop over `get`; de-N+1s deja-loop/server/facade labelling) |
 | Write (5) | `cal_add_if_novel` + `cal_add_batch` (promote existing inherent methods), `capture(CaptureMeta)`, `attach_facts(FactDraftDto, FactAttributionDto)`, **`merge_heads`** (must be on-trait: fork collapse is the #1 parity risk and must be conformance-testable) |
 | Graph/time (6) | `related(TraversalDir)`, `entity_at(TimeAxis)`, `step_actions`, `run_trace`, `run_yield`, `runs_touching` (kept separate: hosts conditionally skip the yield leg) |
 | Oplog/sync (5) | `changes_since(OpRecordDto)`, `bundle_since`, `import_bundle(path, max_hlc)` (merges `_until`), `verify(VerifyReportDto)`, `stats(StoreStatsDto)` |
 | Meta/config (5) | `store_info()` → one DTO folding `index_text_enabled`/`embedder_dim`/`declared_embedding`/`indexed_documents`/`open_warnings` (absorbs 12 calls across 8 sites), `rebuild_text_index`, `rebuild_link_indexes`, promote `meta_warnings` + `mount_aliases` |
-| Telemetry (1) | `telemetry_view(ns) -> Option<TelemetryViewDto>` (None = sidecar off; shape ≈ `waiser::TelemetryView` so the adapter is a one-line map) |
+| Telemetry (1) | `telemetry_view(ns) -> Option<TelemetryViewDto>` (None = sidecar off; shape ≈ `deja_loop::TelemetryView` so the adapter is a one-line map) |
 | Admin (3) | `migrate_payload(MigrateReportDto)`, `subjects_with_relation` (for the MemoryTool refactor), `capabilities() -> BackendCapabilities {crypto_erasure, file_backed, read_only, multi_writer}` |
 
 All new methods: `&self`, DTO-only, defaults (`Err(Internal)`/empty) so mocks
@@ -266,11 +266,11 @@ diagnostic"; the portable, conformance-tested half is `hash_mismatches`/`undecod
 |---|---|
 | `set_embedder`/`set_reranker` (trait objects, `&mut`) | Move `EmbedBackend`/`RerankBackend` traits to `dejadb-core`; add `fn set_embedder(&self, Box<dyn EmbedBackend>)` on the facade trait (interior mutability — the Mutex is already there). On Pg, first install creates the `vector(dim)` table + stamps meta; later mismatch = hard `VAL` error (an upgrade over Turso's warning). |
 | Bundle file paths | Add `bundle_since_bytes` / `import_bundle_bytes` variants; path variants default-delegate. Also fixes the server's write-body-to-disk-then-import dance and its silent 1 MiB truncation. |
-| waiser `store_state` (read-then-write in one lock) | Dedicated atomic method `put_state(ns, subject, relation, json) -> Hash` — splitting it would introduce a lost-update race. **Highest-priority hazard of the promotion.** |
-| waiser `all_grains` (changes_since + get per op, MAX_SCAN=1M) | `get_many`, or better `grains_of_type(gt, ns, live_only)` pushed into the backend. Worst Pg path in the codebase if left N+1. |
+| deja-loop `store_state` (read-then-write in one lock) | Dedicated atomic method `put_state(ns, subject, relation, json) -> Hash` — splitting it would introduce a lost-update race. **Highest-priority hazard of the promotion.** |
+| deja-loop `all_grains` (changes_since + get per op, MAX_SCAN=1M) | `get_many`, or better `grains_of_type(gt, ns, live_only)` pushed into the backend. Worst Pg path in the codebase if left N+1. |
 | `MemoryTool` (borrows `&mut DejaDB`) | Refactor to take `&dyn CalStoreFacade` (it uses exactly 6 primitives, 5 already on the trait + `subjects_with_relation`). No `memory_tool` trait method needed. |
 | `migrate_payload` (free fn over `&mut DejaDB`) | Pragmatic first cut: opaque per-backend trait method (G2). Genericize the ~500-line module later. |
-| Typed-grain writes (waiser `add(&Fact)`, CLI seeds) | Convert to `cal_add` field maps; **verify `created_at` survives the JSON round trip** (waiser stamps it deliberately for deterministic content addressing — the waiser goldens will catch drift). |
+| Typed-grain writes (deja-loop `add(&Fact)`, CLI seeds) | Convert to `cal_add` field maps; **verify `created_at` survives the JSON round trip** (the loop stamps it deliberately for deterministic content addressing — the loop goldens will catch drift). |
 | `into_inner() -> DejaDB` | Stays inherent on `DejaDbFacade` only; delete `DejaDbSubstrate::into_store`. |
 | `mount(alias, DejaDB)` | Becomes `mount(alias, Box<dyn CalStoreFacade>)`; assert `capabilities().read_only` intent at mount time. |
 | Host constructors (`Server::new(DejaDbFacade)` etc.) | Become `Box<dyn CalStoreFacade>`/`Arc<dyn …>` — **breaking API change for dejadb-server and dejadb-mcp** → minor version bump, changelog entry. |
@@ -280,7 +280,7 @@ diagnostic"; the portable, conformance-tested half is `hash_mismatches`/`undecod
 
 ### 3.3 Host migration order
 
-1. **waiser adapter** (cleanest; `crates/waiser` is already substrate-agnostic).
+1. **loop adapter** (cleanest; `crates/deja-loop` is already substrate-agnostic).
 2. **server + mcp** (10 + 8 sites, mostly absorbed by `store_info`/`telemetry_view`/`stats`/graph methods).
 3. **py** (26 sites) — run pytest.
 4. **js** (23 sites) — outside the workspace: manual `napi build --release` +
@@ -485,7 +485,7 @@ Atmatic's `ext`-schema relocation since vector types resolve via search_path).
   suite's `import_golden()` at a schema URL — 40 exact-output assertions
   (including `golden_manifest_hashes_stable`: content addresses are computed in
   dejadb-core before SQL, so manifests must be byte-identical on Pg) become a
-  free cross-surface conformance layer. Waiser goldens deferred to after the
+  free cross-surface conformance layer. Deja Loop goldens deferred to after the
   substrate migration settles.
 - **Multichannel test** gets a Pg variant at Phase 3/4 — the natural end-to-end
   fork-parity proof.
@@ -525,8 +525,8 @@ Risk register (top 5):
    DSN).
 4. Coercion wrong-answers (int4/numeric → `v_i64` = None → `unwrap_or(0)`)
    → all-bigint DDL + make strict accessors error, not None, in the Pg impl.
-5. Behavior drift via `cal_add` conversion of typed writes (waiser
-   `created_at` stamping) → waiser goldens + explicit round-trip test.
+5. Behavior drift via `cal_add` conversion of typed writes (deja-loop
+   `created_at` stamping) → loop goldens + explicit round-trip test.
 
 ---
 

@@ -355,7 +355,7 @@ fn all_grain_types_round_trip_is_deterministic() {
     assert_grain_round_trip(
         &Recommendation::new(
             "entity:conformance/alice",
-            Analyzer::new("waiser.duplicate_sweep/1"),
+            Analyzer::new("loop.duplicate_sweep/1"),
             Summary {
                 template_id: "dup.consolidate".into(),
                 args: serde_json::json!({ "count": 3, "subject": "alice" }),

@@ -151,7 +151,7 @@ test('bad input rejects with a JS Error', async () => {
   await assert.rejects(() => m.forget('nothex'), Error)
 })
 
-// A scripted fake speaking the Waiser wire protocol — hermetic, no network
+// A scripted fake speaking the Deja Loop wire protocol — hermetic, no network
 // and no key, the same shape crates/dejadb-cli/tests/remember_llm_tests.rs uses.
 const FAKE_LLM_PY = `
 import json, sys
@@ -315,24 +315,24 @@ test('passphrase constructor rejects a wrong key on reopen', async () => {
   assert.equal(JSON.parse(await m.recall('john')).length, 1)
 })
 
-test('waiser: record tool calls, run, review, apply', async () => {
+test('loop: record tool calls, run, review, apply', async () => {
   const m = makeDb('caller')
   // 4 failures + 1 success for one tool → tool-failure clustering fires.
   // Distinct payloads per call: grains are content-addressed, so four
   // byte-identical failures recorded inside the same millisecond hash to the
-  // same address and the fourth is rejected. This test is about the Waiser
+  // same address and the fourth is rejected. This test is about the Deja Loop
   // loop, so it records four distinguishable failures.
   for (let i = 0; i < 4; i++) {
     await m.recordToolCall('stripe_refund', `rate_limited 429 (attempt ${i})`, true)
   }
   await m.recordToolCall('stripe_refund', 'ok', false)
 
-  const run = JSON.parse(await m.waiserRun())
+  const run = JSON.parse(await m.loopRun())
   assert.equal(run.outcome, 'ran')
   assert.ok(run.stored >= 1)
 
   const pending = JSON.parse(await m.recommendations())
-  const tf = pending.find((r) => r.analyzer.startsWith('waiser.tool_failure'))
+  const tf = pending.find((r) => r.analyzer.startsWith('loop.tool_failure'))
   assert.ok(tf, 'a tool-failure recommendation')
   assert.ok(tf.summary.includes('rate_limited'), 'signature is non-empty')
 
@@ -340,16 +340,16 @@ test('waiser: record tool calls, run, review, apply', async () => {
   assert.equal(applied.hash, tf.hash)
 
   // A second bare run is idempotent (dedup).
-  assert.equal(JSON.parse(await m.waiserRun()).stored, 0)
+  assert.equal(JSON.parse(await m.loopRun()).stored, 0)
 
   // The Verify gate's record parses (empty until checkpoints elapse) and an
   // applied recommendation rolls back with a mandatory reason.
-  assert.ok(Array.isArray(JSON.parse(await m.waiserOutcomes())))
+  assert.ok(Array.isArray(JSON.parse(await m.loopOutcomes())))
   const rb = JSON.parse(await m.rollbackRecommendation(tf.hash, 'the lesson did not help'))
   assert.equal(rb.status, 'rolled_back')
 
   // A full-memory sweep (reflect semantics) still runs after the rollback.
-  const sweep = await m.waiserRun(null, null, null, null, null, null, null, null, true)
+  const sweep = await m.loopRun(null, null, null, null, null, null, null, null, true)
   assert.equal(JSON.parse(sweep).outcome, 'ran')
 })
 
@@ -500,7 +500,7 @@ test('nearest without an embedder names the Node remedy, not a CLI flag', async 
 
 test('valid_to set at top level is stored as the typed field', async () => {
   // It used to be swallowed into context as the compacted key "vt", where
-  // waiser.staleness and the world-time projection cannot see it.
+  // loop.staleness and the world-time projection cannot see it.
   const m = makeDb()
   const past = 1600000000000
   await m.add('fact', JSON.stringify({
@@ -511,17 +511,17 @@ test('valid_to set at top level is stored as the typed field', async () => {
   assert.ok(!JSON.stringify(fields.context ?? {}).includes('vt'), JSON.stringify(fields))
 })
 
-// ── Waiser: the review queue and its gates (#34, #35, #39) ──────────────────
+// ── Deja Loop: the review queue and its gates (#34, #35, #39) ──────────────────
 
 async function aDestructiveRec() {
-  // waiser.staleness on an expired fact. `vt` is the compact spelling of
+  // loop.staleness on an expired fact. `vt` is the compact spelling of
   // valid_to; both reach common.valid_to, and this one keeps the fixture
   // independent of the top-level routing fix (#36), which lands separately.
   const m = makeDb()
   await m.add('fact', JSON.stringify({
     subject: 'promo', relation: 'code', object: 'SAVE20', vt: 1600000000000,
   }))
-  await m.waiserRun()
+  await m.loopRun()
   const recs = JSON.parse(await m.recommendations())
   assert.ok(recs.length && recs[0].destructive, JSON.stringify(recs))
   return { m, hash: recs[0].hash }
@@ -545,7 +545,7 @@ test('a refused destructive apply leaves the rec dismissable', async () => {
   // destructive gate — stranding the rec in `approved`, which has no exit but
   // `applied` or `expired`, so it could no longer be rejected.
   const { m, hash } = await aDestructiveRec()
-  await assert.rejects(() => m.applyRecommendation(hash, 'looks right'), /WSR-E023/)
+  await assert.rejects(() => m.applyRecommendation(hash, 'looks right'), /LOP-E023/)
 
   const after = JSON.parse(await m.recommendations('{"status":"all"}')).map((r) => r.status)
   assert.deepEqual(after, ['pending'], 'a refused apply must not record the approval')
@@ -556,9 +556,9 @@ test('approve without apply, and scopes enforce separation of duties', async () 
   const { m, hash } = await aDestructiveRec()
   await assert.rejects(
     () => m.applyRecommendation(hash, 'no apply scope', false, 'review'),
-    /WSR-E022/,
+    /LOP-E022/,
   )
-  await assert.rejects(() => m.approveRecommendation(hash, 'wrong scope', 'apply'), /WSR-E022/)
+  await assert.rejects(() => m.approveRecommendation(hash, 'wrong scope', 'apply'), /LOP-E022/)
   await assert.rejects(() => m.approveRecommendation(hash, 'typo', 'reviewer'), /unknown scope/)
 
   const out = JSON.parse(await m.approveRecommendation(hash, 'evidence checks out', 'review'))
@@ -569,21 +569,21 @@ test('approve without apply, and scopes enforce separation of duties', async () 
   )
 })
 
-test('waiser health and per-analyzer config are reachable', async () => {
+test('loop health and per-analyzer config are reachable', async () => {
   const { m } = await aDestructiveRec()
-  const health = JSON.parse(await m.waiserHealth())
+  const health = JSON.parse(await m.loopHealth())
   assert.equal(health.pending, 1)
   assert.equal(health.applied, 0)
   assert.equal(health.stale, false)
 
   // The roster is how a caller learns the id, which carries a version suffix.
-  const ids = JSON.parse(await m.waiserAnalyzers()).map((a) => a.id)
-  assert.ok(ids.includes('waiser.staleness/1'), JSON.stringify(ids))
+  const ids = JSON.parse(await m.loopAnalyzers()).map((a) => a.id)
+  assert.ok(ids.includes('loop.staleness/1'), JSON.stringify(ids))
 
-  await m.setAnalyzerConfig('waiser.staleness/1', false)
+  await m.setAnalyzerConfig('loop.staleness/1', false)
   const off = Object.fromEntries(
-    JSON.parse(await m.waiserAnalyzers()).map((a) => [a.id, a.enabled]),
+    JSON.parse(await m.loopAnalyzers()).map((a) => [a.id, a.enabled]),
   )
-  assert.equal(off['waiser.staleness/1'], false)
-  await m.setAnalyzerConfig('waiser.staleness/1', true)
+  assert.equal(off['loop.staleness/1'], false)
+  await m.setAnalyzerConfig('loop.staleness/1', true)
 })

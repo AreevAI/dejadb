@@ -214,21 +214,21 @@ to gate it off for both this tool and `dejadb_forget`.
 
 ---
 
-### `dejadb_waiser`
+### `dejadb_loop`
 
 Runs one governed self-improvement pass and returns the run outcome plus the
 pending recommendation queue. The engine is the deterministic analyzer set;
 auto-apply happens only under the host policy the server was started with
-(`deja serve --mcp --policy waiser-policy.json` or `$WAISER_POLICY` — never
+(`deja serve --mcp --policy loop-policy.json` or `$DEJA_LOOP_POLICY` — never
 controllable by the client), and LLM reflection attaches on the CLI, not
 here. Call it at session start; review pending recommendations before
-acting. See [waiser.md](waiser.md).
+acting. See [loop.md](loop.md).
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `min_new` | integer | no | only run if at least this many new grains since the last run |
 | `min_new_errors` | integer | no | …or this many new tool failures |
-| `full_sweep` | boolean | no | re-analyze the whole memory (the `deja waiser reflect` semantics) instead of the incremental watermark |
+| `full_sweep` | boolean | no | re-analyze the whole memory (the `deja loop reflect` semantics) instead of the incremental watermark |
 
 Result: `{ "run": <run-outcome>, "pending": [ <recommendation>, … ] }`.
 
@@ -237,7 +237,7 @@ Result: `{ "run": <run-outcome>, "pending": [ <recommendation>, … ] }`.
 Lists recommendations, or acts on one. Without `action`, lists by status
 (default `pending`). With `action` + a `hash` + a mandatory `because` reason,
 performs the audited transition. An agent approving **its own** proposal is
-blocked (self-approval, `WSR-E021`) — run a reviewer process with distinct
+blocked (self-approval, `LOP-E021`) — run a reviewer process with distinct
 `--scopes`/`--actor` for separation of duties.
 
 | Parameter | Type | Required | Description |

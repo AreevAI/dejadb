@@ -3,7 +3,7 @@
 //! Run: cargo run --release -p dejadb-store --example voice_loop
 //!
 //! Telemetry is **on** (`aggregate`) here on purpose: a voice receptionist
-//! using Waiser runs with recall telemetry enabled, so this gate proves the
+//! using Deja Loop runs with recall telemetry enabled, so this gate proves the
 //! buffered, non-blocking capture stays inside the 50ms voice budget. The
 //! off path is a strict subset (a single `None` branch), so protecting the
 //! on path protects both.

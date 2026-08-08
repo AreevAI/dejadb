@@ -16,9 +16,9 @@ use dejadb_cal::store_types::RecallParams;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::Hash;
 use dejadb_store::{Axis, Capture, Direction};
-use dejadb_waiser::{now_ms, BorrowedSubstrate};
+use dejadb_loop::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
-use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
 pub const SERVER_NAME: &str = "dejadb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -34,11 +34,11 @@ pub struct McpServer {
     /// arguments are ignored and `dejadb_cal` queries are namespace-overridden,
     /// so an agent cannot read or write outside its partition.
     locked_ns: Option<String>,
-    /// Host waiser policy (§6.2) for the `dejadb_waiser` engine — the same
-    /// `waiser-policy.json` the CLI takes (`deja serve --mcp --policy`).
+    /// Host loop policy (§6.2) for the `dejadb_loop` engine — the same
+    /// `loop-policy.json` the CLI takes (`deja serve --mcp --policy`).
     /// Absent → the closed default (nothing auto-applies). Host config, set at
     /// process start, never controllable by the MCP client.
-    waiser_policy: Option<waiser::Policy>,
+    loop_policy: Option<deja_loop::Policy>,
 }
 
 impl McpServer {
@@ -54,21 +54,21 @@ impl McpServer {
             default_ns,
             allow_destructive_ops: true,
             locked_ns: None,
-            waiser_policy: None,
+            loop_policy: None,
         }
     }
 
-    /// Attach a host waiser policy so an MCP-triggered `dejadb_waiser` run
+    /// Attach a host loop policy so an MCP-triggered `dejadb_loop` run
     /// honors the same auto-apply grants, denies, and severity floors as
-    /// `deja waiser run --policy`.
-    pub fn with_waiser_policy(mut self, policy: waiser::Policy) -> Self {
-        self.waiser_policy = Some(policy);
+    /// `deja loop run --policy`.
+    pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
+        self.loop_policy = Some(policy);
         self
     }
 
-    /// The waiser engine for a call: builtins + the host policy when set.
+    /// The loop engine for a call: builtins + the host policy when set.
     fn engine(&self) -> Engine {
-        match &self.waiser_policy {
+        match &self.loop_policy {
             Some(p) => Engine::with_builtins().with_policy(p.clone()),
             None => Engine::with_builtins(),
         }
@@ -429,7 +429,7 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 serde_json::to_string(&res.result).map_err(|e| e.to_string())
             }
-            "dejadb_waiser" => {
+            "dejadb_loop" => {
                 let opts = RunOptions {
                     min_new: args.get("min_new").and_then(Value::as_u64),
                     min_new_errors: args.get("min_new_errors").and_then(Value::as_u64),
@@ -509,7 +509,7 @@ fn status_or_pending(s: &str) -> RecStatus {
     }
 }
 
-fn rec_json(r: &waiser::Recommendation) -> Value {
+fn rec_json(r: &deja_loop::Recommendation) -> Value {
     json!({
         "hash": r.hash,
         "status": r.status.as_str(),
@@ -633,7 +633,7 @@ fn tool_defs() -> Vec<Value> {
             }, "required": ["query"]}
         }),
         json!({
-            "name": "dejadb_waiser",
+            "name": "dejadb_loop",
             "description": "Run one governed self-improvement pass (deterministic analyzers; auto-apply only under the host policy the server was started with; LLM reflection attaches on the CLI, not here) and return the run outcome plus the pending recommendation queue. Call at session start; review pending recommendations before acting.",
             "inputSchema": {"type": "object", "properties": {
                 "min_new": {"type": "integer", "description": "only run if at least this many new grains since the last run (optional)"},

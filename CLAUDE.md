@@ -40,7 +40,7 @@ cargo run -p dejadb -- recall --db demo.db --ns caller --subject john
 
 ```
 memory stack:  dejadb-core ← dejadb-store ← dejadb-cal ← dejadb-context ┐
-waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
+loop engine: deja-loop ← dejadb-loop (adapter) · dejadb-llm (providers) ┤
                               both feed the leaf crates ↓                 ↓
              dejadb-mcp, dejadb-server, dejadb-py, dejadb (binary), dejadb-bench
 ```
@@ -52,9 +52,9 @@ waiser engine: waiser ← dejadb-waiser (adapter) · dejadb-llm (providers) ┤
 | `dejadb-conformance` | Backend-parameterized conformance suite (`publish = false`) — one case list (forks, replication, tombstones, PITR, BM25, vectors, CAS, CAL smoke) run against BOTH backends; the Pg runner needs `DATABASE_URL`/`DEJADB_PG_URL` and hard-fails when `CI=true` without one | — |
 | `dejadb-cal` | CAL lexer/parser/executor, ASSEMBLE, `DejaDbFacade` + mounts | yes |
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |
-| `waiser` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/waiser.md` | — |
-| `dejadb-waiser` | DejaDB substrate adapter for Waiser (`waiser::OmsSubstrate` over `DejaDbFacade`) + recall-telemetry sidecar | — |
-| `dejadb-llm` | Out-of-box LLM backends (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) for Waiser + the `remember()` free-text→Fact extraction (`extract.rs`) | — |
+| `deja-loop` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/loop.md` | — |
+| `dejadb-loop` | DejaDB substrate adapter for Deja Loop (`deja_loop::OmsSubstrate` over `DejaDbFacade`) + recall-telemetry sidecar | — |
+| `dejadb-llm` | Out-of-box LLM backends (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) for Deja Loop + the `remember()` free-text→Fact extraction (`extract.rs`) | — |
 | `dejadb-mcp` | Stdio MCP server (see below) | — |
 | `dejadb-server` | Web console + dejad hub (see below) | — |
 | `dejadb` | The `deja` binary (see below) | — |
@@ -147,7 +147,7 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
   Basic is hand-rolled (no dep). Body cap 1 MiB. Cross-origin POSTs are
   rejected via Origin check (drive-by protection). The console is
   one embedded HTML file (`console.html`, vanilla JS, no build step) — a
-  plain-language memory browser with an interactive graph, the waiser review
+  plain-language memory browser with an interactive graph, the loop review
   queue, and a Developer-mode toggle that reveals hashes/op-log/CAL; design
   source of truth is the Paper file "DejaDB", page "Console v2 — Redesign".
   Read-only `GET /api/config` reports effective config + file-vs-host

@@ -2,13 +2,13 @@
 
 Deterministic integration tests: import a committed, known dataset and
 validate the *exact* data DejaDB produces — content hashes, recall sets and
-ordering, CAL payloads, render text, waiser runs, cross-surface parity.
+ordering, CAL payloads, render text, loop runs, cross-surface parity.
 Modeled on `areev/tests/golden/`. Two layers share the plumbing here:
 
 - **Memory stack** (`golden_tests.rs` + `generator.rs` + `golden.bundle`) — a
-  deliberately *clean* dataset (zero waiser findings).
-- **Waiser** (`golden_waiser_tests.rs` + `waiser_generator.rs` +
-  `waiser.bundle`) — a dataset in which every deterministic analyzer has a
+  deliberately *clean* dataset (zero loop findings).
+- **Deja Loop** (`golden_loop_tests.rs` + `loop_generator.rs` +
+  `loop.bundle`) — a dataset in which every deterministic analyzer has a
   deliberately seeded target, driven through the real binary with the engine
   clock pinned.
 
@@ -26,16 +26,16 @@ Modeled on `areev/tests/golden/`. Two layers share the plumbing here:
 ```
 tests/
 ├── golden_tests.rs         ← 33 memory-stack tests + 5 known-bug regressions + bless
-├── golden_waiser_tests.rs  ← 34 waiser E2E tests + bless (suites W1–W15)
+├── golden_loop_tests.rs  ← 34 loop E2E tests + bless (suites W1–W15)
 └── golden/
     ├── mod.rs              ← paths, `deja`/`deja_at` runners, imports, assert_golden
     ├── generator.rs        ← memory-stack dataset (pinned epoch 2026-01-15)
-    ├── waiser_generator.rs ← waiser dataset (same epoch; seed table in its docs)
+    ├── loop_generator.rs ← loop dataset (same epoch; seed table in its docs)
     └── dataset/
         ├── golden.bundle + manifest.json   ← memory stack (39 grains)
         ├── renders/                        ← recall/ASSEMBLE golden text
-        ├── waiser.bundle + waiser-manifest.json  ← waiser (21 grains incl. a fork)
-        └── waiser/                         ← waiser output goldens (runs, queue,
+        ├── loop.bundle + loop-manifest.json  ← deja-loop (21 grains incl. a fork)
+        └── loop/                         ← deja-loop output goldens (runs, queue,
                                               show payloads, outcomes, policy…)
 ```
 
@@ -43,7 +43,7 @@ tests/
 
 ```bash
 cargo test -p dejadb --test golden_tests
-cargo test -p dejadb --test golden_waiser_tests
+cargo test -p dejadb --test golden_loop_tests
 ```
 
 Each test imports its own copy of the bundle into a temp dir — DejaDB is
@@ -76,16 +76,16 @@ anywhere — so every content hash is reproducible on any machine.
 - Clause order matters: `LIMIT` before `WITH`, `BUDGET` before `FORMAT`.
 - ASSEMBLE `FORMAT json` returns a `grains` payload, not rendered text.
 
-## The waiser layer
+## The loop layer
 
-`WAISER_NOW_MS` (read by `dejadb_waiser::now_ms`, so CLI, MCP serve, and the
+`DEJA_LOOP_NOW_MS` (read by `dejadb_loop::now_ms`, so CLI, MCP serve, and the
 console all honor it) pins the engine clock; the substrate stamps
 recommendation/audit grains from engine time (`created_at_ms`/`at_ms`), so a
-waiser run through the real binary is a **pure function of (file, policy,
+loop run through the real binary is a **pure function of (file, policy,
 now)** — recommendation content addresses included. That is what lets the
 suite byte-pin `run`/`list`/`show`/`outcomes` output and step time across
 outcome horizons and rejection cooldowns without sleeping. Garbled
-`WAISER_NOW_MS` fails loud (never silently falls back to wall time).
+`DEJA_LOOP_NOW_MS` fails loud (never silently falls back to wall time).
 
 What the suites cover: the analyzer registry + default-closed policy pins;
 first-run findings byte-exact (11 recs; run at `--telemetry off` so the
@@ -95,13 +95,13 @@ honest re-proposal; the mandatory BECAUSE, self-approval block, and the
 destructive (`FORGET`) gate; outcome measurement across 1d/7d horizons (held
 and regressed→revert); rejection cooldown expiry; auto-apply under a granting
 policy vs the trust floor under a maximal one; `--fail-on` exit codes; the
-`recall-hook --with-waiser` context block; scripted-fake LLM reflection
+`recall-hook --with-loop` context block; scripted-fake LLM reflection
 (DISCOVER→GROUND→VERIFY) and `--analyzer-cmd` external analyzers (both
 python-gated, skip when absent); live telemetry-fed analyzers; CLI↔MCP hash
-parity across separate imports; and `waiser-manifest.json` regeneration as a
+parity across separate imports; and `loop-manifest.json` regeneration as a
 frozen-format canary over Tool/Skill/Observation/Goal/valid_to shapes.
 
-Semantics the waiser suite pins (learned, not assumed):
+Semantics the loop suite pins (learned, not assumed):
 
 - **Import UNIONs heads**, so seeds written as repeated plain ADDs to one
   (subject, relation) — the duplicate and contradiction targets — are genuine
@@ -113,7 +113,7 @@ Semantics the waiser suite pins (learned, not assumed):
   `duplicate_sweep` flags on the next run — see `run-after-regression.json`'s
   `stored: 2`.
 - Hybrid recall is deadline-bounded fail-open, so `recall-hook`'s memory half
-  is **not** byte-stable under load — only the waiser block is pinned.
+  is **not** byte-stable under load — only the loop block is pinned.
 - The hook injection caps at the top 3 by severity; LLM drafts are always
   stamped `low`, so the `[llm]` badge is asserted in a minimal memory where
   the llm finding tops the queue.
@@ -146,19 +146,19 @@ Memory stack:
 3. `GOLDEN_BLESS=1 cargo test -p dejadb --test golden_tests render`
 4. Review and commit the diff in `dataset/` — the diff IS the review.
 
-Waiser:
+Deja Loop:
 
-1. Edit `waiser_generator.rs` (timestamps stay offsets from the base epoch).
-2. `cargo test -p dejadb --test golden_waiser_tests -- --ignored bless`
-3. `rm -rf golden/dataset/waiser/` (drops orphaned goldens), then
-   `GOLDEN_BLESS=1 cargo test -p dejadb --test golden_waiser_tests`
+1. Edit `loop_generator.rs` (timestamps stay offsets from the base epoch).
+2. `cargo test -p dejadb --test golden_loop_tests -- --ignored bless`
+3. `rm -rf golden/dataset/loop/` (drops orphaned goldens), then
+   `GOLDEN_BLESS=1 cargo test -p dejadb --test golden_loop_tests`
 4. Review and commit the diff — expected-count asserts inside
-   `golden_waiser_tests.rs` (stored totals, cold counts) may need the same
+   `golden_loop_tests.rs` (stored totals, cold counts) may need the same
    edit; they exist so a bless can't silently absorb a semantic change.
 
-If `golden_manifest_hashes_stable` / `waiser_manifest_hashes_stable` fails
+If `golden_manifest_hashes_stable` / `loop_manifest_hashes_stable` fails
 **without** a dataset edit, canonical serialization changed — that is a
 frozen-format / OMS conformance break (root CLAUDE.md invariant #2), not a
-test to appease. A `waiser/` golden diff without a dataset edit means
+test to appease. A `loop/` golden diff without a dataset edit means
 analyzer semantics, engine stamping, or a CLI surface changed — review it as
 a behavior change, then bless deliberately.

@@ -1,7 +1,7 @@
-//! Out-of-box LLM provider backends for Waiser (design: `waiser-reflection.md`
-//! §9). Three adapters implement `waiser::LlmBackend` over a small **blocking**
+//! Out-of-box LLM provider backends for Deja Loop (design: `loop-reflection.md`
+//! §9). Three adapters implement `deja_loop::LlmBackend` over a small **blocking**
 //! HTTP client (`ureq`) — no tokio/reqwest, matching the tree's dependency-light
-//! posture; the HTTP surface lives in this opt-in crate so `waiser`/core stay
+//! posture; the HTTP surface lives in this opt-in crate so `deja-loop`/core stay
 //! serde-only:
 //!
 //! - [`OpenAiCompat`] — the workhorse. One `POST {base_url}/chat/completions`
@@ -13,14 +13,14 @@
 //!
 //! [`resolve`] turns `--model provider:name` + environment keys into a boxed
 //! backend, so the feature lights up with zero config when a standard key is
-//! present. `--llm-cmd` (`waiser::CommandLlm`) remains the zero-dependency
+//! present. `--llm-cmd` (`deja_loop::CommandLlm`) remains the zero-dependency
 //! escape hatch for anything these three don't cover.
 //!
-//! Each adapter translates the Waiser wire protocol (a JSON request whose
+//! Each adapter translates the Deja Loop wire protocol (a JSON request whose
 //! `instructions` field is the fixed engine prompt, kept separate from the
 //! evidence data) into a chat request: `instructions` → the **system** message,
 //! the remaining request JSON → the **user** message. Output is requested as
-//! JSON; Waiser's parsers tolerate anything malformed (dropping that stage's
+//! JSON; Deja Loop's parsers tolerate anything malformed (dropping that stage's
 //! contribution), so a stray wrapper is safe.
 //!
 //! [`extract`] rides the same protocol for a second consumer: turning the free
@@ -33,7 +33,7 @@ pub use extract::{extract_facts, extract_pipeline, ground_facts, ExtractedFact, 
 
 use serde_json::{json, Value};
 use std::time::Duration;
-use waiser::{Error, LlmBackend, Result};
+use deja_loop::{Error, LlmBackend, Result};
 
 const CONNECT_SECS: u64 = 30;
 const READ_SECS: u64 = 120; // the reflection loop is async/batchy — a slow call is fine
@@ -69,7 +69,7 @@ fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value>
     serde_json::from_str(&text).map_err(|e| Error::LlmBackend(format!("decode response: {e}")))
 }
 
-/// Split a Waiser protocol request into (system, user): `instructions` become
+/// Split a Deja Loop protocol request into (system, user): `instructions` become
 /// the system prompt; the remaining fields (op/findings/evidence/claims) become
 /// the user content, so the fixed instruction never interleaves with the
 /// (possibly attacker-influenced) evidence text.
@@ -170,11 +170,11 @@ impl OpenAiCompat {
     fn build_body(&self, system: &str, user: &str, op: &str, use_schema: bool) -> Value {
         // Schema-constrained decoding (guaranteed-valid JSON) when the op has a
         // schema; otherwise plain json_object. The instruction still carries the
-        // shape, and Waiser's parsers tolerate deviation.
+        // shape, and Deja Loop's parsers tolerate deviation.
         let response_format = match (use_schema, op_schema(op)) {
             (true, Some(schema)) => json!({
                 "type": "json_schema",
-                "json_schema": {"name": "waiser", "strict": true, "schema": schema}
+                "json_schema": {"name": "loop", "strict": true, "schema": schema}
             }),
             _ => json!({"type": "json_object"}),
         };
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn split_request_isolates_instructions() {
         let (sys, user) = split_request(
-            r#"{"waiser":1,"op":"discover","instructions":"be careful","evidence":[{"hash":"h1"}]}"#,
+            r#"{"loop":1,"op":"discover","instructions":"be careful","evidence":[{"hash":"h1"}]}"#,
         );
         assert_eq!(sys, "be careful");
         assert!(user.contains("\"op\":\"discover\""));

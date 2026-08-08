@@ -38,14 +38,14 @@ structured logging and interface envelopes.
 | `VAL` | Request / input validation (cross-cutting) | `DejaDbError` |
 | `CAL` | CAL language: lexer, parser, executor, ASSEMBLE, templates, saved queries | `CalError` — `dejadb-cal/src/errors.rs` |
 | `SYS` | Internal / unexpected engine faults | `DejaDbError` |
-| `WSR` | Waiser self-improvement engine: analyzers, recommendation lifecycle, governance gates | `waiser::Error` — `crates/waiser/src/error.rs` |
+| `LOP` | Deja Loop self-improvement engine: analyzers, recommendation lifecycle, governance gates | `deja_loop::Error` — `crates/deja-loop/src/error.rs` |
 
 The MCP server, HTTP console, CLI, and Python binding do not mint their own
 codes — they surface the underlying `DejaDbError` / `CalError` (and thus its
 code) through their own envelopes (MCP `isError` result, HTTP body, stderr,
-`PyValueError`). The `waiser` engine crate is the exception: it has zero
-dejadb dependencies, so it owns the `WSR` domain. REVIEW/APPLY *syntax*
-errors stay in the substrate's `CAL` domain; `WSR` covers engine semantics
+`PyValueError`). The `deja-loop` engine crate is the exception: it has zero
+dejadb dependencies, so it owns the `LOP` domain. REVIEW/APPLY *syntax*
+errors stay in the substrate's `CAL` domain; `LOP` covers engine semantics
 (lifecycle, gates, analyzers).
 
 ## Registry — non-CAL codes
@@ -68,25 +68,25 @@ errors stay in the substrate's `CAL` domain; `WSR` covers engine semantics
 | `CAL-E084` | `AccumulateInternal` | ACCUMULATE internal failure |
 | `CAL-E085` | `AccumulateBackpressureRejected` | ACCUMULATE inflight cap exceeded |
 
-`waiser::Error` — Waiser engine (`crates/waiser/src/error.rs`), append-only:
+`deja_loop::Error` — Deja Loop engine (`crates/deja-loop/src/error.rs`), append-only:
 
 | Code | Variant | Meaning |
 |------|---------|---------|
-| `WSR-E001` | `Substrate` | A substrate call (grain read/write, CAL) failed |
-| `WSR-E002` | `CalUnsupported` | The substrate cannot execute the given CAL |
-| `WSR-E010` | `InvalidTargetRef` | A `target_ref` did not parse to a known scheme |
-| `WSR-E011` | `InvalidProposal` | A proposal payload failed validation (incl. missing BECAUSE) |
-| `WSR-E012` | `InvalidRecommendation` | A recommendation draft/grain is malformed |
-| `WSR-E020` | `LifecycleViolation` | An illegal lifecycle transition was attempted |
-| `WSR-E021` | `SelfApproval` | The approving actor authored the recommendation |
-| `WSR-E022` | `ScopeDenied` | The caller lacks a required scope (review/apply) |
-| `WSR-E023` | `DestructiveGated` | Destructive apply without admin + allow_destructive |
-| `WSR-E030` | `AnalyzerFailed` | One analyzer's run failed (its findings are dropped) |
-| `WSR-E031` | `ParamInvalid` | An analyzer parameter is outside its `ParamSpec` |
-| `WSR-E032` | `CapabilityMissing` | A required substrate capability (forks/telemetry/embeddings) is absent |
-| `WSR-E040` | `NotFound` | No recommendation at the given hash |
-| `WSR-E050` | `LlmBackend` | The optional LLM enrichment backend (`--llm-cmd`) is misconfigured or failed (never fatal — the contribution is dropped) |
-| `WSR-E099` | `Internal` | Unexpected internal fault (should not happen — file a bug) |
+| `LOP-E001` | `Substrate` | A substrate call (grain read/write, CAL) failed |
+| `LOP-E002` | `CalUnsupported` | The substrate cannot execute the given CAL |
+| `LOP-E010` | `InvalidTargetRef` | A `target_ref` did not parse to a known scheme |
+| `LOP-E011` | `InvalidProposal` | A proposal payload failed validation (incl. missing BECAUSE) |
+| `LOP-E012` | `InvalidRecommendation` | A recommendation draft/grain is malformed |
+| `LOP-E020` | `LifecycleViolation` | An illegal lifecycle transition was attempted |
+| `LOP-E021` | `SelfApproval` | The approving actor authored the recommendation |
+| `LOP-E022` | `ScopeDenied` | The caller lacks a required scope (review/apply) |
+| `LOP-E023` | `DestructiveGated` | Destructive apply without admin + allow_destructive |
+| `LOP-E030` | `AnalyzerFailed` | One analyzer's run failed (its findings are dropped) |
+| `LOP-E031` | `ParamInvalid` | An analyzer parameter is outside its `ParamSpec` |
+| `LOP-E032` | `CapabilityMissing` | A required substrate capability (forks/telemetry/embeddings) is absent |
+| `LOP-E040` | `NotFound` | No recommendation at the given hash |
+| `LOP-E050` | `LlmBackend` | The optional LLM enrichment backend (`--llm-cmd`) is misconfigured or failed (never fatal — the contribution is dropped) |
+| `LOP-E099` | `Internal` | Unexpected internal fault (should not happen — file a bug) |
 
 `SchemaSubsetError` — portable tool-schema (bind-tool) validation
 (`dejadb-core/src/types/json_schema_subset.rs`):

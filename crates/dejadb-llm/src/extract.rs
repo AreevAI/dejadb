@@ -3,20 +3,20 @@
 //! `DejaDB::remember` stores raw content as an Event and hands it to a
 //! caller-supplied extractor. In-process Rust hosts pass a closure; every other
 //! surface (CLI, Python, Node) had no way to run a model at all. This module is
-//! that extractor, built on the same [`LlmBackend`] the Waiser reflection loop
+//! that extractor, built on the same [`LlmBackend`] the Deja Loop reflection loop
 //! uses — so `--model openai:gpt-4o-mini`, `--model ollama:llama3`, and the
 //! `--llm-cmd` subprocess escape hatch all light up with no new provider code.
 //!
 //! Two stages, deliberately separate calls (proposer ≠ scorer — the same
-//! anti-Goodhart rule as `waiser-reflection.md` §5):
+//! anti-Goodhart rule as `loop-reflection.md` §5):
 //!
 //! - [`extract_facts`] (`op: "extract"`) proposes `(subject, relation, object)`
 //!   triples with a self-reported confidence.
-//! - [`ground_facts`] (`op: "ground"`, reusing Waiser's GROUND shape verbatim)
+//! - [`ground_facts`] (`op: "ground"`, reusing Deja Loop's GROUND shape verbatim)
 //!   is the **opt-in** entailment check: is each proposed fact actually
 //!   supported by the source text? Unsupported facts are dropped by the caller.
 //!
-//! Both follow the tolerance convention of `waiser::llm`'s parsers: model
+//! Both follow the tolerance convention of `deja_loop::llm`'s parsers: model
 //! garbage never errors. Extraction degrades to *no facts* (the source grain is
 //! still stored, so nothing is lost); grounding degrades to *nothing supported*
 //! (fail-closed — an unreadable verdict must not admit a fact).
@@ -28,8 +28,8 @@
 
 use serde::Deserialize;
 use serde_json::json;
-use waiser::llm::{parse_ground, EvidenceItem, GroundItem, GroundRequest};
-use waiser::{LlmBackend, Result};
+use deja_loop::llm::{parse_ground, EvidenceItem, GroundItem, GroundRequest};
+use deja_loop::{LlmBackend, Result};
 
 /// Confidence assigned when the model omits one — matches the default the
 /// `--facts` JSON path has always used, so both routes agree.
@@ -109,7 +109,7 @@ pub fn extract_facts(
         return Ok(Vec::new());
     }
     let request = json!({
-        "waiser": 1,
+        "loop": 1,
         "op": "extract",
         "instructions": extract_instructions(hint),
         "content": content,
@@ -122,7 +122,7 @@ pub fn extract_facts(
 /// verdict per input fact, in order.
 ///
 /// Fail-closed: an unparseable response, or a response missing an id, marks
-/// that fact unsupported. Reusing Waiser's GROUND wire shape means a backend
+/// that fact unsupported. Reusing Deja Loop's GROUND wire shape means a backend
 /// configured for reflection grounding works here unchanged.
 pub fn ground_facts(
     llm: &dyn LlmBackend,
@@ -141,7 +141,7 @@ pub fn ground_facts(
         }]
     };
     let req = GroundRequest {
-        waiser: 1,
+        loop_proto: 1,
         op: "ground",
         instructions: GROUND_INSTRUCTIONS,
         claims: facts

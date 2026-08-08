@@ -525,7 +525,7 @@ pub struct FactAttribution<'a> {
     /// audit can answer "which model wrote this?" from the grain itself.
     ///
     /// It rides in `extra_fields` as `extractor_model` — the same mechanism
-    /// Waiser uses to carry structured data on a grain. `GrainCommon` has a
+    /// Deja Loop uses to carry structured data on a grain. `GrainCommon` has a
     /// `provenance_chain` field that looks like the natural home, but nothing
     /// in `dejadb-core` serializes it, so a value written there would be
     /// silently dropped at the blob boundary.

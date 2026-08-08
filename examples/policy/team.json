@@ -1,8 +1,8 @@
 {
   "auto_apply_enabled": true,
   "auto_apply": [
-    { "analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low" },
-    { "analyzer": "waiser.fork_surfacing", "targets": ["memory"], "max_severity": "medium" }
+    { "analyzer": "loop.duplicate_sweep", "targets": ["memory"], "max_severity": "low" },
+    { "analyzer": "loop.fork_surfacing", "targets": ["memory"], "max_severity": "medium" }
   ],
   "deny": [],
   "severity_floors": {},

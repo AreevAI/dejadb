@@ -172,7 +172,7 @@ To keep your normal result set and merely mark the disputed parts of it, use
 This detects **structural** contradiction — divergent writes to one key. Two
 independently-added facts that merely disagree in meaning ("prefers tea" vs
 "prefers coffee") are not a fork and are not reported here; that is a semantic
-judgement, and belongs to the Waiser verifier (`docs/waiser.md`).
+judgement, and belongs to the Deja Loop verifier (`docs/loop.md`).
 
 Resolve a fork with `deja merge` (or `DejaDB::merge_heads`), which supersedes
 every tip with one merged grain and records all parents.

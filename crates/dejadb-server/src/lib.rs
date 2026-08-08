@@ -10,9 +10,9 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
-use dejadb_waiser::{now_ms, BorrowedSubstrate};
+use dejadb_loop::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Value};
-use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 
@@ -48,11 +48,11 @@ pub struct UiServer {
     /// Set true only when the operator intentionally serves to other hosts
     /// (CLI `--allow-remote`), where a non-loopback `Host` is expected.
     allow_remote: bool,
-    /// Host waiser policy (§6.2) applied to the `/api/waiser/*` engine — the
-    /// same `waiser-policy.json` the CLI takes (`deja ui --policy`). Absent →
+    /// Host loop policy (§6.2) applied to the `/api/loop/*` engine — the
+    /// same `loop-policy.json` the CLI takes (`deja ui --policy`). Absent →
     /// the closed default: nothing auto-applies, nothing is denied. Host
     /// config, never persisted in the memory file.
-    waiser_policy: Option<waiser::Policy>,
+    loop_policy: Option<deja_loop::Policy>,
 }
 
 impl UiServer {
@@ -65,22 +65,22 @@ impl UiServer {
             auth_all: false,
             segment_dir: None,
             allow_remote: false,
-            waiser_policy: None,
+            loop_policy: None,
         }
     }
 
-    /// Attach a host waiser policy to the console's waiser routes, so a
+    /// Attach a host loop policy to the console's loop routes, so a
     /// console-triggered run honors the same auto-apply grants, denies, and
-    /// severity floors as `deja waiser run --policy`.
-    pub fn with_waiser_policy(mut self, policy: waiser::Policy) -> Self {
-        self.waiser_policy = Some(policy);
+    /// severity floors as `deja loop run --policy`.
+    pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
+        self.loop_policy = Some(policy);
         self
     }
 
-    /// The waiser engine for a request: builtins + the host policy when one
+    /// The loop engine for a request: builtins + the host policy when one
     /// was attached.
     fn engine(&self) -> Engine {
-        match &self.waiser_policy {
+        match &self.loop_policy {
             Some(p) => Engine::with_builtins().with_policy(p.clone()),
             None => Engine::with_builtins(),
         }
@@ -310,7 +310,7 @@ impl UiServer {
             }
         } else if method == "POST" {
             // §5.7: token-less `deja ui` is read-only. The ONLY POST allowed is
-            // a read-only CAL statement; every write (any waiser mutation, an
+            // a read-only CAL statement; every write (any loop mutation, an
             // ADD/SUPERSEDE/FORGET CAL batch, etc.) requires --token-env. This
             // closes the bypass where a local process could execute a
             // proposal's CAL directly and skip the review queue.
@@ -638,9 +638,9 @@ impl UiServer {
                                br#"{"ok":false,"error":"no such segment"}"#.to_vec()),
                 }
             }
-            // ── Waiser API (§5.4) — GETs are reads (token-less OK); the POST
+            // ── Deja Loop API (§5.4) — GETs are reads (token-less OK); the POST
             //    mutations are guarded above (token-less → 401). ────────────
-            ("GET", "/api/waiser/recommendations") => {
+            ("GET", "/api/loop/recommendations") => {
                 let status = q("status").and_then(|s| status_from_str(&s));
                 let sub = BorrowedSubstrate::new(&self.facade);
                 match self.engine().recommendations(&sub, status) {
@@ -651,21 +651,21 @@ impl UiServer {
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
-            ("GET", "/api/waiser/health") => {
+            ("GET", "/api/loop/health") => {
                 let sub = BorrowedSubstrate::new(&self.facade);
                 match self.engine().health(&sub, now_ms()) {
                     Ok(h) => ok_json(json!({"ok": true, "health": h})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
-            ("GET", "/api/waiser/outcomes") => {
+            ("GET", "/api/loop/outcomes") => {
                 let sub = BorrowedSubstrate::new(&self.facade);
                 match self.engine().outcomes(&sub) {
                     Ok(o) => ok_json(json!({"ok": true, "outcomes": o})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
-            ("GET", "/api/waiser/analyzers") => {
+            ("GET", "/api/loop/analyzers") => {
                 // Effective settings (manifest merged with the file-config), so
                 // the Setup view renders accurate on/off state and floors.
                 let sub = BorrowedSubstrate::new(&self.facade);
@@ -674,9 +674,9 @@ impl UiServer {
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
-            ("GET", "/api/waiser/telemetry") => {
+            ("GET", "/api/loop/telemetry") => {
                 // Recall-telemetry rollups for the Sessions view. A read — open
-                // in read-only mode like the other waiser GETs.
+                // in read-only mode like the other loop GETs.
                 let mode = self.facade.with_store(|m| m.telemetry_mode());
                 if mode == dejadb_store::TelemetryMode::Off {
                     ok_json(json!({"ok": true, "enabled": false}))
@@ -712,17 +712,17 @@ impl UiServer {
                     }
                 }
             }
-            ("POST", "/api/waiser/run") => {
+            ("POST", "/api/loop/run") => {
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 match self.engine().run(&mut sub, &RunOptions::default(), now_ms()) {
                     Ok(res) => ok_json(json!({"ok": true, "run": res})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }
             }
-            ("POST", "/api/waiser/review") => self.waiser_review(body),
-            ("POST", "/api/waiser/apply") => self.waiser_apply(body),
-            ("POST", "/api/waiser/rollback") => self.waiser_rollback(body),
-            ("POST", "/api/waiser/config") => self.waiser_config(body),
+            ("POST", "/api/loop/review") => self.loop_review(body),
+            ("POST", "/api/loop/apply") => self.loop_apply(body),
+            ("POST", "/api/loop/rollback") => self.loop_rollback(body),
+            ("POST", "/api/loop/config") => self.loop_config(body),
             _ => (
                 "404 Not Found",
                 "application/json",
@@ -733,7 +733,7 @@ impl UiServer {
 
     /// The console is one principal (§5.7); authenticated requests hold all
     /// scopes (local root of trust), actor `user:console` unless overridden.
-    fn waiser_review(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+    fn loop_review(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
@@ -752,7 +752,7 @@ impl UiServer {
         }
     }
 
-    fn waiser_apply(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+    fn loop_apply(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
@@ -767,7 +767,7 @@ impl UiServer {
         }
     }
 
-    fn waiser_rollback(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+    fn loop_rollback(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
@@ -786,13 +786,13 @@ impl UiServer {
     /// namespaces?}`; absent fields are left unchanged. The console holds all
     /// scopes (local root of trust), so `Admin` is satisfied; an unknown
     /// analyzer or bad param is a structured `ok:false` (not a 500).
-    fn waiser_config(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
+    fn loop_config(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
         let id = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|v| v.get("analyzer_id").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
         // The update reads the same body; the extra `analyzer_id` key is ignored.
-        let update: waiser::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
+        let update: deja_loop::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
         let mut sub = BorrowedSubstrate::new(&self.facade);
         match self.engine().set_analyzer_config(&mut sub, &id, update, &ScopeSet::all()) {
             Ok(cfg) => ok_json(json!({"ok": true, "config": cfg})),
@@ -865,7 +865,7 @@ fn status_from_str(s: &str) -> Option<RecStatus> {
     }
 }
 
-fn rec_json(r: &waiser::Recommendation) -> Value {
+fn rec_json(r: &deja_loop::Recommendation) -> Value {
     json!({
         "hash": r.hash,
         "status": r.status.as_str(),
@@ -985,7 +985,7 @@ fn safe_segment_name(name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod waiser_route_tests {
+mod loop_route_tests {
     use super::UiServer;
     use dejadb_cal::DejaDbFacade;
     use dejadb_core::types::{Fact, Grain};
@@ -1014,22 +1014,22 @@ mod waiser_route_tests {
     #[test]
     fn token_less_console_is_read_only() {
         let s = server(None);
-        // A waiser mutation (run) is a write → 401.
-        assert!(s.route("POST", "/api/waiser/run", b"{}", None).0.starts_with("401"));
+        // A loop mutation (run) is a write → 401.
+        assert!(s.route("POST", "/api/loop/run", b"{}", None).0.starts_with("401"));
         // A write CAL → 401.
         let w = s.route("POST", "/api/cal", br#"{"query":"ADD fact SET subject=\"x\""}"#, None);
         assert!(w.0.starts_with("401"), "write CAL must be 401: {}", text(&w));
         // A read CAL → 200.
         let r = s.route("POST", "/api/cal", br#"{"query":"RECALL facts WHERE subject = \"acme\""}"#, None);
         assert!(r.0.starts_with("200"), "read CAL allowed: {}", text(&r));
-        // Waiser reads stay open token-less.
-        assert!(s.route("GET", "/api/waiser/recommendations", b"", None).0.starts_with("200"));
+        // Deja Loop reads stay open token-less.
+        assert!(s.route("GET", "/api/loop/recommendations", b"", None).0.starts_with("200"));
     }
 
     #[test]
     fn telemetry_endpoint_is_an_open_read() {
         let s = server(None);
-        let r = s.route("GET", "/api/waiser/telemetry", b"", None);
+        let r = s.route("GET", "/api/loop/telemetry", b"", None);
         assert!(r.0.starts_with("200"), "telemetry read open: {}", text(&r));
         let body = text(&r);
         assert!(body.contains("\"ok\":true"), "{body}");
@@ -1040,11 +1040,11 @@ mod waiser_route_tests {
     #[test]
     fn authenticated_run_review_apply_roundtrip() {
         let s = server(Some("tok"));
-        let run = s.route("POST", "/api/waiser/run", b"{}", Some("tok"));
+        let run = s.route("POST", "/api/loop/run", b"{}", Some("tok"));
         assert!(run.0.starts_with("200"), "run: {}", text(&run));
         assert!(text(&run).contains("\"ran\""));
 
-        let list = s.route("GET", "/api/waiser/recommendations?status=pending", b"", Some("tok"));
+        let list = s.route("GET", "/api/loop/recommendations?status=pending", b"", Some("tok"));
         let v: serde_json::Value = serde_json::from_slice(&list.2).unwrap();
         let recs = v["recommendations"].as_array().unwrap();
         assert!(!recs.is_empty(), "at least one recommendation");
@@ -1052,7 +1052,7 @@ mod waiser_route_tests {
 
         let rev = s.route(
             "POST",
-            "/api/waiser/review",
+            "/api/loop/review",
             format!(r#"{{"hash":"{hash}","decision":"approve","because":"ok"}}"#).as_bytes(),
             Some("tok"),
         );
@@ -1060,7 +1060,7 @@ mod waiser_route_tests {
 
         let ap = s.route(
             "POST",
-            "/api/waiser/apply",
+            "/api/loop/apply",
             format!(r#"{{"hash":"{hash}","because":"go"}}"#).as_bytes(),
             Some("tok"),
         );
@@ -1071,10 +1071,10 @@ mod waiser_route_tests {
     fn config_edit_toggles_analyzer_via_console() {
         let s = server(Some("tok"));
         // Token-less write → 401 (guarded like every POST).
-        assert!(s.route("POST", "/api/waiser/config", b"{}", None).0.starts_with("401"));
+        assert!(s.route("POST", "/api/loop/config", b"{}", None).0.starts_with("401"));
 
         // Read the analyzers; pick one that is on by default.
-        let list = s.route("GET", "/api/waiser/analyzers", b"", Some("tok"));
+        let list = s.route("GET", "/api/loop/analyzers", b"", Some("tok"));
         let v: serde_json::Value = serde_json::from_slice(&list.2).unwrap();
         let id = v["analyzers"]
             .as_array()
@@ -1089,14 +1089,14 @@ mod waiser_route_tests {
         // Disable it via the console endpoint.
         let post = s.route(
             "POST",
-            "/api/waiser/config",
+            "/api/loop/config",
             format!(r#"{{"analyzer_id":"{id}","enabled":false}}"#).as_bytes(),
             Some("tok"),
         );
         assert!(text(&post).contains("\"ok\":true"), "config: {}", text(&post));
 
         // It reads back disabled.
-        let list2 = s.route("GET", "/api/waiser/analyzers", b"", Some("tok"));
+        let list2 = s.route("GET", "/api/loop/analyzers", b"", Some("tok"));
         let v2: serde_json::Value = serde_json::from_slice(&list2.2).unwrap();
         let now = v2["analyzers"]
             .as_array()
@@ -1108,10 +1108,10 @@ mod waiser_route_tests {
     }
 
     #[test]
-    fn self_approval_surfaces_wsr_code() {
+    fn self_approval_surfaces_lop_code() {
         let s = server(Some("tok"));
-        s.route("POST", "/api/waiser/run", b"{}", Some("tok"));
-        let list = s.route("GET", "/api/waiser/recommendations?status=pending", b"", Some("tok"));
+        s.route("POST", "/api/loop/run", b"{}", Some("tok"));
+        let list = s.route("GET", "/api/loop/recommendations?status=pending", b"", Some("tok"));
         let v: serde_json::Value = serde_json::from_slice(&list.2).unwrap();
         let rec = &v["recommendations"].as_array().unwrap()[0];
         let hash = rec["hash"].as_str().unwrap();
@@ -1120,11 +1120,11 @@ mod waiser_route_tests {
         // The engine actor approving its own proposal is blocked.
         let rev = s.route(
             "POST",
-            "/api/waiser/review",
+            "/api/loop/review",
             format!(r#"{{"hash":"{hash}","decision":"approve","because":"self","actor":"{creator}"}}"#).as_bytes(),
             Some("tok"),
         );
-        assert!(text(&rev).contains("WSR-E021"), "self-approval blocked: {}", text(&rev));
+        assert!(text(&rev).contains("LOP-E021"), "self-approval blocked: {}", text(&rev));
     }
 }
 

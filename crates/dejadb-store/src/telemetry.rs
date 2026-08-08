@@ -2,7 +2,7 @@
 //!
 //! Disposable, rebuildable, **never-syncing** evidence about recall behavior:
 //! which grains get retrieved, which queries return nothing, how often. It
-//! feeds the telemetry-fed Waiser analyzers (cold grains, coverage gaps,
+//! feeds the telemetry-fed Deja Loop analyzers (cold grains, coverage gaps,
 //! budget pressure) — the signals that turn memory *hygiene* into memory
 //! *utility*.
 //!

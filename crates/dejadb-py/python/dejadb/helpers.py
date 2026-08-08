@@ -3,8 +3,8 @@
 The core binding is deliberately minimal — scalars in, JSON strings out. This
 module is the ergonomic layer over it: plain-dict views, a fresh-open that
 clears stale files, a review-trail printer, a clock-pin context manager for
-rehearsing Waiser's time-based checkpoints, LLM auto-detection for
-`waiser_run(model=...)`, and a labeled bar chart with PNG export (matplotlib
+rehearsing Deja Loop's time-based checkpoints, LLM auto-detection for
+`loop_run(model=...)`, and a labeled bar chart with PNG export (matplotlib
 is imported lazily and only needed for `bar`).
 
 Import it explicitly — nothing here loads unless you ask for it:
@@ -12,11 +12,11 @@ Import it explicitly — nothing here loads unless you ask for it:
     from dejadb.helpers import *
 
     db = fresh("support.db", ns="support")
-    db.waiser_run(full_sweep=True, model=auto_model())
+    db.loop_run(full_sweep=True, model=auto_model())
     for rec in show_recs(db):
         db.apply_recommendation(rec["hash"], because="...")
     with days_later(2):
-        db.waiser_run(full_sweep=True)
+        db.loop_run(full_sweep=True)
     outcomes(db)
 """
 import json
@@ -119,7 +119,7 @@ def outcomes(db):
     This is the Verify gate's record — ``held`` means the metric stayed at or
     under its baseline after the change, ``regressed`` means it got worse.
     """
-    rows = json.loads(db.waiser_outcomes())
+    rows = json.loads(db.loop_outcomes())
     for o in rows:
         print(f"  {o['metric']}: baseline={o['baseline']:.0f} → "
               f"current={o['current']:.0f}  — {o['verdict'].upper()}")
@@ -130,31 +130,31 @@ def outcomes(db):
 def days_later(n):
     """Run a block as if ``n`` days had passed.
 
-    Sets ``WAISER_NOW_MS`` — DejaDB's documented clock-pin seam, honored by
+    Sets ``DEJA_LOOP_NOW_MS`` — DejaDB's documented clock-pin seam, honored by
     the engine, CLI, MCP, and console — for the duration of the block, so
-    Waiser's 1d/7d/30d verification checkpoints can be rehearsed without
+    Deja Loop's 1d/7d/30d verification checkpoints can be rehearsed without
     waiting. Restores whatever was there before, so nesting these (or using
     one inside an already-pinned process) leaves the outer pin intact.
     """
-    previous = os.environ.get("WAISER_NOW_MS")
+    previous = os.environ.get("DEJA_LOOP_NOW_MS")
     base = int(previous) if previous else int(time.time() * 1000)
-    os.environ["WAISER_NOW_MS"] = str(base + n * 24 * 3600 * 1000)
+    os.environ["DEJA_LOOP_NOW_MS"] = str(base + n * 24 * 3600 * 1000)
     try:
         yield
     finally:
         if previous is None:
-            os.environ.pop("WAISER_NOW_MS", None)
+            os.environ.pop("DEJA_LOOP_NOW_MS", None)
         else:
-            os.environ["WAISER_NOW_MS"] = previous
+            os.environ["DEJA_LOOP_NOW_MS"] = previous
 
 
 def auto_model():
-    """Pick an LLM spec for ``waiser_run(model=...)`` from the environment.
+    """Pick an LLM spec for ``loop_run(model=...)`` from the environment.
 
     Checks Google Colab's Secrets panel (when running in Colab) and the
     process environment for ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, then
     ``OPENROUTER_API_KEY``, and returns a matching model spec. Returns
-    ``None`` when no key is configured — ``waiser_run(model=None)`` runs the
+    ``None`` when no key is configured — ``loop_run(model=None)`` runs the
     deterministic analyzers only, which is always a safe, keyless floor.
     """
     try:  # Colab: surface keys from the Secrets panel into the environment

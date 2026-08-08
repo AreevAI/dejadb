@@ -1,7 +1,7 @@
 # Attach prebuilt `deja` binaries to the GitHub Release.
 #
 # Until this existed, the only way to get the CLI was `cargo install dejadb` —
-# a full Rust build. That put the web console (`deja ui`, including the Waiser
+# a full Rust build. That put the web console (`deja ui`, including the Deja Loop
 # review queue) out of reach of anywhere without a toolchain: notebooks, Colab,
 # a scratch container, an ops box evaluating the tool.
 #

@@ -167,7 +167,7 @@ reachable only through the JSON path, not CAL's `* N`.
 **6.5 Human-in-the-loop is already modeled.** `ExecutorKind::Client` = pause and
 ask. No new concept needed — implement the envelope `tool.rs` already describes.
 
-**6.6 Governance seam (not v1).** Waiser's four gates could gate a run's writes,
+**6.6 Governance seam (not v1).** Deja Loop's four gates could gate a run's writes,
 and `runs_touching` already makes "what did this run change" answerable. Design
 the seam; build it later.
 
@@ -237,7 +237,7 @@ These imply different v1 completeness bars. Decide before building.
   workspace's `dejadb-*` convention and with `deja hub` / `deja serve`.
   Describes what it does: runs a defined workflow. **Recommended.**
 - **`deja-agent`** — overpromises autonomy for v1, and collides conceptually
-  with Waiser, which is already the self-improving-agent story. Reads like a
+  with Deja Loop, which is already the self-improving-agent story. Reads like a
   second agent product.
 
 Recommendation: crate `dejadb-run`, CLI `deja run`. Describe the *product* as an

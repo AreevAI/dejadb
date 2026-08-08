@@ -446,60 +446,60 @@ def test_open_warnings_is_json_list(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# waiser — the governed self-improvement loop
+# deja-loop — the governed self-improvement loop
 # --------------------------------------------------------------------------
 
-def test_waiser_loop_rollback_and_outcomes(tmp_path):
+def test_loop_loop_rollback_and_outcomes(tmp_path):
     m = make_db(tmp_path)
     # Distinct payloads per call: grains are content-addressed, so four
     # byte-identical failures recorded inside the same millisecond hash to the
     # same address and the fourth is rejected. Whether four identical failures
     # in one millisecond should be four grains is an engine question; this test
-    # is about the Waiser loop, so it records four distinguishable ones.
+    # is about the Deja Loop loop, so it records four distinguishable ones.
     for i in range(4):
         m.record_tool_call("stripe_refund", f"rate_limited 429 (attempt {i})", True)
     m.record_tool_call("stripe_refund", "ok", False)
 
-    run = json.loads(m.waiser_run())
+    run = json.loads(m.loop_run())
     assert run["outcome"] == "ran"
     assert run["stored"] >= 1
 
     pending = json.loads(m.recommendations())
-    tf = next(r for r in pending if r["analyzer"].startswith("waiser.tool_failure"))
+    tf = next(r for r in pending if r["analyzer"].startswith("loop.tool_failure"))
     assert "rate_limited" in tf["summary"]
 
     applied = json.loads(m.apply_recommendation(tf["hash"], "codify the lesson"))
     assert applied["rollbackable"] is True
 
     # The Verify gate's record is a JSON list (empty until checkpoints elapse).
-    assert isinstance(json.loads(m.waiser_outcomes()), list)
+    assert isinstance(json.loads(m.loop_outcomes()), list)
 
     rb = json.loads(m.rollback_recommendation(tf["hash"], "the lesson did not help"))
     assert rb["status"] == "rolled_back"
 
-    # A full-memory sweep (the `deja waiser reflect` semantics) still runs.
-    sweep = json.loads(m.waiser_run(full_sweep=True))
+    # A full-memory sweep (the `deja loop reflect` semantics) still runs.
+    sweep = json.loads(m.loop_run(full_sweep=True))
     assert sweep["outcome"] == "ran"
 
 
-def test_waiser_policy_file_grants_auto_apply(tmp_path):
-    """The bindings honor a host waiser-policy.json (path in, same file the
+def test_loop_policy_file_grants_auto_apply(tmp_path):
+    """The bindings honor a host loop-policy.json (path in, same file the
     CLI takes) — and only value-identical structural curation auto-applies."""
     m = make_db(tmp_path)
     # A case-variant exact duplicate (distinct bytes, same normalized value).
     m.add_fact("acme", "tier", "Enterprise")
     m.add_fact("acme", "tier", "enterprise")
 
-    policy = tmp_path / "waiser-policy.json"
+    policy = tmp_path / "loop-policy.json"
     policy.write_text(json.dumps({
         "auto_apply_enabled": True,
         "auto_apply": [
-            {"analyzer": "waiser.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}
+            {"analyzer": "loop.duplicate_sweep", "targets": ["memory"], "max_severity": "low"}
         ],
     }))
 
     # Without the policy nothing auto-applies.
-    run = json.loads(m.waiser_run())
+    run = json.loads(m.loop_run())
     assert run["auto_applied"] == 0
 
     # The pending consolidation is not re-proposed on a re-run (dedup), so
@@ -507,13 +507,13 @@ def test_waiser_policy_file_grants_auto_apply(tmp_path):
     fresh = dejadb.DejaDB(str(tmp_path / "granted.db"), ns="caller")
     fresh.add_fact("acme", "tier", "Enterprise")
     fresh.add_fact("acme", "tier", "enterprise")
-    granted = json.loads(fresh.waiser_run(policy=str(policy)))
+    granted = json.loads(fresh.loop_run(policy=str(policy)))
     assert granted["auto_applied"] == 1
 
     bad = tmp_path / "bad-policy.json"
     bad.write_text('{"auto_apply_enabled": true, "surprise": 1}')
     with pytest.raises(ValueError):
-        fresh.waiser_run(policy=str(bad))  # unknown keys are rejected
+        fresh.loop_run(policy=str(bad))  # unknown keys are rejected
 
 
 # --------------------------------------------------------------------------
@@ -667,7 +667,7 @@ def test_nearest_without_an_embedder_names_the_python_remedy(tmp_path):
 def test_valid_to_at_top_level_is_stored_as_the_typed_field(tmp_path):
     # add() accepts the documented spelling, and the value lands in exactly one
     # place — not swallowed into context as the compacted key "vt", where
-    # waiser.staleness and the world-time projection cannot see it.
+    # loop.staleness and the world-time projection cannot see it.
     m = make_db(tmp_path)
     past = 1_600_000_000_000
     m.add("fact", json.dumps({
@@ -838,10 +838,10 @@ def test_runs_touching_rejects_a_bad_hash(tmp_path):
         m.runs_touching("not-a-hash")
 
 
-# ── Waiser: the review queue and its gates (#34, #35, #39) ──────────────────
+# ── Deja Loop: the review queue and its gates (#34, #35, #39) ──────────────────
 
 def _a_destructive_rec(tmp_path, name="w.db"):
-    """A pending destructive recommendation: waiser.staleness on an expired fact."""
+    """A pending destructive recommendation: loop.staleness on an expired fact."""
     m = dejadb.DejaDB(str(tmp_path / name), ns="caller")
     # The compact spelling `vt` — both spellings reach `common.valid_to`, and
     # this one keeps the fixture independent of the top-level `valid_to`
@@ -850,7 +850,7 @@ def _a_destructive_rec(tmp_path, name="w.db"):
         "subject": "promo", "relation": "code", "object": "SAVE20",
         "vt": 1_600_000_000_000,
     }))
-    m.waiser_run(full_sweep=True)
+    m.loop_run(full_sweep=True)
     recs = json.loads(m.recommendations())
     assert recs and recs[0]["destructive"], recs
     return m, recs[0]["hash"]
@@ -879,7 +879,7 @@ def test_a_refused_destructive_apply_leaves_the_rec_dismissable(tmp_path):
     # The reviewer could then neither apply nor dismiss it.
     m, h = _a_destructive_rec(tmp_path)
 
-    with pytest.raises(ValueError, match="WSR-E023"):
+    with pytest.raises(ValueError, match="LOP-E023"):
         m.apply_recommendation(h, because="looks right to me")
 
     assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["pending"], \
@@ -901,9 +901,9 @@ def test_scoped_actors_enforce_separation_of_duties(tmp_path):
     # not be enforced from Python even though the engine implements it.
     m, h = _a_destructive_rec(tmp_path)
 
-    with pytest.raises(ValueError, match="WSR-E022"):
+    with pytest.raises(ValueError, match="LOP-E022"):
         m.apply_recommendation(h, because="no apply scope", scopes="review")
-    with pytest.raises(ValueError, match="WSR-E022"):
+    with pytest.raises(ValueError, match="LOP-E022"):
         m.approve_recommendation(h, "no review scope", scopes="apply")
     with pytest.raises(ValueError, match="unknown scope"):
         m.approve_recommendation(h, "typo", scopes="reviewer")
@@ -913,9 +913,9 @@ def test_scoped_actors_enforce_separation_of_duties(tmp_path):
     assert [r["status"] for r in json.loads(m.recommendations('{"status":"all"}'))] == ["approved"]
 
 
-def test_waiser_health_reports_the_loop_state(tmp_path):
+def test_loop_health_reports_the_loop_state(tmp_path):
     m, _h = _a_destructive_rec(tmp_path)
-    health = json.loads(m.waiser_health())
+    health = json.loads(m.loop_health())
     assert health["pending"] == 1
     assert health["applied"] == 0
     assert health["last_run_ms"] is not None
@@ -924,13 +924,13 @@ def test_waiser_health_reports_the_loop_state(tmp_path):
 
 def test_per_analyzer_config_round_trips(tmp_path):
     m, _h = _a_destructive_rec(tmp_path)
-    roster = json.loads(m.waiser_analyzers())
+    roster = json.loads(m.loop_analyzers())
     # The roster is how a caller discovers the id — which carries a version
-    # suffix (`waiser.staleness/1`), so guessing it is not viable.
+    # suffix (`loop.staleness/1`), so guessing it is not viable.
     ids = [a["id"] for a in roster]
-    assert "waiser.staleness/1" in ids, ids
+    assert "loop.staleness/1" in ids, ids
 
-    m.set_analyzer_config("waiser.staleness/1", enabled=False)
-    assert {a["id"]: a["enabled"] for a in json.loads(m.waiser_analyzers())}["waiser.staleness/1"] is False
-    m.set_analyzer_config("waiser.staleness/1", enabled=True)
-    assert {a["id"]: a["enabled"] for a in json.loads(m.waiser_analyzers())}["waiser.staleness/1"] is True
+    m.set_analyzer_config("loop.staleness/1", enabled=False)
+    assert {a["id"]: a["enabled"] for a in json.loads(m.loop_analyzers())}["loop.staleness/1"] is False
+    m.set_analyzer_config("loop.staleness/1", enabled=True)
+    assert {a["id"]: a["enabled"] for a in json.loads(m.loop_analyzers())}["loop.staleness/1"] is True

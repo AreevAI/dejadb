@@ -360,7 +360,7 @@ memory, so the write is shaped to stay honest about that:
 
 - **Grounding is opt-in.** `--ground-model` / `--ground-cmd` runs a *separate*
   call that checks each proposed fact against the source text — proposer ≠
-  scorer, the same rule the Waiser verifier follows. Facts the grounder does not
+  scorer, the same rule the Deja Loop verifier follows. Facts the grounder does not
   support are dropped; survivors are stamped `"verified"`.
 - **Nothing is dropped silently.** `proposed` vs `dropped` in the output account
   for everything the confidence floor (`--min-confidence`) and the grounder
@@ -392,8 +392,8 @@ deja memtool '{"command":"create","path":"/memories/notes.md","file_text":"prefe
 > writes. For the same loop **governed** — deterministic analyzers that find
 > duplicates, contradictions, recurring tool failures, and stale lessons, each
 > as a reviewable, undoable, audited recommendation — see
-> [§12 Self-improve with Waiser](#12-self-improve-with-waiser-governed-deterministic)
-> and [docs/waiser.md](waiser.md). Waiser sits on exactly the substrate below.
+> [§12 Self-improve with Deja Loop](#12-self-improve-with-loop-governed-deterministic)
+> and [docs/loop.md](loop.md). Deja Loop sits on exactly the substrate below.
 
 A self-improvement loop is: **act → log experience → reflect → distill lessons
 → recall them next time**. DejaDB is the substrate for that loop, not the loop
@@ -541,7 +541,7 @@ there is no prompt or no match, so it never adds noise.
 
 The *reflect* step — turning captured experience into lessons — is a model
 call. DejaDB will make it for you if you point it at a model (`deja remember
---model` for extraction, §9; `deja waiser run --model` for governed
+--model` for extraction, §9; `deja loop run --model` for governed
 reflection), but nothing runs one by default, and the harness below keeps the
 call entirely in your hands. The shape of a nightly (or on-`SessionEnd`)
 harness:
@@ -605,10 +605,10 @@ prints a JSON array of floats.
 
 ---
 
-## 12. Self-improve with Waiser (governed, deterministic)
+## 12. Self-improve with Deja Loop (governed, deterministic)
 
 [§10](#10-build-an-agent-that-learns-and-can-unlearn--by-hand) builds the loop
-by hand. **Waiser** governs it: it turns your agent's history into
+by hand. **Deja Loop** governs it: it turns your agent's history into
 recommendations — evidence-cited, reviewable, undoable, measured — with **no
 model calls**. The 60-second proof needs no agent:
 
@@ -620,7 +620,7 @@ for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=
 db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
 db.add_fact("acme", "deploy_target", "eu-west-1", 0.9)     # a contradiction
 
-db.waiser_run()                                            # deterministic; bare = never gated
+db.loop_run()                                            # deterministic; bare = never gated
 pending = json.loads(db.recommendations('{"status":"pending"}'))
 for r in pending: print(r["severity"], r["summary"])
 
@@ -633,27 +633,27 @@ From the CLI, the same loop against a seeded demo backend:
 
 ```bash
 deja init --db demo.db --template demo --ns caller     # plants dupes, a contradiction, a stale grain
-deja waiser run  --db demo.db --ns caller
-deja waiser list --db demo.db --ns caller              # the queue
-deja waiser approve <hash> --db demo.db --ns caller --because "confirmed"
-deja waiser apply   <hash> --db demo.db --ns caller --because "consolidating"
-deja ui --db demo.db --token-env DEJA_TOKEN            # the Waiser tab (token-less = read-only)
+deja loop run  --db demo.db --ns caller
+deja loop list --db demo.db --ns caller              # the queue
+deja loop approve <hash> --db demo.db --ns caller --because "confirmed"
+deja loop apply   <hash> --db demo.db --ns caller --because "consolidating"
+deja ui --db demo.db --token-env DEJA_TOKEN            # the Deja Loop tab (token-less = read-only)
 ```
 
 Ops without a daemon — a run is a cheap idempotent command hosts trigger
 however they already do (hook, cron, CI):
 
 ```bash
-deja waiser run  --db agent.db --min-new 20 --min-new-errors 3 --if-stale 6h --quiet   # cheap no-op off a watermark
-deja waiser list --db agent.db --fail-on high --format json                            # CI gate: exit 2 on match
+deja loop run  --db agent.db --min-new 20 --min-new-errors 3 --if-stale 6h --quiet   # cheap no-op off a watermark
+deja loop list --db agent.db --fail-on high --format json                            # CI gate: exit 2 on match
 ```
 
 Import history that predates DejaDB, auto-apply structural curation via a
 policy file, and the multi-agent supervisor pattern each have a runnable
 example under [`../examples/`](../examples/). Auto-apply is off unless a host
-`waiser-policy.json` grants it, and even then it is limited to non-destructive
+`loop-policy.json` grants it, and even then it is limited to non-destructive
 structural curation with no model- or tool-derived free text. Full guide:
-[docs/waiser.md](waiser.md).
+[docs/loop.md](loop.md).
 
 ---
 

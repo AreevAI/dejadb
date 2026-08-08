@@ -3,8 +3,8 @@
 > English · [中文](README.zh-CN.md)
 
 **The embedded memory engine for AI agents** — memory that doesn't rot, stays
-current, and proves where every fact came from — plus **Waiser**, the built-in
-loop that improves it: governed, evidence-cited, undoable, measured.
+current, and proves where every fact came from — plus **Deja Loop**, built-in
+governed self-improvement: evidence-cited, undoable, measured.
 
 [![CI](https://github.com/AreevAI/dejadb/actions/workflows/ci.yml/badge.svg)](https://github.com/AreevAI/dejadb/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -27,14 +27,14 @@ semantics, millisecond-class recall.
 > merges, and encrypted incremental sync — built into the data model, because
 > grains *are* content-addressed immutable objects.
 
-*Status: `1.1.0` — the `.mg` format and CAL are stable and documented (conformant
+*Status: `1.1.1` — the `.mg` format and CAL are stable and documented (conformant
 with the Open Memory Spec, OMS).*
 
 ## Watch the 2½-minute overview
 
-[![DejaDB in 2½ minutes — grains, CAL, and the Waiser learning loop](demo/screens/video-cover.png)](https://www.youtube.com/watch?v=HqNcgkTIryQ)
+[![DejaDB in 2½ minutes — grains, CAL, and the Deja Loop learning engine](demo/screens/video-cover.png)](https://www.youtube.com/watch?v=HqNcgkTIryQ)
 
-Grains → context assembly → CAL → the loop → Waiser, in one animated pass.
+Grains → context assembly → CAL → the agent loop → Deja Loop, in one animated pass.
 
 ## Screenshots
 
@@ -67,7 +67,7 @@ embed**, built so memory *can't* rot silently.
   point-in-time rollback of the memory file make the loop auditable and
   reversible:
   [build an agent that learns](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn--by-hand).
-- **Self-improvement with governance — [Waiser](#waiser--governed-self-improvement-built-in),
+- **Self-improvement with governance — [Deja Loop](#deja-loop--governed-self-improvement-built-in),
   built in**: eleven deterministic analyzers turn the agent's own history into
   recommendations — *"this tool failed 71% of its calls"*, *"these two facts
   contradict"* — each citing the grains it was computed from, gated
@@ -125,10 +125,10 @@ curl -fsSL https://raw.githubusercontent.com/AreevAI/dejadb/main/scripts/install
 ```
 
 It installs to `~/.local/bin` (`/usr/local/bin` as root; override with
-`DEJA_INSTALL`), pins with `DEJA_VERSION=v1.1.0`, and verifies the download
+`DEJA_INSTALL`), pins with `DEJA_VERSION=v1.1.1`, and verifies the download
 against the release's `SHA256SUMS`. Or grab an archive straight from the
 [Releases page](https://github.com/AreevAI/dejadb/releases) — handy in a
-notebook, where the wheel covers the memory and Waiser loop but `deja ui` (the
+notebook, where the wheel covers the memory and the loop but `deja ui` (the
 web console, including the review queue) lives in the binary.
 
 Embedding the store in a Rust project? Add the library crates instead of the CLI:
@@ -219,9 +219,9 @@ lesson so the harness supersedes it instead of adding a near-duplicate
 (advise-only — it never drops a write itself). Full loop:
 [cookbook §10](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn--by-hand).
 
-### Waiser — governed self-improvement, built in
+### Deja Loop — governed self-improvement, built in
 
-The section above is the loop *by hand*. **Waiser** governs it: it turns your
+The section above is the loop *by hand*. **Deja Loop** governs it: it turns your
 agent's history into recommendations — evidence-cited, reviewable, undoable,
 measured — starting with **zero model calls**. The fastest way to see it needs
 no agent and no waiting:
@@ -231,7 +231,7 @@ import dejadb, json
 db = dejadb.DejaDB("proof.db", actor="user:me")
 for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
 for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
-db.waiser_run()                                             # deterministic; never gated when bare
+db.loop_run()                                             # deterministic; never gated when bare
 for r in json.loads(db.recommendations('{"status":"pending"}')): print(r["severity"], r["summary"])
 # → high  Tool "stripe_refund" failed 5 times (71% of calls): rate_limited
 db.apply_recommendation(<hash>, because="retries belong in the client")   # audited, undoable
@@ -247,7 +247,7 @@ What that buys you:
   never recalled (`cold_grains`), questions that keep coming back empty
   (`coverage_gap`), context budgets overflowing (`budget_pressure`).
   Precision is measured, not asserted: 1.00 on the labeled fixture,
-  CI-gated at 0.90 (`cargo run -p dejadb-bench --bin waiser_precision`).
+  CI-gated at 0.90 (`cargo run -p dejadb-bench --bin loop_precision`).
 - **Nothing changes behind your back.** Four gates — propose → review →
   apply → verify — with separation of duties, a **mandatory reason** on every
   decision, a hash-chained audit grain per transition, and a stored inverse
@@ -256,9 +256,9 @@ What that buys you:
 - **It proves whether its own advice worked.** A recommendation that carries
   a metric is re-measured after you apply it — at 1d / 7d / 30d checkpoints,
   against what actually happened (did that tool failure recur?); a late
-  regression proposes a revert. `deja waiser outcomes` is the receipt.
+  regression proposes a revert. `deja loop outcomes` is the receipt.
 - **Add an LLM for what determinism can't see — verified, never trusted.**
-  `deja waiser run --model claude-sonnet` (or `openai:gpt-5`,
+  `deja loop run --model claude-sonnet` (or `openai:gpt-5`,
   `ollama:llama3.1`, any OpenAI-compatible endpoint, or `--llm-cmd 'CMD'`)
   lets a model discover cross-fact issues like a semantic contradiction — but
   every draft must ground against the cited grains and survive an
@@ -267,18 +267,18 @@ What that buys you:
   report" is a first-class answer, so it doesn't invent findings to look busy.
 - **It runs where you already run things — no daemon.** A cheap, idempotent
   command with watermark gates (`--min-new`, `--if-stale`): a Claude Code
-  `SessionEnd` hook, cron, CI (`deja waiser list --fail-on high` exits 2 —
-  a build gate), or the `dejadb_waiser` MCP tool. And the loop closes *into*
-  the agent: `deja recall-hook --with-waiser` rides the pending queue into
+  `SessionEnd` hook, cron, CI (`deja loop list --fail-on high` exits 2 —
+  a build gate), or the `dejadb_loop` MCP tool. And the loop closes *into*
+  the agent: `deja recall-hook --with-loop` rides the pending queue into
   the context Claude Code injects, so the agent sees its own recommendations
   without polling. The console (`deja ui`) shows the queue, recall sessions,
   and measured outcomes.
 
 From a fresh install: `deja init --db demo.db --template demo` seeds a demo
-corpus, `deja waiser run` proposes across analyzers (`deja waiser reflect`
-sweeps the whole memory), and the Waiser tab in `deja ui` is the governed
-review queue. Full guide: [docs/waiser.md](docs/waiser.md) · why the LLM layer
-is verified, never trusted: [docs/waiser-reflection.md](docs/waiser-reflection.md).
+corpus, `deja loop run` proposes across analyzers (`deja loop reflect`
+sweeps the whole memory), and the Deja Loop tab in `deja ui` is the governed
+review queue. Full guide: [docs/loop.md](docs/loop.md) · why the LLM layer
+is verified, never trusted: [docs/loop-reflection.md](docs/loop-reflection.md).
 
 ### Rust
 
@@ -505,8 +505,8 @@ with a projection for current Pi hardware:
 | Doc | For |
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | How DejaDB works: grains, `.mg` format, CAL, recall, sync |
-| [`docs/waiser.md`](docs/waiser.md) | Waiser — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
-| [`docs/waiser-reflection.md`](docs/waiser-reflection.md) | The reflection engine — how LLM proposals are grounded, verified, and measured |
+| [`docs/loop.md`](docs/loop.md) | Deja Loop — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
+| [`docs/loop-reflection.md`](docs/loop-reflection.md) | The reflection engine — how LLM proposals are grounded, verified, and measured |
 | [`docs/cal-reference.md`](docs/cal-reference.md) | The CAL query language reference |
 | [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 8 tools |
 | [`docs/migrate.md`](docs/migrate.md) | Importing from mem0, Zep, Letta, LangMem, Basic Memory, JSONL |
@@ -537,11 +537,11 @@ local machine, and report vulnerabilities per our [security policy](SECURITY.md)
 | `dejadb-store` | Turso-backed store: dictionary-encoded triples, hybrid recall, heads/forks, blobs (CAS), bundles/streaming, memory-tool adapter |
 | `dejadb-cal` | CAL lexer/parser/executor, multi-source ASSEMBLE, saved queries, `DejaDbFacade` (+ read-only mounts) |
 | `dejadb-context` | Budget-aware provider-optimal rendering (SML/TOON/Markdown/JSON) |
-| `waiser` | The self-improvement engine — substrate-agnostic: analyzers, four gates, recommendation lifecycle, LLM verifier (no DejaDB deps) |
-| `dejadb-waiser` | DejaDB substrate adapter for Waiser + the recall-telemetry sidecar |
-| `dejadb-llm` | Out-of-box LLM backends for Waiser reflection (OpenAI-compatible / Anthropic / Ollama) |
-| `dejadb-mcp` | Stdio MCP server (`dejadb_recall/add/supersede/forget/remember/cal` + `dejadb_waiser/recommendations`) |
-| `dejadb-server` | Local web console (memories / graph / query / Waiser queue / sessions, light + dark) + dejad hub mode (segment push/pull, bearer auth) |
+| `deja-loop` | The self-improvement engine — substrate-agnostic: analyzers, four gates, recommendation lifecycle, LLM verifier (no DejaDB deps) |
+| `dejadb-loop` | DejaDB substrate adapter for Deja Loop + the recall-telemetry sidecar |
+| `dejadb-llm` | Out-of-box LLM backends for Deja Loop reflection (OpenAI-compatible / Anthropic / Ollama) |
+| `dejadb-mcp` | Stdio MCP server (`dejadb_recall/add/supersede/forget/remember/cal` + `dejadb_loop/recommendations`) |
+| `dejadb-server` | Local web console (memories / graph / query / Deja Loop queue / sessions, light + dark) + dejad hub mode (segment push/pull, bearer auth) |
 | `dejadb` | The `deja` binary |
 | `dejadb-py` | Python bindings (`import dejadb`) |
 | `dejadb-js` | Node bindings (napi-rs native addon, `require('dejadb')`) |

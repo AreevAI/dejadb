@@ -13,14 +13,14 @@ carrying a `tool_calls` array.
 deja migrate --from tool-log --file examples/import/tool-calls.jsonl --db agent.db --ns caller
 #   {"added": 7, ...}
 
-deja waiser run --db agent.db --ns caller
-deja waiser list --db agent.db --ns caller
+deja loop run --db agent.db --ns caller
+deja loop list --db agent.db --ns caller
 #   … Tool "stripe_refund" failed 3 times (75% of calls): # rate_limited: too many requests
 #   (digit runs collapse to '#' so the signature is stable across error codes)
 
 # review with judgment — apply the lesson, or dismiss it with a reason
-deja waiser approve <hash> --db agent.db --ns caller --because "retries belong in the client"
-deja waiser apply   <hash> --db agent.db --ns caller --because "codifying the retry rule"
+deja loop approve <hash> --db agent.db --ns caller --because "retries belong in the client"
+deja loop apply   <hash> --db agent.db --ns caller --because "codifying the retry rule"
 ```
 
 `stripe_refund` failed 3 of its 4 calls (75% ≥ the 40% threshold, 3 ≥ the

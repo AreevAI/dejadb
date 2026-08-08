@@ -43,10 +43,10 @@ def test_fresh_only_removes_this_files_own_sidecars(tmp_path):
 
 
 def test_days_later_restores_an_existing_pin(monkeypatch):
-    monkeypatch.setenv("WAISER_NOW_MS", "1700000000000")
+    monkeypatch.setenv("DEJA_LOOP_NOW_MS", "1700000000000")
     with days_later(1):
-        assert os.environ["WAISER_NOW_MS"] == str(1700000000000 + 86_400_000)
-    assert os.environ["WAISER_NOW_MS"] == "1700000000000"
+        assert os.environ["DEJA_LOOP_NOW_MS"] == str(1700000000000 + 86_400_000)
+    assert os.environ["DEJA_LOOP_NOW_MS"] == "1700000000000"
 
 
 def test_facts_and_recs_are_plain_dicts(tmp_path):
@@ -59,28 +59,28 @@ def test_facts_and_recs_are_plain_dicts(tmp_path):
 
     for i in range(4):
         db.record_tool_call("tool", f"boom {i}", is_error=True, thread="s")
-    db.waiser_run(full_sweep=True)
+    db.loop_run(full_sweep=True)
     pending = recs(db)
-    assert pending and pending[0]["analyzer"].startswith("waiser.tool_failure")
+    assert pending and pending[0]["analyzer"].startswith("loop.tool_failure")
     assert show_recs(db) == pending
 
 
 def test_days_later_sets_and_restores_clock_pin(tmp_path):
-    assert "WAISER_NOW_MS" not in os.environ
+    assert "DEJA_LOOP_NOW_MS" not in os.environ
     with days_later(2):
-        pinned = int(os.environ["WAISER_NOW_MS"])
+        pinned = int(os.environ["DEJA_LOOP_NOW_MS"])
         assert pinned > 1e12
-    assert "WAISER_NOW_MS" not in os.environ
+    assert "DEJA_LOOP_NOW_MS" not in os.environ
 
 
 def test_verify_checkpoint_via_days_later(tmp_path, capsys):
     db = fresh(str(tmp_path / "h.db"), ns="t")
     for i in range(4):
         db.record_tool_call("tool", f"boom {i}", is_error=True, thread="s")
-    db.waiser_run(full_sweep=True)
+    db.loop_run(full_sweep=True)
     db.apply_recommendation(recs(db)[0]["hash"], because="test")
     with days_later(2):
-        db.waiser_run(full_sweep=True)
+        db.loop_run(full_sweep=True)
     rows = outcomes(db)
     assert rows and rows[0]["verdict"] == "held"
     assert "HELD" in capsys.readouterr().out

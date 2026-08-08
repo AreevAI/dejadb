@@ -1712,7 +1712,7 @@ fn the_anchoring_rule_binds_untyped_recalls_only() {
 /// `valid_to` (and its three siblings) are first-class common fields, but no
 /// builder arm claimed them, so they were swept into `common.context` — which
 /// compacts its keys on write, turning `valid_to` into `{"context": {"vt": …}}`.
-/// Nothing reads that: `waiser.staleness` looks for a top-level `valid_to`, and
+/// Nothing reads that: `loop.staleness` looks for a top-level `valid_to`, and
 /// so does the store's world-time projection. A bindings user setting expiry
 /// the documented way got a fact that silently never expires.
 #[test]

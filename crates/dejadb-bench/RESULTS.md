@@ -397,11 +397,11 @@ Readings:
    a phase the firmware is running at 600. Sample `vcgencmd measure_clock arm`
    *during* the phase, never after.
 
-## Waiser analyzer precision (fixture floor)
+## Deja Loop analyzer precision (fixture floor)
 
-`cargo run --release -p dejadb-bench --bin waiser_precision`
+`cargo run --release -p dejadb-bench --bin loop_precision`
 
-Fixture-measured precision/recall for the deterministic Waiser analyzers
+Fixture-measured precision/recall for the deterministic Deja Loop analyzers
 (proposal §8: no invented precision — measured numbers decide default-on).
 The fixture plants, per analyzer, N=6 positives (situations the analyzer
 should flag) and N=6 decoys (look-alikes it must not), then runs the real
@@ -413,16 +413,16 @@ regressions in CI.
 
 | analyzer | proposed | TP | FP | precision | recall |
 |---|---|---|---|---|---|
-| waiser.cold_grains | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.contradiction_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.coverage_gap | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.duplicate_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.skill_stall | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.staleness | 6 | 6 | 0 | 1.00 | 1.00 |
-| waiser.tool_failure | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.cold_grains | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.contradiction_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.coverage_gap | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.duplicate_sweep | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.skill_stall | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.staleness | 6 | 6 | 0 | 1.00 | 1.00 |
+| loop.tool_failure | 6 | 6 | 0 | 1.00 | 1.00 |
 
-(`waiser.goal_stagnation` is default-**off** — "stalled" is ambiguous — and
-`waiser.budget_pressure`, default-on since its ASSEMBLE overflow datasource was
+(`loop.goal_stagnation` is default-**off** — "stalled" is ambiguous — and
+`loop.budget_pressure`, default-on since its ASSEMBLE overflow datasource was
 wired, is a single global signal; neither appears in this per-finding fixture,
 and both are unit-tested separately. The two telemetry-fed fixtures,
 `cold_grains` and `coverage_gap`, run over an injected telemetry snapshot in
@@ -435,9 +435,9 @@ outcome_review need concurrent heads / applied history and are exercised by
 the crate tests, not this fixture). All seven fixture analyzers clear the
 0.90 default-on bar.
 
-## Waiser reflection — Effective Reliability (verifier machinery)
+## Deja Loop reflection — Effective Reliability (verifier machinery)
 
-`cargo run --release -p dejadb-bench --bin waiser_reflection`
+`cargo run --release -p dejadb-bench --bin loop_reflection`
 
 Scores the LLM reflection pipeline on a reference corpus of planted positives
 (real hidden issues DISCOVER should surface) and decoys (superficially similar
@@ -455,7 +455,7 @@ The verifier lifts ER from +0.00 to +1.00 on this corpus by filtering the
 decoys; CI guards spurious = 0 and recall ≥ 0.9. This is the **machinery
 number** (mock backend, reference corpus) — it proves the pre-queue filter
 discriminates, not what a given model scores in the field. A live model can be
-scored with `WAISER_EVAL_MODEL` (see `waiser_reflection.rs`); the live
+scored with `DEJA_LOOP_EVAL_MODEL` (see `loop_reflection.rs`); the live
 approval-rate of `origin=llm` findings accrues per file and prints on
-`deja waiser`. A corpus-scale ER number on a labeled non-parasitic corpus is
-tracked as an open follow-up in `docs/waiser-reflection.md` §6.
+`deja loop`. A corpus-scale ER number on a labeled non-parasitic corpus is
+tracked as an open follow-up in `docs/loop-reflection.md` §6.

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/dejadb-core", "crates/dejadb-store", "crates/dejadb-cal", "crates/dejadb-cli", "crates/dejadb-mcp", "crates/dejadb-context", "crates/dejadb-server", "crates/dejadb-py", "crates/dejadb-bench", "crates/waiser", "crates/dejadb-waiser", "crates/dejadb-llm", "crates/dejadb-conformance"]
+members = ["crates/dejadb-core", "crates/dejadb-store", "crates/dejadb-cal", "crates/dejadb-cli", "crates/dejadb-mcp", "crates/dejadb-context", "crates/dejadb-server", "crates/dejadb-py", "crates/dejadb-bench", "crates/deja-loop", "crates/dejadb-loop", "crates/dejadb-llm", "crates/dejadb-conformance"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["MindGryd Software Private Limited"]

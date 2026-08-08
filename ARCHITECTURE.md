@@ -17,7 +17,7 @@ Related references:
 
 - [CAL query language reference](docs/cal-reference.md)
 - [MCP server reference](docs/mcp-reference.md)
-- [Waiser: governed self-improvement](docs/waiser.md)
+- [Deja Loop: governed self-improvement](docs/loop.md)
 - [Security model & threat model](docs/security-model.md)
 - [Vulnerability reporting](SECURITY.md)
 
@@ -26,7 +26,7 @@ Related references:
 ## System at a glance
 
 DejaDB is one loop: memory is **assembled** into a prompt on the read path,
-and every action feeds back into memory on the write path — which **Waiser**
+and every action feeds back into memory on the write path — which **Deja Loop**
 then governs, verifies, and improves.
 
 ```
@@ -59,7 +59,7 @@ then governs, verifies, and improves.
 
    recall — in-process, p50 ~33µs · no server in the recall path
    write  — append-only · immutable history · full provenance · forks surface contradictions
-   waiser — deterministic core needs no model · the LLM only proposes, never gates or applies ·
+   deja-loop — deterministic core needs no model · the LLM only proposes, never gates or applies ·
             every change is evidence-cited, reviewed, undoable, and re-measured · no daemon
 ```
 
@@ -75,7 +75,7 @@ then governs, verifies, and improves.
 3. **Actions (write path).** The model calls tools; execution is always the
    **host's** job (DejaDB stores tool grains, never runs them). Results and new
    events are **captured back** as fresh grains.
-4. **Waiser (inner loop, §8).** Tails the op-log and recall telemetry, runs
+4. **Deja Loop (inner loop, §8).** Tails the op-log and recall telemetry, runs
    deterministic analyzers (optionally an *independently verified* LLM), and
    writes vetted improvements back — but only through four governance gates.
    Unlike an autonomous consolidation daemon, it has no scheduler: a run is a
@@ -482,13 +482,13 @@ agent.
 
 ---
 
-## 8. Waiser: governed self-improvement
+## 8. Deja Loop: governed self-improvement
 
-Recall (§5–§7) makes memory *useful* on the read path. **Waiser** is the layer
+Recall (§5–§7) makes memory *useful* on the read path. **Deja Loop** is the layer
 that makes memory *get better* on the write path — an agent learning from its
 own history — without the failure mode that keeps most teams from shipping it:
 an agent that edits its own memory and prompt is an unreviewed production deploy
-that runs continuously. Waiser's stance is that **self-improvement is a
+that runs continuously. Deja Loop's stance is that **self-improvement is a
 governance problem before it is an intelligence problem**. Every change to the
 backend is a first-class object — evidence-cited, reviewable, undoable, measured.
 
@@ -501,7 +501,7 @@ Two properties shape everything below:
   enrichment — it can never gate, approve, or apply anything.
 - **Governance is native.** Every change passes four gates and lands as
   hash-chained audit grains. There is no daemon and no scheduler anywhere; a
-  waiser run is a cheap, idempotent command a host triggers however it already
+  loop run is a cheap, idempotent command a host triggers however it already
   triggers things (a hook, cron, CI, an MCP call).
 
 ### 8.1 The loop and the four gates
@@ -532,7 +532,7 @@ Auto-apply is **off by default** and, where a host policy file grants it, is
 restricted to structural, engine-verified, non-destructive curation on
 memory/query targets only — never prompts, never destruction, never LLM-drafted
 text. The rule is one sentence: **the file selects and restricts; only the host
-grants** — so a synced or hostile memory file can never arrive pre-armed. Waiser
+grants** — so a synced or hostile memory file can never arrive pre-armed. Deja Loop
 inherits DejaDB's standing invariant that the only destructive verb is
 single-grain `FORGET` (§5.2), so a staleness sweep proposes tombstones a human
 must approve under `admin` + `allow_destructive_ops`. The audit trail is grains:
@@ -546,13 +546,13 @@ Eleven built-in analyzers (ten default-on) read typed grains, never prose:
 tool-failure clustering, duplicate/near-duplicate consolidation, contradiction
 resolution under functional relations, fork surfacing, staleness, skill-stall,
 goal-stagnation, and three **telemetry-fed** analyzers — cold grains, coverage
-gaps, and budget pressure — that move Waiser from *hygiene* (is memory
+gaps, and budget pressure — that move Deja Loop from *hygiene* (is memory
 internally correct?) to *utility* (is memory used, and does it help?). Precision
-is measured, not asserted: the `waiser_precision` bench scores each analyzer
+is measured, not asserted: the `loop_precision` bench scores each analyzer
 against a labeled fixture and gates CI. Teams extend the set without recompiling
 via `--analyzer-cmd`: a subprocess that reads a live-grain snapshot and returns
 advisory findings, at trust class `command` (auto-apply `never`) — it surfaces,
-never mutates. `deja waiser reflect` re-runs every analyzer over the whole
+never mutates. `deja loop reflect` re-runs every analyzer over the whole
 memory (ignoring the incremental watermark) for a first pass or a periodic deep
 sweep; dedup keeps it from re-proposing what is already queued.
 
@@ -566,7 +566,7 @@ non-blocking, so it never touches the microsecond recall / 50 ms voice budgets
 
 ### 8.3 The optional, verified LLM path
 
-Attach a model (`deja waiser run --model claude-sonnet`, or `--llm-cmd` for a
+Attach a model (`deja loop run --model claude-sonnet`, or `--llm-cmd` for a
 subprocess backend) and the pipeline gains strictly additive stages that are the
 identity when no backend is set:
 
@@ -601,33 +601,33 @@ change help." When an applied recommendation carries a metric, the engine
 re-measures it on a **schedule of checkpoints** (1d / 7d / 30d) — a typed read
 over subsequent history, no LLM — and records each outcome as a file-truth
 (`held` / `regressed`); a late regression proposes a revert. The LLM path is
-measured too: the `waiser_reflection` bench scores **Effective Reliability** (it
-subtracts for confident-wrong, unlike raw precision), and `deja waiser` reports
+measured too: the `loop_reflection` bench scores **Effective Reliability** (it
+subtracts for confident-wrong, unlike raw precision), and `deja loop` reports
 the live approval-rate of LLM drafts.
 
 The boundary is deliberate. This works for **internal, bounded, attributable**
 outcomes — did this tool fail again, does this duplicate still exist — the facts
-Waiser owns. It does **not** claim open-ended, world-facing outcomes (was a
+Deja Loop owns. It does **not** claim open-ended, world-facing outcomes (was a
 generated post good, is a patient happier); those surface as a monitored trend a
-human judges, never a machine verdict. Waiser improves the agent's *memory*, not
+human judges, never a machine verdict. Deja Loop improves the agent's *memory*, not
 its *outputs*.
 
 ### 8.5 Where it lives
 
-Waiser is three crates (§9). The **`waiser`** engine is substrate-agnostic — it
+Deja Loop is three crates (§9). The **`deja-loop`** engine is substrate-agnostic — it
 depends on no DejaDB crate and runs against any OMS-shaped store through the
 `OmsSubstrate` trait — so the governance model is not DejaDB-specific.
-**`dejadb-waiser`** implements that trait over `DejaDbFacade`; **`dejadb-llm`**
+**`dejadb-loop`** implements that trait over `DejaDbFacade`; **`dejadb-llm`**
 implements the `LlmBackend` trait with out-of-box providers. The whole user
-surface — the `deja waiser` verb family and `deja init`, two MCP tools, the
-`/api/waiser/*` routes, the Waiser console tab, and the Python/Node bindings —
+surface — the `deja loop` verb family and `deja init`, two MCP tools, the
+`/api/loop/*` routes, the Deja Loop console tab, and the Python/Node bindings —
 reduces to that engine. The OMS `0x0C` **Recommendation** type is now realized
-in `dejadb-core` (§2.3), but Waiser still writes its recommendation and audit
-grains as content-addressed Fact grains in a `waiser` namespace: migrating the
+in `dejadb-core` (§2.3), but Deja Loop still writes its recommendation and audit
+grains as content-addressed Fact grains in a `deja-loop` namespace: migrating the
 existing queue to the native type is a data decision, not a format one, and is
 deliberately separate from landing the type. Full design:
-[`waiser.md`](docs/waiser.md) and
-[`waiser-reflection.md`](docs/waiser-reflection.md).
+[`loop.md`](docs/loop.md) and
+[`loop-reflection.md`](docs/loop-reflection.md).
 
 ---
 
@@ -635,15 +635,15 @@ deliberately separate from landing the type. Full design:
 
 DejaDB is a Rust workspace of 12 crates (plus `dejadb-js`, a standalone napi
 package built outside the workspace). Two foundations converge on the leaf
-crates — the memory stack, and the Waiser self-improvement engine:
+crates — the memory stack, and the Deja Loop self-improvement engine:
 
 ```
   the memory stack
     dejadb-core ─▶ dejadb-store ─▶ dejadb-cal ─▶ dejadb-context
 
   the self-improvement engine
-    waiser ─▶ dejadb-waiser   (waiser::OmsSubstrate over DejaDbFacade)
-         └──▶ dejadb-llm      (waiser::LlmBackend — OpenAI / Anthropic / Ollama)
+    deja-loop ─▶ dejadb-loop   (deja_loop::OmsSubstrate over DejaDbFacade)
+         └──▶ dejadb-llm      (deja_loop::LlmBackend — OpenAI / Anthropic / Ollama)
 
   both feed the leaf crates
     dejadb-mcp · dejadb-server · dejadb-py · dejadb (binary) · dejadb-bench (harness)
@@ -655,14 +655,14 @@ crates — the memory stack, and the Waiser self-improvement engine:
 | **dejadb-store** | core | The Turso store: dictionary-encoded triple indexes, `entity_latest` heads/forks, hybrid recall + RRF, bounded graph ops, the op-log + HLC + tombstones, the CAS blob sidecar, bundles/streaming, and the memory-tool adapter. |
 | **dejadb-cal** | core, store | CAL lexer, parser, AST, executor, multi-source ASSEMBLE, templates, saved queries, and the `DejaDbFacade` (with read-only mounts) that binds CAL to the store. |
 | **dejadb-context** | cal, core | Budget-aware rendering (SML/TOON/Markdown/JSON), progressive disclosure, provider presets, and tool-schema formats. |
-| **waiser** | — (substrate-agnostic) | The Waiser self-improvement engine: the `OmsSubstrate` / `LlmBackend` / `Analyzer` traits, the 11 deterministic analyzers, the recommendation lifecycle + four gates, the LLM DISCOVER → GROUND → VERIFY verifier, and outcome measurement. Depends on no DejaDB crate — it runs against any OMS-shaped store. |
-| **dejadb-waiser** | waiser, cal, store, core | The DejaDB substrate adapter: implements `waiser::OmsSubstrate` over `DejaDbFacade` so `deja waiser` runs against real `.mg`/Turso files, plus the recall-telemetry sidecar. |
-| **dejadb-llm** | waiser | Out-of-box LLM provider backends (OpenAI-compatible, Anthropic, Ollama) implementing `waiser::LlmBackend` over a small blocking HTTP client — isolates the HTTP surface so the core crates stay dependency-light. |
-| **dejadb-mcp** | cal, core, store, waiser, dejadb-waiser | The stdio MCP server — eight memory- and improvement-semantic tools (six memory + `dejadb_waiser` / `dejadb_recommendations`) over newline-delimited JSON-RPC 2.0. See the [MCP reference](docs/mcp-reference.md). |
-| **dejadb-server** | cal, context, core, store, waiser, dejadb-waiser | A dependency-light HTTP/1.1 web console (loopback, read-only without a token) plus the `/api/waiser/*` routes and Waiser console tab, and an optional sync-hub mode with bearer-token auth. |
-| **dejadb** | all of the above | The `deja` binary: ~27 verbs (`add`, `recall`, `cal`, `history`, `log`, `bundle`, `import`, `migrate`, `reindex`, `verify`, `serve --mcp`, `ui`, `repl`, `remember`, `init`, `waiser`, …). |
-| **dejadb-py** | cal, context, core, store, waiser, dejadb-waiser | Python bindings (`import dejadb`); scalars in, JSON strings out. |
-| **dejadb-bench** | most of the stack | Reproducible accuracy and latency benchmark harnesses (latency, honesty, LoCoMo accuracy, `waiser_precision`, `waiser_reflection`). |
+| **deja-loop** | — (substrate-agnostic) | The Deja Loop self-improvement engine: the `OmsSubstrate` / `LlmBackend` / `Analyzer` traits, the 11 deterministic analyzers, the recommendation lifecycle + four gates, the LLM DISCOVER → GROUND → VERIFY verifier, and outcome measurement. Depends on no DejaDB crate — it runs against any OMS-shaped store. |
+| **dejadb-loop** | deja-loop, cal, store, core | The DejaDB substrate adapter: implements `deja_loop::OmsSubstrate` over `DejaDbFacade` so `deja loop` runs against real `.mg`/Turso files, plus the recall-telemetry sidecar. |
+| **dejadb-llm** | deja-loop | Out-of-box LLM provider backends (OpenAI-compatible, Anthropic, Ollama) implementing `deja_loop::LlmBackend` over a small blocking HTTP client — isolates the HTTP surface so the core crates stay dependency-light. |
+| **dejadb-mcp** | cal, core, store, deja-loop, dejadb-loop | The stdio MCP server — eight memory- and improvement-semantic tools (six memory + `dejadb_loop` / `dejadb_recommendations`) over newline-delimited JSON-RPC 2.0. See the [MCP reference](docs/mcp-reference.md). |
+| **dejadb-server** | cal, context, core, store, deja-loop, dejadb-loop | A dependency-light HTTP/1.1 web console (loopback, read-only without a token) plus the `/api/loop/*` routes and Deja Loop console tab, and an optional sync-hub mode with bearer-token auth. |
+| **dejadb** | all of the above | The `deja` binary: ~27 verbs (`add`, `recall`, `cal`, `history`, `log`, `bundle`, `import`, `migrate`, `reindex`, `verify`, `serve --mcp`, `ui`, `repl`, `remember`, `init`, `loop`, …). |
+| **dejadb-py** | cal, context, core, store, deja-loop, dejadb-loop | Python bindings (`import dejadb`); scalars in, JSON strings out. |
+| **dejadb-bench** | most of the stack | Reproducible accuracy and latency benchmark harnesses (latency, honesty, LoCoMo accuracy, `loop_precision`, `loop_reflection`). |
 
 ---
 
@@ -737,11 +737,11 @@ a safety property you can rely on.
 ### Self-improvement is governed, not autonomous
 
 Most agent-memory products treat self-improvement as an intelligence problem —
-let an LLM rewrite memory and hope. [Waiser](#8-waiser-governed-self-improvement)
+let an LLM rewrite memory and hope. [Deja Loop](#8-loop-governed-self-improvement)
 treats it as a governance problem first: a deterministic core that needs no
 model, an LLM that can only *propose* under an independent verifier, four gates
 on every change, an undo for every apply, and a re-measured outcome for every
-metric. Just as deliberately, there is **no daemon and no scheduler** — a waiser
+metric. Just as deliberately, there is **no daemon and no scheduler** — a deja-loop
 run is a command a host triggers, so improvement never runs unattended. That is
 the difference between "an LLM edits your memory" and self-improvement you can
 put in production.

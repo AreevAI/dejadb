@@ -1,10 +1,10 @@
-# Waiser policy variants
+# Deja Loop policy variants
 
-`waiser-policy.json` is the **only** place auto-apply is granted, and it is
+`loop-policy.json` is the **only** place auto-apply is granted, and it is
 host config — never persisted in a memory file. Pass it with
-`deja waiser --policy <file>` (or `$WAISER_POLICY`). It rejects unknown keys,
+`deja loop --policy <file>` (or `$DEJA_LOOP_POLICY`). It rejects unknown keys,
 so a stolen or committed policy file is inert (it cannot register an
-executable). `deja waiser policy` prints the effective policy.
+executable). `deja loop policy` prints the effective policy.
 
 > The schema rejects unknown keys, so these files carry **no comment keys** —
 > the explanation lives here in prose.

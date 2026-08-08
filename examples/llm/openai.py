@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Waiser --llm-cmd backend over the OpenAI API. One JSON request on stdin,
+"""Deja Loop --llm-cmd backend over the OpenAI API. One JSON request on stdin,
 one JSON response on stdout (see README). Needs OPENAI_API_KEY and `openai`."""
 import json
 import os
 import sys
 
 req = json.load(sys.stdin)
-MODEL = os.environ.get("WAISER_LLM_MODEL", "gpt-4o-mini")
+MODEL = os.environ.get("DEJA_LOOP_LLM_MODEL", "gpt-4o-mini")
 
 # Probe is answered locally — no model call.
 if req.get("op") == "probe":

@@ -1,0 +1,11 @@
+f1f8fc8617be  high    loop.tool_failure/1           Tool "stripe_refund" failed 5 times (83% of calls): rate limited # retry later
+04be34e8240f  medium  loop.contradiction_sweep/1    "deploy" holds 2 live values for functional relation "region"
+9d4ca5d61f05  medium  loop.contradiction_sweep/1    "sam" holds 2 live values for functional relation "lives_in"
+56cfa979d0a5  medium  loop.fork_surfacing/1         Entity "acme/tier" has 3 competing heads
+31b699696c98  medium  loop.fork_surfacing/1         Entity "deploy/region" has 2 competing heads
+51cc09e1fab9  medium  loop.fork_surfacing/1         Entity "sam/lives_in" has 2 competing heads
+64a0e7826b31  medium  loop.skill_stall/1            Skill "parse_invoices" isn't improving: practiced 12× but proficiency is still 0.25
+53a0a188353d  medium  loop.staleness/1              Expire "promo-black-friday": past its declared valid_to (100d ago)
+bf09712f1ebb  low     loop.duplicate_sweep/1        Consolidate 3 exact-duplicate grains for "acme"
+4567e2aeb3ff  low     loop.staleness/1              Expire "promo-spring": past its declared valid_to (10d ago)
+f8740b39ee73  info    loop.duplicate_sweep/1        Consolidate 2 near-duplicate observations (similarity ≥ 0.9)

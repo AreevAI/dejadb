@@ -637,7 +637,7 @@
           <button data-s="applied">Applied</button>
           <button data-s="rejected">Dismissed</button>
         </div>
-        <button class="btn sm" id="runWaiser">Run analysis</button>
+        <button class="btn sm" id="runLoop">Run analysis</button>
       </div>
       <div class="col" id="sugList"><div class="empty">loading…</div></div>
     </section>
@@ -845,7 +845,7 @@ const REL_PHRASE = {
   role: 'Role is {o}', title: 'Title is {o}', speaks: 'Speaks {o}', located_in: 'Is located in {o}',
 };
 /* No sentence is allowed to be a wall of text. A fact's object can be a
-   serialized record (waiser stores recommendations as Facts), and an
+   serialized record (the loop stores recommendations as Facts), and an
    unbroken 1.5 KB of JSON has no wrap opportunities — it just blows the
    column out sideways. */
 const MAX_SAY = 180;
@@ -904,11 +904,11 @@ let PAGE = 'memory', MVIEW = 'list', SUGTAB = 'pending', CONTAB = 'agent', ACTFI
 let ENTITY = null, ANSWER = null, SEL = null, ACTIVE_ENTS = [];
 const isGone = g => !!(g.forgotten || g.missing || g.op === 'forget');
 const isCurrent = g => !isGone(g) && !g.superseded_by && !g._stale;
-/* Waiser keeps its own bookkeeping in the file (namespace "waiser",
-   subject "__waiser_state__"). It is a real grain, but it is not something
+/* Deja Loop keeps its own bookkeeping in the file (namespace "deja-loop",
+   subject "__loop_state__"). It is a real grain, but it is not something
    the agent remembers *about anyone* — keep it out of the human views.
    It stays reachable from the op-log and the CAL console. */
-const INTERNAL_NS = new Set(['waiser']);
+const INTERNAL_NS = new Set(['deja-loop']);
 function isInternal(g) {
   const f = g.fields || {};
   if (INTERNAL_NS.has(f.namespace)) return true;
@@ -1034,7 +1034,7 @@ const TAB_STATUS = { pending: ['pending', 'approved'], applied: ['applied'], rej
 async function loadRecs(tab) {
   const out = [];
   for (const s of (TAB_STATUS[tab] || [tab])) {
-    const r = await api('/api/waiser/recommendations?status=' + encodeURIComponent(s));
+    const r = await api('/api/loop/recommendations?status=' + encodeURIComponent(s));
     if (r && r.ok && Array.isArray(r.recommendations)) out.push(...r.recommendations);
   }
   RECS[tab] = out;
@@ -1093,7 +1093,7 @@ function wireChrome() {
     b.onclick = async () => { SUGTAB = b.dataset.s; if (!RECS[SUGTAB]) await loadRecs(SUGTAB); render(); };
   });
   $('conTabs').querySelectorAll('button').forEach(b => { b.onclick = () => { CONTAB = b.dataset.c; render(); }; });
-  $('runWaiser').onclick = runAnalysis;
+  $('runLoop').onclick = runAnalysis;
   /* the run button is a write too — gate it once config lands */
   $('panelShade').onclick = closePanel;
   $('qrun').onclick = () => runQuery();
@@ -1156,7 +1156,7 @@ function render() {
   renderRail(); renderHeader(); renderExamples(); renderBanner(); renderFilterBar();
   if (PAGE === 'memory') { renderAnswer(); renderMemList(); if (MVIEW === 'graph') Graph.rebuild(); }
   if (PAGE === 'activity') renderActivity();
-  if (PAGE === 'suggestions') { renderSuggestions(); lock($('runWaiser')); }
+  if (PAGE === 'suggestions') { renderSuggestions(); lock($('runLoop')); }
   if (PAGE === 'connect') renderConnect();
   if (PAGE === 'query') {
     queryNotice(); syncEditor(); renderQueryResult(); renderOnramp();
@@ -1676,8 +1676,8 @@ function renderActivity() {
 }
 
 /* ══ suggestions ══════════════════════════════════════════════════════ */
-/* "waiser.contradiction_sweep/1" → "contradiction sweep" */
-const analyzerName = id => String(id || '').replace(/^waiser\./, '').replace(/\/\d+$/, '').replace(/[._-]/g, ' ');
+/* "loop.contradiction_sweep/1" → "contradiction sweep" */
+const analyzerName = id => String(id || '').replace(/^loop\./, '').replace(/\/\d+$/, '').replace(/[._-]/g, ' ');
 function analyzerWord(id) {
   const s = analyzerName(id);
   if (/contradict|conflict/.test(s)) return 'a conflict';
@@ -1787,26 +1787,26 @@ function sugCard(r) {
   conf.onclick = async () => {
     if (!why.value.trim()) { toast('A reason is required — it goes in the audit trail'); why.focus(); return; }
     conf.disabled = true; cancel.disabled = true;
-    await waiserAct(r.hash, armed, why.value.trim());
+    await loopAct(r.hash, armed, why.value.trim());
     conf.disabled = false; cancel.disabled = false;
   };
   return card;
 }
-/* Waiser cites evidence as bare content addresses (Vec<String>). A hash is
+/* Deja Loop cites evidence as bare content addresses (Vec<String>). A hash is
    not evidence to a human — resolve it to the sentence it stands for, and
    say so plainly when the grain is not in the loaded window. */
 const HASH_RE = /^(sha256:)?[0-9a-f]{64}$/i;
-/* Waiser's own records are Facts too — cite them as what they are rather
+/* Deja Loop's own records are Facts too — cite them as what they are rather
    than dumping the serialized recommendation into the card. */
 function internalLabel(g) {
   const f = g.fields || {};
-  if (f.relation === 'waiser_recommendation') {
+  if (f.relation === 'loop_recommendation') {
     let a = null;
     try { a = JSON.parse(f.object).analyzer; } catch (e) { /* not JSON */ }
     return a ? 'An earlier suggestion from the ' + analyzerName(a) + ' check'
              : 'An earlier suggestion from this memory’s review queue';
   }
-  if (f.relation === 'waiser_audit') return 'An entry in the audit trail';
+  if (f.relation === 'loop_audit') return 'An entry in the audit trail';
   return 'An internal DejaDB record';
 }
 function describeRef(ref) {
@@ -1865,7 +1865,7 @@ function evidenceRows(evidence) {
   return box;
 }
 async function renderOutcomes(parent) {
-  const r = await api('/api/waiser/outcomes');
+  const r = await api('/api/loop/outcomes');
   const list = (r && r.ok && r.outcomes) || [];
   if (!list.length) return;
   const host = el('div', 'stack');
@@ -1902,29 +1902,29 @@ function readOnlyNote() {
 const errText = res => ((res && res.error) || 'unknown error') + (res && res.code ? ' [' + res.code + ']' : '');
 /* The engine's lifecycle is Pending → Approved → Applied, so applying a
    pending recommendation is two calls, not one — going straight to apply
-   fails with WSR-E020. One reason covers both: the user made one decision. */
-async function waiserAct(hash, action, because) {
+   fails with LOP-E020. One reason covers both: the user made one decision. */
+async function loopAct(hash, action, because) {
   const post = (url, body) => api(url, { method: 'POST',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const done = async msg => { toast(msg); RECS = {}; await loadRecs(SUGTAB); await refresh(); };
   let res;
   if (action === 'approve_and_apply') {
-    res = await post('/api/waiser/review', { hash, decision: 'approve', because });
+    res = await post('/api/loop/review', { hash, decision: 'approve', because });
     if (!(res && res.ok)) return done('Could not approve: ' + errText(res));
-    res = await post('/api/waiser/apply', { hash, because });
+    res = await post('/api/loop/apply', { hash, because });
     return done(res && res.ok ? 'Applied ✓'
       : 'Approved, but applying failed: ' + errText(res) + ' — finish it from Needs review');
   }
-  if (action === 'apply') res = await post('/api/waiser/apply', { hash, because });
-  else if (action === 'rollback') res = await post('/api/waiser/rollback', { hash, because });
-  else res = await post('/api/waiser/review', { hash, decision: 'reject', because });
+  if (action === 'apply') res = await post('/api/loop/apply', { hash, because });
+  else if (action === 'rollback') res = await post('/api/loop/rollback', { hash, because });
+  else res = await post('/api/loop/review', { hash, decision: 'reject', because });
   return done(res && res.ok
     ? (action === 'reject' ? 'Dismissed' : action === 'rollback' ? 'Undone ✓' : 'Applied ✓')
     : 'Could not ' + (action === 'reject' ? 'dismiss' : action) + ': ' + errText(res));
 }
 async function runAnalysis() {
-  const b = $('runWaiser'); b.disabled = true; b.textContent = 'Analysing…';
-  const res = await api('/api/waiser/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  const b = $('runLoop'); b.disabled = true; b.textContent = 'Analysing…';
+  const res = await api('/api/loop/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   b.disabled = false; b.textContent = 'Run analysis';
   if (res && res.ok) {
     const n = (res.run && res.run.stored) || 0;
@@ -2175,7 +2175,7 @@ function renderConnectSettings(host) {
   ah.appendChild(el('span', 'meta', 'analyzers that produce suggestions'));
   host.appendChild(ah);
   const alist = el('div'); host.appendChild(alist);
-  api('/api/waiser/analyzers').then(r => {
+  api('/api/loop/analyzers').then(r => {
     const list = (r && r.ok && r.analyzers) || [];
     if (!list.length) { alist.appendChild(el('div', 'empty', 'No analyzers reported.')); return; }
     for (const a of list) {
@@ -2197,7 +2197,7 @@ function renderConnectSettings(host) {
       const sw = el('button', 'btn ghost sm', a.enabled ? 'On' : 'Off');
       sw.onclick = async () => {
         sw.disabled = true;
-        const res = await api('/api/waiser/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        const res = await api('/api/loop/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ analyzer_id: a.id, enabled: !a.enabled }) });
         sw.disabled = false;
         if (res && res.ok) { toast(a.enabled ? 'Turned off' : 'Turned on'); render(); }
@@ -2236,7 +2236,7 @@ function renderDevbar() {
        grain and show what was written; keep the address on hover, and fall back
        to it when the grain is not in the loaded window (or was erased). */
     const g = BYHASH[o.hash];
-    /* Bookkeeping the engine writes for itself (__waiser_state__ and friends)
+    /* Bookkeeping the engine writes for itself (__loop_state__ and friends)
        has no sentence worth reading — name the machinery instead. */
     const said = !g ? shortHash(o.hash)
       : isInternal(g) ? 'engine bookkeeping · ' + ((g.fields || {}).relation || rgType(g) || '')

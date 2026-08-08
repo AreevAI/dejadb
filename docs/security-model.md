@@ -146,13 +146,13 @@ top of that.
 - Forged grain provenance when syncing with an untrusted peer (integrity is
   guaranteed; authenticity is not, until signing lands).
 
-## Waiser (self-improvement) trust boundary
+## Deja Loop (self-improvement) trust boundary
 
-Waiser lets an agent change its own memory, so its governance *is* a security
-boundary. See [`waiser.md`](waiser.md) for the surfaces; the invariants:
+Deja Loop lets an agent change its own memory, so its governance *is* a security
+boundary. See [`loop.md`](loop.md) for the surfaces; the invariants:
 
 - **Read-only token-less console (breaking change).** Token-less `deja ui` is
-  read-only. Every write — any waiser mutation, or an `ADD`/`SUPERSEDE`/
+  read-only. Every write — any loop mutation, or an `ADD`/`SUPERSEDE`/
   `FORGET` CAL batch — returns 401 without `--token-env VAR`. This closes the
   bypass where a local process could execute a proposal's CAL directly and
   skip the review queue, which would void the whole governance story. The
@@ -169,7 +169,7 @@ boundary. See [`waiser.md`](waiser.md) for the surfaces; the invariants:
   recommendation introducing evidence-derived text is always approval-required
   with the untrusted prose shown as a literal, escaped diff.
 - **Auto-apply is default-off and host-granted only.** It requires host opt-in
-  plus a matching grant in the optional `waiser-policy.json`, a built-in
+  plus a matching grant in the optional `loop-policy.json`, a built-in
   analyzer, a memory/query target, non-destructive payload, and an engine-side
   per-draft shape check. The policy file is host config, never persisted in a
   memory file, and rejects unknown keys — a stolen or committed policy file is

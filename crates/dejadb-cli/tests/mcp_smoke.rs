@@ -41,7 +41,7 @@ fn mcp_round_trip() {
             "query": "RECALL facts WHERE subject = \"alice\" | COUNT"}})),
         rpc(7, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
             "query": "DELETE sha256:abc"}})),
-        rpc(8, "tools/call", serde_json::json!({"name": "dejadb_waiser", "arguments": {}})),
+        rpc(8, "tools/call", serde_json::json!({"name": "dejadb_loop", "arguments": {}})),
         rpc(9, "ping", serde_json::json!({})),
         // The remembered turn must be readable back through the run join —
         // dejadb_remember had no run_id, so dejadb_run_trace could only ever
@@ -94,12 +94,12 @@ fn mcp_round_trip() {
     // destructive CAL is a tool error, not a crash
     assert_eq!(by_id(7)["result"]["isError"], true);
 
-    // dejadb_waiser runs a pass and returns the run outcome + pending queue
+    // dejadb_loop runs a pass and returns the run outcome + pending queue
     assert_eq!(by_id(8)["result"]["isError"], false);
-    let waiser_text = by_id(8)["result"]["content"][0]["text"].as_str().unwrap();
-    let waiser: serde_json::Value = serde_json::from_str(waiser_text).unwrap();
-    assert_eq!(waiser["run"]["outcome"], "ran");
-    assert!(waiser["pending"].is_array());
+    let loop_text = by_id(8)["result"]["content"][0]["text"].as_str().unwrap();
+    let loop_result: serde_json::Value = serde_json::from_str(loop_text).unwrap();
+    assert_eq!(loop_result["run"]["outcome"], "ran");
+    assert!(loop_result["pending"].is_array());
 
     assert!(by_id(9)["result"].is_object());
 

@@ -1,10 +1,10 @@
 {
   "auto_apply_enabled": false,
   "auto_apply": [],
-  "deny": ["waiser.staleness"],
+  "deny": ["loop.staleness"],
   "severity_floors": {
-    "waiser.contradiction_sweep": "high",
-    "waiser.tool_failure": "medium"
+    "loop.contradiction_sweep": "high",
+    "loop.tool_failure": "medium"
   },
   "telemetry": "off"
 }

@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-09
+
+**The self-improvement engine, previously named Waiser, is renamed Deja
+Loop** — every surface, no aliases. This is technically a breaking release
+shipped as a patch: nothing had adopted the old names, so the rename went
+out clean rather than dragging a deprecation tail. If you somehow depended
+on the old names, this is the one entry that maps them. Historical entries
+below have been rewritten to the new names.
+
+### Changed — breaking (rename only; no behavior changes)
+
+- **Crates**: `waiser` → **`deja-loop`** (engine, still zero DejaDB deps),
+  `dejadb-waiser` → **`dejadb-loop`** (substrate adapter). The old crates
+  stay published on crates.io but are abandoned at 1.1.0.
+- **CLI**: `deja waiser <sub>` → **`deja loop <sub>`** (same subcommands);
+  `deja recall-hook --with-waiser` → `--with-loop`.
+- **HTTP API**: `/api/waiser/*` → **`/api/loop/*`** (all ten routes).
+- **MCP**: tool `dejadb_waiser` → **`dejadb_loop`** (`dejadb_recommendations`
+  unchanged).
+- **Bindings**: Python `waiser_run/waiser_health/waiser_analyzers/
+  waiser_outcomes` → `loop_run/loop_health/loop_analyzers/loop_outcomes`;
+  Node `waiserRun/…` → `loopRun/…`; Rust builders `with_waiser_policy` →
+  `with_loop_policy`.
+- **Host config**: policy file `waiser-policy.json` → **`loop-policy.json`**;
+  env vars `WAISER_POLICY`/`WAISER_NOW_MS` → `DEJA_LOOP_POLICY`/
+  `DEJA_LOOP_NOW_MS`.
+- **Error codes**: domain `WSR` → **`LOP`** (same numbers, e.g. `WSR-E021` →
+  `LOP-E021`). A one-time exception to the append-only rule, taken while
+  nothing external consumed the codes.
+- **Persisted values** (old files keep working for reads, but engine
+  bookkeeping written by ≤1.1.0 is not found by 1.1.1 — regenerate with one
+  `deja loop run`): internal namespace `waiser` → **`deja-loop`**
+  (hyphenated so it cannot collide with a user namespace named `loop`),
+  state subject `__waiser_state__` → `__loop_state__`, relations
+  `waiser_recommendation`/`waiser_audit` → `loop_recommendation`/
+  `loop_audit`, analyzer ids `waiser.<name>/1` → **`loop.<name>/1`**.
+- **Wire protocols** (external `--llm-cmd` / `--analyzer-cmd` processes):
+  request marker `"waiser": 1` → `"loop": 1`, `"waiser_analyzer": 1` →
+  `"loop_analyzer": 1`.
+
+### Fixed
+
+- The engine's error-code uniqueness test now covers all 15 variants
+  (`LlmBackend` was missing from the representative list).
+- `loop.goal_stagnation/1`'s doc no longer references a `deja loop enable`
+  subcommand that never existed.
+- `crates/dejadb-js/Cargo.toml` version drift (was stuck at 1.0.5).
+
 ## [1.1.0] - 2026-08-08
 
 A minor rather than a patch: this release removes and renames public
@@ -73,15 +121,15 @@ and State-JSON changes only.
   cannot compile turso's mimalloc/zstd deps. `scripts/install.sh` is the
   matching `curl | sh` installer: it resolves the latest tag, verifies the
   download against `SHA256SUMS`, and installs to `~/.local/bin`. This is what
-  makes `deja ui` — the console, including the Waiser review queue — reachable
+  makes `deja ui` — the console, including the Deja Loop review queue — reachable
   from a notebook or a scratch container, where the wheel covers the memory
   loop but the console lives in the binary.
-- **Waiser bindings parity** (#39). Four capabilities the CLI and HTTP
-  surfaces had and the bindings did not: `waiser_health()` / `waiserHealth()`
+- **Deja Loop bindings parity** (#39). Four capabilities the CLI and HTTP
+  surfaces had and the bindings did not: `loop_health()` / `loopHealth()`
   (the loop's staleness snapshot — how a host notices a SessionEnd hook or cron
   came unwired), `approve_recommendation()` / `approveRecommendation()` (approve
   **without** applying, so a supervising agent can approve for a human to apply
-  later), `waiser_analyzers()` + `set_analyzer_config()` (the roster and the
+  later), `loop_analyzers()` + `set_analyzer_config()` (the roster and the
   per-analyzer enable/disable behind the console's Setup tab), and an optional
   `scopes` argument on the review/apply calls. The bindings previously
   hardcoded `ScopeSet::all()`, so the separation-of-duties gate
@@ -155,7 +203,7 @@ and State-JSON changes only.
   `system_valid_from`, `system_valid_to`) are first-class common fields, but no
   builder arm claimed them, so they were swept into `common.context` — which
   compacts its keys on write, so `valid_to` came back as
-  `{"context": {"vt": …}}`. Nothing reads that: `waiser.staleness` looks for a
+  `{"context": {"vt": …}}`. Nothing reads that: `loop.staleness` looks for a
   top-level `valid_to`, and so does the store's world-time (`vf`/`vt`) column
   projection. Any bindings user setting expiry the documented way got a fact
   that silently never expires and never participates in an as-of query. The
@@ -387,7 +435,7 @@ and State-JSON changes only.
   never occur through `ADD`/`SUPERSEDE SET` — the type is engine-emitted and
   lifecycle-gated. SML 1.1's `<recommendation>` element renders it.
 
-  Waiser has **not** been migrated onto the type — its recommendations still
+  Deja Loop has **not** been migrated onto the type — its recommendations still
   ride as Facts. Landing the format and rewriting a live queue are different
   risks, and they are sequenced separately.
 
@@ -449,7 +497,7 @@ and State-JSON changes only.
   so in a comment: "the CLI can't run an LLM"). `deja remember --content "..."
   --model openai:gpt-4o-mini` now does the extraction, as do `model=` /
   `llm_cmd=` on the Python and Node bindings. Extraction rides the existing
-  Waiser wire protocol as a new `extract` op, so all three shipped providers
+  Deja Loop wire protocol as a new `extract` op, so all three shipped providers
   (OpenAI-compatible / Anthropic / Ollama) plus the `--llm-cmd` subprocess
   escape hatch work with no new provider code, and no new dependency.
 
@@ -465,7 +513,7 @@ and State-JSON changes only.
     CAL-filterable, so `RECALL facts WHERE verification_status = "unverified"`
     is a review queue rather than a pile of new writes.
   - `--ground-model` / `--ground-cmd` adds an opt-in entailment pass in a
-    *separate* call (proposer ≠ scorer, as in the Waiser verifier): unsupported
+    *separate* call (proposer ≠ scorer, as in the Deja Loop verifier): unsupported
     facts are dropped, survivors become `"verified"`.
   - Drops are never silent — the output accounts for `proposed` vs `dropped`
     across the `--min-confidence` floor and the grounder, and a response that
@@ -830,7 +878,7 @@ and State-JSON changes only.
   all-clear. Reaches every surface that speaks CAL (`deja cal`, the MCP
   `dejadb_cal` tool, the console, both bindings). Detects **structural**
   contradiction only — semantically incompatible facts that were never forked
-  remain Waiser's job. New `CalStoreFacade::open_forks()` (default: no forks) and
+  remain Deja Loop's job. New `CalStoreFacade::open_forks()` (default: no forks) and
   `store_types::ForkGroupInfo`. Covered by ten end-to-end tests in
   `crates/dejadb-cal/tests/cal_integration.rs`.
 - **`deja hub`** — the sync hub (`dejad`) as a CLI verb: many apps, one shared
@@ -839,13 +887,13 @@ and State-JSON changes only.
   non-loopback bind still needs `--allow-remote`. Segment reads are gated too,
   not just pushes; a pushed segment can only ever *add* grains.
 - **A redesigned web console** for non-technical reviewers: a plain-language
-  memory browser with an interactive graph, the Waiser review queue, a CAL
+  memory browser with an interactive graph, the Deja Loop review queue, a CAL
   workbench (cards, table, graph, formats, history, saved queries), and a
   Developer-mode toggle that reveals hashes, the op log and CAL. Still one
   embedded `console.html` with no build step.
 - **`dejadb.helpers`**, shipped inside the Python wheel: `fresh`, `facts` /
   `show_facts`, `recs` / `show_recs`, `audit`, `outcomes`, `days_later`
-  (a context manager over the `WAISER_NOW_MS` clock-pin seam), `auto_model`
+  (a context manager over the `DEJA_LOOP_NOW_MS` clock-pin seam), `auto_model`
   and `bar`. Imported explicitly — the core surface is still exactly the native
   class. `dejadb-py` moves to maturin's mixed layout, so the native module is
   now `dejadb.dejadb`; `import dejadb` is unchanged.
@@ -870,7 +918,7 @@ and State-JSON changes only.
   only; `WITH superseded` opts the full chain back in (on this leg — the
   anchored leg followed in the next release, see Unreleased).
   New `DejaDB::recent_live`, so scans that legitimately want
-  every version — Waiser's analyzers — keep `recent` unchanged.
+  every version — Deja Loop's analyzers — keep `recent` unchanged.
 - **`CONTRADICTIONS` no longer answers "nothing is contested" about a memory
   that is.** The clause filters after recall, so the recall's `LIMIT` — 50 by
   default — also bounded which forks could be seen: a fork sitting below the
@@ -908,7 +956,7 @@ and State-JSON changes only.
 - `dejadb.helpers.fresh` removes exactly the memory file and its known
   sidecars. It globbed on the name as a prefix, so `fresh("h.db")` also deleted
   a neighbouring `h.db.backup` — and `rmtree`'d a neighbouring directory.
-- `dejadb.helpers.days_later` restores a pre-existing `WAISER_NOW_MS` instead
+- `dejadb.helpers.days_later` restores a pre-existing `DEJA_LOOP_NOW_MS` instead
   of unsetting it, so the context manager nests.
 - An `ASSEMBLE` no longer holds a second copy of its whole result set: the
   budget trim splits the grains it already owns instead of cloning both the
@@ -961,7 +1009,7 @@ and State-JSON changes only.
 
 ### Added
 
-- **`deja recall-hook --with-waiser`** — the UserPromptSubmit hook now closes
+- **`deja recall-hook --with-loop`** — the UserPromptSubmit hook now closes
   the loop *into* the agent's context: after the memory block it appends a
   compact pending-recommendation queue (severity + summary, capped at 3,
   `origin=llm`/external entries labeled). `deja init` and `deja hook
@@ -974,26 +1022,26 @@ and State-JSON changes only.
   Duplicate consolidation deliberately carries no metric yet: a supersession
   creates a replacement grain, so a live-grain count can't honestly measure it
   (needs a supersede-by-existing primitive).
-- **Waiser bindings parity** — Python/Node gain `rollback_recommendation`,
-  `waiser_outcomes`, and `waiser_run(full_sweep=…, policy=…)`: the full-memory
+- **Deja Loop bindings parity** — Python/Node gain `rollback_recommendation`,
+  `loop_outcomes`, and `loop_run(full_sweep=…, policy=…)`: the full-memory
   `reflect` semantics and the host policy file (the only auto-apply path) are
   now reachable from the bindings.
 - **Host policy on every run surface** — `deja ui --policy` and
-  `deja serve --mcp --policy` (or `$WAISER_POLICY`) attach the same
-  `waiser-policy.json` the CLI takes, so console- and MCP-triggered runs honor
-  one set of grants; never controllable by a client. The console's Waiser tab
-  states it; the `dejadb_waiser` tool description no longer implies the CLI
+  `deja serve --mcp --policy` (or `$DEJA_LOOP_POLICY`) attach the same
+  `loop-policy.json` the CLI takes, so console- and MCP-triggered runs honor
+  one set of grants; never controllable by a client. The console's Deja Loop tab
+  states it; the `dejadb_loop` tool description no longer implies the CLI
   and MCP engines are identical (LLM reflection remains CLI-only).
 - **`examples/analyzers/`** — a ready-to-run external command analyzer (a PII
   scan in dependency-free Python) with the probe/analyze protocol documented
   inline; validated live against the demo corpus.
-- **`waiser_reflection` results table in RESULTS.md** — the Effective-
+- **`loop_reflection` results table in RESULTS.md** — the Effective-
   Reliability machinery numbers (verifier lifts ER +0.00 → +1.00 on the
   reference corpus) are now recorded alongside the analyzer-precision table.
 
-- **Waiser recall-telemetry sidecar (§8).** A disposable, never-syncing
+- **Deja Loop recall-telemetry sidecar (§8).** A disposable, never-syncing
   `<file>.telemetry.db` records what recall actually surfaced — grain access,
-  query outcomes, assembly-budget pressure — so Waiser can see memory *utility*,
+  query outcomes, assembly-budget pressure — so Deja Loop can see memory *utility*,
   not just internal consistency. Encrypted under the main file's key,
   `FORGET`-scrubbed, rebuildable. Capture on the recall path is buffered and
   non-blocking (voice-loop recall p50 stays ~82µs with telemetry on). Host-only
@@ -1005,24 +1053,24 @@ and State-JSON changes only.
   and `budget_pressure` (assembly overflow). All default-on (`budget_pressure`
   once its ASSEMBLE overflow datasource was wired — see below);
   `cold_grains`/`coverage_gap` at 1.00 fixture precision.
-- **Optional LLM enrichment (§9).** `deja waiser run --llm-cmd 'CMD'` attaches a
+- **Optional LLM enrichment (§9).** `deja loop run --llm-cmd 'CMD'` attaches a
   subprocess backend (`CommandLlm`, mirroring `--embed-cmd`) that only *adds* —
   DISCOVER proposes cited `origin=llm` drafts (never auto-applied), ENRICH adds
   a whitelisted guidance note; with no backend the stages are the identity, so
   the deterministic output is unchanged. Backends in `examples/llm/`. New error
-  `WSR-E050`.
-- **Console Sessions + Setup views** and `GET /api/waiser/telemetry`: visualize
+  `LOP-E050`.
+- **Console Sessions + Setup views** and `GET /api/loop/telemetry`: visualize
   recall activity, coverage gaps, and the effective configuration.
-- **Waiser reflection verifier + measurement** (design:
-  `docs/waiser-reflection.md`). The LLM path is no longer "cite a real hash and
+- **Deja Loop reflection verifier + measurement** (design:
+  `docs/loop-reflection.md`). The LLM path is no longer "cite a real hash and
   hope": DISCOVER runs under an abstention-legitimate objective, then every
   draft passes an independent **GROUND** (evidence-entailment) and **VERIFY**
   (adversarial keep/kill) gate — each a separate call (proposer ≠ scorer) —
   before it can reach the review queue, stamped with the verifier's calibrated
-  confidence. Measured, not asserted: a `waiser_reflection` Effective-Reliability
+  confidence. Measured, not asserted: a `loop_reflection` Effective-Reliability
   bench (the verifier lifts ER from +0.00 to +1.00 on the reference corpus by
-  filtering decoys) and a live approval-rate metric on `deja waiser`.
-- **Out-of-box LLM providers** (`dejadb-llm` crate): `deja waiser run --model
+  filtering decoys) and a live approval-rate metric on `deja loop`.
+- **Out-of-box LLM providers** (`dejadb-llm` crate): `deja loop run --model
   claude-sonnet` (or `openai:gpt-5`, `ollama:llama3.1`) attaches a built-in
   backend — OpenAI-compatible (covers ~90% of providers incl. Gemini's compat
   endpoint, Groq, OpenRouter, vLLM, LM Studio, llama.cpp), Anthropic, or Ollama
@@ -1033,7 +1081,7 @@ and State-JSON changes only.
   native `format`) with a `json_object` fallback; prompt caching is transparent
   on OpenAI/OpenRouter and explicit (`cache_control`) on Anthropic; an
   `openrouter:` shortcut reaches many models with one key. `--model` / `--llm-cmd`
-  are also exposed on the Python and Node `waiser_run`.
+  are also exposed on the Python and Node `loop_run`.
 - **budget_pressure is now default-on**: the ASSEMBLE budget allocator records
   overflow (grains dropped to fit the token budget) via
   `CalStoreFacade::note_assembly_budget`, feeding the analyzer's telemetry.
@@ -1060,13 +1108,13 @@ and State-JSON changes only.
   findings — trust class `command`, auto-apply `never` (surfaces, never mutates).
   The only custom-analyzer path for Python/Node. A failure skips the analyzer,
   never the run.
-- **Full-memory reflection sweep** (`deja waiser reflect`): re-analyze the whole
+- **Full-memory reflection sweep** (`deja loop reflect`): re-analyze the whole
   memory in one pass, ignoring the incremental watermark, for a first look at an
   imported memory or a periodic deep pass. Dedup/cooldowns still suppress what is
   already queued and the watermark still advances, so later runs stay incremental.
 - **Writable console Setup**: toggle analyzers on/off from the console, persisted
-  to the file's waiser config (`POST /api/waiser/config`, Admin-gated like every
-  write). `GET /api/waiser/analyzers` now returns effective settings + trust
+  to the file's loop config (`POST /api/loop/config`, Admin-gated like every
+  write). `GET /api/loop/analyzers` now returns effective settings + trust
   class. Auto-apply is still only grantable via a host policy file, never the UI.
 
 ### Fixed
@@ -1084,7 +1132,7 @@ and State-JSON changes only.
 - **CAL scoping.** Saved-query bodies stay read-only even when parameterized,
   and a nested `ASSEMBLE`'s `WITH` recall-tuning options scope to that assemble
   instead of leaking to the enclosing `EXPLAIN`/`COALESCE` query.
-- **Waiser.** Tool-failure lessons re-measure against their exact failure
+- **Deja Loop.** Tool-failure lessons re-measure against their exact failure
   signature, so an unrelated later failure of the same tool no longer reverts a
   valid lesson; rejection cooldowns now back off exponentially; empty-signature
   clusters and auto-apply consolidations that would drop an expiry are refused;

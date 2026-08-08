@@ -1,11 +1,11 @@
-# Waiser LLM enrichment backends (`--llm-cmd`)
+# Deja Loop LLM enrichment backends (`--llm-cmd`)
 
 The optional LLM layer (proposal §9) is a **subprocess protocol**, exactly like
-`--embed-cmd`: waiser writes one JSON request to the command's stdin and reads
+`--embed-cmd`: the loop writes one JSON request to the command's stdin and reads
 one JSON response from its stdout. No SDK, no network code in DejaDB.
 
 ```bash
-deja waiser run --db agent.db --llm-cmd './examples/llm/claude.sh'
+deja loop run --db agent.db --llm-cmd './examples/llm/claude.sh'
 ```
 
 The LLM can only **add** to the deterministic output — it never gates or
@@ -27,7 +27,7 @@ never fails the run.
 
 ```json
 {
-  "waiser": 1,
+  "loop": 1,
   "op": "probe" | "discover" | "ground" | "verify" | "enrich",
   "instructions": "<fixed engine instruction — treat as the system prompt>",
   "findings":  [{"analyzer": "...", "summary": "...", "target": "...", "severity": "..."}],
@@ -64,7 +64,7 @@ The pipeline is `DISCOVER → GROUND → VERIFY → ENRICH`, each a **separate c
 
 Return **only** JSON. Unknown fields are dropped; strings are capped; a response
 that doesn't parse drops that stage's contribution (safe default). See
-`docs/waiser-reflection.md` for the full design.
+`docs/loop-reflection.md` for the full design.
 
 ## Backends here
 

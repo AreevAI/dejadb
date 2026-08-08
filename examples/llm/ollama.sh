@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Waiser --llm-cmd backend using a local model via `ollama`.
+# Deja Loop --llm-cmd backend using a local model via `ollama`.
 # Protocol: one JSON request on stdin, one JSON response on stdout (see README).
-# Requires: ollama, jq. Model via $WAISER_LLM_MODEL (default llama3.1).
+# Requires: ollama, jq. Model via $DEJA_LOOP_LLM_MODEL (default llama3.1).
 set -euo pipefail
 
-model="${WAISER_LLM_MODEL:-llama3.1}"
+model="${DEJA_LOOP_LLM_MODEL:-llama3.1}"
 req="$(cat)"
 op="$(printf '%s' "$req" | jq -r '.op')"
 

@@ -59,18 +59,18 @@ publishes, in this order — a crate can only publish once its path dependencies
 are on crates.io:
 
 ```
-dejadb-core, waiser          (no internal deps)
+dejadb-core, deja-loop          (no internal deps)
   → dejadb-store             (core)
   → dejadb-cal               (core, store)
   → dejadb-context           (cal, core)
-  → dejadb-llm               (waiser)
-  → dejadb-waiser            (cal, core, store, waiser)
+  → dejadb-llm               (deja-loop)
+  → dejadb-loop            (cal, core, store, deja-loop)
   → dejadb-mcp, dejadb-server, dejadb
 ```
 
-**Ten publishable crates, not seven** — this list used to omit `waiser`,
-`dejadb-llm` and `dejadb-waiser`, so following it failed at `dejadb-mcp`
-(which needs `dejadb-waiser`). Recompute rather than trust it:
+**Ten publishable crates, not seven** — this list used to omit `deja-loop`,
+`dejadb-llm` and `dejadb-loop`, so following it failed at `dejadb-mcp`
+(which needs `dejadb-loop`). Recompute rather than trust it:
 
 ```bash
 # topological order from the manifests

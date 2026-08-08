@@ -3,12 +3,12 @@
 //! read-only tests share.
 //!
 //! Compiled into BOTH golden test binaries (`golden_tests`,
-//! `golden_waiser_tests`); each uses its own subset, so per-binary dead-code
+//! `golden_loop_tests`); each uses its own subset, so per-binary dead-code
 //! lints are expected noise, not rot.
 #![allow(dead_code)]
 
 pub mod generator;
-pub mod waiser_generator;
+pub mod loop_generator;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -48,17 +48,17 @@ pub fn deja(args: &[&str]) -> (bool, String, String) {
     )
 }
 
-/// Run `deja` with the waiser clock pinned to `now_ms` (`WAISER_NOW_MS` — the
-/// simulation seam) and the ambient waiser environment scrubbed, so a
-/// developer's own `WAISER_POLICY` can never leak into golden output. Returns
-/// (exit_code, stdout, stderr) — waiser's `--fail-on` gate makes exit codes
+/// Run `deja` with the deja-loop clock pinned to `now_ms` (`DEJA_LOOP_NOW_MS` — the
+/// simulation seam) and the ambient loop environment scrubbed, so a
+/// developer's own `DEJA_LOOP_POLICY` can never leak into golden output. Returns
+/// (exit_code, stdout, stderr) — the loop's `--fail-on` gate makes exit codes
 /// part of the contract, so the code is surfaced rather than collapsed to a
 /// bool.
 pub fn deja_at(now_ms: i64, args: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_deja"))
         .args(args)
-        .env("WAISER_NOW_MS", now_ms.to_string())
-        .env_remove("WAISER_POLICY")
+        .env("DEJA_LOOP_NOW_MS", now_ms.to_string())
+        .env_remove("DEJA_LOOP_POLICY")
         .env_remove("DEJADB_DB")
         .output()
         .expect("spawn deja");
@@ -101,42 +101,42 @@ impl GoldenDb {
     }
 }
 
-// --- waiser golden dataset ---------------------------------------------------
+// --- loop golden dataset ---------------------------------------------------
 
-pub fn waiser_bundle_path() -> PathBuf {
-    dataset_dir().join("waiser.bundle")
+pub fn loop_bundle_path() -> PathBuf {
+    dataset_dir().join("loop.bundle")
 }
 
-pub fn waiser_manifest_path() -> PathBuf {
-    dataset_dir().join("waiser-manifest.json")
+pub fn loop_manifest_path() -> PathBuf {
+    dataset_dir().join("loop-manifest.json")
 }
 
-/// `tests/golden/dataset/waiser/` — committed golden outputs of the waiser
+/// `tests/golden/dataset/loop/` — committed golden outputs of the deja-loop
 /// surfaces (run results, queue listings, show payloads, registry/policy pins).
-pub fn waiser_golden_dir() -> PathBuf {
-    dataset_dir().join("waiser")
+pub fn loop_golden_dir() -> PathBuf {
+    dataset_dir().join("loop")
 }
 
-/// Load the committed waiser manifest.
-pub fn waiser_manifest() -> generator::Manifest {
-    let raw = std::fs::read_to_string(waiser_manifest_path())
-        .expect("missing waiser-manifest.json — run the ignored bless_waiser_golden_dataset test");
-    generator::Manifest::from_json(&serde_json::from_str(&raw).expect("waiser-manifest.json parse"))
+/// Load the committed loop manifest.
+pub fn loop_manifest() -> generator::Manifest {
+    let raw = std::fs::read_to_string(loop_manifest_path())
+        .expect("missing loop-manifest.json — run the ignored bless_loop_golden_dataset test");
+    generator::Manifest::from_json(&serde_json::from_str(&raw).expect("loop-manifest.json parse"))
 }
 
-/// A private import of the waiser golden bundle (same isolation rationale as
+/// A private import of the loop golden bundle (same isolation rationale as
 /// `import_golden`).
-pub fn import_waiser_golden() -> GoldenDb {
+pub fn import_loop_golden() -> GoldenDb {
     let dir = TempDir::new().expect("tempdir");
-    let db = dir.path().join("waiser-golden.db").to_str().unwrap().to_string();
+    let db = dir.path().join("loop-golden.db").to_str().unwrap().to_string();
     let (ok, _out, err) = deja(&[
         "import",
         "--db",
         &db,
         "--bundle",
-        waiser_bundle_path().to_str().unwrap(),
+        loop_bundle_path().to_str().unwrap(),
     ]);
-    assert!(ok, "waiser golden bundle import failed: {err}");
+    assert!(ok, "loop golden bundle import failed: {err}");
     GoldenDb { _dir: dir, db }
 }
 

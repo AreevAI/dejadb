@@ -12,10 +12,10 @@ use dejadb_store::memory_tool::MemoryTool;
 use dejadb_store::{
     parse_relations, Axis, CommandEmbed, DejaDB as RustDejaDB, Direction, FactDraft, TelemetryMode,
 };
-use dejadb_waiser::{now_ms, BorrowedSubstrate};
+use dejadb_loop::{now_ms, BorrowedSubstrate};
 use napi_derive::napi;
 use serde_json::json;
-use waiser::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
 
 /// Drop a memory schema entirely — the postgres backend's memory-level
 /// erasure primitive (`DROP SCHEMA … CASCADE`), the analogue of deleting a
@@ -37,9 +37,9 @@ fn err<E: std::fmt::Display>(e: E) -> napi::Error {
 fn resolve_llm(
     cmd: Option<String>,
     spec: Option<String>,
-) -> napi::Result<Option<Box<dyn waiser::LlmBackend>>> {
+) -> napi::Result<Option<Box<dyn deja_loop::LlmBackend>>> {
     if let Some(cmd) = cmd {
-        return Ok(Some(Box::new(waiser::CommandLlm::new(&cmd, None).map_err(err)?)));
+        return Ok(Some(Box::new(deja_loop::CommandLlm::new(&cmd, None).map_err(err)?)));
     }
     if let Some(spec) = spec {
         return Ok(Some(dejadb_llm::resolve(&spec, None, None).map_err(err)?));
@@ -52,8 +52,8 @@ fn resolve_llm(
 /// the raw text was already stored under, so the caller can retry against it
 /// instead of losing the content.
 fn extract_and_ground(
-    llm: &dyn waiser::LlmBackend,
-    grounder: Option<&dyn waiser::LlmBackend>,
+    llm: &dyn deja_loop::LlmBackend,
+    grounder: Option<&dyn deja_loop::LlmBackend>,
     source: &Hash,
     content: &str,
     hint: Option<&str>,
@@ -99,11 +99,11 @@ fn parse_scopes(spec: Option<&str>) -> napi::Result<ScopeSet> {
     let mut out = Vec::new();
     for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         out.push(match name {
-            "read" => waiser::Scope::Read,
-            "write" => waiser::Scope::Write,
-            "review" => waiser::Scope::Review,
-            "apply" => waiser::Scope::Apply,
-            "admin" => waiser::Scope::Admin,
+            "read" => deja_loop::Scope::Read,
+            "write" => deja_loop::Scope::Write,
+            "review" => deja_loop::Scope::Review,
+            "apply" => deja_loop::Scope::Apply,
+            "admin" => deja_loop::Scope::Admin,
             other => {
                 return Err(err(DejaDbError::Validation(format!(
                     "unknown scope {other:?} — expected a comma-separated subset of: \
@@ -239,7 +239,7 @@ pub struct DejaDb {
     /// object that started it.
     facade: FacadeSlot,
     ns: String,
-    /// Host-asserted actor label stamped on every waiser audit grain (§6.6).
+    /// Host-asserted actor label stamped on every loop audit grain (§6.6).
     actor: String,
 }
 
@@ -1086,7 +1086,7 @@ impl DejaDb {
         })
     }
 
-    // ── Waiser: the governed self-improvement loop (§6.6) ────────────────────
+    // ── Deja Loop: the governed self-improvement loop (§6.6) ────────────────────
 
     /// Record a tool call as a Tool grain — the flagship analyzer's food.
     #[napi(ts_return_type = "Promise<string>")]
@@ -1113,12 +1113,12 @@ impl DejaDb {
     }
 
     /// Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
-    /// the whole memory (`deja waiser reflect` semantics); `policy` is a path
-    /// to a host `waiser-policy.json` — the only way auto-apply is granted
+    /// the whole memory (`deja loop reflect` semantics); `policy` is a path
+    /// to a host `loop-policy.json` — the only way auto-apply is granted
     /// from the bindings. Returns run-outcome JSON.
     #[napi(ts_return_type = "Promise<string>")]
     #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
-    pub fn waiser_run(
+    pub fn loop_run(
         &self,
         min_new: Option<u32>,
         min_new_errors: Option<u32>,
@@ -1152,17 +1152,17 @@ impl DejaDb {
             if let Some(path) = policy {
                 let s = std::fs::read_to_string(&path)
                     .map_err(|e| err(format!("policy {path}: {e}")))?;
-                engine = engine.with_policy(waiser::Policy::from_json(&s).map_err(err)?);
+                engine = engine.with_policy(deja_loop::Policy::from_json(&s).map_err(err)?);
             }
             if let Some(cmd) = llm_cmd {
-                let llm = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+                let llm = deja_loop::CommandLlm::new(&cmd, None).map_err(err)?;
                 engine = engine.with_llm(Box::new(llm));
             } else if let Some(spec) = model {
                 engine = engine.with_llm(dejadb_llm::resolve(&spec, None, None).map_err(err)?);
             }
             // Optional separate grounding backend (defaults to the reflection model).
             if let Some(cmd) = ground_cmd {
-                let g = waiser::CommandLlm::new(&cmd, None).map_err(err)?;
+                let g = deja_loop::CommandLlm::new(&cmd, None).map_err(err)?;
                 engine = engine.with_ground_llm(Box::new(g));
             } else if let Some(spec) = ground_model {
                 engine =
@@ -1170,7 +1170,7 @@ impl DejaDb {
             }
             // Optional external analyzer (advisory only — never auto-applies).
             if let Some(cmd) = analyzer_cmd {
-                engine.register(Box::new(waiser::CommandAnalyzer::new(&cmd).map_err(err)?));
+                engine.register(Box::new(deja_loop::CommandAnalyzer::new(&cmd).map_err(err)?));
             }
             let mut sub = BorrowedSubstrate::new(&facade);
             let res = engine.run(&mut sub, &opts, now_ms()).map_err(err)?;
@@ -1299,9 +1299,9 @@ impl DejaDb {
 
     /// Health snapshot of the loop: when it last ran, how much is un-analyzed
     /// since, the queue counts, and whether it looks stalled. Parity with bare
-    /// `deja waiser` and `GET /api/waiser/health`.
+    /// `deja loop` and `GET /api/loop/health`.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn waiser_health(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+    pub fn loop_health(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
@@ -1313,7 +1313,7 @@ impl DejaDb {
 
     /// The analyzer roster: id, whether it is enabled, and its settings.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn waiser_analyzers(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+    pub fn loop_analyzers(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
@@ -1324,7 +1324,7 @@ impl DejaDb {
     }
 
     /// Enable/disable one analyzer, or set its parameters — reachable from the
-    /// console's Setup tab (`POST /api/waiser/config`) but not, until now, from
+    /// console's Setup tab (`POST /api/loop/config`) but not, until now, from
     /// the bindings. `paramsJson` is an optional JSON object of overrides.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn set_analyzer_config(
@@ -1340,7 +1340,7 @@ impl DejaDb {
                 Some(ref s) => serde_json::from_str(s).map_err(err)?,
                 None => None,
             };
-            let update = waiser::AnalyzerConfigUpdate { enabled, params, ..Default::default() };
+            let update = deja_loop::AnalyzerConfigUpdate { enabled, params, ..Default::default() };
             let mut sub = BorrowedSubstrate::new(&facade);
             let cfg = Engine::with_builtins()
                 .set_analyzer_config(&mut sub, &analyzer_id, update, &ScopeSet::all())
@@ -1372,7 +1372,7 @@ impl DejaDb {
 
     /// Roll back an applied recommendation (retracts the grains it created).
     /// Mandatory reason; fails for non-rollbackable applies (FORGET has no
-    /// inverse). Parity with `deja waiser rollback`.
+    /// inverse). Parity with `deja loop rollback`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn rollback_recommendation(
         &self,
@@ -1393,9 +1393,9 @@ impl DejaDb {
 
     /// Measured outcomes of applied recommendations — the Verify gate's
     /// record (`held` / `regressed` per checkpoint). JSON list, parity with
-    /// `deja waiser outcomes`.
+    /// `deja loop outcomes`.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn waiser_outcomes(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+    pub fn loop_outcomes(&self) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;

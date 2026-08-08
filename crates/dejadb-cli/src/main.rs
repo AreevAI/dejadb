@@ -9,8 +9,8 @@ use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
 use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::{Axis, DejaDB, Direction};
-use dejadb_waiser::{now_ms, DejaDbSubstrate};
-use waiser::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
+use dejadb_loop::{now_ms, DejaDbSubstrate};
+use deja_loop::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
 
 const USAGE: &str = "\
 deja — embedded memory engine for AI agents (OMS + CAL on Turso)
@@ -23,7 +23,7 @@ USAGE:
 COMMANDS:
   init     [--template blank|demo|coding-agent] [--ns NS]   seed a backend +
            print the Claude Code hook snippet (never writes your settings)
-  waiser   <run|reflect|list|show|approve|reject|apply|rollback|analyzers|policy>
+  loop     <run|reflect|list|show|approve|reject|apply|rollback|analyzers|policy>
            the governed self-improvement loop (deterministic core; optional verified LLM):
            run    [--min-new N --min-new-errors N --if-stale 6h --format json --quiet]
                   [--model provider:name | --llm-cmd 'CMD']   optional LLM reflection
@@ -37,7 +37,7 @@ COMMANDS:
            list   [--status pending|all|applied|...] [--fail-on high]  (exit 2 on match)
            show <hash> | approve/reject/apply/rollback <hash> --because \"...\" [--actor A]
            outcomes  the Verify gate: did applied advice hold, or regress?
-           [--policy FILE] grants auto-apply (else $WAISER_POLICY); `policy` prints it
+           [--policy FILE] grants auto-apply (else $DEJA_LOOP_POLICY); `policy` prints it
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
            [--idempotent]   no-op if this exact value is already the head
@@ -556,7 +556,7 @@ each exchange (with tool outcomes) when a turn ends:
   "hooks": {{
     "UserPromptSubmit": [{{ "hooks": [{{
       "type": "command",
-      "command": "{exe} recall-hook --db {db} --ns {ns} --with-waiser"
+      "command": "{exe} recall-hook --db {db} --ns {ns} --with-loop"
     }}] }}],
     "Stop": [{{ "hooks": [{{
       "type": "command",
@@ -1147,12 +1147,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 server = server.lock_namespace(lock.clone());
                 eprintln!("deja: namespace locked to '{lock}' (per-call namespace ignored)");
             }
-            // Host waiser policy (--policy FILE or $WAISER_POLICY): the
-            // dejadb_waiser tool honors the same grants as the CLI run. Host
+            // Host loop policy (--policy FILE or $DEJA_LOOP_POLICY): the
+            // dejadb_loop tool honors the same grants as the CLI run. Host
             // config set at process start — never controllable by the client.
             if let Some(p) = load_policy(&flags)? {
-                server = server.with_waiser_policy(p);
-                eprintln!("deja: waiser host policy attached to dejadb_waiser");
+                server = server.with_loop_policy(p);
+                eprintln!("deja: loop host policy attached to dejadb_loop");
             }
             server.serve_stdio().map_err(|e| e.to_string())?;
         }
@@ -1222,14 +1222,14 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 return Ok(());
             }
             let k: usize = flag(&flags, "k").and_then(|v| v.parse().ok()).unwrap_or(5);
-            // --with-waiser additionally injects the pending recommendation
+            // --with-loop additionally injects the pending recommendation
             // queue (a compact, capped block) so the loop closes into the
             // agent's context instead of waiting to be polled.
-            let with_waiser = flag(&flags, "with-waiser").is_some();
+            let with_loop = flag(&flags, "with-loop").is_some();
             let grains = m
                 .recall_hybrid(&ns, None, None, Some(&query), k, None)
                 .map_err(|e| e.to_string())?;
-            if grains.is_empty() && !with_waiser {
+            if grains.is_empty() && !with_loop {
                 return Ok(());
             }
             if !grains.is_empty() {
@@ -1262,7 +1262,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     println!("Relevant memory from DejaDB:\n{}", ctx.text);
                 }
             }
-            if with_waiser {
+            if with_loop {
                 // Read-only listing over the same store handle (single writer
                 // per file — never a second open). Engine-templated summaries;
                 // origin=llm entries are labeled. Capped so a long queue can't
@@ -1276,13 +1276,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     pending.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.hash.cmp(&b.hash)));
                     const CAP: usize = 3;
                     println!(
-                        "\nWaiser: {} pending recommendation(s) for this memory (review with `deja waiser list`, act with approve/apply/reject --because):",
+                        "\nDeja Loop: {} pending recommendation(s) for this memory (review with `deja loop list`, act with approve/apply/reject --because):",
                         pending.len()
                     );
                     for r in pending.iter().take(CAP) {
                         let origin = match r.origin {
-                            waiser::Origin::Llm { .. } => " [llm]",
-                            waiser::Origin::Command { .. } => " [external]",
+                            deja_loop::Origin::Llm { .. } => " [llm]",
+                            deja_loop::Origin::Command { .. } => " [external]",
                             _ => "",
                         };
                         println!("  [{}] {}{}  {}", r.severity.as_str(), short(&r.hash), origin, r.summary.render());
@@ -1425,12 +1425,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             } else {
                 eprintln!("deja: console is UNAUTHENTICATED (enable with --token-env <VAR>)");
             }
-            // Host waiser policy (--policy FILE or $WAISER_POLICY): a
-            // console-triggered waiser run honors the same grants as the CLI
+            // Host loop policy (--policy FILE or $DEJA_LOOP_POLICY): a
+            // console-triggered loop run honors the same grants as the CLI
             // run. Never grantable from the console itself.
             if let Some(p) = load_policy(&flags)? {
-                server = server.with_waiser_policy(p);
-                eprintln!("deja: waiser host policy attached to the console's waiser routes");
+                server = server.with_loop_policy(p);
+                eprintln!("deja: loop host policy attached to the console's loop routes");
             }
             let listener = dejadb_server::UiServer::bind(&addr).map_err(|e| e.to_string())?;
             if !addr_is_loopback(&addr) {
@@ -1684,8 +1684,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         "init" => {
             run_init(m, &ns, &flags, &positional)?;
         }
-        "waiser" => {
-            run_waiser(m, &ns, &flags, &positional)?;
+        "loop" => {
+            run_loop(m, &ns, &flags, &positional)?;
         }
         other => return Err(format!("unknown command '{other}' — try `deja help`")),
     }
@@ -1749,7 +1749,7 @@ fn resolve_hash(engine: &Engine, sub: &DejaDbSubstrate, prefix: &str) -> Result<
 }
 
 /// Resolve an LLM backend from a `--<prefix>cmd` / `--<prefix>model` flag pair,
-/// the same two ways `deja waiser run` attaches one: a subprocess (the
+/// the same two ways `deja loop run` attaches one: a subprocess (the
 /// zero-dependency escape hatch) or a built-in HTTP provider whose key is read
 /// from the environment, never from the command line. The subprocess wins when
 /// both are given. Both fail at construction, before anything is written.
@@ -1757,10 +1757,10 @@ fn resolve_llm(
     flags: &HashMap<String, String>,
     cmd_flag: &str,
     model_flag: &str,
-) -> Result<Option<Box<dyn waiser::LlmBackend>>, String> {
+) -> Result<Option<Box<dyn deja_loop::LlmBackend>>, String> {
     if let Some(cmd) = flag(flags, cmd_flag) {
         let label = flag(flags, "llm-model");
-        let llm = waiser::CommandLlm::new(&cmd, label.as_deref()).map_err(|e| e.to_string())?;
+        let llm = deja_loop::CommandLlm::new(&cmd, label.as_deref()).map_err(|e| e.to_string())?;
         return Ok(Some(Box::new(llm)));
     }
     if let Some(spec) = flag(flags, model_flag) {
@@ -1788,7 +1788,7 @@ fn resolve_llm(
 /// stamped `verification_status = "unverified"` (CAL-filterable, so they can be
 /// reviewed) unless `--ground-model`/`--ground-cmd` runs a separate entailment
 /// pass over them — a different call from the one that proposed them, the same
-/// proposer ≠ scorer rule the Waiser verifier follows. Facts the grounder does
+/// proposer ≠ scorer rule the Deja Loop verifier follows. Facts the grounder does
 /// not support are dropped; survivors are stamped `"verified"`.
 fn run_remember(mut m: DejaDB, ns: &str, flags: &HashMap<String, String>) -> Result<(), String> {
     let content = need(flags, "content")?;
@@ -1933,8 +1933,8 @@ fn run_remember(mut m: DejaDB, ns: &str, flags: &HashMap<String, String>) -> Res
 /// survivors to store drafts. Warns on stderr when a response hit the per-call
 /// cap, so a truncated extraction is never silent.
 fn extract_drafts(
-    llm: &dyn waiser::LlmBackend,
-    grounder: Option<&dyn waiser::LlmBackend>,
+    llm: &dyn deja_loop::LlmBackend,
+    grounder: Option<&dyn deja_loop::LlmBackend>,
     source: &str,
     content: &str,
     hint: Option<&str>,
@@ -1971,9 +1971,9 @@ fn draft_json(d: &dejadb_store::FactDraft) -> serde_json::Value {
     })
 }
 
-/// Load the host policy from `--policy FILE` or `$WAISER_POLICY` (§6.2).
+/// Load the host policy from `--policy FILE` or `$DEJA_LOOP_POLICY` (§6.2).
 fn load_policy(flags: &HashMap<String, String>) -> Result<Option<Policy>, String> {
-    let path = flag(flags, "policy").or_else(|| std::env::var("WAISER_POLICY").ok());
+    let path = flag(flags, "policy").or_else(|| std::env::var("DEJA_LOOP_POLICY").ok());
     match path {
         Some(p) => {
             let s = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
@@ -1983,8 +1983,8 @@ fn load_policy(flags: &HashMap<String, String>) -> Result<Option<Policy>, String
     }
 }
 
-/// `deja waiser <run|list|show|approve|reject|apply|rollback|analyzers|policy|status>`.
-fn run_waiser(
+/// `deja loop <run|list|show|approve|reject|apply|rollback|analyzers|policy|status>`.
+fn run_loop(
     m: DejaDB,
     ns: &str,
     flags: &HashMap<String, String>,
@@ -1992,7 +1992,7 @@ fn run_waiser(
 ) -> Result<(), String> {
     let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("status");
     let mut sub = DejaDbSubstrate::new(m, Some(ns.to_string()));
-    // Host policy (--policy FILE or $WAISER_POLICY) — the only place
+    // Host policy (--policy FILE or $DEJA_LOOP_POLICY) — the only place
     // auto-apply is granted. Absent → a closed default (nothing auto-applies).
     let policy = load_policy(flags)?;
     let mut engine = match policy {
@@ -2007,7 +2007,7 @@ fn run_waiser(
     // `--llm-cmd` wins if both are given.
     if let Some(cmd) = flag(flags, "llm-cmd") {
         let model = flag(flags, "llm-model");
-        let llm = waiser::CommandLlm::new(&cmd, model.as_deref()).map_err(|e| e.to_string())?;
+        let llm = deja_loop::CommandLlm::new(&cmd, model.as_deref()).map_err(|e| e.to_string())?;
         engine = engine.with_llm(Box::new(llm));
     } else if let Some(spec) = flag(flags, "model") {
         // Key is read from the environment (ANTHROPIC_API_KEY / OPENAI_API_KEY /
@@ -2022,7 +2022,7 @@ fn run_waiser(
     // cheaper or specialized model, or take the generative model out of grounding
     // entirely. Falls back to the main backend when absent. `--ground-cmd` wins.
     if let Some(cmd) = flag(flags, "ground-cmd") {
-        let g = waiser::CommandLlm::new(&cmd, None).map_err(|e| e.to_string())?;
+        let g = deja_loop::CommandLlm::new(&cmd, None).map_err(|e| e.to_string())?;
         engine = engine.with_ground_llm(Box::new(g));
     } else if let Some(spec) = flag(flags, "ground-model") {
         let base = flag(flags, "llm-base-url");
@@ -2035,7 +2035,7 @@ fn run_waiser(
     // (trust class Command → advisory only, never auto-applies). Registered up
     // front so it participates in the pass like a built-in.
     if let Some(cmd) = flag(flags, "analyzer-cmd") {
-        let a = waiser::CommandAnalyzer::new(&cmd).map_err(|e| e.to_string())?;
+        let a = deja_loop::CommandAnalyzer::new(&cmd).map_err(|e| e.to_string())?;
         engine.register(Box::new(a));
     }
     let now = now_ms();
@@ -2061,7 +2061,7 @@ fn run_waiser(
             } else if res.ran() {
                 if !flags.contains_key("quiet") {
                     eprintln!(
-                        "waiser: ran — proposed {} ({} deduped, {} auto-applied) across {} analyzer(s)",
+                        "loop: ran — proposed {} ({} deduped, {} auto-applied) across {} analyzer(s)",
                         res.stored,
                         res.deduped,
                         res.auto_applied,
@@ -2069,10 +2069,10 @@ fn run_waiser(
                     );
                 }
                 if res.stored > 0 {
-                    eprintln!("waiser: {} new — deja waiser list", res.stored);
+                    eprintln!("loop: {} new — deja loop list", res.stored);
                 }
             } else if !flags.contains_key("quiet") {
-                eprintln!("waiser: skipped ({:?})", res.skip_reason);
+                eprintln!("loop: skipped ({:?})", res.skip_reason);
             }
         }
         "list" => {
@@ -2094,7 +2094,7 @@ fn run_waiser(
                     .collect();
                 println!("{}", serde_json::to_string(&rows).map_err(|e| e.to_string())?);
             } else if recs.is_empty() {
-                eprintln!("no recommendations — run `deja waiser run` first");
+                eprintln!("no recommendations — run `deja loop run` first");
             } else {
                 for r in &recs {
                     println!(
@@ -2113,7 +2113,7 @@ fn run_waiser(
                     .iter()
                     .any(|r| r.status == RecStatus::Pending && r.severity >= threshold);
                 if hit {
-                    eprintln!("waiser: pending recommendation(s) at or above severity '{sev}'");
+                    eprintln!("loop: pending recommendation(s) at or above severity '{sev}'");
                     std::process::exit(2);
                 }
             }
@@ -2121,7 +2121,7 @@ fn run_waiser(
         "show" => {
             let prefix = positional
                 .get(1)
-                .ok_or_else(|| "usage: deja waiser show <hash>".to_string())?;
+                .ok_or_else(|| "usage: deja loop show <hash>".to_string())?;
             let hash = resolve_hash(&engine, &sub, prefix)?;
             let recs = engine.recommendations(&sub, None).map_err(|e| e.to_string())?;
             let r = recs.iter().find(|r| r.hash == hash).unwrap();
@@ -2159,7 +2159,7 @@ fn run_waiser(
         "approve" | "reject" => {
             let prefix = positional
                 .get(1)
-                .ok_or_else(|| format!("usage: deja waiser {sub_cmd} <hash> --because \"...\""))?;
+                .ok_or_else(|| format!("usage: deja loop {sub_cmd} <hash> --because \"...\""))?;
             let because = need(flags, "because")?;
             let hash = resolve_hash(&engine, &sub, prefix)?;
             let decision = if sub_cmd == "approve" { Decision::Approve } else { Decision::Reject };
@@ -2171,7 +2171,7 @@ fn run_waiser(
         "apply" => {
             let prefix = positional
                 .get(1)
-                .ok_or_else(|| "usage: deja waiser apply <hash> --because \"...\"".to_string())?;
+                .ok_or_else(|| "usage: deja loop apply <hash> --because \"...\"".to_string())?;
             let because = need(flags, "because")?;
             let hash = resolve_hash(&engine, &sub, prefix)?;
             let allow_destructive = flags.contains_key("allow-destructive");
@@ -2187,7 +2187,7 @@ fn run_waiser(
         "rollback" => {
             let prefix = positional
                 .get(1)
-                .ok_or_else(|| "usage: deja waiser rollback <hash> --because \"...\"".to_string())?;
+                .ok_or_else(|| "usage: deja loop rollback <hash> --because \"...\"".to_string())?;
             let because = need(flags, "because")?;
             let hash = resolve_hash(&engine, &sub, prefix)?;
             engine
@@ -2247,18 +2247,18 @@ fn run_waiser(
                 serde_json::to_string_pretty(engine.policy()).map_err(|e| e.to_string())?
             );
         }
-        // Bare `deja waiser` (or an unknown subcommand) prints a health summary.
+        // Bare `deja loop` (or an unknown subcommand) prints a health summary.
         _ => {
             let h = engine.health(&sub, now).map_err(|e| e.to_string())?;
             if json {
                 println!("{}", serde_json::to_string(&h).map_err(|e| e.to_string())?);
             } else {
                 println!(
-                    "waiser: {} recommendation(s) — {} pending, {} applied",
+                    "loop: {} recommendation(s) — {} pending, {} applied",
                     h.total, h.pending, h.applied
                 );
                 match h.last_run_ms {
-                    None => println!("  never run — deja waiser run"),
+                    None => println!("  never run — deja loop run"),
                     Some(last) => {
                         let days = (now - last) / 86_400_000;
                         println!(
@@ -2280,9 +2280,9 @@ fn run_waiser(
                     }
                 }
                 if h.stale {
-                    eprintln!("  ⚠ the loop may be stale — run `deja waiser run` or wire the SessionEnd hook");
+                    eprintln!("  ⚠ the loop may be stale — run `deja loop run` or wire the SessionEnd hook");
                 } else if h.pending > 0 {
-                    println!("  review with: deja waiser list");
+                    println!("  review with: deja loop list");
                 }
             }
         }
@@ -2313,7 +2313,7 @@ fn run_init(
 
     println!("initialized backend (template: {template}, seeded {seeded} grain(s))");
     if template == "demo" {
-        println!("next: deja waiser run --db <file>   # ~4 recommendations across analyzers");
+        println!("next: deja loop run --db <file>   # ~4 recommendations across analyzers");
     }
     // Print the Claude Code hook snippet — deja never edits your settings.
     let exe = std::env::current_exe()
@@ -2321,14 +2321,14 @@ fn run_init(
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "deja".to_string());
     eprintln!("\nClaude Code hooks (paste into settings.json — absolute path baked in):");
-    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns} --with-waiser");
+    eprintln!("  UserPromptSubmit → {exe} recall-hook --ns {ns} --with-loop");
     eprintln!("  Stop             → {exe} capture-stop --ns {ns}");
-    eprintln!("  SessionEnd       → {exe} waiser run --min-new 20 --min-new-errors 3 --quiet --ns {ns}");
+    eprintln!("  SessionEnd       → {exe} loop run --min-new 20 --min-new-errors 3 --quiet --ns {ns}");
     Ok(())
 }
 
 /// Seed the demo corpus: planted duplicates, a contradiction, and a stale
-/// grain, so the first `deja waiser run` fires several analyzers at once.
+/// grain, so the first `deja loop run` fires several analyzers at once.
 fn seed_demo(m: &mut DejaDB, ns: &str) -> Result<usize, String> {
     let past = 1_000_000_000_000; // year 2001 — safely elapsed
     let grains = [

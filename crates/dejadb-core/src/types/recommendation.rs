@@ -38,7 +38,7 @@ impl Proposal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analyzer {
     /// Versioned identifier `publisher.name/major`, e.g.
-    /// `"waiser.duplicate_sweep/1"`.
+    /// `"loop.duplicate_sweep/1"`.
     pub id: String,
     /// Optional snapshot of the parameters it ran with — full "why" provenance
     /// without a second grain.
@@ -338,7 +338,7 @@ mod tests {
     fn rec() -> Recommendation {
         Recommendation::new(
             "entity:caller/alice",
-            Analyzer::new("waiser.duplicate_sweep/1"),
+            Analyzer::new("loop.duplicate_sweep/1"),
             Summary {
                 template_id: "dup.consolidate".into(),
                 args: serde_json::json!({ "count": 3 }),
@@ -353,7 +353,7 @@ mod tests {
         // must not re-propose the entire queue as novel.
         let a = rec();
         let mut b = rec();
-        b.analyzer = Analyzer::new("waiser.duplicate_sweep/2");
+        b.analyzer = Analyzer::new("loop.duplicate_sweep/2");
         let b = Recommendation::new(&b.target_ref, b.analyzer, b.summary, b.proposal);
         assert_eq!(a.dedup_key, b.dedup_key);
     }
@@ -364,7 +364,7 @@ mod tests {
         let a = rec();
         let b = Recommendation::new(
             "entity:caller/alice",
-            Analyzer::new("waiser.duplicate_sweep/1"),
+            Analyzer::new("loop.duplicate_sweep/1"),
             Summary {
                 template_id: "dup.consolidate".into(),
                 args: serde_json::json!({ "count": 9 }),
@@ -379,19 +379,19 @@ mod tests {
         let a = rec();
         let other_target = Recommendation::new(
             "entity:caller/bob",
-            Analyzer::new("waiser.duplicate_sweep/1"),
+            Analyzer::new("loop.duplicate_sweep/1"),
             a.summary.clone(),
             Proposal::Cal("x".into()),
         );
         let other_analyzer = Recommendation::new(
             "entity:caller/alice",
-            Analyzer::new("waiser.staleness/1"),
+            Analyzer::new("loop.staleness/1"),
             a.summary.clone(),
             Proposal::Cal("x".into()),
         );
         let other_kind = Recommendation::new(
             "entity:caller/alice",
-            Analyzer::new("waiser.duplicate_sweep/1"),
+            Analyzer::new("loop.duplicate_sweep/1"),
             a.summary.clone(),
             Proposal::Data(serde_json::json!({})),
         );
@@ -402,11 +402,11 @@ mod tests {
 
     #[test]
     fn dedup_key_case_folds_the_family_but_not_the_target() {
-        let lower = compute_dedup_key("waiser.dup", "grain:sha256:AABB", "cal");
-        let upper = compute_dedup_key("WAISER.DUP", "grain:sha256:AABB", "cal");
+        let lower = compute_dedup_key("loop.dup", "grain:sha256:AABB", "cal");
+        let upper = compute_dedup_key("LOOP.DUP", "grain:sha256:AABB", "cal");
         assert_eq!(lower, upper, "analyzer family is case-folded");
 
-        let other_case_target = compute_dedup_key("waiser.dup", "grain:sha256:aabb", "cal");
+        let other_case_target = compute_dedup_key("loop.dup", "grain:sha256:aabb", "cal");
         assert_ne!(
             lower, other_case_target,
             "a target ref may be case-sensitive and must not be folded"
@@ -431,8 +431,8 @@ mod tests {
 
     #[test]
     fn analyzer_family_strips_only_the_major_suffix() {
-        assert_eq!(Analyzer::new("waiser.dup/1").family(), "waiser.dup");
-        assert_eq!(Analyzer::new("waiser.dup").family(), "waiser.dup");
+        assert_eq!(Analyzer::new("loop.dup/1").family(), "loop.dup");
+        assert_eq!(Analyzer::new("loop.dup").family(), "loop.dup");
         assert_eq!(Analyzer::new("a/b/2").family(), "a/b");
     }
 

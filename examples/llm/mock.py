@@ -2,7 +2,7 @@
 """A deterministic mock --llm-cmd backend: no model, no network — echoes a
 canned response per op so you can test the wiring (and CI can exercise the LLM
 path). NOT for real use. Cites the first evidence hash so the DISCOVER draft
-survives waiser's cite-check."""
+survives the loop's cite-check."""
 import json
 import sys
 

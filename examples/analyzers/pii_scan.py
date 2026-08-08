@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""pii_scan.py — a sample external Waiser analyzer (`--analyzer-cmd`).
+"""pii_scan.py — a sample external Deja Loop analyzer (`--analyzer-cmd`).
 
 Protocol (one JSON object on stdin, one on stdout):
-  probe    {"waiser_analyzer":1,"op":"probe"}
+  probe    {"loop_analyzer":1,"op":"probe"}
            → {"id":"example.pii_scan/1","title":"…","description":"…"}
-  analyze  {"waiser_analyzer":1,"op":"analyze","now_ms":…,"grains":[…]}
+  analyze  {"loop_analyzer":1,"op":"analyze","now_ms":…,"grains":[…]}
            → {"findings":[{"target":"entity:<ns>/<subject>","summary":"…",
               "severity":"low|medium|high","evidence":["<hash>"],
               "confidence":0.0-1.0}]}
@@ -14,9 +14,9 @@ SURFACE an issue a human then reviews, never mutate memory. A failure skips
 the analyzer for the run, never the pass.
 
 Run it:
-  deja waiser run --db mem.db --analyzer-cmd 'python3 examples/analyzers/pii_scan.py'
-  # Python:  db.waiser_run(analyzer_cmd="python3 examples/analyzers/pii_scan.py")
-  # Node:    m.waiserRun(..., analyzerCmd)
+  deja loop run --db mem.db --analyzer-cmd 'python3 examples/analyzers/pii_scan.py'
+  # Python:  db.loop_run(analyzer_cmd="python3 examples/analyzers/pii_scan.py")
+  # Node:    m.loopRun(..., analyzerCmd)
 """
 import json
 import re

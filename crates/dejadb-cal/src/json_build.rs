@@ -538,7 +538,7 @@ pub fn build_grain_from_json<S: GrainSink>(
                 // claimed them, so `collect_context_extras` swept them into
                 // `common.context` — where the write path compacts the key, and
                 // `valid_to` came back as `{"context": {"vt": …}}`. Nothing
-                // reads that: `waiser.staleness` looks for a top-level
+                // reads that: `loop.staleness` looks for a top-level
                 // `valid_to`, and so does the store's world-time (`vf`/`vt`)
                 // column projection. So a bindings user setting expiry the
                 // documented way got a fact that silently never expires and

@@ -48,7 +48,7 @@ headline facts:
   Postgres facade + recursive-SQL graph module existed in the ancestor
   codebase and was "intentionally not ported".
 - The seam leaks: `DejaDbFacade::with_store(|m: &mut DejaDB| …)` has **87
-  production call sites** outside CAL (py 26, js 23, waiser 17, server 10,
+  production call sites** outside CAL (py 26, js 23, deja-loop 17, server 10,
   mcp 8, cli 3), and the CLI additionally makes ~31 direct `DejaDB` calls
   that bypass the facade entirely. Every one binds a surface to the concrete
   Turso-backed type. (Corrected from an earlier ~107/67-method estimate —
@@ -298,7 +298,7 @@ resolution). This preserves the invariant's *semantics*:
    refactor, green under the existing ~950-test suite. Highest-leverage
    single step; valuable even if Postgres never ships.
 2. **Close the `with_store` hole**: promote the ~87 concrete-type escape
-   hatches (py/js/waiser/server/mcp/cli, plus the CLI's direct calls) into
+   hatches (py/js/deja-loop/server/mcp/cli, plus the CLI's direct calls) into
    `CalStoreFacade` methods.
    Independently valuable — it makes the trait the crate already claims to
    have real. Note `dejadb-js` is outside the workspace; its 23 sites need

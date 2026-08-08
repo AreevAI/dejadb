@@ -66,10 +66,10 @@ DEFAULTS = {
     # Token budget for the block injected each turn.
     "budget_tokens": 800,
     "recent_turns": 8,
-    # Run Waiser's deterministic analyzers when a session ends. No LLM, no
+    # Run Deja Loop's deterministic analyzers when a session ends. No LLM, no
     # network; it only ever files advisory recommendations, which never
-    # auto-apply. Review them with `deja waiser list`.
-    "waiser_on_session_end": True,
+    # auto-apply. Review them with `deja loop list`.
+    "loop_on_session_end": True,
 }
 
 
@@ -374,17 +374,17 @@ class DejaDbMemoryProvider(MemoryProvider):
         advisory recommendation grains that never auto-apply."""
         if not self._db or not self._writable:
             return
-        if not self._cfg.get("waiser_on_session_end"):
+        if not self._cfg.get("loop_on_session_end"):
             return
         try:
-            outcome = json.loads(self._db.waiser_run())
+            outcome = json.loads(self._db.loop_run())
             if outcome.get("stored"):
                 logger.info(
-                    "dejadb: waiser filed %s recommendation(s) — `deja waiser list`",
+                    "dejadb: loop filed %s recommendation(s) — `deja loop list`",
                     outcome["stored"],
                 )
         except Exception as e:
-            logger.debug("dejadb: waiser run skipped: %s", e)
+            logger.debug("dejadb: loop run skipped: %s", e)
 
     # -- tools --------------------------------------------------------------
 
@@ -462,8 +462,8 @@ class DejaDbMemoryProvider(MemoryProvider):
                 "required for free-text search if index_text is off."},
             {"key": "budget_tokens", "description":
                 "Token budget for the block injected each turn", "default": 800},
-            {"key": "waiser_on_session_end", "description":
-                "Run Waiser's deterministic analyzers at session end (advisory only)",
+            {"key": "loop_on_session_end", "description":
+                "Run Deja Loop's deterministic analyzers at session end (advisory only)",
              "default": True, "choices": [True, False]},
         ]
 

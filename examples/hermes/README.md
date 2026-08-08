@@ -21,7 +21,7 @@ and the previous wording is gone from disk.
 | per-turn recall | both files pasted in whole, every turn | one budgeted `ASSEMBLE` — profile + prior sessions, token-capped |
 | current session's turns | in context already | deliberately excluded from injection, so budget goes to what the model *cannot* see |
 | "what did I believe last month" | not answerable | `dejadb_memory` with `action: history` |
-| hygiene | — | Waiser's deterministic analyzers at session end, advisory only |
+| hygiene | — | Deja Loop's deterministic analyzers at session end, advisory only |
 
 Measured here, at 2,080 grains (40 profile notes + 2,000 prior turns), Apple M4
 Max: **`prefetch()` p50 0.83 ms** (p95 3.9 ms), `sync_turn()` 0.47 ms. `prefetch()`
@@ -59,7 +59,7 @@ Optional; every key has a default. `hermes memory setup` writes
   "embed_cmd": "",
   "budget_tokens": 800,
   "recent_turns": 8,
-  "waiser_on_session_end": true
+  "loop_on_session_end": true
 }
 ```
 
@@ -92,7 +92,7 @@ than returning an empty list.
 | `sync_turn(user, assistant)` | one Event grain per side, tagged with the Hermes `session_id` |
 | `on_memory_write(action, target, content)` | mirrors each `MEMORY.md`/`USER.md` edit as an audit Event **and** a profile Fact |
 | `on_pre_compress(messages)` | persists what compression is about to discard |
-| `on_session_end(messages)` | `waiser_run()` — deterministic analyzers, no LLM, advisory only |
+| `on_session_end(messages)` | `loop_run()` — deterministic analyzers, no LLM, advisory only |
 | `get_tool_schemas()` | one tool, `dejadb_memory`, with `search` / `recall` / `history` / `cal` |
 
 Assembly logic is data, not code: define a saved query named `hermes_prefetch`
@@ -118,7 +118,7 @@ deja cal 'DEFINE QUERY "hermes_prefetch"($user, $query) DESCRIPTION "my prompt"
   comes from mirroring Hermes's own curated `USER.md`/`MEMORY.md` rather than
   from extracting facts out of conversation. That is a deliberate floor, not a
   placeholder: extraction without a verifier is how memory layers accumulate
-  confident nonsense. Run `deja waiser` for the governed version.
+  confident nonsense. Run `deja loop` for the governed version.
 - **Skills are out of scope.** Hermes's procedural memory has its own
   `skills.write_approval` path and no provider hook; a memory provider cannot
   see or govern it.

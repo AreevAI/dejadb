@@ -604,7 +604,7 @@ fn recommendation_round_trips_through_the_store_and_renders() {
 
     let rec = Recommendation::new(
         "entity:caller/alice",
-        Analyzer::new("waiser.duplicate_sweep/1"),
+        Analyzer::new("loop.duplicate_sweep/1"),
         Summary {
             template_id: "dup.consolidate".into(),
             args: serde_json::json!({ "subject": "alice", "count": 3 }),
@@ -618,7 +618,7 @@ fn recommendation_round_trips_through_the_store_and_renders() {
     let g = recall_one(&ex, &facade, "recommendations");
     let f = &g["fields"];
     assert_eq!(f["target_ref"], "entity:caller/alice");
-    assert_eq!(f["analyzer"]["id"], "waiser.duplicate_sweep/1");
+    assert_eq!(f["analyzer"]["id"], "loop.duplicate_sweep/1");
     assert_eq!(f["summary"]["template_id"], "dup.consolidate");
     assert_eq!(f["summary"]["args"]["count"], 3);
     assert_eq!(f["severity"], "medium");
@@ -644,7 +644,7 @@ fn recommendations_are_filterable_by_their_type_specific_fields() {
     ] {
         let rec = Recommendation::new(
             target,
-            Analyzer::new("waiser.staleness/1"),
+            Analyzer::new("loop.staleness/1"),
             Summary {
                 template_id: "stale".into(),
                 args: serde_json::json!({}),

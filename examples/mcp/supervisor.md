@@ -1,6 +1,6 @@
 # Multi-agent supervisor pattern (separation of duties)
 
-Waiser's self-approval block bites when actors are distinct. Run **two MCP
+Deja Loop's self-approval block bites when actors are distinct. Run **two MCP
 processes over the same backend file** with different scopes and actors, so a
 worker agent can propose but only a reviewer can approve.
 
@@ -19,7 +19,7 @@ worker agent can propose but only a reviewer can approve.
 ```
 
 The worker captures tool calls (`dejadb_add` / a `record_tool_call` loop) and
-may run `dejadb_waiser` to surface recommendations — but a `write`-scoped
+may run `dejadb_loop` to surface recommendations — but a `write`-scoped
 actor holds neither `review` nor `apply`.
 
 ### Reviewer — approves and applies
@@ -37,7 +37,7 @@ If the worker tries to approve its own proposal, the engine refuses:
 
 ```
 dejadb_recommendations { "action": "approve", "hash": "…", "because": "lgtm" }
-→ WSR-E021 self-approval blocked: agent:worker created this recommendation
+→ LOP-E021 self-approval blocked: agent:worker created this recommendation
 ```
 
 No agent can rubber-stamp its own memory edits. The reviewer approves with a

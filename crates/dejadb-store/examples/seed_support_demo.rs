@@ -2,7 +2,7 @@
 //!
 //! A support org whose agent memory holds the billing knowledge graph: who
 //! owns each queue, who backs them up, who each account is assigned to, and
-//! which system bills them. The corpus is planted so a single `deja waiser
+//! which system bills them. The corpus is planted so a single `deja loop
 //! run` fires most of the built-in analyzers on data a support lead can read:
 //! a live ownership contradiction, an exact-duplicate contact, a dead legacy
 //! cluster, two stalled skills, an expired promo, and a tool that keeps 403ing.

@@ -184,11 +184,11 @@ export declare class DejaDb {
   recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null): Promise<string>
   /**
    * Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
-   * the whole memory (`deja waiser reflect` semantics); `policy` is a path
-   * to a host `waiser-policy.json` — the only way auto-apply is granted
+   * the whole memory (`deja loop reflect` semantics); `policy` is a path
+   * to a host `loop-policy.json` — the only way auto-apply is granted
    * from the bindings. Returns run-outcome JSON.
    */
-  waiserRun(minNew?: number | undefined | null, minNewErrors?: number | undefined | null, ifStale?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, analyzerCmd?: string | undefined | null, fullSweep?: boolean | undefined | null, policy?: string | undefined | null): Promise<string>
+  loopRun(minNew?: number | undefined | null, minNewErrors?: number | undefined | null, ifStale?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, analyzerCmd?: string | undefined | null, fullSweep?: boolean | undefined | null, policy?: string | undefined | null): Promise<string>
   /**
    * List recommendations. `filter` is optional JSON, e.g. `{"status":
    * "pending"}`; `{"status":"all"}` clears the filter. JSON list.
@@ -212,14 +212,14 @@ export declare class DejaDb {
   /**
    * Health snapshot of the loop: when it last ran, how much is un-analyzed
    * since, the queue counts, and whether it looks stalled. Parity with bare
-   * `deja waiser` and `GET /api/waiser/health`.
+   * `deja loop` and `GET /api/loop/health`.
    */
-  waiserHealth(): Promise<string>
+  loopHealth(): Promise<string>
   /** The analyzer roster: id, whether it is enabled, and its settings. */
-  waiserAnalyzers(): Promise<string>
+  loopAnalyzers(): Promise<string>
   /**
    * Enable/disable one analyzer, or set its parameters — reachable from the
-   * console's Setup tab (`POST /api/waiser/config`) but not, until now, from
+   * console's Setup tab (`POST /api/loop/config`) but not, until now, from
    * the bindings. `paramsJson` is an optional JSON object of overrides.
    */
   setAnalyzerConfig(analyzerId: string, enabled?: boolean | undefined | null, paramsJson?: string | undefined | null): Promise<string>
@@ -228,15 +228,15 @@ export declare class DejaDb {
   /**
    * Roll back an applied recommendation (retracts the grains it created).
    * Mandatory reason; fails for non-rollbackable applies (FORGET has no
-   * inverse). Parity with `deja waiser rollback`.
+   * inverse). Parity with `deja loop rollback`.
    */
   rollbackRecommendation(hash: string, because: string): Promise<string>
   /**
    * Measured outcomes of applied recommendations — the Verify gate's
    * record (`held` / `regressed` per checkpoint). JSON list, parity with
-   * `deja waiser outcomes`.
+   * `deja loop outcomes`.
    */
-  waiserOutcomes(): Promise<string>
+  loopOutcomes(): Promise<string>
 }
 
 /**

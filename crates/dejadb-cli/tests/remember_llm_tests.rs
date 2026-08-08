@@ -1,9 +1,9 @@
 //! `deja remember` LLM extraction, end-to-end through the real binary.
 //!
 //! Hermetic: every "model" here is a small python script driven over the
-//! `--llm-cmd` subprocess backend (the same fake-LLM pattern the Waiser golden
+//! `--llm-cmd` subprocess backend (the same fake-LLM pattern the Deja Loop golden
 //! suite uses), so no test touches the network or needs a key. The scripts
-//! speak the Waiser wire protocol — `probe` at construction, then `extract` and
+//! speak the Deja Loop wire protocol — `probe` at construction, then `extract` and
 //! `ground`.
 //!
 //! What is pinned here is the *trust posture*, not the prompt: the raw text

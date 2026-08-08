@@ -215,7 +215,7 @@ fn a_new_grain_type_stamps_min_reader_version() {
 
         let rec = Recommendation::new(
             "entity:ns/a",
-            Analyzer::new("waiser.dup/1"),
+            Analyzer::new("loop.dup/1"),
             Summary {
                 template_id: "t".into(),
                 args: serde_json::json!({}),

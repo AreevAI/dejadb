@@ -1,0 +1,5 @@
+Deja Loop: 11 pending recommendation(s) for this memory (review with `deja loop list`, act with approve/apply/reject --because):
+  [high] f1f8fc8617be  Tool "stripe_refund" failed 5 times (83% of calls): rate limited # retry later
+  [medium] 04be34e8240f  "deploy" holds 2 live values for functional relation "region"
+  [medium] 31b699696c98  Entity "deploy/region" has 2 competing heads
+  … and 8 more
