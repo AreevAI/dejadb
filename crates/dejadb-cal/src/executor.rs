@@ -4236,9 +4236,21 @@ fn value_to_cal_literal(value: &super::ast::Value) -> String {
 fn cal_value_to_json(val: &super::ast::Value) -> serde_json::Value {
     match val {
         super::ast::Value::String { value } => serde_json::Value::String(value.clone()),
-        super::ast::Value::Number { value } => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        // An integral literal becomes a JSON *integer*, not a float. The AST
+        // holds every number as f64, and `Number::from_f64` always yields a
+        // float — so `serde_json::Value::as_i64()` returned None for all of
+        // them, and every i64-typed field set from CAL (`created_at`,
+        // `valid_to`, `duration_ms`, …) was silently discarded on the way to
+        // the grain builder. Fractional values are unaffected.
+        super::ast::Value::Number { value } => {
+            if value.fract() == 0.0 && value.abs() < 9.007_199_254_740_992e15 {
+                serde_json::Value::Number(serde_json::Number::from(*value as i64))
+            } else {
+                serde_json::Number::from_f64(*value)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        }
         super::ast::Value::Boolean { value } => serde_json::Value::Bool(*value),
         super::ast::Value::Array { values } => {
             serde_json::Value::Array(values.iter().map(cal_value_to_json).collect())

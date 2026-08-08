@@ -1773,8 +1773,9 @@ impl DejaDB {
     pub fn rebuild_text_index(&mut self) -> Result<usize> {
         if !self.index_text {
             return Err(DejaDbError::Validation(
-                "text indexing is off for this file — reopen with --index-text true \
-                 (open_with index_text) before rebuilding the FTS index"
+                "text indexing is off for this file — reopen it with text indexing on \
+                 (open_with index_text, index_text=True from Python, indexText from \
+                 Node, --index-text true on the CLI) before rebuilding the FTS index"
                     .to_string(),
             ));
         }
@@ -4224,8 +4225,17 @@ impl DejaDB {
         k: usize,
     ) -> Result<Vec<(Hash, f32)>> {
         if self.embedder.is_none() {
+            // Surface-neutral on purpose. This used to name `--embed-cmd`, a
+            // `deja` CLI flag that does not exist in Python or Node — and
+            // `pip install dejadb` ships only the bindings, so a pip-only user
+            // could not act on it at all. It also called this a "novelty
+            // check", the CLI's `deja novelty` verb, when the caller had
+            // reached it through `nearest()`. Each surface appends its own
+            // remedy; this layer states only what is missing.
             return Err(DejaDbError::Validation(
-                "novelty check requires an embedder (e.g. --embed-cmd); none installed".into(),
+                "semantic nearest-neighbour search requires an installed embedder; \
+                 none is installed"
+                    .into(),
             ));
         }
         let Some(ns_id) = self.term_lookup(ns)? else {

@@ -627,8 +627,56 @@ def test_search_without_any_leg_raises_rather_than_answering_empty(tmp_path):
     m = dejadb.DejaDB(str(tmp_path / "noleg.db"), ns="caller", index_text=False)
     m.add_fact("john", "prefers", "window seat")
     assert json.loads(m.recall("john"))  # structural recall still works
-    with pytest.raises(ValueError, match="text or vector leg"):
+    with pytest.raises(ValueError, match="text or vector leg") as exc:
         m.search("window")
+    # Following the first remedy alone leaves a silent empty result: reopening
+    # with index_text=True turns indexing on for FUTURE writes, so grains
+    # written while it was off stay invisible. The error has to name the second
+    # step, because a user who hit an exception is looking at the exception.
+    assert "reindex_text()" in str(exc.value), str(exc.value)
+
+
+def test_reopening_with_index_text_needs_reindex_to_see_old_grains(tmp_path):
+    # The exact sequence the error text now describes, end to end.
+    path = str(tmp_path / "idx.db")
+    m = dejadb.DejaDB(path, ns="caller", index_text=False)
+    m.add_fact("john", "prefers", "window seat")
+    del m
+
+    m2 = dejadb.DejaDB(path, ns="caller", index_text=True)
+    assert json.loads(m2.search("window")) == [], "written while indexing was off"
+    m2.reindex_text()
+    assert len(json.loads(m2.search("window"))) == 1
+
+
+def test_nearest_without_an_embedder_names_the_python_remedy(tmp_path):
+    # The message used to point at `--embed-cmd` (a `deja` CLI flag that does
+    # not exist in Python; pip installs no binary) and call this a "novelty
+    # check" (the CLI's verb) when the caller had reached it through nearest().
+    m = make_db(tmp_path)
+    m.add_fact("john", "prefers", "tea")
+    with pytest.raises(ValueError) as exc:
+        m.nearest("tea", k=3)
+    msg = str(exc.value)
+    assert "nearest()" in msg, msg
+    assert "set_embedder" in msg and "set_embedder_command" in msg, msg
+    assert "--embed-cmd" not in msg, msg
+    assert "novelty check" not in msg, msg
+
+
+def test_valid_to_at_top_level_is_stored_as_the_typed_field(tmp_path):
+    # add() accepts the documented spelling, and the value lands in exactly one
+    # place — not swallowed into context as the compacted key "vt", where
+    # waiser.staleness and the world-time projection cannot see it.
+    m = make_db(tmp_path)
+    past = 1_600_000_000_000
+    m.add("fact", json.dumps({
+        "subject": "promo", "relation": "code", "object": "SAVE20",
+        "valid_to": past,
+    }))
+    fields = json.loads(m.recall("promo"))[0]["fields"]
+    assert fields.get("valid_to") == past, fields
+    assert "vt" not in json.dumps(fields.get("context", {})), fields
 
 
 def test_add_batch_roundtrip(tmp_path):
