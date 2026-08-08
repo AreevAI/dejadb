@@ -313,6 +313,10 @@ impl<'a> AssembleEngine<'a> {
             source.with_options.clone()
         };
         let surrogate = CalQuery {
+            // Inherit the enclosing query's resolved LET bindings so a source
+            // can scope on them: `ASSEMBLE … FROM p: (RECALL … WHERE subject
+            // IN $friends)` is the whole point of the two-step pattern.
+            let_values: query.let_values.clone(),
             version: query.version,
             statement: *source.query.clone(),
             pipeline: Vec::new(),
@@ -726,6 +730,7 @@ mod tests {
             fields: serde_json::json!({"subject": "john", "relation": "likes", "object": "coffee"}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };

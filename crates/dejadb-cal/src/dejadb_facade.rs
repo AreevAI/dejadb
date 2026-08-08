@@ -6,7 +6,7 @@
 //! M2 scope: structural recall only. Semantic (`query`) recall returns a
 //! clear error until the FTS/vector legs land (M4).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use dejadb_core::error::{Hash, DejaDbError, Result};
@@ -20,7 +20,8 @@ use crate::facade::{CalStoreFacade, TemplateInfo};
 use crate::json_build::{build_grain_from_json, GrainSink};
 use crate::queries::{PersistedQuery, QueryEntry, QueryListEntry, QueryRegistry};
 use crate::store_types::{
-    DiversityMethod, ForkGroupInfo, RecallParams, SearchHit, SupersessionStatus, VersionEntry,
+    ConflictStatus, DiversityMethod, ForkGroupInfo, RecallParams, SearchHit, SupersessionStatus,
+    VersionEntry,
 };
 use crate::templates::{PersistedTemplate, TemplateRegistry};
 
@@ -34,6 +35,50 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Membership test for the `WHERE <field> IN (...)` filters. `None` is "no
+/// filter"; an empty set never reaches here (the caller short-circuits, because
+/// an empty `IN` selects nothing rather than everything).
+fn set_contains(set: &Option<Vec<String>>, value: Option<&str>) -> bool {
+    match set {
+        None => true,
+        Some(values) => value.is_some_and(|v| values.iter().any(|c| c == v)),
+    }
+}
+
+/// "3 hours ago" for `WITH annotate_relative_time`. Coarse on purpose: the
+/// point is freshness at a glance, and a model reading "2 weeks ago" needs no
+/// more precision than that. Negative ages (a grain stamped in the future,
+/// which import and clock skew both produce) read as "just now" rather than
+/// wrapping into a nonsense past.
+fn relative_time_label(age_ms: i64) -> String {
+    const MIN: i64 = 60_000;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    let plural = |n: i64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    match age_ms {
+        a if a < MIN => "just now".into(),
+        a if a < HOUR => plural(a / MIN, "minute"),
+        a if a < DAY => plural(a / HOUR, "hour"),
+        a if a < 7 * DAY => plural(a / DAY, "day"),
+        a if a < 30 * DAY => plural(a / (7 * DAY), "week"),
+        a if a < 365 * DAY => plural(a / (30 * DAY), "month"),
+        a => plural(a / (365 * DAY), "year"),
+    }
 }
 
 /// CalStoreFacade implementation over an embedded `DejaDB` store.
@@ -593,6 +638,17 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn recall(&self, params: &RecallParams) -> Result<Vec<SearchHit>> {
+        // `WHERE <field> IN (...)` with nothing in it selects nothing. This is
+        // the sharp edge of the whole `IN` family: `LET $friends = …` binding to
+        // the empty set is the *natural* "this user has no friends yet"
+        // outcome, and treating an empty filter as no filter answered with the
+        // entire table. Fail closed, before any leg runs.
+        for empty in [&params.subject_in, &params.relation_in, &params.object_in] {
+            if empty.as_ref().is_some_and(|v| v.is_empty()) {
+                return Ok(Vec::new());
+            }
+        }
+
         // mount routing: "alias.inner" namespaces hit mounted replicas
         let requested = params.namespace.as_deref().or(self.namespace.as_deref());
         let (mount_alias, ns_owned) = match requested {
@@ -624,7 +680,23 @@ impl CalStoreFacade for DejaDbFacade {
         // Which leg ran matters below: `recent` takes no structural predicates
         // and does not know about supersession, so this path has to reapply
         // both itself.
-        let unanchored = params.subject.is_none() && params.query.is_none();
+        //
+        // `WHERE subject IN (a, b, c)` anchors just as well as `subject = a` —
+        // it is a union of anchored legs, one per value. Treating it as
+        // unanchored dropped the query into the recent-by-type scan, where the
+        // filter was never applied at all (it lives in `RecallParams` and
+        // nothing downstream read it), so the documented
+        // `LET $friends = SUBJECTS OF (…)` pattern answered with *everybody's*
+        // preferences instead of the friends'. Anchoring per value also means
+        // the scan is bounded by the subjects asked for rather than by
+        // `default_limit` — a post-filter over the newest 50 would miss a
+        // named subject whose grains are older than that.
+        let anchors: Vec<String> = match (&params.subject, &params.subject_in) {
+            (Some(s), _) => vec![s.clone()],
+            (None, Some(values)) => values.clone(),
+            (None, None) => Vec::new(),
+        };
+        let unanchored = anchors.is_empty() && params.query.is_none();
         // `WITH superseded` — the caller is asking about the past, so every leg
         // widens from the heads to the whole supersession chain.
         let include_superseded = params.exclude_superseded == Some(false);
@@ -668,15 +740,50 @@ impl CalStoreFacade for DejaDbFacade {
                 }),
                 include_superseded,
             };
-            m.recall_hybrid_tuned(
-                ns,
-                params.subject.as_deref(),
-                params.relation.as_deref(),
-                params.query.as_deref(),
-                k.saturating_mul(Self::RECALL_OVERFETCH),
-                None,
-                tuning,
-            )?
+            let budget = k.saturating_mul(Self::RECALL_OVERFETCH);
+            match anchors.len() {
+                // The common case, and the voice hot path: one anchored leg.
+                0 | 1 => m.recall_hybrid_tuned(
+                    ns,
+                    anchors.first().map(String::as_str),
+                    params.relation.as_deref(),
+                    params.query.as_deref(),
+                    budget,
+                    None,
+                    tuning,
+                )?,
+                // `subject IN (a, b, …)`: one anchored leg per value, unioned.
+                // Each leg gets the full budget so a subject with many grains
+                // cannot starve the others out of the result set; the union is
+                // deduped by content address and the caller's LIMIT is applied
+                // below, as it is on every other path.
+                _ => {
+                    let mut seen: HashSet<Hash> = HashSet::new();
+                    let mut union = Vec::new();
+                    for anchor in &anchors {
+                        for g in m.recall_hybrid_tuned(
+                            ns,
+                            Some(anchor.as_str()),
+                            params.relation.as_deref(),
+                            params.query.as_deref(),
+                            budget,
+                            None,
+                            tuning,
+                        )? {
+                            if seen.insert(g.hash) {
+                                union.push(g);
+                            }
+                        }
+                    }
+                    // Newest first, matching what a single anchored leg returns.
+                    union.sort_by(|a, b| {
+                        b.get_i64("created_at")
+                            .unwrap_or(0)
+                            .cmp(&a.get_i64("created_at").unwrap_or(0))
+                    });
+                    union
+                }
+            }
         };
 
         // `WITH multi_hop(n)` — entity-graph expansion.
@@ -773,6 +880,15 @@ impl CalStoreFacade for DejaDbFacade {
                 Some(o) => g.get_str("object") == Some(o.as_str()),
                 None => true,
             })
+            // The `IN` family. `subject_in` already anchored the legs above, but
+            // an anchored leg on "jane" can still surface grains where jane is
+            // the *object*, so all three are re-applied here as membership
+            // tests. Before this, nothing in the engine read these three fields
+            // at all: the executor set them and the query returned every row the
+            // rest of the WHERE matched, with no error and no warning.
+            .filter(|g| set_contains(&params.subject_in, g.get_str("subject")))
+            .filter(|g| set_contains(&params.relation_in, g.get_str("relation")))
+            .filter(|g| set_contains(&params.object_in, g.get_str("object")))
             .filter(|g| match params.grain_type {
                 Some(gt) => g.grain_type == gt,
                 None => true,
@@ -815,6 +931,98 @@ impl CalStoreFacade for DejaDbFacade {
                 }
             }
         }
+
+        // `WITH conflict_resolution` — keep only the newest grain per
+        // (subject, relation). Documented in §5 and advertised by DESCRIBE, but
+        // the implementation lived on the ASSEMBLE post-merge path only, which
+        // a RECALL payload never reaches — so a caller specifically trying to
+        // avoid feeding two contradictory values into a model's context got
+        // both, with no signal. Ties break on the later hash so the choice is
+        // deterministic across nodes rather than dependent on scan order.
+        if params.conflict_resolution == Some(true) {
+            let mut newest: HashMap<(String, String), (i64, Hash)> = HashMap::new();
+            for h in &hits {
+                let (Some(s), Some(r)) = (h.grain.get_str("subject"), h.grain.get_str("relation"))
+                else {
+                    continue;
+                };
+                let created = h.grain.get_i64("created_at").unwrap_or(0);
+                let key = (s.to_string(), r.to_string());
+                let better = match newest.get(&key) {
+                    None => true,
+                    Some((best, best_hash)) => {
+                        (created, h.hash.as_bytes()) > (*best, best_hash.as_bytes())
+                    }
+                };
+                if better {
+                    newest.insert(key, (created, h.hash));
+                }
+            }
+            for h in &mut hits {
+                let keep = match (h.grain.get_str("subject"), h.grain.get_str("relation")) {
+                    // A grain with no (subject, relation) key has nothing to
+                    // conflict with, so it is never the loser of a comparison.
+                    (Some(s), Some(r)) => newest
+                        .get(&(s.to_string(), r.to_string()))
+                        .is_none_or(|(_, hash)| *hash == h.hash),
+                    _ => true,
+                };
+                h.conflict_status = Some(if keep {
+                    ConflictStatus::Current
+                } else {
+                    ConflictStatus::Outdated
+                });
+            }
+            hits.retain(|h| h.conflict_status != Some(ConflictStatus::Outdated));
+        }
+
+        // `WITH annotate_relative_time` — "3 hours ago" beside the epoch
+        // milliseconds, so a model reading the context does not have to do
+        // date arithmetic to know whether a memory is fresh.
+        if params.annotate_relative_time == Some(true) {
+            let now = now_ms();
+            for h in &mut hits {
+                h.relative_time = h
+                    .grain
+                    .get_i64("created_at")
+                    .map(|created| relative_time_label(now - created));
+            }
+        }
+
+        // `WITH explanation` — why this grain came back. Template-based and
+        // derived entirely from the predicates that ran (the field's contract:
+        // no LLM, suitable for EU AI Act Art. 86 disclosure).
+        if params.explanation == Some(true) {
+            for h in &mut hits {
+                let mut why: Vec<String> = Vec::new();
+                if !anchors.is_empty() {
+                    if let Some(s) = h.grain.get_str("subject") {
+                        if anchors.iter().any(|a| a == s) {
+                            why.push(format!("anchored on subject \"{s}\""));
+                        }
+                    }
+                }
+                if let Some(q) = &params.query {
+                    why.push(format!("matched the free-text query \"{q}\""));
+                }
+                if let Some(r) = params.relation.as_deref().or_else(|| {
+                    params.relation_in.as_ref().and_then(|_| h.grain.get_str("relation"))
+                }) {
+                    why.push(format!("relation is \"{r}\""));
+                }
+                if why.is_empty() {
+                    why.push(match params.grain_type {
+                        Some(gt) => format!("recent {} in this namespace", gt.as_str()),
+                        None => "recent grain in this namespace".into(),
+                    });
+                }
+                if h.supersession_status == Some(SupersessionStatus::Superseded) {
+                    why.push("included as history by WITH superseded".into());
+                }
+                h.explanation = Some(why.join("; "));
+            }
+        }
+
         Ok(hits)
     }
 

@@ -2910,6 +2910,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -2930,6 +2931,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -2947,6 +2949,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -2965,6 +2968,7 @@ mod tests {
             }),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         }
@@ -3030,6 +3034,7 @@ mod tests {
             contested_by: None,
             explanation: None,
             score_breakdown: None,
+            relative_time: None,
         };
         let content = |g: &CalGrainResult| match project_content(g) {
             ResolvedValue::Str(s) => s,
@@ -3958,6 +3963,7 @@ mod tests {
                 contested_by: None,
                 explanation: None,
                 score_breakdown: None,
+                relative_time: None,
             })
             .collect();
         let t = parse_template("{{#each grains}}x{{/each}}").unwrap();
@@ -4336,6 +4342,7 @@ mod tests {
             fields: json!({}),
             score_breakdown: None,
             explanation: None,
+            relative_time: None,
             is_deterministic: false,
             contested_by: None,
         };
