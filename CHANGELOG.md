@@ -73,6 +73,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   three latent issues: `apply_supersede_flip` now runs in a transaction,
   `rebuild_link_indexes` rolls back on error, and the write path's per-add
   statement preparation is now cached.
+- `DESCRIBE <grain type>` reports `required_fields` — the fields the write
+  path refuses to build the grain without. Previously the only way to learn a
+  type's shape was to hit `VAL-E001` one field at a time (`skill` asks for
+  `name`, then asks for `description`). A test pins the list to the validator,
+  and `crates/dejadb-cal/tests/docs_examples.rs` parses every `sql` example in
+  `docs/cal-reference.md` on each run, so a documented query that does not
+  parse fails CI rather than a user's first session.
 
 ### Fixed
 
@@ -111,6 +118,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   release the claim on drop, but Node's drop waits for GC, so without it a
   handle that had gone out of JS scope would hold the file until then. Calling
   a method on a closed handle is an error, not a silent reopen.
+- **Documentation that described a different engine than the one that
+  shipped** (#37, #48, #49, #51, #54). `docs/cal-reference.md` §3.1 claimed
+  *every* `RECALL` needs a subject filter or free-text query — the rule binds
+  untyped (`*`/`grains`/`all`) recalls only, and the section's own
+  `| COUNT` example depended on that; §4's pipeline table listed a
+  `| WHERE` stage the grammar never had; the "copy-pasteable examples"
+  `ASSEMBLE` printed `PRIORITY` before `BUDGET` and did not parse.
+  `ARCHITECTURE.md` §2.3 omitted a required field from three of eleven grain
+  shapes, so `observation`/`consent`/`skill` built from exactly their
+  documented columns were rejected. `docs/cookbook.md` still called
+  encryption at rest CLI-only, which stopped being true when both bindings
+  gained a `passphrase` constructor argument.
 
 ### Changed
 

@@ -2807,6 +2807,13 @@ impl CalExecutor {
                 serde_json::json!({
                     "grain_type": type_name,
                     "specific_fields": specific_fields,
+                    // What the write path refuses to build the grain without.
+                    // Without this a caller discovers the shape one VAL-E001 at
+                    // a time — `skill` asks for `name`, then asks for
+                    // `description` — with no way to ask up front.
+                    "required_fields": crate::json_build::required_fields(
+                        gt.to_grain_type().map(|t| t.as_str()).unwrap_or("")
+                    ),
                     "common_fields": [
                         "namespace", "user_id", "created_at", "tags", "importance"
                     ]
