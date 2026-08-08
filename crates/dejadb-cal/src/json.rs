@@ -143,6 +143,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -188,6 +189,7 @@ mod tests {
             with_options: vec![WithOption::ScoreBreakdown],
             format: Some(FormatClause::Single(FormatSpec::Json)),
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -221,6 +223,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -318,6 +321,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -385,6 +389,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -419,6 +424,7 @@ mod tests {
             pipeline: vec![],
             with_options: vec![],
             format: None,
+            let_values: Default::default(),
             let_bindings: vec![LetBinding {
                 name: "people".to_string(),
                 extractor: Extractor::Subjects,
@@ -463,6 +469,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -511,6 +518,7 @@ mod tests {
             with_options: vec![WithOption::Superseded, WithOption::ScoreBreakdown],
             format: Some(FormatClause::Single(FormatSpec::Json)),
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -544,6 +552,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: std::collections::HashMap::new(),
             warnings: vec![],
         };
@@ -584,6 +593,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: vars,
             warnings: vec![],
         };
@@ -625,6 +635,7 @@ mod tests {
             with_options: vec![],
             format: None,
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: {
                 let mut v = std::collections::HashMap::new();
                 v.insert("x".into(), "y".into());

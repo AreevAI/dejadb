@@ -392,6 +392,19 @@ Comparators: `=`, `!=`, `>`, `>=`, `<`, `<=`. Values are strings (`"..."`),
 numbers, booleans, arrays (`["a", "b"]`), content hashes (`sha256:abcdef...`), or
 parameter references (`$name`). Membership sets are capped at 100 values.
 
+`IN` fails **closed** in both directions, which matters because these filters
+usually scope a recall to a tenant, a session, or a user:
+
+- `subject IN $var` where `$var` bound to nothing selects **nothing**, not
+  everything. "This user has no friends yet" is the natural outcome of the
+  two-step pattern, and it must not widen to the whole table.
+- An unbound `$var` is an error (`CAL-E008`), not an empty set — scoping to
+  nothing silently is as wrong as scoping to everything silently.
+
+`hash` is a filter field like any other (`WHERE hash = "<64-hex>"`, with or
+without the `sha256:` prefix, and `hash IN (...)`), even though a grain's
+content address lives on the envelope rather than among its fields.
+
 ---
 
 ## 4. The pipeline
@@ -430,7 +443,8 @@ representative selection:
 | `WITH superseded` | Include historical (superseded) grains, each stamped with the `superseded_by` hash of the version that replaced it. Applies to every recall leg — structural, free-text and vector — so text that survives only in an old version becomes findable. Forgotten grains stay gone. |
 | `WITH provenance` | Include the provenance chain in results |
 | `WITH include_sources` | Include `derived_from` source grains |
-| `WITH score_breakdown` / `WITH explanation` | Return ranking detail |
+| `WITH explanation` | Stamp each grain with why it matched (which predicate anchored it, whether the free-text leg hit, whether it is history). Template-based, no LLM. |
+| `WITH score_breakdown` | Per-leg ranking detail. **Not available on `RECALL`** — the recall path returns fused grains, not per-leg scores, so structural hits all carry the sentinel `1.0`. Passing it emits `CAL-W014` rather than changing the result. |
 | `WITH diversity(0.5)` | Apply MMR diversity (optional lambda) |
 | `WITH dedup(object)` | Deduplicate, optionally by a field |
 | `WITH rerank` / `WITH rerank("model")` | Cross-encoder reranking (feature-gated) |
@@ -448,7 +462,15 @@ RECALL facts WHERE subject = "john" WITH superseded, provenance
 ```
 
 Options requiring an unavailable backend (e.g. a reranker feature that is not
-compiled in) return an honest error rather than silently degrading.
+compiled in) return an honest error rather than silently degrading. An option
+that parses but cannot change the result on the statement it is attached to
+emits `CAL-W014` naming the option and the surface — a warning rather than an
+error, because these have shipped for several releases and a hard failure would
+break callers who pass them today. Either way the contract is that **silence
+means the option did something**.
+
+`DESCRIBE`'s `with_options` lists the options that actually change a `RECALL`
+result, so a client can introspect rather than guess.
 
 ---
 

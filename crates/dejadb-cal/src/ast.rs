@@ -58,6 +58,17 @@ pub struct CalQuery {
     #[serde(default)]
     pub user_vars: HashMap<String, String>,
 
+    /// `LET` bindings after evaluation, keyed by name without the `$`.
+    ///
+    /// Execution state, not query text, so it is never serialized: the parser
+    /// leaves this empty and the executor fills it once the bindings have run.
+    /// It exists because `$friends` in `WHERE subject IN $friends` has to
+    /// become a list of values somewhere, and threading a scope object through
+    /// every statement executor to do it would touch far more surface than
+    /// carrying the answer on the query does.
+    #[serde(skip)]
+    pub let_values: HashMap<String, Vec<String>>,
+
     /// Warnings emitted during parsing (non-fatal).
     #[serde(skip)]
     pub warnings: Vec<super::errors::CalWarning>,
@@ -1892,6 +1903,7 @@ mod tests {
             with_options: vec![WithOption::ScoreBreakdown],
             format: Some(FormatClause::Single(FormatSpec::Json)),
             let_bindings: vec![],
+            let_values: Default::default(),
             user_vars: HashMap::new(),
             warnings: vec![],
         };

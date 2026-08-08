@@ -1365,6 +1365,21 @@ pub enum CalWarning {
     /// "nothing among the first N is contested" are different claims; without
     /// this warning the second would be indistinguishable from the first.
     ContradictionScanBounded { scanned: usize },
+
+    /// CAL-W014 — A `WITH` option parsed and ran, but does nothing on the
+    /// statement it was attached to.
+    ///
+    /// §5 promises that an option needing an unavailable backend "returns an
+    /// honest error rather than silently degrading". Several did neither: they
+    /// parsed, ran, and returned output byte-identical to the same query
+    /// without them. A hard error would break callers who have been passing
+    /// these since 1.0, so the honest form is a warning that names the option
+    /// and the surface — silence was the actual defect.
+    WithOptionInert {
+        option: &'static str,
+        statement: &'static str,
+        why: &'static str,
+    },
 }
 
 impl CalWarning {
@@ -1383,6 +1398,7 @@ impl CalWarning {
             Self::UnrecognizedWhereField { .. } => "CAL-W010",
             Self::EachIterationCapped { .. } => "CAL-W011",
             Self::ContradictionScanBounded { .. } => "CAL-W012",
+            Self::WithOptionInert { .. } => "CAL-W014",
         }
     }
 
@@ -1399,7 +1415,9 @@ impl CalWarning {
             | Self::IsCategoryOnNonRelation { span, .. }
             | Self::AssembleUnscopedSource { span, .. }
             | Self::UnrecognizedWhereField { span, .. } => *span,
-            Self::EachIterationCapped { .. } | Self::ContradictionScanBounded { .. } => None,
+            Self::EachIterationCapped { .. }
+            | Self::ContradictionScanBounded { .. }
+            | Self::WithOptionInert { .. } => None,
         }
     }
 }
@@ -1480,6 +1498,16 @@ impl std::fmt::Display for CalWarning {
                 write!(
                     f,
                     "CAL-W012: CONTRADICTIONS examined the first {scanned} matching grains (the executor's max_limit) — grains past that were not checked, so this is not a complete all-clear. Narrow the query with WHERE/ABOUT/SINCE to be sure."
+                )
+            }
+            Self::WithOptionInert {
+                option,
+                statement,
+                why,
+            } => {
+                write!(
+                    f,
+                    "CAL-W014: WITH {option} has no effect on {statement} — {why}. The result is the same as without it."
                 )
             }
         }

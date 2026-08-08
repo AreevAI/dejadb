@@ -128,6 +128,7 @@ and are the source of truth. Ranges:
 | `CAL-E120` | Invalid JSON+CAL |
 | `CAL-W001`–`W012` | Warnings (unknown relation, deprecated operator, `{{#each}}` cap, bounded `CONTRADICTIONS` scan, …) |
 | `CAL-W013` | `WITH auto_relate` accepted but not implemented — no relations are inferred |
+| `CAL-W014` | A `WITH` option parsed and ran but cannot change the result on this statement (e.g. `score_breakdown` on `RECALL`) |
 
 `CAL-E116` is the "needs an external LLM, not implemented" error for
 `WITH hyde` / `WITH llm_rerank` — DejaDB takes no LLM dependency by policy.

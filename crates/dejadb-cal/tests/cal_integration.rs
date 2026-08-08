@@ -1617,3 +1617,282 @@ fn with_superseded_widens_the_anchored_legs_and_labels_the_history() {
     assert_eq!(grains(r#"RECALL facts ABOUT "tea""#).len(), 0);
     assert_eq!(grains(r#"RECALL facts ABOUT "tea" WITH superseded"#).len(), 1);
 }
+
+// ── WHERE ... IN, and the WITH options that used to do nothing (#47, #53) ──
+//
+// Every assertion below checks that a clause **excludes** something. A test
+// that only checks "the row I wanted is present" passes against a filter that
+// is ignored entirely, which is exactly how `IN` shipped broken: the executor
+// set `RecallParams::subject_in` and nothing downstream ever read it.
+
+fn seeded() -> (CalExecutor, DejaDbFacade, TempDir) {
+    let (ex, facade, d) = setup();
+    let add = |s: &str, r: &str, o: &str| {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "{s}" SET relation = "{r}" SET object = "{o}" SET namespace = "caller" REASON "seed""#
+            ),
+            &facade,
+        )
+        .unwrap();
+    };
+    add("john", "prefers", "tea");
+    add("jane", "prefers", "coffee");
+    add("bob", "prefers", "water");
+    add("jane", "knows", "john");
+    (ex, facade, d)
+}
+
+fn subjects(ex: &CalExecutor, facade: &DejaDbFacade, q: &str) -> Vec<String> {
+    match ex.execute(q, facade).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => {
+            let mut s: Vec<String> = grains
+                .iter()
+                .filter_map(|g| g.fields.get("subject")?.as_str().map(str::to_string))
+                .collect();
+            s.sort();
+            s
+        }
+        other => panic!("expected grains, got: {other:?}"),
+    }
+}
+
+#[test]
+fn where_in_actually_filters() {
+    let (ex, f, _d) = seeded();
+
+    assert_eq!(
+        subjects(&ex, &f, r#"RECALL facts WHERE subject IN ("jane") AND relation = "prefers""#),
+        vec!["jane"],
+        "a one-element IN must exclude john and bob"
+    );
+    assert_eq!(
+        subjects(
+            &ex,
+            &f,
+            r#"RECALL facts WHERE subject IN ("jane", "bob") AND relation = "prefers""#
+        ),
+        vec!["bob", "jane"],
+    );
+    // relation/object IN exclude too.
+    assert_eq!(
+        subjects(&ex, &f, r#"RECALL facts WHERE subject = "jane" AND relation IN ("knows")"#),
+        vec!["jane"]
+    );
+    assert!(
+        subjects(&ex, &f, r#"RECALL facts WHERE subject = "jane" AND object IN ("nothing")"#)
+            .is_empty()
+    );
+}
+
+/// The sharp edge: an empty binding is the *natural* "no friends yet" outcome,
+/// and treating an empty filter as no filter returned the whole table into a
+/// model's context.
+#[test]
+fn an_empty_in_selects_nothing_not_everything() {
+    let (ex, f, _d) = seeded();
+    assert!(
+        subjects(
+            &ex,
+            &f,
+            r#"LET $none = SUBJECTS OF (RECALL facts WHERE relation = "nobody_has_this");
+               RECALL facts WHERE subject IN $none AND relation = "prefers""#
+        )
+        .is_empty(),
+        "an empty LET binding must scope to nothing"
+    );
+}
+
+/// The documented two-step pattern from §7. The LET scope was evaluated and
+/// then dropped — the executor comment called WHERE resolution "Phase 3" — so
+/// "friends-of-john's preferences" answered with everybody's.
+#[test]
+fn the_documented_let_pattern_scopes_the_recall() {
+    let (ex, f, _d) = seeded();
+    assert_eq!(
+        subjects(
+            &ex,
+            &f,
+            r#"LET $friends = SUBJECTS OF (RECALL facts WHERE relation = "knows" AND object = "john");
+               RECALL facts WHERE subject IN $friends AND relation = "prefers""#
+        ),
+        vec!["jane"],
+        "only john's friends, not the whole table"
+    );
+}
+
+/// Silently scoping to nothing is as wrong as silently scoping to everything;
+/// the caller can only tell the difference if we say so.
+#[test]
+fn an_undefined_variable_is_an_error() {
+    let (ex, f, _d) = seeded();
+    let err = ex
+        .execute(r#"RECALL facts WHERE subject IN $never_defined"#, &f)
+        .expect_err("an unbound parameter must not be silently dropped");
+    assert!(err.to_string().contains("never_defined"), "got: {err}");
+}
+
+/// `hash` is on the envelope, not in `fields`. `WHERE hash = <real address>`
+/// used to match nothing structurally and filter nothing afterwards, so it
+/// returned every grain; `hash IN` took the other branch and returned none.
+#[test]
+fn where_hash_resolves_the_envelope_in_both_directions() {
+    let (ex, f, _d) = seeded();
+    let all = match ex
+        .execute(r#"RECALL facts WHERE subject = "john""#, &f)
+        .unwrap()
+        .result
+    {
+        CalResultPayload::Grains { grains, .. } => grains,
+        other => panic!("{other:?}"),
+    };
+    let h = all[0].hash.clone();
+
+    for q in [
+        format!(r#"RECALL facts WHERE hash = "{h}""#),
+        format!(r#"RECALL facts WHERE hash IN ("{h}")"#),
+        // `sha256:` is how the rest of CAL spells an address.
+        format!(r#"RECALL facts WHERE hash = "sha256:{h}""#),
+    ] {
+        match ex.execute(&q, &f).unwrap().result {
+            CalResultPayload::Grains { grains, .. } => {
+                assert_eq!(grains.len(), 1, "`{q}` should select exactly one grain");
+                assert_eq!(grains[0].hash, h);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        subjects(&ex, &f, &format!(r#"RECALL facts WHERE hash = "{}""#, "0".repeat(64)))
+            .is_empty(),
+        "an address nothing has must select nothing"
+    );
+}
+
+/// §5 promises `conflict_resolution` keeps only the newest grain per
+/// (subject, relation). It was implemented on the ASSEMBLE post-merge path
+/// only, which a RECALL payload never reaches.
+#[test]
+fn with_conflict_resolution_keeps_one_grain_per_key() {
+    let (ex, facade, _d) = setup();
+    for (rel, obj) in [("prefers", "window seat"), ("prefers", "tea"), ("allergic_to", "peanuts")] {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "john" SET relation = "{rel}" SET object = "{obj}" SET namespace = "caller" REASON "seed""#
+            ),
+            &facade,
+        )
+        .unwrap();
+    }
+    let relations = |q: &str| match ex.execute(q, &facade).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => {
+            let mut r: Vec<String> = grains
+                .iter()
+                .filter_map(|g| g.fields.get("relation")?.as_str().map(str::to_string))
+                .collect();
+            r.sort();
+            r
+        }
+        other => panic!("{other:?}"),
+    };
+
+    assert_eq!(
+        relations(r#"RECALL facts WHERE subject = "john""#),
+        vec!["allergic_to", "prefers", "prefers"],
+        "without the option both `prefers` values are served"
+    );
+    assert_eq!(
+        relations(r#"RECALL facts WHERE subject = "john" WITH conflict_resolution"#),
+        vec!["allergic_to", "prefers"],
+        "with it, one grain per (subject, relation)"
+    );
+}
+
+/// `dedup(<field>)` was implemented for ASSEMBLE and inert on RECALL, though
+/// §5 introduces the whole table with "WITH options tune recall behavior".
+#[test]
+fn with_dedup_field_applies_to_recall_and_assemble_alike() {
+    let (ex, facade, _d) = setup();
+    for (rel, obj) in [("prefers", "tea"), ("also_likes", "tea"), ("hates", "coffee")] {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "john" SET relation = "{rel}" SET object = "{obj}" SET namespace = "caller" REASON "seed""#
+            ),
+            &facade,
+        )
+        .unwrap();
+    }
+    let count = |q: &str| match ex.execute(q, &facade).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => grains.len(),
+        CalResultPayload::Assembled { grains, .. } => grains.len(),
+        other => panic!("{other:?}"),
+    };
+
+    assert_eq!(count(r#"RECALL facts WHERE subject = "john""#), 3);
+    assert_eq!(
+        count(r#"RECALL facts WHERE subject = "john" WITH dedup(object)"#),
+        2,
+        "two grains share the object \"tea\""
+    );
+    // Clause order used to decide whether the option applied at all: the
+    // documented order routed it to the ASSEMBLE engine, the other order to the
+    // post-merge pass, which ignored the field and did similarity dedup.
+    for q in [
+        r#"ASSEMBLE "x" FROM p: (RECALL facts WHERE subject = "john") FORMAT json WITH dedup(object)"#,
+        r#"ASSEMBLE "x" FROM p: (RECALL facts WHERE subject = "john") WITH dedup(object) FORMAT json"#,
+    ] {
+        let payload = ex.execute(q, &facade).unwrap().result;
+        let n = match payload {
+            CalResultPayload::Formatted { grain_count, .. } => grain_count,
+            CalResultPayload::Assembled { ref grains, .. } => grains.len(),
+            CalResultPayload::Grains { ref grains, .. } => grains.len(),
+            ref other => panic!("{other:?}"),
+        };
+        assert_eq!(n, 2, "`{q}` must dedup on `object` regardless of clause order");
+    }
+}
+
+/// `annotate_relative_time` and `explanation` returned output byte-identical to
+/// the same query without them.
+#[test]
+fn annotate_and_explain_change_the_payload() {
+    let (ex, f, _d) = seeded();
+    let grains = |q: &str| match ex.execute(q, &f).unwrap().result {
+        CalResultPayload::Grains { grains, .. } => grains,
+        other => panic!("{other:?}"),
+    };
+
+    let annotated = grains(r#"RECALL facts WHERE subject = "john" WITH annotate_relative_time"#);
+    assert!(
+        annotated.iter().all(|g| g.relative_time.is_some()),
+        "every grain should carry a relative-time label"
+    );
+    assert!(grains(r#"RECALL facts WHERE subject = "john""#)
+        .iter()
+        .all(|g| g.relative_time.is_none()));
+
+    let explained = grains(r#"RECALL facts WHERE subject = "john" WITH explanation"#);
+    assert!(
+        explained
+            .iter()
+            .all(|g| g.explanation.as_deref().is_some_and(|e| e.contains("john"))),
+        "the explanation should name the predicate that matched: {explained:?}"
+    );
+}
+
+/// §5's own rule: an option that cannot be honoured "returns an honest error
+/// rather than silently degrading". `score_breakdown` has shipped for several
+/// releases, so a warning is the non-breaking form of honest — the defect was
+/// the silence, not the absence.
+#[test]
+fn an_inert_with_option_says_so() {
+    let (ex, f, _d) = seeded();
+    let res = ex
+        .execute(r#"RECALL facts WHERE subject = "john" WITH score_breakdown"#, &f)
+        .unwrap();
+    assert!(
+        res.warnings.iter().any(|w| w.contains("CAL-W014") && w.contains("score_breakdown")),
+        "expected a CAL-W014 warning, got: {:?}",
+        res.warnings
+    );
+}
