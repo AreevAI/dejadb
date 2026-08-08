@@ -82,6 +82,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   breaking `add_if_novel`'s value probe.
 - The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
   blobs in the probe statement itself (join) instead of one query per hit.
+- **Re-adding a grain that is already stored is a no-op instead of an error**
+  (#40). A content address *is* the content, so two byte-identical grains are
+  one grain — but the second insert raised
+  `STO-E001: UNIQUE constraint failed: grains.hash`. `created_at` has
+  millisecond resolution, so two identical events in the same millisecond
+  genuinely are the same grain; an agent retrying a failing tool in a tight
+  loop hit this intermittently through `record_tool_call`, the flagship
+  analyzer's ingest path, and the only workaround was to corrupt the payload
+  (jitter the result string) to satisfy the store. `add` now returns the
+  existing address. A skipped duplicate consumes no sequence number and writes
+  no op-log row — nothing changed, so nothing replicates — and duplicates
+  *within* one batch collapse too.
 
 ### Changed
 
