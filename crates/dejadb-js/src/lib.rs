@@ -846,7 +846,20 @@ impl DejaDb {
                 .with_store(|m| {
                     m.nearest_semantic(&ns, subject.as_deref(), relation.as_deref(), &text, k)
                 })
-                .map_err(err)?;
+                // Name the API the caller is holding, not the CLI's flag —
+                // this package ships no `deja` binary. Mirrors dejadb-py.
+                .map_err(|e| match e {
+                    DejaDbError::Validation(msg)
+                        if msg.contains("requires an installed embedder") =>
+                    {
+                        err(DejaDbError::Validation(
+                            "nearest() requires an embedder; install one with \
+                             setEmbedderCommand(cmd)"
+                                .to_string(),
+                        ))
+                    }
+                    other => err(other),
+                })?;
             let out: Vec<serde_json::Value> = matches
                 .iter()
                 .map(|(h, sim)| json!({"hash": h.to_hex(), "similarity": sim}))
