@@ -675,6 +675,16 @@ voice edge never blocks on a lock. Multi-writer conflict is handled honestly by
 the [heads/forks model](#4-versioning-heads-forks-supersession-tombstones)
 rather than by hidden last-writer-wins.
 
+
+**Adding a grain that is already stored is a no-op.** A content address *is*
+the content, so two byte-identical grains are one grain; re-adding returns the
+existing address rather than failing on the `grains.hash` unique index. This
+matters for event ingest: `created_at` has millisecond resolution, so two
+identical tool calls in the same millisecond genuinely are the same grain, and
+requiring callers to jitter their payloads would mean corrupting the record to
+satisfy the store. A skipped duplicate consumes no sequence number and writes no
+op-log row — nothing changed, so nothing replicates.
+
 ### Host config is never persisted in the file
 
 A memory file declares *what it physically is* — its text-index and
