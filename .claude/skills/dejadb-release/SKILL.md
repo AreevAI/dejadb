@@ -30,7 +30,11 @@ must publish bottom-up.
     NOT Cargo's `version.workspace`).
   After a release, verify the registries actually flipped:
   `npm view dejadb version`, `curl -s https://pypi.org/pypi/dejadb/json | jq -r .info.version` —
-  a green workflow is not proof the version changed.
+  a green workflow is not proof the version changed. **PyPI's JSON API is
+  CDN-cached and can serve the previous version for minutes after a
+  successful upload** — confirm with `curl -o /dev/null -w '%{http_code}'
+  https://pypi.org/pypi/dejadb/<ver>/json` (200 = published) before chasing a
+  phantom failure.
 - **Regenerate `crates/dejadb-js/index.js` in the same commit.** It is a
   *generated* file that hard-codes the expected version in every platform arm
   (`bindingPackageVersion !== '<ver>'`). Bumping package.json without
@@ -53,9 +57,43 @@ crates, then publish in this order (a crate can only publish after its path
 dependencies are on crates.io):
 
 ```
-dejadb-core → dejadb-store → dejadb-cal → dejadb-context
-            → dejadb-mcp, dejadb-server, dejadb
+dejadb-core, waiser          (no internal deps)
+  → dejadb-store             (core)
+  → dejadb-cal               (core, store)
+  → dejadb-context           (cal, core)
+  → dejadb-llm               (waiser)
+  → dejadb-waiser            (cal, core, store, waiser)
+  → dejadb-mcp, dejadb-server, dejadb
 ```
+
+**Ten publishable crates, not seven** — this list used to omit `waiser`,
+`dejadb-llm` and `dejadb-waiser`, so following it failed at `dejadb-mcp`
+(which needs `dejadb-waiser`). Recompute rather than trust it:
+
+```bash
+# topological order from the manifests
+python3 - <<'EOF'
+import glob, tomllib
+pkgs = {}
+for p in glob.glob("crates/*/Cargo.toml"):
+    d = tomllib.load(open(p, "rb"))
+    if d["package"].get("publish") is False: continue
+    pkgs[d["package"]["name"]] = {k for k, v in d.get("dependencies", {}).items()
+                                  if isinstance(v, dict) and "path" in v}
+done = set()
+while len(done) < len(pkgs):
+    for n in sorted(pkgs):
+        if n not in done and pkgs[n] <= done | (pkgs[n] - pkgs.keys()):
+            print(n); done.add(n)
+EOF
+```
+
+**Bump the internal dependency requirements too.** Crates declare each other
+as `version = "1.0.0"`; on a minor/major release that requirement still
+permits the OLD version, so cargo can resolve new-crate + old-dep from a
+lockfile and fail to compile while the manifest claims the pair is supported.
+1.1.0 hit exactly this (`dejadb-cal` used `GrainType::Recommendation`, absent
+from `dejadb-core` 1.0.5).
 
 ```bash
 cargo publish -p dejadb-core

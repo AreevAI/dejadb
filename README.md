@@ -137,11 +137,6 @@ Embedding the store in a Rust project? Add the library crates instead of the CLI
 cargo add dejadb-store dejadb-core
 ```
 
-> **npm on Windows:** the `dejadb-win32-x64-msvc` prebuilt binary isn't on npm yet
-> (package name under review); macOS and Linux install cleanly today, and Windows
-> resolves automatically once it publishes. `pip install dejadb` and
-> `cargo install dejadb` already work on Windows.
-
 Or build from source (Rust 1.90+):
 
 ```bash
