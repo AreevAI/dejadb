@@ -54,12 +54,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   case list (forks, two-hop replication, tombstones, PITR, BM25, vectors,
   CAS, CAL end-to-end) executed against both backends, plus a Postgres CI
   job on `pgvector/pgvector:pg16`.
+- **Prebuilt `deja` binaries on every GitHub Release** (#38). Releases
+  v1.0.0–v1.0.5 carried no binary assets, so the only way to get the CLI was
+  `cargo install dejadb` — a full Rust build. `release-cli.yml` now builds
+  Linux x86_64/aarch64, macOS x86_64/arm64 and Windows x86_64, smoke-tests each
+  one (`--version`, then a real add/recall round trip) before packaging, and
+  attaches the archives plus a `SHA256SUMS` file. Linux aarch64 builds on a
+  native arm64 runner for the same reason `release-pypi.yml` does — cross-gcc
+  cannot compile turso's mimalloc/zstd deps. `scripts/install.sh` is the
+  matching `curl | sh` installer: it resolves the latest tag, verifies the
+  download against `SHA256SUMS`, and installs to `~/.local/bin`. This is what
+  makes `deja ui` — the console, including the Waiser review queue — reachable
+  from a notebook or a scratch container, where the wheel covers the memory
+  loop but the console lives in the binary.
 - Internal `Db` backend seam in `dejadb-store`: the store logic is
   backend-agnostic; the embedded Turso engine and the Postgres transport are
   interchangeable implementations behind it. By construction this also fixed
   three latent issues: `apply_supersede_flip` now runs in a transaction,
   `rebuild_link_indexes` rolls back on error, and the write path's per-add
   statement preparation is now cached.
+- `DESCRIBE <grain type>` reports `required_fields` — the fields the write
+  path refuses to build the grain without. Previously the only way to learn a
+  type's shape was to hit `VAL-E001` one field at a time (`skill` asks for
+  `name`, then asks for `description`). A test pins the list to the validator,
+  and `crates/dejadb-cal/tests/docs_examples.rs` parses every `sql` example in
+  `docs/cal-reference.md` on each run, so a documented query that does not
+  parse fails CI rather than a user's first session.
 
 ### Fixed
 
@@ -69,6 +89,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   breaking `add_if_novel`'s value probe.
 - The RRF fusion sort is NaN-safe, and `recall`/`thread_tail` fetch their
   blobs in the probe statement itself (join) instead of one query per hit.
+- **Re-adding a grain that is already stored is a no-op instead of an error**
+  (#40). A content address *is* the content, so two byte-identical grains are
+  one grain — but the second insert raised
+  `STO-E001: UNIQUE constraint failed: grains.hash`. `created_at` has
+  millisecond resolution, so two identical events in the same millisecond
+  genuinely are the same grain; an agent retrying a failing tool in a tight
+  loop hit this intermittently through `record_tool_call`, the flagship
+  analyzer's ingest path, and the only workaround was to corrupt the payload
+  (jitter the result string) to satisfy the store. `add` now returns the
+  existing address. A skipped duplicate consumes no sequence number and writes
+  no op-log row — nothing changed, so nothing replicates — and duplicates
+  *within* one batch collapse too.
+
+- **A second handle on one file, in one process, is refused at open** (#50).
+  The embedded backend is single-writer per file and enforces that across
+  processes with an OS file lock; inside one process that lock is already held,
+  so a second `open()` succeeded silently. The two handles then allocated from
+  their own cached `next_seq`/`next_term` until a write collided — surfacing as
+  `UNIQUE constraint failed: terms.id` on **the first handle**, long after the
+  mistake, in a message naming neither handles nor writers. It is now `STO-E002`
+  at open, naming the cause and the fix. Opening a handle per request or per
+  agent turn is the natural move if you think of a memory file as a database
+  connection; sharing one handle across threads is fully supported, and is
+  documented on the Python class, in `ARCHITECTURE.md`, and in the error
+  registry. The Postgres backend is unaffected — it admits multiple concurrent
+  writers per memory by design. Node gains **`close()`**: Rust and Python
+  release the claim on drop, but Node's drop waits for GC, so without it a
+  handle that had gone out of JS scope would hold the file until then. Calling
+  a method on a closed handle is an error, not a silent reopen.
+- **Documentation that described a different engine than the one that
+  shipped** (#37, #48, #49, #51, #54). `docs/cal-reference.md` §3.1 claimed
+  *every* `RECALL` needs a subject filter or free-text query — the rule binds
+  untyped (`*`/`grains`/`all`) recalls only, and the section's own
+  `| COUNT` example depended on that; §4's pipeline table listed a
+  `| WHERE` stage the grammar never had; the "copy-pasteable examples"
+  `ASSEMBLE` printed `PRIORITY` before `BUDGET` and did not parse.
+  `ARCHITECTURE.md` §2.3 omitted a required field from three of eleven grain
+  shapes, so `observation`/`consent`/`skill` built from exactly their
+  documented columns were rejected. `docs/cookbook.md` still called
+  encryption at rest CLI-only, which stopped being true when both bindings
+  gained a `passphrase` constructor argument.
 - **CAL clauses that parsed, ran, and did nothing** (#47, #53). Each of these
   failed *open* — no error, no warning, and the result feeds a model's
   context:

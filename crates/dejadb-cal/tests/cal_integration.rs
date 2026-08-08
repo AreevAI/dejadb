@@ -368,30 +368,36 @@ fn saved_query_round_trips_through_the_file() {
         );
     }
 
-    // A new process over the same file must still see it, and be able to run it.
-    let facade = facade_at(&path);
-    let saved = facade
-        .get_query("john brief")
-        .expect("saved query must survive reopen");
-    assert_eq!(saved.description, "what we know");
-    assert!(!saved.builtin);
+    // A new process over the same file must still see it, and be able to run
+    // it. Each reopen is scoped: one memory is one handle, so the previous one
+    // has to be dropped first — which is also what "a new process" means.
+    {
+        let facade = facade_at(&path);
+        let saved = facade
+            .get_query("john brief")
+            .expect("saved query must survive reopen");
+        assert_eq!(saved.description, "what we know");
+        assert!(!saved.builtin);
 
-    let run = ex.execute(r#"RUN "john brief""#, &facade).expect("RUN must work");
-    match run.result {
-        CalResultPayload::Grains { grains, .. } => assert_eq!(grains.len(), 1),
-        other => panic!("expected Grains from RUN, got: {other:?}"),
+        let run = ex.execute(r#"RUN "john brief""#, &facade).expect("RUN must work");
+        match run.result {
+            CalResultPayload::Grains { grains, .. } => assert_eq!(grains.len(), 1),
+            other => panic!("expected Grains from RUN, got: {other:?}"),
+        }
     }
 
     // RUN records last_run_at, and that too is persisted.
-    let after = facade_at(&path).get_query("john brief").unwrap();
     assert!(
-        after.last_run_at.is_some(),
+        facade_at(&path).get_query("john brief").unwrap().last_run_at.is_some(),
         "RUN should have recorded last_run_at on disk"
     );
 
     // DROP removes it from the file, not just from memory.
-    ex.execute(r#"DROP QUERY "john brief""#, &facade)
-        .expect("DROP QUERY must succeed");
+    {
+        let facade = facade_at(&path);
+        ex.execute(r#"DROP QUERY "john brief""#, &facade)
+            .expect("DROP QUERY must succeed");
+    }
     assert!(facade_at(&path).get_query("john brief").is_none());
 }
 
@@ -547,9 +553,11 @@ fn an_invalid_saved_query_name_is_not_persisted() {
     use dejadb_cal::facade::CalStoreFacade;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("m.db");
-    let facade = facade_at(&path);
-    // Leading digit violates the name rule.
-    assert!(facade.define_query("9bad", "RECALL facts", None, &[]).is_err());
+    {
+        let facade = facade_at(&path);
+        // Leading digit violates the name rule.
+        assert!(facade.define_query("9bad", "RECALL facts", None, &[]).is_err());
+    }
     assert!(facade_at(&path).get_query("9bad").is_none());
 }
 
@@ -1616,6 +1624,87 @@ fn with_superseded_widens_the_anchored_legs_and_labels_the_history() {
     // cannot find that word at all.
     assert_eq!(grains(r#"RECALL facts ABOUT "tea""#).len(), 0);
     assert_eq!(grains(r#"RECALL facts ABOUT "tea" WITH superseded"#).len(), 1);
+}
+/// The exact path `record_tool_call` takes on both bindings (#40).
+///
+/// `created_at` has millisecond resolution, so two identical calls in the same
+/// millisecond are byte-identical grains — one content address, and the second
+/// insert used to raise `STO-E001: UNIQUE constraint failed: grains.hash`. It
+/// is timing-dependent, so it passed on slow runs and failed on warm ones, and
+/// an agent retrying a failing tool is exactly the workload that hits it.
+#[test]
+fn re_recording_an_identical_tool_call_is_idempotent() {
+    use dejadb_cal::facade::CalStoreFacade;
+    let (_ex, facade, _d) = setup();
+
+    let fields = serde_json::json!({
+        "tool_name": "crm_lookup",
+        "content": "timeout after 30s",
+        "is_error": true,
+        "namespace": "caller",
+        "session_id": "ep-1",
+        // Pinned, so the same-millisecond case is deterministic rather than a
+        // race the test has to win.
+        "created_at": 1_700_000_000_000i64,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let first = facade.cal_add("tool", &fields).unwrap();
+    for attempt in 0..5 {
+        let again = facade
+            .cal_add("tool", &fields)
+            .unwrap_or_else(|e| panic!("attempt {attempt} raised {e}"));
+        assert_eq!(first, again, "the same content is the same address");
+    }
+    assert_eq!(facade.count().unwrap(), 1, "stored exactly once");
+}
+
+/// docs/cal-reference §3.1 claimed *every* `RECALL` needs a subject filter or a
+/// free-text query. It doesn't — the rule only binds untyped recalls, and the
+/// doc's own `RECALL facts WHERE namespace = "caller" | COUNT` example relies
+/// on that. #48 was someone hardening a deployment on the stronger reading.
+/// Pin what the engine actually does so prose and behavior cannot drift again.
+#[test]
+fn the_anchoring_rule_binds_untyped_recalls_only() {
+    let (ex, facade, _d) = setup();
+    ex.execute(
+        r#"ADD fact SET subject = "john" SET relation = "prefers" SET object = "tea" SET namespace = "caller" REASON "seed""#,
+        &facade,
+    )
+    .unwrap();
+
+    let count = |q: &str| -> usize {
+        match ex.execute(q, &facade).unwrap().result {
+            CalResultPayload::Grains { grains, .. } => grains.len(),
+            CalResultPayload::Count { count, .. } => count,
+            other => panic!("expected grains/count, got: {other:?}"),
+        }
+    };
+
+    // Typed: unanchored is legal, bounded by default_limit rather than a filter.
+    for q in [
+        "RECALL facts",
+        "RECALL facts RECENT 5",
+        "RECALL facts LIMIT 10",
+        r#"RECALL facts WHERE namespace = "caller""#,
+    ] {
+        assert_eq!(count(q), 1, "typed unanchored recall `{q}` should run");
+    }
+    // The doc's own copy-pasteable example.
+    assert_eq!(
+        count(r#"RECALL facts WHERE namespace = "caller" | COUNT"#),
+        1
+    );
+
+    // Untyped: rejected, because `*` has no type to bound the scan with.
+    for q in ["RECALL *", "RECALL grains", "RECALL all"] {
+        assert!(
+            ex.execute(q, &facade).is_err(),
+            "untyped unanchored recall `{q}` must be rejected"
+        );
+    }
 }
 
 // ── WHERE ... IN, and the WITH options that used to do nothing (#47, #53) ──

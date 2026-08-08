@@ -117,6 +117,20 @@ pip install dejadb            # Python bindings
 npm install dejadb            # Node bindings
 ```
 
+No Rust toolchain? Every release also carries prebuilt `deja` binaries for
+Linux (x86_64 / aarch64), macOS (Intel / Apple Silicon) and Windows x86_64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AreevAI/dejadb/main/scripts/install.sh | sh
+```
+
+It installs to `~/.local/bin` (`/usr/local/bin` as root; override with
+`DEJA_INSTALL`), pins with `DEJA_VERSION=v1.0.5`, and verifies the download
+against the release's `SHA256SUMS`. Or grab an archive straight from the
+[Releases page](https://github.com/AreevAI/dejadb/releases) — handy in a
+notebook, where the wheel covers the memory and Waiser loop but `deja ui` (the
+web console, including the review queue) lives in the binary.
+
 Embedding the store in a Rust project? Add the library crates instead of the CLI:
 
 ```bash
