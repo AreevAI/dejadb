@@ -482,6 +482,12 @@ error, because these have shipped for several releases and a hard failure would
 break callers who pass them today. Either way the contract is that **silence
 means the option did something**.
 
+Warnings reach you as a `warnings` array of `CAL-Wnnn` strings in the result
+payload from `cal()` in Python and Node and from the MCP `dejadb_cal` tool, and
+alongside the payload on `POST /api/cal`. The key is present only when there is
+something to report, so a clean query returns the shape it always had. The
+`deja cal` CLI prints them to stderr instead, keeping stdout pure JSON.
+
 `DESCRIBE`'s `with_options` lists the options that actually change a `RECALL`
 result, so a client can introspect rather than guess.
 

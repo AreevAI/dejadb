@@ -48,6 +48,11 @@ fn mcp_round_trip() {
         // answer empty over MCP.
         rpc(10, "tools/call", serde_json::json!({"name": "dejadb_run_trace", "arguments": {
             "run_id": "run-a"}})),
+        // An inert WITH option must announce itself in the payload — an agent
+        // reading a tool result has no stderr to check, so a dropped CAL-W014
+        // leaves it believing the option worked (#68).
+        rpc(11, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
+            "query": "RECALL facts WHERE subject = \"alice\" WITH score_breakdown"}})),
     ];
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -62,8 +67,8 @@ fn mcp_round_trip() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 10 requests (the notification gets no response)
-    assert_eq!(lines.len(), 10, "one response per request");
+    // 11 requests (the notification gets no response)
+    assert_eq!(lines.len(), 11, "one response per request");
 
     let by_id = |id: u64| lines.iter().find(|v| v["id"] == id).unwrap();
 
@@ -102,6 +107,16 @@ fn mcp_round_trip() {
     assert!(loop_result["pending"].is_array());
 
     assert!(by_id(9)["result"].is_object());
+
+    // A CAL warning survives into the tool result.
+    let warn_text = by_id(11)["result"]["content"][0]["text"].as_str().unwrap();
+    let warned: serde_json::Value = serde_json::from_str(warn_text).unwrap();
+    assert!(
+        warned["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|s| s.as_str().is_some_and(|s| s.contains("CAL-W014")))),
+        "expected CAL-W014 in the tool result, got: {warn_text}"
+    );
 
     // The turn remembered under run-a comes back through the run join.
     let trace_text = by_id(10)["result"]["content"][0]["text"].as_str().unwrap();

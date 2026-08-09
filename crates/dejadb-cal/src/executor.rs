@@ -131,6 +131,35 @@ pub struct CalExecResult {
     pub metadata: CalMetadata,
 }
 
+impl CalExecResult {
+    /// The wire payload every embedding surface returns: `result` with the
+    /// non-fatal `warnings` folded in under a `warnings` key.
+    ///
+    /// Warnings used to be a field only the caller could reach, and the three
+    /// surfaces that return JSON to a user — Python, Node, and the MCP
+    /// `dejadb_cal` tool — all serialized `result` alone. So every `CAL-Wnnn`
+    /// the executor raised was dropped on the way out, and an option that
+    /// parsed but could not change the result (`score_breakdown` on `RECALL`,
+    /// `CAL-W014`) read as a silent no-op — the exact failure the warning
+    /// exists to make visible. `warnings` is omitted when empty, so a clean
+    /// query keeps the payload it always had.
+    /// Errors exactly where serializing `result` alone would have, so folding
+    /// the warnings in never converts a failure into a plausible-looking
+    /// payload.
+    pub fn payload_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut v = serde_json::to_value(&self.result)?;
+        if !self.warnings.is_empty() {
+            // `CalResultPayload` is internally tagged, so it always serializes
+            // to an object — but degrade to the bare payload rather than panic
+            // if that ever stops being true.
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("warnings".into(), serde_json::json!(self.warnings));
+            }
+        }
+        Ok(v)
+    }
+}
+
 /// Metadata about a CAL query execution.
 #[derive(Debug, serde::Serialize)]
 pub struct CalMetadata {

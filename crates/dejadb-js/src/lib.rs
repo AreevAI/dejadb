@@ -757,6 +757,8 @@ impl DejaDb {
     }
 
     /// Execute CAL. Returns the wire-format payload as a JSON string.
+    /// Non-fatal `CAL-Wnnn` warnings ride along under a `warnings` key
+    /// (absent when the query raised none).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn cal(&self, query: String) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
@@ -764,7 +766,7 @@ impl DejaDb {
             let facade = take_facade(&slot)?;
             let ex = CalExecutor::new(CalExecutorConfig::default());
             let res = ex.execute(&query, &*facade).map_err(err)?;
-            serde_json::to_string(&res.result).map_err(err)
+            serde_json::to_string(&res.payload_json().map_err(err)?).map_err(err)
         })
     }
 
@@ -1089,6 +1091,12 @@ impl DejaDb {
     // ── Deja Loop: the governed self-improvement loop (§6.6) ────────────────────
 
     /// Record a tool call as a Tool grain — the flagship analyzer's food.
+    ///
+    /// `callId` is the invocation's own id (the provider's `tool_call_id`),
+    /// stored on the grain and queryable — the correlation key back to the LLM
+    /// transcript. Omitted, one is synthesized. Either way each call is its own
+    /// occurrence, which is what makes a tool that failed five times read as
+    /// five failures; recording is append-only, never de-duplicating.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn record_tool_call(
         &self,
@@ -1096,19 +1104,23 @@ impl DejaDb {
         result: String,
         is_error: Option<bool>,
         thread: Option<String>,
+        call_id: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
-        let mut fields = serde_json::Map::new();
-        fields.insert("tool_name".into(), json!(name));
-        fields.insert("content".into(), json!(result));
-        fields.insert("is_error".into(), json!(is_error.unwrap_or(false)));
-        fields.insert("namespace".into(), json!(self.ns));
-        if let Some(t) = thread {
-            fields.insert("session_id".into(), json!(t));
-        }
+        let ns = self.ns.clone();
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
-            Ok(facade.cal_add("tool", &fields).map_err(err)?.to_hex())
+            Ok(facade
+                .record_tool_call(
+                    &ns,
+                    &name,
+                    &result,
+                    is_error.unwrap_or(false),
+                    thread.as_deref(),
+                    call_id.as_deref(),
+                )
+                .map_err(err)?
+                .to_hex())
         })
     }
 

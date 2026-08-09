@@ -427,7 +427,10 @@ impl McpServer {
                     .executor
                     .execute(query, &self.facade)
                     .map_err(|e| e.to_string())?;
-                serde_json::to_string(&res.result).map_err(|e| e.to_string())
+                // Warnings ride in the payload under `warnings` — an agent
+                // reading this tool result has no stderr to check.
+                let payload = res.payload_json().map_err(|e| e.to_string())?;
+                serde_json::to_string(&payload).map_err(|e| e.to_string())
             }
             "dejadb_loop" => {
                 let opts = RunOptions {

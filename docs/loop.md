@@ -226,7 +226,8 @@ Same methods in both (scalars in, JSON strings out):
 
 ```python
 db = dejadb.DejaDB("agent.db", actor="user:alice")
-db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42")
+db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42",
+                    call_id="toolu_01A")   # the provider's tool_call_id, if you have it
 db.loop_run(min_new=20, min_new_errors=3, if_stale="6h")   # gated; bare call never gates
 db.loop_run(full_sweep=True)                 # the `reflect` semantics: whole memory
 db.loop_run(policy="loop-policy.json")     # host policy file — the only auto-apply path
@@ -385,6 +386,16 @@ Existing write callers add `--token-env`; a token unlocks review + apply.
 - **Tool grains.** The flagship analyzer reads Tool grains (0x05), which
   carry `tool_name`/`is_error`/`content` natively. `record_tool_call` and
   `deja migrate --from tool-log` both produce them.
+- **Occurrences, not values.** Content-addressed dedup is right for a fact —
+  a fact restated is the same fact — and wrong for a tool call: a tool that
+  failed five times is a different state of the world from one that failed
+  once, and that count is the entire input to `loop.tool_failure`. So
+  `record_tool_call` stamps each call with an identity (`call_id`, or a
+  synthesized one) and recording is append-only. Pass the provider's real
+  `tool_call_id` when you have it — it is stored as the grain's
+  `tool_call_id` and is queryable, so a recommendation's evidence links back
+  to the transcript that produced it. Adding a Tool grain through the raw
+  `add()` path keeps ordinary value semantics.
 - **Determinism.** A loop run's *deterministic* recommendations are a pure
   function of (store state, params, now) — the same finding yields the same
   `dedup_key` on any host, so a synced file behaves identically on its next

@@ -691,12 +691,29 @@ rather than by hidden last-writer-wins.
 
 **Adding a grain that is already stored is a no-op.** A content address *is*
 the content, so two byte-identical grains are one grain; re-adding returns the
-existing address rather than failing on the `grains.hash` unique index. This
-matters for event ingest: `created_at` has millisecond resolution, so two
-identical tool calls in the same millisecond genuinely are the same grain, and
-requiring callers to jitter their payloads would mean corrupting the record to
-satisfy the store. A skipped duplicate consumes no sequence number and writes no
-op-log row — nothing changed, so nothing replicates.
+existing address rather than failing on the `grains.hash` unique index. A
+skipped duplicate consumes no sequence number and writes no op-log row —
+nothing changed, so nothing replicates.
+
+**…but an occurrence is not a value, and carries its own identity.** That
+dedup rule is right for the things a memory *knows* — a fact restated is the
+same fact — and wrong for the things it *witnesses*. `created_at` has
+millisecond resolution and is part of the content address, so two identical
+tool calls inside one millisecond would otherwise collapse into a single
+grain. A tool that failed five times is a different state of the world from
+one that failed once, and that count is the entire input to the
+`loop.tool_failure` analyzer: an agent retrying a failing call with identical
+arguments is precisely the workload it exists to catch, so collapsing those
+retries deletes the signal exactly where it matters.
+
+The recording API therefore gives each call an identity.
+`record_tool_call(…, call_id=…)` takes the provider's own `tool_call_id` —
+stored on the grain, queryable, and the link from a recommendation's evidence
+back to the transcript that produced it. Absent one, a synthetic `auto:` id is
+stamped so occurrences never merge. Recording is append-only: replaying a tool
+log twice records it twice, and the host owns that. The raw `add("tool", …)`
+path is unchanged and keeps ordinary value semantics — the distinction is
+between the two APIs, not two kinds of grain.
 
 **One handle per file, shared across threads.** The rule is enforced in both
 directions: across processes by an OS file lock, and within a process by a

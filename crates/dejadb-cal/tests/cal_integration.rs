@@ -2056,3 +2056,36 @@ fn an_inert_with_option_says_so() {
         res.warnings
     );
 }
+
+/// …and the warning has to survive the trip to a caller (#68). Raising it into
+/// `CalExecResult::warnings` was only half the channel: Python, Node and the
+/// MCP `dejadb_cal` tool all serialized `result` alone, so every `CAL-Wnnn`
+/// was dropped at the boundary and `score_breakdown` stayed exactly as silent
+/// as before the warning existed. `payload_json` is what those three return.
+#[test]
+fn warnings_survive_into_the_wire_payload() {
+    let (ex, f, _d) = seeded();
+    let res = ex
+        .execute(r#"RECALL facts WHERE subject = "john" WITH score_breakdown"#, &f)
+        .unwrap();
+    let payload = res.payload_json().unwrap();
+    let warnings = payload["warnings"]
+        .as_array()
+        .expect("payload must carry a warnings array");
+    assert!(
+        warnings.iter().any(|w| w.as_str().is_some_and(|s| s.contains("CAL-W014"))),
+        "expected CAL-W014 in the payload, got: {payload}"
+    );
+    // The payload a caller already parses is unchanged otherwise.
+    assert_eq!(payload["type"], "grains");
+
+    // A clean query keeps the exact shape it had before — `warnings` is added
+    // only when there is something to say.
+    let clean = ex
+        .execute(r#"RECALL facts WHERE subject = "john""#, &f)
+        .unwrap();
+    assert!(
+        clean.payload_json().unwrap().get("warnings").is_none(),
+        "no warnings means no key, not an empty array"
+    );
+}

@@ -129,6 +129,62 @@ def test_cal_count_pipeline(tmp_path):
     assert payload["count"] == 2
 
 
+def test_cal_surfaces_warnings(tmp_path):
+    """CAL-W* warnings must reach the caller (#68).
+
+    `score_breakdown` cannot change a RECALL result and the executor raises
+    CAL-W014 to say so, but the binding serialized the payload alone — so the
+    option stayed exactly as silent as before the warning existed.
+    """
+    m = make_db(tmp_path)
+    m.add_fact("john", "prefers", "tea")
+
+    got = json.loads(m.cal('RECALL facts WHERE subject = "john" WITH score_breakdown'))
+    assert isinstance(got.get("warnings"), list)
+    assert any("CAL-W014" in w for w in got["warnings"])
+    assert got["type"] == "grains"  # the rest of the payload is unchanged
+
+    # A clean query keeps the shape it always had — no empty array.
+    clean = json.loads(m.cal('RECALL facts WHERE subject = "john"'))
+    assert "warnings" not in clean
+
+
+def test_record_tool_call_records_occurrences(tmp_path):
+    """Identical retries are distinct occurrences, not one grain (#66)."""
+    m = make_db(tmp_path)
+    for _ in range(5):
+        m.record_tool_call("stripe_refund", '{"error":"rate_limited"}', True)
+
+    n = json.loads(m.cal('RECALL tools WHERE tool_name = "stripe_refund" | COUNT'))
+    assert n["count"] == 5
+
+    # A host-supplied call id lands on the grain and is filterable.
+    m.record_tool_call("stripe_refund", "boom", True, call_id="call_xyz")
+    by_id = json.loads(m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
+    assert len(by_id["grains"]) == 1
+
+
+def test_add_explains_engine_authored_types(tmp_path):
+    """A type that exists but may not be host-authored says why (#67).
+
+    `DESCRIBE` lists 12 grain types; `add()` used to call the 12th unknown,
+    sending the caller to hunt for a typo in a name the engine had just
+    returned to them.
+    """
+    m = make_db(tmp_path)
+    assert len(json.loads(m.cal("DESCRIBE"))["info"]["grain_types"]) == 12
+
+    with pytest.raises(ValueError) as e:
+        m.add("recommendation", json.dumps({"target_ref": "entity:x", "analyzer": "loop.x/1",
+                                            "summary": "s", "dedup_key": "k"}))
+    assert "engine-authored" in str(e.value)
+    assert "unknown grain type" not in str(e.value)
+
+    with pytest.raises(ValueError) as e:
+        m.add("sandwich", "{}")
+    assert "unknown grain type" in str(e.value)
+
+
 # --------------------------------------------------------------------------
 # evolution: supersede / latest / history
 # --------------------------------------------------------------------------
@@ -451,13 +507,13 @@ def test_open_warnings_is_json_list(tmp_path):
 
 def test_loop_loop_rollback_and_outcomes(tmp_path):
     m = make_db(tmp_path)
-    # Distinct payloads per call: grains are content-addressed, so four
-    # byte-identical failures recorded inside the same millisecond hash to the
-    # same address and the fourth is rejected. Whether four identical failures
-    # in one millisecond should be four grains is an engine question; this test
-    # is about the Deja Loop loop, so it records four distinguishable ones.
-    for i in range(4):
-        m.record_tool_call("stripe_refund", f"rate_limited 429 (attempt {i})", True)
+    # Byte-identical failures on purpose. Whether four identical failures in one
+    # millisecond are four grains was an open engine question when this test was
+    # written, and it worked around it by jittering the payload; #66 settled it —
+    # a retry is a countable occurrence, so `record_tool_call` gives each call
+    # its own identity and all four survive.
+    for _ in range(4):
+        m.record_tool_call("stripe_refund", "rate_limited 429", True)
     m.record_tool_call("stripe_refund", "ok", False)
 
     run = json.loads(m.loop_run())

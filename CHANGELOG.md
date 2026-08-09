@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A retried tool call is counted again instead of silently merging away**
+  ([#66]). Making a duplicate add a no-op in 1.1.1 fixed a crash but turned it
+  into a wrong answer in the same headline example: five identical
+  `record_tool_call` failures collapsed to one grain, so `loop.tool_failure`
+  had nothing to cluster and the README's "proof" block ran clean and printed
+  nothing. Content-addressed dedup is right for a fact and wrong for an
+  occurrence — an agent retrying a failing call with identical arguments is
+  exactly the workload that analyzer exists to catch. `record_tool_call` now
+  gives each call an identity, so occurrences stay distinct while the store
+  stays deduplicated. The raw `add("tool", …)` path is unchanged.
+- **`record_tool_call` gained `call_id`** (Python `call_id=`, Node `callId`) —
+  the provider's own `tool_call_id`. It is stored on the grain and queryable
+  (`RECALL tools WHERE tool_call_id = …`), linking a recommendation's evidence
+  back to the transcript that produced it. Omitted, a synthetic id is stamped.
+  `tool_call_id` had been serialized and listed as queryable since 1.0 but no
+  builder ever set it, so it was unreachable from every host surface.
+- **CAL warnings reach the bindings** ([#68]). Python, Node and the MCP
+  `dejadb_cal` tool serialized the result payload alone, dropping every
+  `CAL-Wnnn` the executor raised — so `WITH score_breakdown` on `RECALL`
+  stayed a silent no-op despite `CAL-W014` existing to announce it, and none
+  of the fourteen documented warnings could reach a binding user. `cal()` now
+  returns them under a `warnings` key, present only when non-empty.
+- **`add()` explains an engine-authored type instead of calling it unknown**
+  ([#67]). `DESCRIBE` lists 12 grain types and `add("recommendation", …)`
+  answered `unknown grain type`, sending callers to hunt for a typo in a name
+  the engine had just returned. Recommendations stay host-unwritable — their
+  `dedup_key` is computed from the analyzer family, so a host-authored one
+  would enter the review queue as though an analyzer had produced it — but the
+  refusal now says that, and points at `RECALL recommendations`. The
+  addable set is sourced from the grain-type registry (`host_addable`) and
+  test-pinned to the builder, so the surfaces cannot drift again.
+
+- **A release-mode test flake, found while fixing the above.**
+  `review_queue_is_severity_ordered_and_stable_across_runs` failed about half
+  the time under `cargo test --release` (never in debug, which is what CI runs).
+  Its fixture seeded two byte-identical Facts to stand for a duplicate, and
+  those collapse to one grain whenever both writes land in the same
+  millisecond — so `loop.duplicate_sweep` had nothing to find and the queue
+  came back two long instead of three. The fixture now stamps explicit
+  `created_at` values. Same underlying property as #66, but here dedup is
+  behaving correctly and the test was the thing making a claim it had not
+  arranged for.
+
+[#66]: https://github.com/AreevAI/dejadb/issues/66
+[#67]: https://github.com/AreevAI/dejadb/issues/67
+[#68]: https://github.com/AreevAI/dejadb/issues/68
+
 ## [1.1.1] - 2026-08-09
 
 **The self-improvement engine, previously named Waiser, is renamed Deja

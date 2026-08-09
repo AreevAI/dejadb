@@ -116,7 +116,11 @@ export declare class DejaDb {
    * "dropped", "verification_status"} when a model ran.
    */
   remember(content: string, factsJson?: string | undefined | null, observer?: string | undefined | null, ns?: string | undefined | null, model?: string | undefined | null, llmCmd?: string | undefined | null, groundModel?: string | undefined | null, groundCmd?: string | undefined | null, extractHint?: string | undefined | null, minConfidence?: number | undefined | null, sessionId?: string | undefined | null, role?: string | undefined | null, runId?: string | undefined | null): Promise<string>
-  /** Execute CAL. Returns the wire-format payload as a JSON string. */
+  /**
+   * Execute CAL. Returns the wire-format payload as a JSON string.
+   * Non-fatal `CAL-Wnnn` warnings ride along under a `warnings` key
+   * (absent when the query raised none).
+   */
   cal(query: string): Promise<string>
   /** Supersession-chain history for (subject, relation), newest first. */
   history(subject: string, relation: string, ns?: string | undefined | null): Promise<string>
@@ -180,8 +184,16 @@ export declare class DejaDb {
    * mutating it — retries show up as several records for one node.
    */
   stepActions(workflow: string, node?: string | undefined | null, limit?: number | undefined | null, ns?: string | undefined | null): Promise<string>
-  /** Record a tool call as a Tool grain — the flagship analyzer's food. */
-  recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null): Promise<string>
+  /**
+   * Record a tool call as a Tool grain — the flagship analyzer's food.
+   *
+   * `callId` is the invocation's own id (the provider's `tool_call_id`),
+   * stored on the grain and queryable — the correlation key back to the LLM
+   * transcript. Omitted, one is synthesized. Either way each call is its own
+   * occurrence, which is what makes a tool that failed five times read as
+   * five failures; recording is append-only, never de-duplicating.
+   */
+  recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null, callId?: string | undefined | null): Promise<string>
   /**
    * Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
    * the whole memory (`deja loop reflect` semantics); `policy` is a path

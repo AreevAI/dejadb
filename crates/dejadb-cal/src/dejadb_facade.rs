@@ -44,6 +44,38 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A synthetic tool-call id for a host that did not supply one, so that two
+/// executions of the same tool stay two records.
+///
+/// The `auto:` prefix is deliberate: it marks the id as minted here rather than
+/// carried from a provider, so nothing downstream mistakes it for a real
+/// `tool_call_id` it could correlate against an LLM transcript.
+///
+/// Uniqueness comes from the counter, which is monotonic within a process and
+/// therefore holds even where the clock is coarse or steps backwards. The
+/// timestamp and pid only separate *different* processes writing the same
+/// memory in sequence — a clock tick alone would not, since a short-lived
+/// process restarts the counter at zero.
+///
+/// This does make the record non-reproducible: recording the same call twice
+/// writes two grains. That is the intended reading of an occurrence log — it
+/// happened twice — and it is why the id is minted per call rather than derived
+/// from the call's content, which would put us straight back into collapsing
+/// retries.
+fn occurrence_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "auto:{}-{}-{}",
+        std::process::id(),
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| now_ms().saturating_mul(1_000_000)),
+        n
+    )
+}
+
 /// Membership test for the `WHERE <field> IN (...)` filters. `None` is "no
 /// filter"; an empty set never reaches here (the caller short-circuits, because
 /// an empty `IN` selects nothing rather than everything).
@@ -175,6 +207,56 @@ impl DejaDbFacade {
     ) -> Result<(Hash, bool)> {
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(grain_type, fields, AddIfNovelSink { m: &mut m })
+    }
+
+    /// Record one tool execution. The single implementation behind
+    /// `record_tool_call` on every binding, so Python and Node cannot drift.
+    ///
+    /// Each call is stamped with an identity, which is what makes this record an
+    /// *occurrence* rather than a value. Without one they collapsed: grains are
+    /// content-addressed over the whole blob and `created_at` has millisecond
+    /// resolution, so byte-identical calls recorded inside one millisecond hash
+    /// to a single address, and since 1.1.1 a duplicate add is a silent no-op.
+    /// An agent retrying a failing tool in a tight loop is precisely that
+    /// workload — and "how many times did this fail" is the entire input to
+    /// `loop.tool_failure`, so the flagship analyzer lost its signal exactly
+    /// where it is meant to fire. The documented five-failure example stored one
+    /// grain and produced no recommendation at all (#66).
+    ///
+    /// `call_id` is the host's invocation id (an LLM `tool_call_id`), stored as
+    /// the grain's `tool_call_id` and queryable as such — the correlation key
+    /// back to the provider transcript. Absent one, [`occurrence_id`] mints a
+    /// synthetic id.
+    ///
+    /// It is not a de-duplication key: replaying the same `call_id` later writes
+    /// a second grain, since `created_at` is part of the content address too.
+    /// Recording is append-only, and a host replaying a tool log owns not
+    /// replaying it twice.
+    pub fn record_tool_call(
+        &self,
+        ns: &str,
+        tool_name: &str,
+        result: &str,
+        is_error: bool,
+        thread: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Result<Hash> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("tool_name".into(), serde_json::json!(tool_name));
+        fields.insert("content".into(), serde_json::json!(result));
+        fields.insert("is_error".into(), serde_json::json!(is_error));
+        fields.insert("namespace".into(), serde_json::json!(ns));
+        if let Some(t) = thread {
+            fields.insert("session_id".into(), serde_json::json!(t));
+        }
+        fields.insert(
+            "tool_call_id".into(),
+            serde_json::json!(match call_id {
+                Some(id) => id.to_string(),
+                None => occurrence_id(),
+            }),
+        );
+        self.cal_add("tool", &fields)
     }
 
     /// Add many grains in one store transaction. Each entry is the same

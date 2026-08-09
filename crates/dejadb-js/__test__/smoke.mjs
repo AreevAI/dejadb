@@ -123,6 +123,37 @@ test('cal RECALL returns the grains wire payload', async () => {
   assert.equal(grain.hash.length, HEX64)
 })
 
+test('cal surfaces CAL-W* warnings instead of dropping them', async () => {
+  const m = makeDb()
+  await m.addFact('john', 'prefers', 'tea')
+
+  // `score_breakdown` cannot change a RECALL result, and the executor says so
+  // with CAL-W014. The binding used to serialize the payload alone, so the
+  // warning never left the process and the option read as a silent no-op (#68).
+  const withOpt = JSON.parse(await m.cal('RECALL facts WHERE subject = "john" WITH score_breakdown'))
+  assert.ok(Array.isArray(withOpt.warnings), 'warnings must reach the caller')
+  assert.ok(withOpt.warnings.some((w) => w.includes('CAL-W014')), 'CAL-W014 must be named')
+  assert.equal(withOpt.type, 'grains', 'the rest of the payload is unchanged')
+
+  // A clean query keeps the exact shape it always had.
+  const clean = JSON.parse(await m.cal('RECALL facts WHERE subject = "john"'))
+  assert.equal(clean.warnings, undefined, 'no warnings means no key')
+})
+
+test('recordToolCall records occurrences, not values', async () => {
+  const m = makeDb()
+  // Byte-identical retries must each survive as their own grain, or the
+  // tool-failure analyzer has nothing to count (#66).
+  for (let i = 0; i < 3; i++) await m.recordToolCall('stripe_refund', 'rate_limited', true)
+  const n = JSON.parse(await m.cal('RECALL tools WHERE tool_name = "stripe_refund" | COUNT'))
+  assert.equal(n.count, 3, 'three retries are three occurrences')
+
+  // A host-supplied call id lands on the grain and is filterable.
+  await m.recordToolCall('stripe_refund', 'rate_limited', true, null, 'call_xyz')
+  const byId = JSON.parse(await m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
+  assert.equal(byId.grains.length, 1)
+})
+
 test('cal COUNT pipeline', async () => {
   const m = makeDb()
   await m.addFact('john', 'prefers', 'tea')
@@ -318,12 +349,13 @@ test('passphrase constructor rejects a wrong key on reopen', async () => {
 test('loop: record tool calls, run, review, apply', async () => {
   const m = makeDb('caller')
   // 4 failures + 1 success for one tool → tool-failure clustering fires.
-  // Distinct payloads per call: grains are content-addressed, so four
-  // byte-identical failures recorded inside the same millisecond hash to the
-  // same address and the fourth is rejected. This test is about the Deja Loop
-  // loop, so it records four distinguishable failures.
+  // The failures are byte-identical on purpose: an agent retrying a failing
+  // call with the same arguments is the workload this analyzer exists for, and
+  // `recordToolCall` stamps each one as its own occurrence so they no longer
+  // collapse to a single grain (#66). This loop used to jitter its payloads to
+  // work around that.
   for (let i = 0; i < 4; i++) {
-    await m.recordToolCall('stripe_refund', `rate_limited 429 (attempt ${i})`, true)
+    await m.recordToolCall('stripe_refund', 'rate_limited 429', true)
   }
   await m.recordToolCall('stripe_refund', 'ok', false)
 

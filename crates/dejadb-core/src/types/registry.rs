@@ -47,9 +47,29 @@ pub struct GrainTypeMeta {
     /// executor, which returns `Unsupported` (never a permission denial). Access
     /// control lives in scopes and `allow_destructive_ops`, not here.
     pub add_via_set: bool,
+    /// Whether a host may author this type at all — i.e. whether the per-type
+    /// JSON builders behind `cal_add` (which the CLI, MCP, Python and Node
+    /// `add()` all reach) accept it.
+    ///
+    /// Unlike [`Self::add_via_set`] this *is* a permission-shaped fact, and it
+    /// is `false` for exactly one type: a Recommendation is engine-emitted and
+    /// lifecycle-gated, so its `dedup_key` is computed from the analyzer family
+    /// rather than chosen by the author. A host-authored recommendation would
+    /// enter the review queue as though an analyzer had produced it.
+    ///
+    /// Enforced in `dejadb_cal::json_build::build_grain_from_json`, and
+    /// test-pinned there against this table so the two cannot drift — the
+    /// disagreement this flag exists to prevent is a surface reporting a type
+    /// as unknown when it is really unwritable.
+    pub host_addable: bool,
     /// Required fields for an `ADD` of this type. Consumed by the per-type JSON
     /// builders regardless of [`Self::add_via_set`] — a type that cannot be
     /// built from flat `SET` pairs still has required fields.
+    ///
+    /// Empty means the type genuinely requires nothing: State, Workflow,
+    /// Reasoning and Consensus are host-shaped containers whose whole payload
+    /// is caller-defined, so an empty one is legal by design rather than by
+    /// oversight.
     pub required_add_fields: &'static [&'static str],
     /// Type-specific fields surfaced by `RECALL <type> WHERE <field> …`.
     pub queryable_fields: &'static [&'static str],
@@ -66,6 +86,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "fact",
         plural: "facts",
         add_via_set: true,
+        host_addable: true,
         required_add_fields: &["subject", "relation", "object"],
         queryable_fields: &["subject", "relation", "object", "confidence"],
         toon_columns: &["subject", "content", "confidence"],
@@ -76,6 +97,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "event",
         plural: "events",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &["content"],
         queryable_fields: &[
             "role",
@@ -98,6 +120,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "state",
         plural: "states",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &[],
         // OMS §8.3: `context` (required) + `plan`/`history` (optional). There is no
         // `checkpoint_data` field in the spec or the struct — it was advertised here
@@ -111,6 +134,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "workflow",
         plural: "workflows",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &["nodes"],
         queryable_fields: &[
             "trigger", "node", "binding", "nodes", "edges", "bindings", "name", "retries",
@@ -123,6 +147,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "tool",
         plural: "tools",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &["tool_name"],
         queryable_fields: &[
             "tool_name",
@@ -141,6 +166,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "observation",
         plural: "observations",
         add_via_set: true,
+        host_addable: true,
         required_add_fields: &["observer_id", "observer_type"],
         queryable_fields: &["observer_id", "observer_type", "sensor", "value", "unit"],
         toon_columns: &["observer", "content"],
@@ -151,6 +177,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "goal",
         plural: "goals",
         add_via_set: true,
+        host_addable: true,
         required_add_fields: &["description"],
         queryable_fields: &[
             "goal_state",
@@ -169,6 +196,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "reasoning",
         plural: "reasonings",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &[],
         queryable_fields: &["reasoning_type", "premises", "conclusion"],
         toon_columns: &["type", "content"],
@@ -179,6 +207,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "consensus",
         plural: "consensuses",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &[],
         queryable_fields: &["threshold", "agreement_count", "participating_observers"],
         toon_columns: &["threshold", "count", "content"],
@@ -189,6 +218,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "consent",
         plural: "consents",
         add_via_set: false,
+        host_addable: true,
         required_add_fields: &["subject_did"],
         queryable_fields: &[
             "consent_action",
@@ -208,6 +238,7 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         name: "skill",
         plural: "skills",
         add_via_set: true,
+        host_addable: true,
         required_add_fields: &["name", "description"],
         queryable_fields: &[
             "name",
@@ -234,6 +265,12 @@ pub const GRAIN_TYPES: &[GrainTypeMeta] = &[
         // `ADD`/`SUPERSEDE SET`. They are emitted by an analyzer layer and
         // moved through review by the audit path.
         add_via_set: false,
+        // …and not host-authorable through the JSON builders either. This is the
+        // one `false` in the table: every other type is a record of something
+        // the host knows, while a recommendation is a claim the engine makes
+        // about the memory, carrying a computed `dedup_key` and an analyzer
+        // attribution that only an analyzer can honestly assert.
+        host_addable: false,
         required_add_fields: &["target_ref", "analyzer", "summary", "dedup_key"],
         // `rec_status` is index-layer (§5.6/§6.1) — filterable, never written
         // by an author.
@@ -274,6 +311,16 @@ pub fn from_str(s: &str) -> Option<GrainType> {
 /// be *written* — see [`GrainTypeMeta::add_via_set`].
 pub fn add_via_set_names() -> impl Iterator<Item = &'static str> {
     GRAIN_TYPES.iter().filter(|m| m.add_via_set).map(|m| m.name)
+}
+
+/// Canonical singular names of every type a host may author through the
+/// per-type JSON builders (`add()`, MCP `dejadb_add`, `deja add`).
+/// See [`GrainTypeMeta::host_addable`].
+pub fn host_addable_names() -> impl Iterator<Item = &'static str> {
+    GRAIN_TYPES
+        .iter()
+        .filter(|m| m.host_addable)
+        .map(|m| m.name)
 }
 
 #[cfg(test)]

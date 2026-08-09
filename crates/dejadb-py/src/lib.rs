@@ -821,6 +821,8 @@ impl DejaDB {
     }
 
     /// Execute CAL. Returns the wire-format payload as a JSON string.
+    /// Non-fatal `CAL-Wnnn` warnings ride along under a `warnings` key
+    /// (absent when the query raised none).
     fn cal(&self, py: Python<'_>, query: String) -> PyResult<String> {
         let res = py
             .detach(|| {
@@ -828,7 +830,7 @@ impl DejaDB {
                 ex.execute(&query, &self.facade)
             })
             .map_err(err)?;
-        serde_json::to_string(&res.result).map_err(err)
+        serde_json::to_string(&res.payload_json().map_err(err)?).map_err(err)
     }
 
     /// Anthropic memory-tool command (LR-13): pass the tool-call dict as
@@ -1136,7 +1138,13 @@ impl DejaDB {
 
     /// Record a tool call as a Tool grain — the flagship analyzer's food. One
     /// line per call in the agent's tool loop. `thread` groups a session.
-    #[pyo3(signature = (name, result, is_error = false, thread = None))]
+    ///
+    /// `call_id` is the invocation's own id (the provider's `tool_call_id`),
+    /// stored on the grain and queryable — the correlation key back to the LLM
+    /// transcript. Omitted, one is synthesized. Either way each call is its own
+    /// occurrence, which is what makes a tool that failed five times read as
+    /// five failures; recording is append-only, never de-duplicating.
+    #[pyo3(signature = (name, result, is_error = false, thread = None, call_id = None))]
     fn record_tool_call(
         &self,
         py: Python<'_>,
@@ -1144,17 +1152,21 @@ impl DejaDB {
         result: String,
         is_error: bool,
         thread: Option<String>,
+        call_id: Option<String>,
     ) -> PyResult<String> {
-        let mut fields = serde_json::Map::new();
-        fields.insert("tool_name".into(), json!(name));
-        fields.insert("content".into(), json!(result));
-        fields.insert("is_error".into(), json!(is_error));
-        fields.insert("namespace".into(), json!(self.ns));
-        if let Some(t) = thread {
-            fields.insert("session_id".into(), json!(t));
-        }
-        py.detach(|| self.facade.cal_add("tool", &fields).map(|h| h.to_hex()))
-            .map_err(err)
+        py.detach(|| {
+            self.facade
+                .record_tool_call(
+                    &self.ns,
+                    &name,
+                    &result,
+                    is_error,
+                    thread.as_deref(),
+                    call_id.as_deref(),
+                )
+                .map(|h| h.to_hex())
+        })
+        .map_err(err)
     }
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an

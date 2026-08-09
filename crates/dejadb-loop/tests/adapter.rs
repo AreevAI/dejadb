@@ -21,19 +21,36 @@ fn open_temp() -> (tempfile::TempDir, DejaDB) {
 
 fn seed(store: &mut DejaDB) {
     // Exact-duplicate facts (also a fork on the same value).
-    store
-        .add(&Fact::new("acme", "tier", "Enterprise").namespace("caller"))
-        .unwrap();
-    store
-        .add(&Fact::new("acme", "tier", "Enterprise").namespace("caller"))
-        .unwrap();
+    //
+    // The two `created_at` stamps are explicit because they are the only thing
+    // that makes these two *grains* rather than one. A grain is addressed by its
+    // whole blob, `created_at` included at millisecond resolution, so with the
+    // clock left to itself these collapse into a single grain whenever both
+    // writes land in one tick — and then there is no duplicate for
+    // `loop.duplicate_sweep` to find. That is a genuine content-addressing
+    // property, not a bug, but leaving it to timing made this seed produce
+    // three recommendations or two depending on how fast the machine was:
+    // reliably two grains in a debug build, roughly a coin flip in release.
+    // Pinning the stamps makes the fixture say what it means.
+    for stamp in [NOW - 2_000, NOW - 1_000] {
+        store
+            .add(
+                &Fact::new("acme", "tier", "Enterprise")
+                    .namespace("caller")
+                    .created_at(stamp),
+            )
+            .unwrap();
+    }
     // Two live values under a functional relation → contradiction (+ fork).
-    store
-        .add(&Fact::new("acme", "deploy_target", "us-east-1").namespace("caller"))
-        .unwrap();
-    store
-        .add(&Fact::new("acme", "deploy_target", "eu-west-1").namespace("caller"))
-        .unwrap();
+    for (target, stamp) in [("us-east-1", NOW - 2_000), ("eu-west-1", NOW - 1_000)] {
+        store
+            .add(
+                &Fact::new("acme", "deploy_target", target)
+                    .namespace("caller")
+                    .created_at(stamp),
+            )
+            .unwrap();
+    }
 }
 
 #[test]
@@ -151,17 +168,16 @@ fn end_to_end_run_review_apply() {
 #[test]
 fn tool_failure_clusters_from_tool_grains_and_applies() {
     let (_d, mut store) = open_temp();
-    // Record tool calls as real Tool grains (what record_tool_call / the
-    // tool-log importer produce). Content compacts to `cnt` → `tool_content`.
+    // Record tool calls as raw Tool grains — the store-level API, below the
+    // occurrence identity that `record_tool_call` stamps. Content compacts to
+    // `cnt` → `tool_content`.
     //
-    // The four failures carry distinct payloads on purpose. Grains are
-    // content-addressed over the whole blob including `created_at`, so
-    // byte-identical calls recorded inside the same millisecond hash to the
-    // same address and the second one fails the UNIQUE constraint. This loop
-    // used to be four identical grains and passed only because writes were
-    // slow enough to straddle a millisecond — once the BM25 leg stopped
-    // costing ~1.6ms per write, they started landing together. Same reasoning
-    // and same fix as `crates/dejadb-js/__test__/smoke.mjs`.
+    // The four failures carry distinct payloads because at this layer
+    // content-addressed dedup is still exactly right: `Tool::new(…)` with the
+    // same fields inside one millisecond *is* one grain, and nothing here
+    // claims otherwise. The occurrence semantics a host gets are covered by
+    // `tests/occurrence_recording.rs`, which records identical payloads
+    // through the binding path and asserts all five survive (#66).
     for attempt in 0..4 {
         store
             .add(

@@ -66,6 +66,43 @@ pub fn required_fields(grain_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// Why `build_grain_from_json` refused a type name.
+///
+/// The builder used to answer both cases with one sentence — "unknown grain
+/// type: '<name>'" followed by a hardcoded list of eleven. For `recommendation`
+/// that was simply false: `DESCRIBE` lists twelve types and CAL `ADD` explains
+/// that this one is engine-emitted, so `add()` was the only surface claiming the
+/// type does not exist. A caller cannot act on a wrong reason.
+fn unbuildable_type_message(grain_type: &str) -> String {
+    use dejadb_core::types::registry;
+    let addable: Vec<&str> = registry::host_addable_names().collect();
+    match registry::from_str(grain_type).map(registry::meta) {
+        // A real OMS type, deliberately not host-authored.
+        Some(m) if !m.host_addable => format!(
+            "grain type '{}' is engine-authored and cannot be created by a host. \
+             It is emitted by an analyzer and moved through review by the audit path — \
+             query it with RECALL {}. Host-addable types: {}.",
+            grain_type,
+            m.plural,
+            addable.join(", ")
+        ),
+        // A real type marked addable with no builder arm behind it. Unreachable
+        // while `builder_accepts_exactly_the_host_addable_types` is green, so
+        // say what is actually wrong rather than inventing a policy reason.
+        Some(m) => format!(
+            "grain type '{}' is declared host-addable but has no builder — this is \
+             a DejaDB bug, please report it. Types that do build: {}.",
+            m.name,
+            addable.join(", ")
+        ),
+        None => format!(
+            "unknown grain type: '{}'. Valid types: {}.",
+            grain_type,
+            addable.join(", ")
+        ),
+    }
+}
+
 /// Per-grain-type known fields (type-specific, not in common).
 fn type_known_fields(grain_type: &str) -> &'static [&'static str] {
     match grain_type {
@@ -87,6 +124,10 @@ fn type_known_fields(grain_type: &str) -> &'static [&'static str] {
             "duration_ms",
             "parent_task_id",
             "output_schema",
+            // A first-class Tool field (compact key `tcid`, queryable per the
+            // registry) that the builder arm below now sets. Listing it keeps
+            // `collect_extra_fields` from also copying it into `extra_fields`.
+            "tool_call_id",
         ],
         "observation" => &[
             "content",
@@ -681,6 +722,15 @@ pub fn build_grain_from_json<S: GrainSink>(
                         tool = tool.duration_ms(d as u64);
                     }
                 }
+                // The invocation this record is the result of. Serialized since
+                // 1.0 (`tcid`) and listed as queryable in the registry, but no
+                // builder arm ever set it, so it was unreachable from `add()`,
+                // `record_tool_call`, MCP and the CLI alike. It is also the
+                // field that makes two executions of the same tool distinct
+                // records rather than one — see `occurrence_id`.
+                if let Some(id) = get_str("tool_call_id") {
+                    tool = tool.tool_call_id(&id);
+                }
                 let mut grain = apply_common!(tool);
                 grain.common_mut().extra_fields = collect_extra_fields(fields, "tool");
                 sink.consume(&grain)
@@ -777,10 +827,7 @@ pub fn build_grain_from_json<S: GrainSink>(
                 grain.common_mut().extra_fields = collect_extra_fields(fields, "skill");
                 sink.consume(&grain)
             }
-            _ => Err(DejaDbError::Validation(format!(
-                "unknown grain type: '{}'. Valid types: fact, event, state, workflow, tool, observation, goal, reasoning, consensus, consent, skill",
-                grain_type
-            ))),
+            _ => Err(DejaDbError::Validation(unbuildable_type_message(grain_type))),
         }
     }
 
@@ -865,5 +912,90 @@ mod tests {
             );
             assert!(required_fields(gt).is_empty());
         }
+    }
+
+    /// The builder's accepted set is exactly the registry's `host_addable`
+    /// column. Three surfaces used to disagree about how many grain types there
+    /// are — `DESCRIBE` said twelve, CAL `ADD` named the four it can shape from
+    /// flat `SET` pairs, and `add()` claimed eleven and called the twelfth
+    /// unknown. Pinning the builder to the registry means a new type is
+    /// reachable, or explicitly not, by one edit rather than by remembering
+    /// this list.
+    #[test]
+    fn builder_accepts_exactly_the_host_addable_types() {
+        for name in dejadb_core::types::registry::host_addable_names() {
+            assert!(
+                ALL_TYPES.contains(&name),
+                "{name} is host_addable in the registry but the builder has no arm"
+            );
+        }
+        for gt in ALL_TYPES {
+            assert!(
+                dejadb_core::types::registry::host_addable_names().any(|n| n == *gt),
+                "{gt} has a builder arm but is not host_addable in the registry"
+            );
+        }
+    }
+
+    /// A type that exists but may not be host-authored must say so. Answering
+    /// "unknown grain type" sends the caller looking for a typo in a name that
+    /// `DESCRIBE` had just listed back to them.
+    #[test]
+    fn engine_authored_types_are_refused_by_reason_not_by_denial() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("target_ref".into(), serde_json::json!("entity:x"));
+        fields.insert("analyzer".into(), serde_json::json!("loop.x/1"));
+        fields.insert("summary".into(), serde_json::json!("s"));
+        fields.insert("dedup_key".into(), serde_json::json!("k"));
+
+        let e = build_grain_from_json("recommendation", &fields, NullSink)
+            .expect_err("recommendation is engine-authored");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("engine-authored"),
+            "must explain why, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unknown grain type"),
+            "recommendation is a real OMS type — saying otherwise is the bug (#67): {msg}"
+        );
+        assert!(
+            msg.contains("RECALL recommendations"),
+            "must point at the surface that does work, got: {msg}"
+        );
+
+        // A name that really is not a type still reads as one.
+        let e = build_grain_from_json("sandwich", &fields, NullSink).expect_err("not a type");
+        assert!(
+            e.to_string().contains("unknown grain type"),
+            "got: {e}"
+        );
+    }
+
+    /// `tool_call_id` is serialized (`tcid`) and listed as queryable in the
+    /// registry, but no builder arm set it, so it was write-only in the worst
+    /// direction: unreachable from every host surface. It is also the field
+    /// that keeps two executions of one tool from collapsing into one grain.
+    #[test]
+    fn tool_call_id_reaches_the_grain() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("tool_name".into(), serde_json::json!("stripe_refund"));
+        fields.insert("tool_call_id".into(), serde_json::json!("call_abc"));
+
+        struct Capture;
+        impl GrainSink for Capture {
+            type Out = Option<String>;
+            fn consume<G: Grain + Clone + 'static>(self, grain: &G) -> Result<Self::Out> {
+                let any = grain as &dyn std::any::Any;
+                Ok(any
+                    .downcast_ref::<dejadb_core::types::Tool>()
+                    .and_then(|t| t.tool_call_id.clone()))
+            }
+        }
+
+        assert_eq!(
+            build_grain_from_json("tool", &fields, Capture).unwrap(),
+            Some("call_abc".to_string()),
+        );
     }
 }
