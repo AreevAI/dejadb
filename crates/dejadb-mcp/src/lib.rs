@@ -439,6 +439,10 @@ impl McpServer {
                     if_stale_ms: None,
                     namespaces: Vec::new(),
                     full_sweep: args.get("full_sweep").and_then(Value::as_bool).unwrap_or(false),
+                    // Same identity the review/apply path uses below — the
+                    // agent that runs the loop cannot approve what its run's
+                    // LLM/external analyzers authored.
+                    triggering_actor: Some("agent:mcp".to_string()),
                 };
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 let engine = self.engine();

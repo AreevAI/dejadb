@@ -1197,6 +1197,9 @@ impl DejaDB {
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
             full_sweep,
+            // The handle's actor — the same identity review/apply stamp — so
+            // the trigger of an LLM/external finding cannot approve it.
+            triggering_actor: Some(self.actor.clone()),
         };
         // The longest call on this surface by far — a sweep plus, optionally,
         // several LLM round trips. Holding the interpreter lock across it would

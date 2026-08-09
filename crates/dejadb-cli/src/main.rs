@@ -2054,6 +2054,7 @@ fn run_loop(
                 if_stale_ms: flag(flags, "if-stale").and_then(|v| parse_duration(&v)),
                 namespaces: Vec::new(),
                 full_sweep: sub_cmd == "reflect",
+                triggering_actor: Some(actor.clone()),
             };
             let res = engine.run(&mut sub, &opts, now).map_err(|e| e.to_string())?;
             if json {

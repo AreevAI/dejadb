@@ -51,6 +51,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behaving correctly and the test was the thing making a claim it had not
   arranged for.
 
+- **The trigger of an LLM loop run can no longer approve its own model's
+  output.** Every recommendation recorded its creator as `engine:<analyzer>` —
+  correct for the deterministic analyzers, whose findings are computed rather
+  than authored, but an LLM or external-command finding exists because a
+  specific principal invoked it, and that principal appeared nowhere the
+  review gate could see. So `deja loop run --model …` followed by
+  `deja loop approve` from the same actor sailed past the self-approval
+  block. Runs now record the triggering principal as co-creator on every
+  non-builtin recommendation (the CLI's `--actor`, the server request's
+  `actor`, MCP's `agent:mcp`, the bindings' handle actor), and review refuses
+  approval from the creator *or* the trigger. Deterministic findings are
+  unchanged — the engine stays their only creator, so a solo operator's
+  normal run-then-approve flow still works.
+
 [#66]: https://github.com/AreevAI/dejadb/issues/66
 [#67]: https://github.com/AreevAI/dejadb/issues/67
 [#68]: https://github.com/AreevAI/dejadb/issues/68

@@ -75,6 +75,13 @@ pub struct RunOptions {
     /// watermark-sensitive inputs (tool-failure window, the non-parasitic LLM
     /// evidence bundle) to the full history.
     pub full_sweep: bool,
+    /// The principal that invoked this run. Recorded as co-creator on every
+    /// non-`Builtin` (LLM / external-command) recommendation the run stores,
+    /// so the review gate's self-approval block also fires for whoever
+    /// triggered the model that authored the finding — an LLM draft is
+    /// authored *via* its trigger, unlike a deterministic finding, which is
+    /// computed. `None` (a headless/scheduled run) records no co-creator.
+    pub triggering_actor: Option<String>,
 }
 
 /// Whether a run executed or was skipped.
@@ -398,6 +405,15 @@ impl Engine {
                 .status_index
                 .insert(hash.clone(), RecStatus::Pending);
             persisted.creators.insert(hash.clone(), actor);
+            // An LLM or external-command finding exists because someone ran
+            // it — record that principal too, so review can refuse the
+            // trigger approving their own model's output. Builtin analyzers
+            // stay engine-only: deterministic output has no human author.
+            if !matches!(rec.origin, Origin::Builtin) {
+                if let Some(trigger) = &opts.triggering_actor {
+                    persisted.co_creators.insert(hash.clone(), trigger.clone());
+                }
+            }
             persisted.audit_heads.insert(hash.clone(), audit_hash);
             stored += 1;
 
@@ -861,6 +877,13 @@ impl Engine {
                 if creator == actor {
                     return Err(Error::SelfApproval(format!(
                         "{actor} created this recommendation"
+                    )));
+                }
+            }
+            if let Some(trigger) = p.co_creators.get(rec_hash) {
+                if trigger == actor {
+                    return Err(Error::SelfApproval(format!(
+                        "{actor} triggered the run that authored this recommendation"
                     )));
                 }
             }

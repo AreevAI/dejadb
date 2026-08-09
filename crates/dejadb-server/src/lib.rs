@@ -714,7 +714,14 @@ impl UiServer {
             }
             ("POST", "/api/loop/run") => {
                 let mut sub = BorrowedSubstrate::new(&self.facade);
-                match self.engine().run(&mut sub, &RunOptions::default(), now_ms()) {
+                // The trigger is recorded as co-creator on LLM/external
+                // findings, so the same principal cannot later approve them.
+                let actor = serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("actor").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| "user:console".to_string());
+                let opts = RunOptions { triggering_actor: Some(actor), ..Default::default() };
+                match self.engine().run(&mut sub, &opts, now_ms()) {
                     Ok(res) => ok_json(json!({"ok": true, "run": res})),
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
                 }

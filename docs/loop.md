@@ -75,7 +75,10 @@ up front); every decision carries a written reason.
    metric snapshot. Analyzers cannot emit free prose.
 2. **Review** — separation of duties (`write` grants neither `review` nor
    `apply`); a **mandatory reason** (BECAUSE) on every decision; self-approval
-   is blocked against the recommendation's creating actor.
+   is blocked against the recommendation's creating actor — and, for LLM and
+   external-command findings, against the principal that triggered the run
+   that authored them (an LLM draft is authored *via* its trigger; a
+   deterministic finding is computed, so the engine stays its only creator).
 3. **Apply** — requires the `apply` scope; destructive applies additionally
    require `admin` + `allow_destructive`; every apply records its inverse.
 4. **Verify** — outcome review re-runs the stored metric after `review_after`

@@ -553,6 +553,84 @@ fn self_approval_blocked_against_creator() {
 }
 
 #[test]
+fn llm_rec_blocks_approval_by_triggering_actor() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"],"confidence":0.9}}
+        ]}}"#
+    );
+    let ground = r#"{"results":[{"id":0,"supported":true,"reason":"entailed"}]}"#.to_string();
+    let verify =
+        r#"{"results":[{"id":0,"keep":true,"confidence":0.88,"reason":"real"}]}"#.to_string();
+    let enrich = r#"{"notes":[]}"#.to_string();
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, ground, verify, enrich }));
+
+    let opts = RunOptions {
+        triggering_actor: Some("user:sam".into()),
+        ..Default::default()
+    };
+    e.run(&mut sub.inner, &opts, 10_000).unwrap();
+
+    let recs = e.recommendations(&sub.inner, Some(RecStatus::Pending)).unwrap();
+    let llm = recs
+        .iter()
+        .find(|r| matches!(r.origin, Origin::Llm { .. }))
+        .expect("an llm-origin recommendation");
+    let det = recs
+        .iter()
+        .find(|r| matches!(r.origin, Origin::Builtin))
+        .expect("a deterministic recommendation");
+
+    // The trigger of the LLM run cannot approve the model's own output —
+    // the creator string is engine:loop.llm/1, so before co_creators this
+    // approval sailed through.
+    let blocked = e.review(
+        &mut sub.inner,
+        &llm.hash,
+        Decision::Approve,
+        "user:sam",
+        ObserverType::Human,
+        &ScopeSet::all(),
+        "looks right to me",
+        11_000,
+    );
+    assert!(matches!(blocked, Err(Error::SelfApproval(_))));
+
+    // A different reviewer can.
+    assert!(e
+        .review(
+            &mut sub.inner,
+            &llm.hash,
+            Decision::Approve,
+            "user:review",
+            ObserverType::Human,
+            &ScopeSet::all(),
+            "verified against the fork",
+            11_000
+        )
+        .is_ok());
+
+    // The deterministic finding stays approvable by the trigger — it is
+    // computed, not authored, so its creator remains the engine.
+    assert!(e
+        .review(
+            &mut sub.inner,
+            &det.hash,
+            Decision::Approve,
+            "user:sam",
+            ObserverType::Human,
+            &ScopeSet::all(),
+            "resolve to latest",
+            11_000
+        )
+        .is_ok());
+}
+
+#[test]
 fn review_requires_review_scope() {
     let mut sub = TestSubstrate::new();
     for _ in 0..5 {
