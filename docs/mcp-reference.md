@@ -51,7 +51,7 @@ per line to stdout. It handles these methods:
 |---|---|
 | `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
 | `ping` | Returns an empty result |
-| `tools/list` | Returns the eight tool definitions (with input schemas) |
+| `tools/list` | Returns the thirteen tool definitions (with input schemas) |
 | `tools/call` | Invokes a tool by `name` with `arguments` |
 
 Conventions:
@@ -98,7 +98,7 @@ multi-tenant host gives an agent a session it must not escape.
 
 ---
 
-## The eight tools
+## The thirteen tools
 
 ### `dejadb_recall`
 
@@ -246,6 +246,69 @@ blocked (self-approval, `LOP-E021`) — run a reviewer process with distinct
 | `action` | string | no | `apply` \| `approve` \| `reject` (omit to list) |
 | `hash` | string | for an action | recommendation hash |
 | `because` | string | for an action | mandatory written reason |
+
+### The graph, time, and run↔memory reads
+
+Five read-only tools expose the graph walk, the as-of axis, and the join
+between execution history and semantic memory. All take an optional
+`namespace`.
+
+#### `dejadb_related`
+
+Walk the entity graph from a starting term (bounded k-hop, breadth-first).
+`in`/`both` directions only see relations the file declares entity-valued.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `start` | string | **yes** | entity term to start from, e.g. `"alice"` |
+| `relations` | string | **yes** | comma-separated, e.g. `"reports_to,mg:knows"` |
+| `direction` | string | no | `out` (default) \| `in` \| `both` |
+| `depth` | integer | no | hops to walk, 1–4 (default 2) |
+| `limit` | integer | no | max entities returned (default 64) |
+
+#### `dejadb_entity_at`
+
+As-of read on two axes: what was true in the world at T (`world`), or what
+the agent knew at T (`knowledge`).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | **yes** | entity, e.g. `"alice"` |
+| `relation` | string | **yes** | relation, e.g. `"employer"` |
+| `at` | integer | **yes** | point in time, epoch milliseconds |
+| `axis` | string | no | `world` (default) \| `knowledge` |
+
+#### `dejadb_step_actions`
+
+Execution records for a workflow: which grains ran which of its nodes.
+Retries appear as several records for one node.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `workflow` | string | **yes** | content address (64-hex) of the Workflow grain |
+| `node` | string | no | narrow to one node id |
+| `limit` | integer | no | max records returned (default 64) |
+
+#### `dejadb_run_trace`
+
+Everything recorded during a run, plus what the run produced downstream
+(facts/lessons derived from it).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `run_id` | string | **yes** | the run identifier recorded on the run's grains |
+| `include_yield` | boolean | no | also return derived grains (default true) |
+| `limit` | integer | no | max grains per section (default 64) |
+
+#### `dejadb_runs_touching`
+
+Which runs produced or refined a grain — the reverse join. Runs that merely
+read the grain are not recorded: a read leaves no grain.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `hash` | string | **yes** | content address (64-hex) of the grain |
+| `depth` | integer | no | provenance hops to walk, max 8 (default 4) |
 
 ---
 

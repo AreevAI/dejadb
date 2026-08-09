@@ -127,9 +127,10 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
 
 ## Smaller crates
 
-- **dejadb-mcp**: 11 tools (`dejadb_recall/add/supersede/forget/remember/cal`,
-  the graph/time reads `dejadb_related/entity_at/step_actions`, and the
-  run<->memory join `dejadb_run_trace/runs_touching`)
+- **dejadb-mcp**: 13 tools (`dejadb_recall/add/supersede/forget/remember/cal`,
+  the graph/time reads `dejadb_related/entity_at/step_actions`, the
+  run<->memory join `dejadb_run_trace/runs_touching`, and the loop pair
+  `dejadb_loop/recommendations`)
   over newline-delimited JSON-RPC 2.0 on stdio, protocol rev `2025-06-18`.
   Convention: tool failures are `isError: true` *results*; only protocol
   errors are JSON-RPC errors. Notifications (no id) get no response. No
