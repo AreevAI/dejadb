@@ -56,6 +56,12 @@ pub struct CalExecutorConfig {
     /// and emit audit events, preserving compliance invariants.
     /// When `false`, they return `Unsupported`. REVERT always returns
     /// `Unsupported` regardless of this flag (semantics undefined).
+    ///
+    /// Under the grants model (`docs/cal-all-you-need-proposal.md`) this is
+    /// a **process-wide restrictive cap**, not the authorization mechanism:
+    /// the session's grants decide who may write, and this flag set `false`
+    /// still wins over any grant — belt-and-suspenders for "serve untrusted
+    /// callers read-only".
     pub tier1_enabled: bool,
     /// Namespace override injected from the auth/capability token.
     ///
@@ -74,6 +80,10 @@ pub struct CalExecutorConfig {
     /// per-process host config (invariant #5) — never persisted in the file.
     /// Set it to `false` to make a session read-only, e.g.
     /// `deja serve --mcp --no-destructive-ops`.
+    ///
+    /// Under the grants model this is a **process-wide restrictive cap**:
+    /// the session's grants (`DejaDbFacade::authz`) decide who may destroy,
+    /// and this flag set `false` still wins over any grant.
     pub allow_destructive_ops: bool,
     /// When `true`, ASSEMBLE results strip internal budget metadata
     /// (tokens_allocated, tokens_used) from the `sources` array.

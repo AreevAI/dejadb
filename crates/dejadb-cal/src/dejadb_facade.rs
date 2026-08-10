@@ -132,6 +132,12 @@ pub struct DejaDbFacade {
     /// so a silently smaller set of saved queries is something the operator
     /// sees rather than discovers.
     meta_warnings: Mutex<Vec<String>>,
+    /// The session's resolved rights. Defaults to the owner session — a
+    /// local open with no principal asserted is the implicit superuser
+    /// (`root@localhost`), which is why the single-user path never meets
+    /// authorization. `with_principal` replaces it with a fail-closed
+    /// restricted set built from the file's own grant grains.
+    authz: dejadb_core::authz::AuthzSet,
 }
 
 impl DejaDbFacade {
@@ -150,7 +156,27 @@ impl DejaDbFacade {
             queries: Mutex::new(None),
             templates: Mutex::new(None),
             meta_warnings: Mutex::new(Vec::new()),
+            authz: dejadb_core::authz::AuthzSet::owner("user:local"),
         }
+    }
+
+    /// Bind this facade to a principal: rights become exactly what the
+    /// file's live grant grains cover (fail closed — a file with no grants
+    /// for this principal allows nothing). Grants are read once here; a
+    /// grant written later needs a rebind (the CAL `GRANT` path will
+    /// refresh this itself when it lands).
+    pub fn with_principal(mut self, principal: &str) -> dejadb_core::error::Result<Self> {
+        let grants = {
+            let mut guard = self.store.lock().unwrap();
+            guard.authz_grants(principal)?
+        };
+        self.authz = dejadb_core::authz::AuthzSet::restricted(principal, grants);
+        Ok(self)
+    }
+
+    /// The session's resolved rights (owner unless a principal was bound).
+    pub fn authz(&self) -> &dejadb_core::authz::AuthzSet {
+        &self.authz
     }
 
     /// Mount a read-only memory (an org/category replica) under an alias.

@@ -18,6 +18,7 @@ pub mod pg;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dejadb_core::authz;
 use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::{deserialize_blob, DeserializedGrain};
 use dejadb_core::format::serialize::serialize_grain;
@@ -2860,6 +2861,35 @@ impl DejaDB {
         self.fts_docs += d_docs;
         self.fts_total_len += d_len;
         Ok(new_hash)
+    }
+
+    /// How many grant grains one principal may carry — a sanity bound, far
+    /// above any real ACL.
+    const AUTHZ_GRANT_CAP: usize = 256;
+
+    /// The live grants for one principal: the `mg:permits` heads in the
+    /// reserved `agent:authz` namespace (OMS 1.6 §12.6), parsed from their
+    /// canonical object strings. Recall reads heads only, so a revoked
+    /// grant — a retraction by supersession — simply stops appearing.
+    /// A malformed grant grain is skipped: under-granting is the safe
+    /// failure. Zero grants = the principal can do nothing (callers build a
+    /// fail-closed `AuthzSet::restricted` from this).
+    pub fn authz_grants(&mut self, principal: &str) -> Result<Vec<authz::Grant>> {
+        let grains = self.recall(
+            authz::AUTHZ_NS,
+            principal,
+            Some(authz::REL_PERMITS),
+            Self::AUTHZ_GRANT_CAP,
+        )?;
+        let mut grants = Vec::new();
+        for g in &grains {
+            if let Some(obj) = g.get_str("object") {
+                if let Ok(grant) = authz::Grant::from_object_string(obj) {
+                    grants.push(grant);
+                }
+            }
+        }
+        Ok(grants)
     }
 
     /// Forget (erase from hot store) — writes a tombstone to the op-log.
