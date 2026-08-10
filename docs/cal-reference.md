@@ -82,10 +82,13 @@ index-layer state rebuilt from the audit chain, never author-written.
 
 ## 3. Statement types
 
-CAL's AST defines 22 statement variants. The ones below are **reachable from
-text queries**. (A handful of variants exist in the AST for the JSON-CAL surface
-and internal use but are intentionally not reachable from text — see
-[§8](#8-destruction-shaped-and-authorization-gated).)
+CAL's AST defines 31 statement variants (CAL 1.3 added the destruction,
+control, governance, and capture statements). The ones below are **reachable
+from text queries**; access control and governance are in
+[§9](#9-access-control--governance-cal-13), destruction in
+[§8](#8-destruction-shaped-and-authorization-gated). (A couple of variants
+exist in the AST for the JSON-CAL surface only — `FORGET SCOPE` stays out of
+the text grammar.)
 
 ### 3.1 Read statements
 
@@ -303,6 +306,19 @@ form for DAG-shaped Workflow grains.
 > `loop.tool_failure` clusters on. The host API (`record_tool_call` on
 > every binding) stamps each call's own identity (`tool_call_id`) so retries
 > stay distinct; raw `ADD tool` does not.
+
+#### `REMEMBER` — capture free text (CAL 1.3)
+
+```
+REMEMBER "<content>" [WITH session("<id>"), role("<user|assistant|system|tool>"), run("<run-id>")]
+```
+
+Stores the text as an Event grain in the session namespace — the same
+capture path as `deja remember` and the bindings' `capture`, so the Event
+lands in the thread index (`session`) and the run↔memory join (`run`). The
+observer is the bound session's principal, never statement text. LLM fact
+extraction stays host configuration (`deja remember --model …`) — the
+statement carries no model names. Requires the `write` grant.
 
 #### `SUPERSEDE` — evolve a grain
 
@@ -666,6 +682,62 @@ Two Unicode invariants also run before tokenization:
   (U+202A–202E, U+2066–2069) are rejected, defeating visual query spoofing.
 - **NFC normalization** — the query is Unicode-NFC-normalized before lexing (and
   again when computing the audit hash).
+
+---
+
+## 9. Access control & governance (CAL 1.3)
+
+Sessions bind to a **principal** (`with_principal` in Rust, `--as` on the
+CLI once wired; an unbound local session is the owner, with every right).
+Rights are per-verb — `read, write, supersede, delete, erase, loop.run,
+loop.review, loop.apply, admin` — scoped to namespaces, and live **in the
+memory file** as ordinary `mg:permits` Facts in the reserved `agent:authz`
+namespace: they sync, replicate, and RECALL like anything else. A refused
+statement returns `AUT-E001` (wrapped as `CAL-E121`) naming the missing
+verb, the namespace, and the principal — exactly what a granting admin
+needs.
+
+### DCL
+
+```
+GRANT <verb>[, <verb>…] ON <ns|*> TO "<principal>" [WITH because("<why>")]
+REVOKE <verb>[, <verb>…] ON <ns|*> FROM "<principal>" [WITH because("<why>")]
+SHOW GRANTS [FOR "<principal>"]
+DESCRIBE PRINCIPAL "<principal>"
+```
+
+Principals are quoted strings (`"agent:support-bot"` — they carry `:` and
+`-`). `GRANT`/`REVOKE` require the `admin` grant. A grant grain records the
+grantor and reason; `REVOKE` is **retraction by supersession** — a partial
+revoke supersedes with the reduced grant, a full revoke leaves a retraction
+record, and revoking narrower than a grant's scope is refused by name
+(revoke at the grant's own scope). Grant history survives under
+`WITH superseded`. A session's rights are fixed when it binds, like a
+database connection. No DCL inside saved-query bodies.
+
+### Governance — the loop lifecycle
+
+```
+RUN LOOP [FULL] [WITH min_new(N), if_stale("6h")]
+DESCRIBE LOOP | ANALYZERS | OUTCOMES | POLICY
+APPROVE  sha256:<rec> BECAUSE "<why>"
+REJECT   sha256:<rec> BECAUSE "<why>"
+APPLY    sha256:<rec> BECAUSE "<why>"
+ROLLBACK sha256:<rec> BECAUSE "<why>"
+```
+
+`DESCRIBE LOOP` is the in-language `deja loop list`: health plus the
+pending queue with the hashes a reviewer acts on. `BECAUSE` is **syntax** —
+a parse error when missing. Identity never rides the statement: the actor,
+scopes, and observer derive from the bound session, and the engine's four
+gates run unchanged — `loop.review` to approve/reject, `loop.apply` to
+apply/rollback (a destructive apply additionally needs the session's own
+`delete`/`erase`), self-approval blocked against the creator *and* the
+principal that triggered the run. `RUN LOOP` is the deterministic pass;
+model-attached reflection stays on host surfaces where credentials live,
+and the loop's *policy* is never writable from CAL. Governance statements
+are refused inside saved-query bodies, and a surface that has not attached
+a governance host answers "governance is not wired" instead of pretending.
 
 ---
 

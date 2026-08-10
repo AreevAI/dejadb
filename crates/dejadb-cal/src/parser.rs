@@ -39,7 +39,7 @@ use super::ast::{
 };
 use super::ast::{
     DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, GovernanceStmt, GrantStmt,
-    PurgeStmt, QueryParam, RevokeStmt, RunLoopStmt, RunQueryStmt, ShowGrantsStmt,
+    PurgeStmt, QueryParam, RememberStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, ShowGrantsStmt,
     TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
@@ -193,6 +193,7 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         CalStatement::Supersede(_) | CalStatement::SupersedeWorkflow(_) => write("SUPERSEDE"),
         CalStatement::Accumulate(_) => write("ACCUMULATE"),
         CalStatement::Revert(_) => write("REVERT"),
+        CalStatement::Remember(_) => write("REMEMBER"),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
         // No DCL inside saved-query bodies — a stored GRANT executing with
@@ -1361,6 +1362,10 @@ impl Parser {
                 token: Token::Show,
                 ..
             }) => self.parse_show_grants(),
+            Some(SpannedToken {
+                token: Token::Remember,
+                ..
+            }) => self.parse_remember(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -5686,6 +5691,80 @@ impl Parser {
             full_sweep,
             min_new,
             if_stale_ms,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REMEMBER "<content>" [WITH session("<id>"), role("<r>"),
+    /// run("<id>")]`.
+    fn parse_remember(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Remember)?;
+        let content = self.parse_string_literal()?;
+        let mut session_id = None;
+        let mut role = None;
+        let mut run_id = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            loop {
+                let opt = match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(w), .. }) => w.to_ascii_lowercase(),
+                    // RUN is a keyword token; `run("<id>")` must still work.
+                    Some(SpannedToken { token: Token::Run, .. }) => "run".to_string(),
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "session(\"<id>\"), role(\"<r>\"), or run(\"<id>\")".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                };
+                match opt.as_str() {
+                    "session" | "role" | "run" => {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        let value = self.parse_string_literal()?;
+                        self.expect_exact(&Token::RParen)?;
+                        match opt.as_str() {
+                            "session" => session_id = Some(value),
+                            "role" => role = Some(value),
+                            _ => run_id = Some(value),
+                        }
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "session(\"<id>\"), role(\"<r>\"), or run(\"<id>\")".into(),
+                            found: other.to_string(),
+                            span: self.peek().map(|t| t.span),
+                            suggestion: Some(
+                                "REMEMBER carries capture metadata only — fact extraction \
+                                 is host configuration (deja remember --model …)"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                if self.at_exact(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::Remember(RememberStmt {
+            content,
+            session_id,
+            role,
+            run_id,
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,

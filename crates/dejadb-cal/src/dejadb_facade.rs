@@ -1330,6 +1330,32 @@ impl CalStoreFacade for DejaDbFacade {
         self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
 
+    /// `REMEMBER` (CAL 1.3) — capture into the session namespace via the
+    /// same store path as `deja remember` and the bindings' `capture`. The
+    /// observer is the bound principal; a `write` grant is the
+    /// authorization.
+    fn cal_remember(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        role: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Hash> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.authz.check(Verb::Write, &ns)?;
+        let observer = self.authz.principal().to_string();
+        self.store.lock().unwrap().capture(
+            &ns,
+            content,
+            &dejadb_store::Capture {
+                observer: Some(&observer),
+                session_id,
+                role,
+                run_id,
+            },
+        )
+    }
+
     /// `GRANT` (CAL 1.3 §8.15) — writes the grant grain: a Fact in the
     /// reserved `agent:authz` namespace, subject = grantee, relation =
     /// `mg:permits`, object = the canonical grant string, grantor + reason

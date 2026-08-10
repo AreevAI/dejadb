@@ -256,6 +256,20 @@ pub trait CalStoreFacade: Send + Sync {
         None
     }
 
+    /// `REMEMBER` (CAL 1.3): capture free text as an Event grain with
+    /// session/role/run metadata. Returns the Event's hash.
+    fn cal_remember(
+        &self,
+        _content: &str,
+        _session_id: Option<&str>,
+        _role: Option<&str>,
+        _run_id: Option<&str>,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "remember not available".into(),
+        ))
+    }
+
     /// Tier-3 DCL (CAL 1.3 §8.15): write a grant grain for `principal`.
     /// Verbs/namespaces are validated and canonicalized by the
     /// implementation; returns the grant grain's hash.

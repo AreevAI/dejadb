@@ -189,6 +189,10 @@ pub enum CalStatement {
     #[serde(alias = "RUN_LOOP", alias = "RunLoop")]
     RunLoop(RunLoopStmt),
 
+    /// `REMEMBER "<content>" [WITH …]`
+    #[serde(alias = "REMEMBER")]
+    Remember(RememberStmt),
+
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
     DefineTemplate(DefineTemplateStmt),
@@ -802,6 +806,30 @@ pub struct PurgeStmt {
     /// The recorded reason (BECAUSE). Mandatory from text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// REMEMBER (Tier 1 — CAL 1.3)
+// ---------------------------------------------------------------------------
+
+/// `REMEMBER "<content>" [WITH session("<id>"), role("<r>"), run("<id>")]`
+///
+/// Capture free text as an Event grain — the onboarding verb, in the
+/// language. The observer is the bound session's principal (never
+/// statement text); LLM fact extraction stays a host concern
+/// (`deja remember --model …`), so the statement carries no model names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RememberStmt {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// `user` | `assistant` | `system` | `tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(skip)]
     pub span: Option<Span>,
 }

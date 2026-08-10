@@ -458,6 +458,11 @@ pub enum Token {
     Revert,
 
     // ── Tier 2 keywords (destructive statements) ─────────────────────────
+    /// `REMEMBER "<content>"` (CAL 1.3) — capture an Event, the
+    /// highest-frequency onboarding verb.
+    #[token("REMEMBER", ignore(ascii_case))]
+    Remember,
+
     /// Governance (CAL 1.3 §8.16): `APPROVE <hash> BECAUSE "<why>"`.
     #[token("APPROVE", ignore(ascii_case))]
     Approve,
@@ -925,6 +930,7 @@ impl Token {
             Token::Revoke => "REVOKE".into(),
             Token::Show => "SHOW".into(),
             Token::To => "TO".into(),
+            Token::Remember => "REMEMBER".into(),
             Token::Approve => "APPROVE".into(),
             Token::Reject => "REJECT".into(),
             Token::Apply => "APPLY".into(),

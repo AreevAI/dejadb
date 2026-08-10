@@ -211,6 +211,8 @@ pub enum CalResultPayload {
     RecApplied { hash: String, rollbackable: bool },
     /// Result of `ROLLBACK`.
     RecRolledBack { hash: String },
+    /// Result of `REMEMBER` — the captured Event's hash.
+    Remembered { hash: String },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -1534,6 +1536,28 @@ impl CalExecutor {
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "purge".into(),
                         message: format!("PURGE failed: {e}"),
+                    }),
+                }
+            }
+
+            // REMEMBER (CAL 1.3) — the capture verb, an append-only write.
+            CalStatement::Remember(rem) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "REMEMBER".into(),
+                        span: rem.span,
+                    });
+                }
+                match store.cal_remember(
+                    &rem.content,
+                    rem.session_id.as_deref(),
+                    rem.role.as_deref(),
+                    rem.run_id.as_deref(),
+                ) {
+                    Ok(hash) => Ok(CalResultPayload::Remembered { hash: hash.to_hex() }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "remember".into(),
+                        message: format!("REMEMBER failed: {e}"),
                     }),
                 }
             }
@@ -4771,6 +4795,7 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::ApplyRec(_) => "apply",
         CalStatement::RollbackRec(_) => "rollback",
         CalStatement::RunLoop(_) => "run_loop",
+        CalStatement::Remember(_) => "remember",
     }
     .to_string()
 }
@@ -4797,7 +4822,8 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::Supersede(_)
         | CalStatement::SupersedeWorkflow(_)
         | CalStatement::Accumulate(_)
-        | CalStatement::Revert(_) => "write",
+        | CalStatement::Revert(_)
+        | CalStatement::Remember(_) => "write",
 
         CalStatement::Forget(_)
         | CalStatement::Purge(_)
@@ -4863,6 +4889,7 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::Reviewed { .. } => 1,
         CalResultPayload::RecApplied { .. } => 1,
         CalResultPayload::RecRolledBack { .. } => 1,
+        CalResultPayload::Remembered { .. } => 1,
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,

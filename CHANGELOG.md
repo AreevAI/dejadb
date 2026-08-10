@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`REMEMBER` is a CAL statement.** The onboarding verb, in the language:
+  `REMEMBER "<content>" [WITH session("<id>"), role("<r>"), run("<id>")]`
+  captures an Event through the same store path as `deja remember` and the
+  bindings' `capture` — thread-indexed, run-joined, observer = the bound
+  session's principal. Requires the `write` grant. LLM fact extraction
+  stays host configuration; the statement carries no model names.
+- **The cross-surface parity gate is a test.** "Every governed operation
+  has a CAL spelling" — the truth condition behind "CAL is all you need" —
+  is now an executable table (`cal_parity_tests.rs`): 28 operations, each
+  parsed and pinned to its statement class in CI.
+- **`docs/cal-for-llms.md`** — the one-page CAL grammar card designed to
+  paste into a system prompt, because the adopter's end user is an LLM:
+  every statement family, the identity rules (AUT-E001 means ask an admin,
+  don't retry), and the boundary in the card itself.
 - **CAL 1.3 governance: the loop lifecycle is CAL.** `RUN LOOP [FULL]
   [WITH min_new(N), if_stale("6h")]` triggers the analysis pass;
   `APPROVE`/`REJECT`/`APPLY`/`ROLLBACK <hash> BECAUSE "…"` are the review

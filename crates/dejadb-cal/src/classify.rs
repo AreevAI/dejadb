@@ -49,7 +49,8 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         | CalStatement::Supersede(_)
         | CalStatement::SupersedeWorkflow(_)
         | CalStatement::Accumulate(_)
-        | CalStatement::Revert(_) => StatementClass::Evolve,
+        | CalStatement::Revert(_)
+        | CalStatement::Remember(_) => StatementClass::Evolve,
         CalStatement::DefineTemplate(_)
         | CalStatement::DropTemplate(_)
         | CalStatement::DefineQuery(_)
