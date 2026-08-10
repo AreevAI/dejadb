@@ -152,6 +152,45 @@ fn parse_hash(hex: &str) -> napi::Result<Hash> {
 /// form degrades to `Promise<unknown>`. Both hand callers a binding that works
 /// at runtime and lies at compile time. Concrete types generate the real
 /// signatures — `Promise<string>`, `Promise<string | null>`, `Promise<void>`.
+/// [`dejadb_store::EmbedBackend`] over a JS callback
+/// `embed(text: string): number[]`, bridged with a threadsafe function.
+///
+/// Every store call in this binding runs on a libuv worker (the job
+/// types below), never on the JS thread — so blocking a worker here while
+/// the JS thread services the callback is deadlock-free by construction.
+/// Keep it that way: a *synchronous* napi method that triggers embedding
+/// would wait on its own thread.
+struct JsEmbed {
+    tsfn: napi::threadsafe_function::ThreadsafeFunction<String, Vec<f64>, String, napi::Status, false>,
+    dim: usize,
+    model: String,
+}
+
+impl dejadb_store::EmbedBackend for JsEmbed {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn embed(&self, text: &str) -> dejadb_core::error::Result<Vec<f32>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tsfn.call_with_return_value(
+            text.to_string(),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+            move |ret: napi::Result<Vec<f64>>, _env| {
+                let _ = tx.send(ret);
+                Ok(())
+            },
+        );
+        let out = rx
+            .recv()
+            .map_err(|_| DejaDbError::Storage("js embedder never answered".into()))?
+            .map_err(|e| DejaDbError::Storage(format!("js embedder raised: {e}")))?;
+        Ok(out.into_iter().map(|v| v as f32).collect())
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
 macro_rules! job_types {
     ($($(#[$m:meta])* $name:ident => $ty:ty),* $(,)?) => {$(
         $(#[$m])*
@@ -253,6 +292,7 @@ impl DejaDb {
         actor: Option<String>,
         telemetry: Option<String>,
         principal: Option<String>,
+        index_text: Option<bool>,
     ) -> napi::Result<Self> {
         let ns = ns.unwrap_or_else(|| "shared".to_string());
         let actor = actor.unwrap_or_else(|| "user:local".to_string());
@@ -270,6 +310,10 @@ impl DejaDb {
         // same API, the memory lives in a Postgres schema (stateless-host
         // deployments; multiple concurrent writers per memory). The page
         // cipher is file-backend-only, so a passphrase with a DSN is an error.
+        // `index_text` follows the CLI's `--index-text` and Python's
+        // `index_text=`: left unset, the file's own declaration wins; passed
+        // explicitly it is a deliberate re-stamp, reported via
+        // `openWarnings()`.
         let is_pg = path.starts_with("postgres://") || path.starts_with("postgresql://");
         let store = match (is_pg, passphrase) {
             (true, Some(_)) => {
@@ -281,16 +325,45 @@ impl DejaDb {
             (true, None) => {
                 let (url, schema) =
                     dejadb_store::pg::split_schema_url(&path).map_err(err)?;
-                if tel != TelemetryMode::Off {
-                    RustDejaDB::open_postgres_with_telemetry(&url, &schema, tel).map_err(err)?
-                } else {
-                    RustDejaDB::open_postgres(&url, &schema).map_err(err)?
+                match index_text {
+                    Some(want_text) => RustDejaDB::open_postgres_with(
+                        &url,
+                        &schema,
+                        dejadb_store::DejaDbOptions {
+                            index_text: want_text,
+                            telemetry: tel,
+                            ..dejadb_store::DejaDbOptions::default()
+                        },
+                    )
+                    .map_err(err)?,
+                    None if tel != TelemetryMode::Off => {
+                        RustDejaDB::open_postgres_with_telemetry(&url, &schema, tel).map_err(err)?
+                    }
+                    None => RustDejaDB::open_postgres(&url, &schema).map_err(err)?,
                 }
             }
-            (false, Some(p)) => {
-                RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?
-            }
-            (false, None) => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
+            (false, pass) => match (index_text, pass) {
+                (None, Some(p)) => {
+                    RustDejaDB::open_with_passphrase_telemetry(&path, &p, tel).map_err(err)?
+                }
+                (None, None) => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
+                (Some(want_text), pass) => {
+                    let key = match pass {
+                        Some(p) => Some(*RustDejaDB::derive_key_for(&path, &p).map_err(err)?),
+                        None => None,
+                    };
+                    RustDejaDB::open_with(
+                        &path,
+                        dejadb_store::DejaDbOptions {
+                            index_text: want_text,
+                            encryption_key: key,
+                            telemetry: tel,
+                            ..dejadb_store::DejaDbOptions::default()
+                        },
+                    )
+                    .map_err(err)?
+                }
+            },
         };
         // `principal` binds the session to the file's grants for that
         // principal (fail closed — CAL 1.3 §9). Absent, the handle is the
@@ -336,9 +409,9 @@ impl DejaDb {
     /// Install a command embedder (same contract as the CLI's --embed-cmd):
     /// the command gets the text on stdin and must print a JSON array of
     /// numbers. Probed once here to learn the dimension. Enables the vector
-    /// recall leg; grains added afterwards are embedded. (An in-process JS
-    /// callback embedder needs an async surface — planned; the command
-    /// embedder is the stable path today.)
+    /// recall leg; grains added afterwards are embedded. (For an
+    /// in-process callback embedder, see `setEmbedder`; the command
+    /// embedder remains the zero-dependency path.)
     #[napi(ts_return_type = "Promise<void>")]
     pub fn set_embedder_command(
         &self,
@@ -353,6 +426,122 @@ impl DejaDb {
             let ce = CommandEmbed::new(&cmd, model.as_deref()).map_err(err)?;
             facade.with_store(|m| m.set_embedder(Box::new(ce)));
             Ok(())
+        })
+    }
+
+    /// Install an embedding callback: `embed(text: string): number[]` —
+    /// the JS mirror of Python's `set_embedder`. Probed once here (on the
+    /// JS thread) to learn the dimension, recorded as the file's embedding
+    /// provenance; store-side embeds run on worker threads and call back
+    /// through a threadsafe function.
+    #[napi]
+    pub fn set_embedder(
+        &self,
+        embed: napi::bindgen_prelude::Function<String, Vec<f64>>,
+        model: Option<String>,
+    ) -> napi::Result<()> {
+        let probe = embed.call("dimension probe".to_string())?;
+        let dim = probe.len();
+        if dim == 0 {
+            return Err(err("embedder returned an empty vector"));
+        }
+        let tsfn = embed.build_threadsafe_function().build()?;
+        let backend = JsEmbed {
+            tsfn,
+            dim,
+            model: model.unwrap_or_else(|| "javascript".to_string()),
+        };
+        let facade = take_facade(&self.facade)?;
+        facade.with_store(|m| m.set_embedder(Box::new(backend)));
+        Ok(())
+    }
+
+    /// Batch-add grains in ONE write transaction — the JS mirror of
+    /// Python's `add_batch`. `grainsJson` is a JSON array of
+    /// `{grain_type|type, fields}` objects; returns a JSON array of
+    /// hashes. Worth ~1.6x over one-at-a-time `add()`, and only with the
+    /// BM25 text index off (with it on, per-row index cost swamps
+    /// batching).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn add_batch(
+        &self,
+        grains_json: String,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        let default_ns = ns.unwrap_or_else(|| self.ns.clone());
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let items: Vec<serde_json::Value> = serde_json::from_str(&grains_json).map_err(err)?;
+            let mut entries = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let grain_type = item
+                    .get("grain_type")
+                    .or_else(|| item.get("type"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| err(format!("grain {i}: missing 'grain_type'")))?
+                    .to_string();
+                let mut fields = item
+                    .get("fields")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .ok_or_else(|| err(format!("grain {i}: missing 'fields' object")))?;
+                fields
+                    .entry("namespace".to_string())
+                    .or_insert_with(|| json!(default_ns));
+                entries.push((grain_type, fields));
+            }
+            let hashes = facade.cal_add_batch(&entries).map_err(err)?;
+            let out: Vec<String> = hashes.iter().map(|h| h.to_hex()).collect();
+            serde_json::to_string(&out).map_err(err)
+        })
+    }
+
+    /// Free-text recall over the BM25 (and vector, when an embedder is
+    /// installed) legs — the JS mirror of Python's `search`, the same path
+    /// as `deja search` and CAL's `RECALL … ABOUT`. Returns a JSON list
+    /// string shaped like `recall()`. Errors loudly when the file has
+    /// neither leg, instead of a silent empty list.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn search(
+        &self,
+        query: String,
+        subject: Option<String>,
+        relation: Option<String>,
+        k: Option<u32>,
+        ns: Option<String>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let k = k.unwrap_or(10) as usize;
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let (has_text, has_vec) = facade
+                .with_store(|m| (m.index_text_enabled(), m.embedder_dim().is_some()));
+            if !has_text && !has_vec {
+                return Err(err(
+                    "search() needs a text or vector leg: this file has the BM25 index off \
+                     (indexText: false) and no embedder installed — reopen with indexText: \
+                     true and then call reindexText() to index the grains written while it \
+                     was off, or call setEmbedder()/setEmbedderCommand()",
+                ));
+            }
+            let grains = facade
+                .with_store(|m| {
+                    m.recall_hybrid(&ns, subject.as_deref(), relation.as_deref(), Some(&query), k, None)
+                })
+                .map_err(err)?;
+            let out: Vec<serde_json::Value> = grains
+                .iter()
+                .map(|g| {
+                    json!({
+                        "hash": g.hash.to_hex(),
+                        "type": format!("{:?}", g.grain_type).to_lowercase(),
+                        "fields": g.fields,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&out).map_err(err)
         })
     }
 

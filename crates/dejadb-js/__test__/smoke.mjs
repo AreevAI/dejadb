@@ -619,3 +619,66 @@ test('loop health and per-analyzer config are reachable', async () => {
   assert.equal(off['loop.staleness/1'], false)
   await m.setAnalyzerConfig('loop.staleness/1', true)
 })
+
+test('addBatch writes many grains in one transaction, JSON hashes out', async () => {
+  const m = makeDb('batch')
+  const grains = JSON.stringify([
+    { grain_type: 'fact', fields: { subject: 'a', relation: 'r', object: 'one' } },
+    { type: 'fact', fields: { subject: 'b', relation: 'r', object: 'two' } },
+  ])
+  const hashes = JSON.parse(await m.addBatch(grains))
+  assert.equal(hashes.length, 2)
+  for (const h of hashes) assert.equal(h.length, HEX64)
+  const rows = JSON.parse(await m.recall('a', 'r'))
+  assert.equal(rows.length, 1)
+  // A malformed entry rejects before anything is written.
+  await assert.rejects(() => m.addBatch(JSON.stringify([{ fields: {} }])), /grain_type/)
+  m.close()
+})
+
+test('setEmbedder installs a JS callback and the vector leg answers', async () => {
+  // indexText off: search would refuse with no legs, so a successful
+  // search here proves the JS-callback vector leg is live — including the
+  // worker→JS-thread round trip under the hood. (Ranking quality is the
+  // real embedder's job; a 4-dim toy only proves plumbing, so assert
+  // membership, not order.)
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-js-'))
+  const m = new DejaDb(join(dir, 'vec.db'), 'vec', null, null, null, null, false)
+  m.setEmbedder((text) => {
+    const v = [0, 0, 0, 0]
+    for (let i = 0; i < text.length; i++) v[i % 4] += text.charCodeAt(i)
+    return v
+  }, 'byte-test')
+  await m.addFact('john', 'prefers', 'window seat')
+  await m.addFact('jane', 'prefers', 'strong coffee')
+  const rows = JSON.parse(await m.search('prefers a window seat'))
+  assert.ok(rows.length >= 1, 'the vector leg must answer')
+  assert.ok(
+    rows.some((r) => r.fields.object === 'window seat'),
+    `the stored preference must be reachable: ${JSON.stringify(rows)}`,
+  )
+  m.close()
+})
+
+test('search errors loudly when the file has neither leg', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-js-'))
+  const m = new DejaDb(join(dir, 'noleg.db'), 'caller', null, null, null, null, false)
+  await m.addFact('john', 'prefers', 'tea')
+  await assert.rejects(() => m.search('tea'), /text or vector leg/)
+  m.close()
+})
+
+test('indexText on the constructor is a deliberate re-stamp', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dejadb-js-'))
+  const path = join(dir, 'stamp.db')
+  const off = new DejaDb(path, 'caller', null, null, null, null, false)
+  await off.addFact('john', 'prefers', 'tea')
+  off.close()
+  const on = new DejaDb(path, 'caller', null, null, null, null, true)
+  const warnings = JSON.parse(await on.openWarnings())
+  assert.ok(
+    warnings.some((w) => /text/i.test(w)),
+    `the re-stamp must be reported: ${JSON.stringify(warnings)}`,
+  )
+  on.close()
+})

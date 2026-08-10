@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Node binding parity** (register confusion #13 closed). `dejadb` on
+  npm gains the three methods Python had alone: `addBatch(grainsJson,
+  ns?)` (one write transaction, JSON hashes out), `search(query,
+  subject?, relation?, k?, ns?)` (the hybrid free-text path, erroring
+  loudly when the file has neither a text nor a vector leg), and
+  `setEmbedder(fn, model?)` — an in-process JS callback embedder bridged
+  over a threadsafe function (store embeds run on worker threads and
+  round-trip through the JS thread; deadlock-free because every store
+  call in this binding is already a worker job). The constructor gains
+  `indexText`, matching Python's `index_text` re-stamp semantics.
 - **CAL 1.3 Wave-3: fork resolution, the graph walk, and the paraphrase
   check are in the language; the console gets a login.** `MERGE "<s>"
   RELATION "<r>" TO "<o>" BECAUSE "…"` closes an open fork (every tip
