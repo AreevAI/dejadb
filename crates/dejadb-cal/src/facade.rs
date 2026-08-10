@@ -256,6 +256,49 @@ pub trait CalStoreFacade: Send + Sync {
         None
     }
 
+    /// `MERGE` (CAL 1.3 Wave 3): close an open fork with a resolved
+    /// value. Returns the merge grain's hash.
+    fn cal_merge(
+        &self,
+        _subject: &str,
+        _relation: &str,
+        _object: &str,
+        _confidence: f64,
+        _because: &str,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "merge not available".into(),
+        ))
+    }
+
+    /// `RELATED` (Wave 3): the bounded k-hop entity walk.
+    fn cal_related(
+        &self,
+        _start: &str,
+        _relations: &[&str],
+        _direction: &str,
+        _depth: usize,
+        _limit: usize,
+    ) -> Result<Vec<String>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "graph walks not available".into(),
+        ))
+    }
+
+    /// `NOVELTY` (Wave 3): nearest existing grains to a candidate text.
+    /// Rows are `(hash-hex, similarity)`.
+    fn cal_novelty(
+        &self,
+        _text: &str,
+        _subject: Option<&str>,
+        _relation: Option<&str>,
+        _k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "novelty checks not available".into(),
+        ))
+    }
+
     /// `ENTITY … AT` (CAL 1.3 Wave 2): the as-of read. `axis` is
     /// `"world"` or `"knowledge"`. Returns the grain as JSON, or None.
     fn cal_entity_at(

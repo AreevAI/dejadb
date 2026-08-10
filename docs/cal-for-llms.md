@@ -25,6 +25,8 @@ READ
   RUNS TOUCHING sha256:<hash>                          -- which runs made this grain
   DERIVED FROM sha256:<hash>                           -- what was distilled from it
   SHOW FORKS                                           -- open contradictions (multi-head)
+  RELATED "alice" VIA "reports_to" DEPTH 2             -- walk the entity graph
+  NOVELTY "prefers a window seat"                      -- is this already known? (needs embedder)
   DESCRIBE CAPABILITIES                                -- what this host supports
   DESCRIBE facts | SCHEMA | FIELDS | STATS | INTEGRITY -- what is queryable / store health
 
@@ -35,6 +37,8 @@ WRITE (append-only; REASON/BECAUSE is your provenance)
       SET object = "window seat" REASON "caller stated"
   SUPERSEDE sha256:<hash> SET object = "aisle seat" BECAUSE "changed mind"
   REVERT sha256:<hash> BECAUSE "supersession was wrong"
+  MERGE "acme" RELATION "tier" TO "enterprise"
+      BECAUSE "confirmed on the call"                  -- close an open fork
 
 DESTROY (takes a hash, an identity, or an age — never a predicate;
          needs your delete/erase grant; every use is audited)

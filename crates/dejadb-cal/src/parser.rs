@@ -39,9 +39,9 @@ use super::ast::{
 };
 use super::ast::{
     DefineQueryStmt, DerivedFromStmt, DropQueryStmt, EntityAtStmt, ForgetStmt, ForgetTarget,
-    GovernanceStmt, GrantStmt, PurgeStmt, QueryParam, RememberStmt, RevokeStmt, RunLoopStmt,
-    RunQueryStmt, RunTraceStmt, RunsTouchingStmt, ShowForksStmt, ShowGrantsStmt,
-    TemplateSectionSources,
+    GovernanceStmt, GrantStmt, MergeStmt, NoveltyStmt, PurgeStmt, QueryParam, RelatedStmt,
+    RememberStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, RunTraceStmt, RunsTouchingStmt,
+    ShowForksStmt, ShowGrantsStmt, TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
@@ -199,7 +199,10 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         | CalStatement::RunTrace(_)
         | CalStatement::RunsTouching(_)
         | CalStatement::DerivedFrom(_)
-        | CalStatement::ShowForks(_) => Ok(()),
+        | CalStatement::ShowForks(_)
+        | CalStatement::Related(_)
+        | CalStatement::Novelty(_) => Ok(()),
+        CalStatement::Merge(_) => write("MERGE"),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
         // No DCL inside saved-query bodies — a stored GRANT executing with
@@ -1385,6 +1388,18 @@ impl Parser {
                 token: Token::Derived,
                 ..
             }) => self.parse_derived_from(),
+            Some(SpannedToken {
+                token: Token::Merge,
+                ..
+            }) => self.parse_merge(),
+            Some(SpannedToken {
+                token: Token::Related,
+                ..
+            }) => self.parse_related(),
+            Some(SpannedToken {
+                token: Token::Novelty,
+                ..
+            }) => self.parse_novelty(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -4755,7 +4770,12 @@ impl Parser {
                     | Token::Rollback
                     | Token::Grant
                     | Token::Revoke
-                    | Token::Show),
+                    | Token::Show
+                    | Token::Merge
+                    | Token::Related
+                    | Token::Novelty
+                    | Token::Remember
+                    | Token::Entity),
                 ..
             }) => {
                 let name = t.description().to_ascii_lowercase();
@@ -4876,6 +4896,12 @@ impl Parser {
             }) => {
                 self.advance();
                 Ok(Some(AddWithOption::Sync))
+            }
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("occurrence") =>
+            {
+                self.advance();
+                Ok(Some(AddWithOption::Occurrence))
             }
             Some(st) => {
                 let found = st.token.description();
@@ -5826,6 +5852,167 @@ impl Parser {
                 suggestion: None,
             }),
         }
+    }
+
+    /// Expect a specific bare-word identifier (case-insensitive).
+    fn expect_word(&mut self, word: &str, form: &str) -> CalResult<()> {
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case(word) =>
+            {
+                self.advance();
+                Ok(())
+            }
+            other => Err(CalError::UnexpectedToken {
+                expected: word.into(),
+                found: other
+                    .map(|t| t.token.description())
+                    .unwrap_or_else(|| "end of input".into()),
+                span: other.map(|t| t.span),
+                suggestion: Some(form.into()),
+            }),
+        }
+    }
+
+    /// Parse `MERGE "<subject>" RELATION "<relation>" TO "<object>"
+    /// [CONFIDENCE <n>] BECAUSE "<why>"` — close an open fork.
+    fn parse_merge(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Merge)?;
+        const FORM: &str = "a merge is spelled MERGE \"<subject>\" RELATION \"<relation>\" \
+                            TO \"<object>\" [CONFIDENCE <n>] BECAUSE \"<why>\"";
+        let subject = self.parse_string_literal()?;
+        self.expect_word("RELATION", FORM)?;
+        let relation = self.parse_string_literal()?;
+        self.expect_exact(&Token::To)?;
+        let object = self.parse_string_literal()?;
+        let mut confidence = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("CONFIDENCE") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                        if (0.0..=1.0).contains(n) =>
+                    {
+                        confidence = Some(*n);
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "a confidence between 0 and 1".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        // Every write carries its reason; a fork resolution doubly so.
+        if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+            return Err(CalError::MissingReason { span: Some(self.current_span()) });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Merge(MergeStmt {
+            subject,
+            relation,
+            object,
+            confidence,
+            reason,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
+    }
+
+    /// Parse `RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both]
+    /// [DEPTH <n>] [LIMIT <n>]` — the bounded graph walk.
+    fn parse_related(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Related)?;
+        const FORM: &str = "the graph walk is spelled RELATED \"<start>\" VIA \
+                            \"<r1,r2>\" [DIRECTION out|in|both] [DEPTH <n>] [LIMIT <n>]";
+        let start = self.parse_string_literal()?;
+        self.expect_word("VIA", FORM)?;
+        let relations = self.parse_string_literal()?;
+        let mut direction = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("DIRECTION") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(d), .. })
+                        if ["out", "in", "both"].iter().any(|x| d.eq_ignore_ascii_case(x)) =>
+                    {
+                        direction = Some(d.to_ascii_lowercase());
+                        self.advance();
+                    }
+                    // IN doubles as the list-membership keyword token.
+                    Some(SpannedToken { token: Token::In, .. }) => {
+                        direction = Some("in".to_string());
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "out, in, or both".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        let depth = self.parse_word_number("DEPTH")?;
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Related(RelatedStmt {
+            start,
+            relations,
+            direction,
+            depth,
+            limit,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
+    }
+
+    /// Parse `NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"]
+    /// [LIMIT <k>]` — the paraphrase check.
+    fn parse_novelty(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Novelty)?;
+        let text = self.parse_string_literal()?;
+        let mut subject = None;
+        let mut relation = None;
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("SUBJECT") && subject.is_none() =>
+                {
+                    self.advance();
+                    subject = Some(self.parse_string_literal()?);
+                }
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("RELATION") && relation.is_none() =>
+                {
+                    self.advance();
+                    relation = Some(self.parse_string_literal()?);
+                }
+                _ => break,
+            }
+        }
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Novelty(NoveltyStmt {
+            text,
+            subject,
+            relation,
+            limit,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
     }
 
     /// Parse `ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms>

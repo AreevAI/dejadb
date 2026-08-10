@@ -467,6 +467,18 @@ pub enum Token {
     #[token("ENTITY", ignore(ascii_case))]
     Entity,
 
+    /// `MERGE "<s>" RELATION "<r>" TO "<o>"` (CAL 1.3) — close a fork.
+    #[token("MERGE", ignore(ascii_case))]
+    Merge,
+
+    /// `RELATED "<start>" VIA "<relations>"` (CAL 1.3) — the graph walk.
+    #[token("RELATED", ignore(ascii_case))]
+    Related,
+
+    /// `NOVELTY "<text>"` (CAL 1.3) — nearest existing grains.
+    #[token("NOVELTY", ignore(ascii_case))]
+    Novelty,
+
     /// `RUNS TOUCHING <hash>` (CAL 1.3) — the reverse run↔memory join.
     #[token("RUNS", ignore(ascii_case))]
     Runs,
@@ -944,6 +956,9 @@ impl Token {
             Token::To => "TO".into(),
             Token::Remember => "REMEMBER".into(),
             Token::Entity => "ENTITY".into(),
+            Token::Merge => "MERGE".into(),
+            Token::Related => "RELATED".into(),
+            Token::Novelty => "NOVELTY".into(),
             Token::Runs => "RUNS".into(),
             Token::Derived => "DERIVED".into(),
             Token::Approve => "APPROVE".into(),

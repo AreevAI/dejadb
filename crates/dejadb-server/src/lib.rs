@@ -492,6 +492,20 @@ impl UiServer {
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string()})),
                 }
             }
+            // Who am I: the principal this request is bound to. In
+            // credential-map mode this reflects the per-request binding;
+            // read-only and mode-agnostic.
+            ("GET", "/api/whoami") => {
+                let a = self.facade.authz();
+                ok_json(json!({
+                    "ok": true,
+                    "principal": a.principal(),
+                    "owner": a.is_owner(),
+                    "mode": if self.credentials.is_some() { "credentials" }
+                            else if self.token.is_some() { "token" }
+                            else { "open" },
+                }))
+            }
             ("GET", "/api/config") => {
                 // Read-only observability: the *effective* per-process
                 // configuration. Nothing here is persisted in the .db —
@@ -1396,5 +1410,15 @@ mod credential_route_tests {
         // The analysis trigger needs loop.run — anonymous gets 403.
         let run = s.route("POST", "/api/loop/run", b"{}", None);
         assert!(run.0.starts_with("403"), "{}", text(&run));
+    }
+
+    #[test]
+    fn whoami_reports_the_bound_principal() {
+        let s = server();
+        let r = s.route("GET", "/api/whoami", b"", Some("reader-secret"));
+        assert!(text(&r).contains("user:reader"), "{}", text(&r));
+        assert!(text(&r).contains("credentials"));
+        let r = s.route("GET", "/api/whoami", b"", None);
+        assert!(text(&r).contains("anonymous"), "{}", text(&r));
     }
 }

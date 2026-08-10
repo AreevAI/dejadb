@@ -209,6 +209,15 @@ pub enum CalStatement {
     /// `SHOW FORKS`
     #[serde(alias = "SHOW_FORKS")]
     ShowForks(ShowForksStmt),
+    /// `MERGE "<s>" RELATION "<r>" TO "<o>" BECAUSE "…"`
+    #[serde(alias = "MERGE")]
+    Merge(MergeStmt),
+    /// `RELATED "<start>" VIA "<relations>"`
+    #[serde(alias = "RELATED")]
+    Related(RelatedStmt),
+    /// `NOVELTY "<text>"`
+    #[serde(alias = "NOVELTY")]
+    Novelty(NoveltyStmt),
 
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
@@ -884,6 +893,57 @@ pub struct DerivedFromStmt {
     pub span: Option<Span>,
 }
 
+/// `MERGE "<subject>" RELATION "<relation>" TO "<object>"
+/// [CONFIDENCE <n>] BECAUSE "<why>"` — close an open fork: a resolved
+/// value that supersedes every live tip (the merge grain records all
+/// parents). Requires the `supersede` grant; refuses when no fork is
+/// open (a merge of one head would be a plain supersede).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MergeStmt {
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    pub reason: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both] [DEPTH <n>]
+/// [LIMIT <n>]` — the bounded k-hop entity walk. `in`/`both` only see
+/// relations the file declares entity-valued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedStmt {
+    pub start: String,
+    /// Comma-separated relation list, as written.
+    pub relations: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"] [LIMIT <k>]` — the
+/// paraphrase check: nearest existing grains to a candidate text.
+/// Requires a host-installed embedder; a clean refusal otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoveltyStmt {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
 /// `SHOW FORKS` — the open forks (subject+relation pairs with >1 live
 /// head), first-class.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1551,6 +1611,11 @@ pub enum AddWithOption {
     ExtractMemories,
     /// Force immediate commit (bypass write batch buffer).
     Sync,
+    /// `WITH occurrence` (ADD tool only): stamp a synthetic per-call
+    /// identity so byte-identical retries stay distinct occurrences
+    /// instead of collapsing to one content address — the #66 semantics,
+    /// reachable from CAL.
+    Occurrence,
 }
 
 // ---------------------------------------------------------------------------

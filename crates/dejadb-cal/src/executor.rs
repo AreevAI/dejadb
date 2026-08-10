@@ -223,6 +223,12 @@ pub enum CalResultPayload {
     DerivedFrom { hash: String, grains: Vec<serde_json::Value> },
     /// Result of `SHOW FORKS` — the open forks.
     Forks { forks: Vec<serde_json::Value> },
+    /// Result of `MERGE` — the resolved head.
+    Merged { hash: String, subject: String, relation: String, object: String },
+    /// Result of `RELATED` — the reachable entities.
+    RelatedEntities { start: String, entities: Vec<String> },
+    /// Result of `NOVELTY` — nearest matches, most similar first.
+    NoveltyMatches { matches: Vec<serde_json::Value> },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -944,6 +950,23 @@ impl CalExecutor {
                         serde_json::Value::String(add.reason.clone()),
                     );
                 }
+                // `WITH occurrence` — honest inert-option handling: tool
+                // grains are not ADD-able from text (add_via_set is false;
+                // the shape check above already refused them), and the host
+                // API that IS the tool-call path (`record_tool_call`)
+                // stamps per-call identity itself. The option exists so an
+                // agent pasting the pattern gets a warning that names the
+                // right tool, not silence.
+                if add
+                    .with_options
+                    .iter()
+                    .any(|o| matches!(o, super::ast::AddWithOption::Occurrence))
+                {
+                    exec_warnings.push(
+                        "CAL-W014: WITH occurrence is inert here — tool occurrences are                          recorded via record_tool_call (every binding), which stamps the                          per-call identity that keeps retries distinct."
+                            .to_string(),
+                    );
+                }
                 self.inject_write_namespace(&mut fields, store);
                 // Build AddOptions from WITH clause.
                 let options = build_add_options(&add.with_options, exec_warnings);
@@ -1598,6 +1621,77 @@ impl CalExecutor {
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "derived_from".into(),
                         message: format!("DERIVED FROM failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Merge(mg) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "MERGE".into(),
+                        span: mg.span,
+                    });
+                }
+                match store.cal_merge(
+                    &mg.subject,
+                    &mg.relation,
+                    &mg.object,
+                    mg.confidence.unwrap_or(0.9),
+                    &mg.reason,
+                ) {
+                    Ok(hash) => Ok(CalResultPayload::Merged {
+                        hash: hash.to_hex(),
+                        subject: mg.subject.clone(),
+                        relation: mg.relation.clone(),
+                        object: mg.object.clone(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "merge".into(),
+                        message: format!("MERGE failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Related(rel) => {
+                let relations: Vec<&str> = rel
+                    .relations
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .collect();
+                match store.cal_related(
+                    &rel.start,
+                    &relations,
+                    rel.direction.as_deref().unwrap_or("out"),
+                    rel.depth.unwrap_or(2),
+                    rel.limit.unwrap_or(64),
+                ) {
+                    Ok(entities) => Ok(CalResultPayload::RelatedEntities {
+                        start: rel.start.clone(),
+                        entities,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "related".into(),
+                        message: format!("RELATED failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Novelty(nv) => {
+                match store.cal_novelty(
+                    &nv.text,
+                    nv.subject.as_deref(),
+                    nv.relation.as_deref(),
+                    nv.limit.unwrap_or(5),
+                ) {
+                    Ok(rows) => Ok(CalResultPayload::NoveltyMatches {
+                        matches: rows
+                            .into_iter()
+                            .map(|(hash, similarity)| {
+                                serde_json::json!({ "hash": hash, "similarity": similarity })
+                            })
+                            .collect(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "novelty".into(),
+                        message: format!("NOVELTY failed: {e}"),
                     }),
                 }
             }
@@ -4797,6 +4891,9 @@ fn build_add_options(opts: &[AddWithOption], warnings: &mut Vec<String>) -> AddO
             AddWithOption::Sync => {
                 options.sync = Some(true);
             }
+            // Handled at the ADD arm (field stamping) — nothing for the
+            // store contract to carry.
+            AddWithOption::Occurrence => {}
         }
     }
     options
@@ -4897,6 +4994,9 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::RunsTouching(_) => "runs_touching",
         CalStatement::DerivedFrom(_) => "derived_from",
         CalStatement::ShowForks(_) => "show_forks",
+        CalStatement::Merge(_) => "merge",
+        CalStatement::Related(_) => "related",
+        CalStatement::Novelty(_) => "novelty",
     }
     .to_string()
 }
@@ -4921,7 +5021,9 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::RunTrace(_)
         | CalStatement::RunsTouching(_)
         | CalStatement::DerivedFrom(_)
-        | CalStatement::ShowForks(_) => "read",
+        | CalStatement::ShowForks(_)
+        | CalStatement::Related(_)
+        | CalStatement::Novelty(_) => "read",
 
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
@@ -4929,7 +5031,8 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::SupersedeWorkflow(_)
         | CalStatement::Accumulate(_)
         | CalStatement::Revert(_)
-        | CalStatement::Remember(_) => "write",
+        | CalStatement::Remember(_)
+        | CalStatement::Merge(_) => "write",
 
         CalStatement::Forget(_)
         | CalStatement::Purge(_)
@@ -5001,6 +5104,9 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::RunsTouching { runs, .. } => runs.len(),
         CalResultPayload::DerivedFrom { grains, .. } => grains.len(),
         CalResultPayload::Forks { forks } => forks.len(),
+        CalResultPayload::Merged { .. } => 1,
+        CalResultPayload::RelatedEntities { entities, .. } => entities.len(),
+        CalResultPayload::NoveltyMatches { matches } => matches.len(),
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,

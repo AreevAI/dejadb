@@ -82,8 +82,8 @@ index-layer state rebuilt from the audit chain, never author-written.
 
 ## 3. Statement types
 
-CAL's AST defines 36 statement variants (CAL 1.3 added the destruction,
-control, governance, capture, and time/provenance statements). The ones below are **reachable
+CAL's AST defines 39 statement variants (CAL 1.3 added the destruction,
+control, governance, capture, time/provenance, and graph statements). The ones below are **reachable
 from text queries**; access control and governance are in
 [§9](#9-access-control--governance-cal-13), destruction in
 [§8](#8-destruction-shaped-and-authorization-gated). (A couple of variants
@@ -268,7 +268,7 @@ COALESCE { RECALL facts WHERE subject = "john" AND relation = "seat" }
 Tries each branch in order, returning the first that yields results (with an
 optional `ELSE` fallback).
 
-#### Wave-2 reads (CAL 1.3): time, runs, provenance, forks
+#### Wave-2/3 reads (CAL 1.3): time, runs, provenance, forks, the graph
 
 ```
 ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms> [AXIS world|knowledge]
@@ -276,6 +276,8 @@ RUN TRACE "<run-id>" [LIMIT <n>]
 RUNS TOUCHING sha256:<hash> [DEPTH <n>]
 DERIVED FROM sha256:<hash>
 SHOW FORKS
+RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both] [DEPTH <n>] [LIMIT <n>]
+NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"] [LIMIT <k>]
 DESCRIBE STATS
 DESCRIBE INTEGRITY
 ```
@@ -293,6 +295,10 @@ DESCRIBE INTEGRITY
   spans namespaces), `SHOW FORKS` lists the open multi-head contradictions,
   and the two `DESCRIBE` reads are the store counters and the
   integrity/content-address recheck (`read` on `*`).
+- `RELATED` is the bounded k-hop entity walk (depth 1–4; `in`/`both` only
+  see relations the file declares entity-valued). `NOVELTY` is the
+  paraphrase check — nearest existing grains to a candidate text; it needs
+  a host-installed embedder and refuses cleanly without one.
 
 ### 3.2 Write statements (append-only)
 
@@ -324,6 +330,18 @@ Link grains explicitly via `related_to`, or widen at read time with
 `WITH multi_hop(n)`.
 There is also an `ADD workflow "name" ... graph ... BIND ... REASON "..."`
 form for DAG-shaped Workflow grains.
+
+#### `MERGE` — close an open fork (CAL 1.3)
+
+```
+MERGE "<subject>" RELATION "<relation>" TO "<object>" [CONFIDENCE <n>] BECAUSE "<why>"
+```
+
+Writes the resolved value as a merge grain superseding **every** live tip
+of the fork (all parents recorded in the grain). Requires an actual fork
+(≥2 tips — a merge of one head would be a plain `SUPERSEDE`, so it refuses
+instead), the `supersede` grant, and a written reason. `SHOW FORKS` before,
+`MERGE` after — detection and resolution in the same language.
 
 > **Recording tool calls: use `record_tool_call`, not raw `ADD tool`.**
 > Grains are content-addressed, so byte-identical `ADD tool` writes collapse

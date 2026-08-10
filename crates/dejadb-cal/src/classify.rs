@@ -50,7 +50,11 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         | CalStatement::RunTrace(_)
         | CalStatement::RunsTouching(_)
         | CalStatement::DerivedFrom(_)
-        | CalStatement::ShowForks(_) => StatementClass::Read,
+        | CalStatement::ShowForks(_)
+        | CalStatement::Related(_)
+        | CalStatement::Novelty(_) => StatementClass::Read,
+        // A merge supersedes every open tip — evolution, never removal.
+        CalStatement::Merge(_) => StatementClass::Evolve,
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
         | CalStatement::Supersede(_)

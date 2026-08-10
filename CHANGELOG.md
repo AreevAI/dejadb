@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CAL 1.3 Wave-3: fork resolution, the graph walk, and the paraphrase
+  check are in the language; the console gets a login.** `MERGE "<s>"
+  RELATION "<r>" TO "<o>" BECAUSE "…"` closes an open fork (every tip
+  superseded, parents recorded, `supersede` grant + written reason
+  required; refuses when no fork is open) — `SHOW FORKS` then `MERGE` is
+  detection and resolution in one language. `RELATED "<start>" VIA
+  "<r1,r2>" [DIRECTION out|in|both] [DEPTH n]` is the bounded entity walk;
+  `NOVELTY "<text>"` ranks the nearest existing grains (host embedder
+  required, clean refusal without). `ADD … WITH occurrence` parses and
+  warns honestly that tool occurrences are `record_tool_call`'s job (tool
+  grains are not ADD-able from text). The multi-principal console gained
+  `GET /api/whoami` plus a rail identity row — see who the session is
+  bound to, sign in with a token, sign out back to read-only anonymous.
+  The parity gate now pins 38 operations.
 - **CAL 1.3 Wave-2 reads: time, runs, and provenance are in the
   language.** `ENTITY "<s>" RELATION "<r>" AT <epoch-ms> [AXIS
   world|knowledge]` is the bitemporal as-of read (what was true vs what

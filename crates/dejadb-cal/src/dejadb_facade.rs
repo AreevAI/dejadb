@@ -1366,6 +1366,68 @@ impl CalStoreFacade for DejaDbFacade {
         self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
 
+    /// `MERGE` — the resolved value supersedes every open tip; the merge
+    /// grain records all parents. `supersede` is the authorization (it is
+    /// a head rewrite, however principled), and the reason rides the
+    /// grain's supersession justification.
+    fn cal_merge(
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        confidence: f64,
+        because: &str,
+    ) -> Result<Hash> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Supersede, &ns)?;
+        let mut merged = dejadb_core::types::Fact::new(subject, relation, object)
+            .namespace(&ns)
+            .confidence(confidence)
+            .created_at(now_epoch_ms());
+        merged.common.supersession_justification = Some(because.to_string());
+        self.store.lock().unwrap().merge_heads(&ns, subject, relation, &mut merged)
+    }
+
+    /// `RELATED` — the bounded k-hop walk in the session namespace.
+    fn cal_related(
+        &self,
+        start: &str,
+        relations: &[&str],
+        direction: &str,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let dir = match direction {
+            "in" => dejadb_store::Direction::In,
+            "both" => dejadb_store::Direction::Both,
+            _ => dejadb_store::Direction::Out,
+        };
+        self.store
+            .lock()
+            .unwrap()
+            .related(&ns, start, relations, dir, depth.clamp(1, 4), limit.min(256))
+    }
+
+    /// `NOVELTY` — nearest existing grains; requires a host embedder.
+    fn cal_novelty(
+        &self,
+        text: &str,
+        subject: Option<&str>,
+        relation: Option<&str>,
+        k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let rows = self
+            .store
+            .lock()
+            .unwrap()
+            .nearest_semantic(&ns, subject, relation, text, k.clamp(1, 64))?;
+        Ok(rows.into_iter().map(|(h, sim)| (h.to_hex(), sim as f64)).collect())
+    }
+
     fn cal_entity_at(
         &self,
         subject: &str,

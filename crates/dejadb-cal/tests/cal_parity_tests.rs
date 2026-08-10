@@ -53,6 +53,9 @@ fn every_governed_operation_has_a_cal_spelling() {
         ("runs-touching", format!("RUNS TOUCHING {H} DEPTH 3"), Read),
         ("provenance", format!("DERIVED FROM {H}"), Read),
         ("forks", "SHOW FORKS".into(), Read),
+        ("merge", r#"MERGE "acme" RELATION "tier" TO "enterprise" CONFIDENCE 0.9 BECAUSE "resolved""#.into(), Evolve),
+        ("related", r#"RELATED "alice" VIA "reports_to, mg:knows" DIRECTION both DEPTH 2 LIMIT 50"#.into(), Read),
+        ("novelty", r#"NOVELTY "prefers a window seat" SUBJECT "john" LIMIT 5"#.into(), Read),
         ("stats", "DESCRIBE STATS".into(), Read),
         ("verify", "DESCRIBE INTEGRITY".into(), Read),
         // ── host metadata (admin) ─────────────────────────────────────
