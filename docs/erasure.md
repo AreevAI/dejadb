@@ -1,13 +1,21 @@
-# Erasure model — bulk deletion requirements and the OMS deviation
+# Erasure model — bulk deletion requirements
+
+> **Status note (2026-08-10).** This document's original "OMS deviation"
+> framing is retired: CAL 1.3 (spec draft `release/oms-v1.6`) brings both
+> bulk operations into the language as authorization-gated Tier-2
+> statements — `FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "…"` and
+> `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<ns>"] BECAUSE "…"` — gated by
+> the session's `erase` grant and recorded as audit Observations. The
+> host-level store/binding/CLI operations below remain, now as the same
+> machinery the CAL statements call. The requirements are unchanged.
 
 DejaDB's base removal model follows OMS: a single-grain tombstone (`FORGET
-<hash>`, CAL's only destructive statement) plus memory-level erasure (delete
+<hash>`) plus memory-level erasure (delete
 the file / crypto-erase its key on the embedded backend, `DROP SCHEMA …
 CASCADE` on the postgres backend). Regulated deployments — healthcare-class
 privacy regimes with right-to-erasure and retention obligations (GDPR /
 PDPL-family) — need two operations that sit BETWEEN those granularities.
-This document is the requirement record for them and the statement of where
-they deviate from OMS.
+This document is the requirement record for them.
 
 ## Requirements
 

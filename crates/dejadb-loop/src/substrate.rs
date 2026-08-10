@@ -404,7 +404,9 @@ fn execute_cal(f: &DejaDbFacade, cal: &str) -> WResult<Vec<Value>> {
         match keyword.to_ascii_uppercase().as_str() {
             "FORGET" => {
                 let h = Hash::from_hex(rest.trim()).map_err(we)?;
-                f.cal_delete(&h).map_err(we)?;
+                // A loop-applied FORGET carries its reason on the audit
+                // chain already; stamp the Tier-2 audit with the source.
+                f.cal_delete(&h, Some("deja-loop apply")).map_err(we)?;
             }
             "ADD" => {
                 let (gtype, fields) = parse_type_and_json(rest)?;

@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **CAL 1.3 Tier-2 destruction: `FORGET SUBJECT` and `PURGE OLDER THAN` are
+  CAL statements.** Bulk erasure was a documented OMS deviation living only
+  on host surfaces (`deja forget-subject` / `purge-older-than`); the CAL 1.3
+  draft brings it into the language, authorization-gated. `FORGET SUBJECT
+  "<id>" [WITH text_mentions] BECAUSE "…"` erases an identity in the session
+  namespace; `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<ns>"] BECAUSE "…"`
+  is the retention sweep (never an implicit all-namespace sweep). BECAUSE is
+  mandatory on both (parse error without — `CAL-E018`), and
+  optional-but-recorded on `FORGET <hash>`. Destruction still takes a hash,
+  an identity, or an age — never a predicate — and `--no-destructive-ops`
+  still switches the whole surface off.
+- **Every destructive CAL execution now writes an audit Observation** in the
+  reserved `agent:authz` namespace: the session principal, the verb
+  (`delete`/`erase`), the target, the reason, and the erased count —
+  hash-addressed, replicated, and recallable
+  (`RECALL observations WHERE namespace = "agent:authz"`). Audit records
+  are occurrences, so each carries a unique frame id (the #66 lesson —
+  two identical erasures stay two records).
+- **Grants-based authorization under CAL** (the "grants, not gates" model —
+  `docs/cal-all-you-need-proposal.md`). Grants live in the memory file as
+  `mg:permits` Facts in `agent:authz`; a facade bound to a principal
+  (`with_principal`) enforces per-namespace verbs — read, write, supersede,
+  delete, erase, loop.\*, admin — at the one chokepoint every CAL surface
+  flows through, fail-closed, with `AUT-Ennn`/`CAL-E121` refusals that name
+  the missing verb. Unbound local sessions stay the implicit owner: the
+  single-user path is byte-identical to before.
+
 ### Fixed
 
 - **A retried tool call is counted again instead of silently merging away**

@@ -38,8 +38,8 @@ use super::ast::{
     UntilClause, Value, WhereClause, WithOption,
 };
 use super::ast::{
-    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, QueryParam, RunQueryStmt,
-    TemplateSectionSources,
+    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, PurgeStmt, QueryParam,
+    RunQueryStmt, TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
@@ -1269,30 +1269,19 @@ impl Parser {
                 token: Token::Revert,
                 ..
             }) => self.parse_revert(),
-            // FORGET <hash> — Tier-2 tombstone, gated at execution by
-            // `allow_destructive_ops`. PURGE remains outside the text grammar.
+            // FORGET <hash> / FORGET SUBJECT — Tier-2 destruction, capped by
+            // `allow_destructive_ops` and authorized by the session's
+            // delete/erase grants at execution.
             Some(SpannedToken {
                 token: Token::Forget,
                 ..
             }) => self.parse_forget(),
+            // PURGE OLDER THAN — the retention sweep (CAL 1.3 §8.14),
+            // authorization-gated at execution like every Tier-2 statement.
             Some(SpannedToken {
                 token: Token::Purge,
-                span,
                 ..
-            }) => {
-                let span = *span;
-                Err(CalError::UnexpectedToken {
-                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, FORGET, DEFINE, DROP, or STREAM".into(),
-                    found: "PURGE".into(),
-                    span: Some(span),
-                    suggestion: Some(
-                        "PURGE is not part of CAL grammar. Use FORGET <hash> to \
-                         tombstone a single grain; bulk erasure is a host-level \
-                         operation."
-                            .into(),
-                    ),
-                })
-            }
+            }) => self.parse_purge(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -5047,10 +5036,259 @@ impl Parser {
     fn parse_forget(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
         self.expect_exact(&Token::Forget)?;
+
+        // `FORGET SUBJECT "<id>"` — identity-scoped erasure (CAL 1.3 §8.14).
+        // USER/SCOPE remain out of the text grammar: SUBJECT is the one
+        // spelled form, matching the host verbs and the spec.
+        if let Some(SpannedToken { token: Token::Ident(word), span, .. }) = self.peek() {
+            let word_up = word.to_ascii_uppercase();
+            let span = *span;
+            match word_up.as_str() {
+                "SUBJECT" => {
+                    self.advance();
+                    let user_id = self.parse_string_literal()?;
+                    // Optional `WITH text_mentions`.
+                    let mut text_mentions = false;
+                    if self.at_exact(&Token::With) {
+                        self.advance();
+                        match self.peek() {
+                            Some(SpannedToken { token: Token::Ident(opt), .. })
+                                if opt.eq_ignore_ascii_case("text_mentions") =>
+                            {
+                                self.advance();
+                                text_mentions = true;
+                            }
+                            other => {
+                                return Err(CalError::UnexpectedToken {
+                                    expected: "text_mentions".into(),
+                                    found: other
+                                        .map(|t| t.token.description())
+                                        .unwrap_or_else(|| "end of input".into()),
+                                    span: other.map(|t| t.span),
+                                    suggestion: Some(
+                                        "FORGET SUBJECT supports exactly one option: \
+                                         WITH text_mentions"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    // BECAUSE is mandatory on the subject form — an identity
+                    // erasure without a recorded reason is not auditable.
+                    if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+                        return Err(CalError::MissingReason {
+                            span: Some(self.current_span()),
+                        });
+                    }
+                    self.advance();
+                    let reason = self.parse_string_literal()?;
+                    let span_end = self.prev_span();
+                    return Ok(CalStatement::Forget(ForgetStmt {
+                        target: ForgetTarget::User { user_id },
+                        reason: Some(reason),
+                        text_mentions,
+                        span: Some(Span::new(
+                            span_start.start,
+                            span_end.end,
+                            span_start.line,
+                            span_start.col,
+                        )),
+                    }));
+                }
+                "USER" | "SCOPE" => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "a grain hash or SUBJECT".into(),
+                        found: word_up,
+                        span: Some(span),
+                        suggestion: Some(
+                            "identity erasure is spelled FORGET SUBJECT \"<id>\" \
+                             BECAUSE \"<why>\"; scope erasure is not part of the \
+                             text grammar"
+                                .into(),
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         let hash = self.parse_hash_literal()?;
+        // BECAUSE is optional on the hash form (it predates the requirement)
+        // but recorded when given.
+        let reason = if self.at_exact(&Token::Reason) || self.at_exact(&Token::Because) {
+            self.advance();
+            Some(self.parse_string_literal()?)
+        } else {
+            None
+        };
         let span_end = self.prev_span();
         Ok(CalStatement::Forget(ForgetStmt {
             target: ForgetTarget::Hash { hash },
+            reason,
+            text_mentions: false,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>]
+    /// [IN "<namespace>"] [LIMIT <n>] BECAUSE "<why>"` (CAL 1.3 §8.14).
+    fn parse_purge(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Purge)?;
+
+        let expect_word = |me: &mut Self, word: &str| -> CalResult<()> {
+            match me.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case(word) =>
+                {
+                    me.advance();
+                    Ok(())
+                }
+                other => Err(CalError::UnexpectedToken {
+                    expected: word.into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the retention sweep is spelled PURGE OLDER THAN <n><d|h|m> \
+                         [TYPE <t>] [IN \"<ns>\"] BECAUSE \"<why>\""
+                            .into(),
+                    ),
+                }),
+            }
+        };
+        expect_word(self, "OLDER")?;
+        expect_word(self, "THAN")?;
+
+        // `90d` lexes as NumberLiteral(90) + Ident("d").
+        let n = match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n > 0.0 => {
+                let n = *n;
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a positive age like 90d, 6h, or 30m".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        let min_age_days = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(u), .. }) => {
+                let unit = u.to_ascii_lowercase();
+                let days = match unit.as_str() {
+                    "d" => n,
+                    "h" => n / 24.0,
+                    "m" => n / 1440.0,
+                    _ => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "an age unit: d, h, or m".into(),
+                            found: u.clone(),
+                            span: self.peek().map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                };
+                self.advance();
+                days
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "an age unit: d, h, or m".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("write the age as one word, e.g. 90d".into()),
+                });
+            }
+        };
+
+        // Optional TYPE <grain-type>, IN "<ns>", LIMIT <n> — any order.
+        let mut grain_type: Option<String> = None;
+        let mut namespace: Option<String> = None;
+        let mut limit: Option<usize> = None;
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("TYPE") && grain_type.is_none() =>
+                {
+                    self.advance();
+                    match self.peek() {
+                        Some(SpannedToken { token: Token::Ident(t), .. }) => {
+                            grain_type = Some(t.to_ascii_lowercase());
+                            self.advance();
+                        }
+                        other => {
+                            return Err(CalError::UnexpectedToken {
+                                expected: "a grain type, e.g. event".into(),
+                                found: other
+                                    .map(|t| t.token.description())
+                                    .unwrap_or_else(|| "end of input".into()),
+                                span: other.map(|t| t.span),
+                                suggestion: None,
+                            });
+                        }
+                    }
+                }
+                Some(SpannedToken { token: Token::In, .. }) if namespace.is_none() => {
+                    self.advance();
+                    namespace = Some(self.parse_string_literal()?);
+                }
+                Some(SpannedToken { token: Token::Limit, .. }) if limit.is_none() => {
+                    self.advance();
+                    match self.peek() {
+                        Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                            if *n >= 1.0 =>
+                        {
+                            limit = Some(*n as usize);
+                            self.advance();
+                        }
+                        other => {
+                            return Err(CalError::UnexpectedToken {
+                                expected: "a positive LIMIT".into(),
+                                found: other
+                                    .map(|t| t.token.description())
+                                    .unwrap_or_else(|| "end of input".into()),
+                                span: other.map(|t| t.span),
+                                suggestion: None,
+                            });
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // BECAUSE is mandatory — a retention sweep without a recorded reason
+        // is not auditable.
+        if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+            return Err(CalError::MissingReason {
+                span: Some(self.current_span()),
+            });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+
+        let span_end = self.prev_span();
+        Ok(CalStatement::Purge(PurgeStmt {
+            min_age_days: Some(min_age_days),
+            namespace,
+            limit,
+            grain_type,
+            reason: Some(reason),
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,

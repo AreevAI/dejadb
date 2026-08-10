@@ -222,14 +222,19 @@ pub trait CalStoreFacade: Send + Sync {
     // ── Tier 2 destructive operations (DELETE, FORGET) ────────────────────
 
     /// Delete a single grain by hash. Maps to `DejaDB::forget()`.
-    fn cal_delete(&self, _hash: &Hash) -> Result<()> {
+    fn cal_delete(&self, _hash: &Hash, _because: Option<&str>) -> Result<()> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),
         ))
     }
 
     /// Crypto-erase all data for a user. Maps to `DejaDB::forget_user()`.
-    fn cal_forget_user(&self, _user_id: &str) -> Result<crate::store_types::ErasureProof> {
+    fn cal_forget_user(
+        &self,
+        _user_id: &str,
+        _text_mentions: bool,
+        _because: &str,
+    ) -> Result<crate::store_types::ErasureProof> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),
         ))
@@ -242,12 +247,14 @@ pub trait CalStoreFacade: Send + Sync {
         ))
     }
 
-    /// Purge stale grains using decay curve. Maps to `DejaDB::forget_stale()`.
+    /// The retention sweep. Maps to `DejaDB::forget_older_than()`.
     fn cal_purge_stale(
         &self,
         _min_age_days: f64,
         _namespace: Option<&str>,
         _batch_limit: usize,
+        _grain_type: Option<&str>,
+        _because: &str,
     ) -> Result<usize> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),

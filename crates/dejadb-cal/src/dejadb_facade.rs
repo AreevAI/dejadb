@@ -180,6 +180,52 @@ impl DejaDbFacade {
         &self.authz
     }
 
+    /// Write the Tier-2 audit Observation (CAL 1.3 §8.14): every destructive
+    /// execution records the session principal, the verb, the target, the
+    /// reason, and how many grains it removed. It is a grain — it syncs with
+    /// the file and is RECALLable — and it rides the reserved authz
+    /// namespace next to the grants. Audit records are *occurrences*, so
+    /// each carries a unique frame id: two identical erasures must stay two
+    /// records (the #66 lesson).
+    fn audit_tier2(
+        &self,
+        verb: &str,
+        target: &str,
+        because: Option<&str>,
+        count: usize,
+    ) -> Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
+        let now = now_epoch_ms();
+        let principal = self.authz.principal().to_string();
+        let mut obs = dejadb_core::types::Observation {
+            observer_id: principal.clone(),
+            observer_type: dejadb_core::authz::observer_kind(&principal).to_string(),
+            subject: Some(target.to_string()),
+            object: Some(verb.to_string()),
+            observer_model: None,
+            frame_id: Some(format!(
+                "tier2:{now}:{}",
+                AUDIT_SEQ.fetch_add(1, Ordering::Relaxed)
+            )),
+            sync_group: None,
+            observation_mode: None,
+            observation_scope: None,
+            compression_ratio: None,
+            common: Default::default(),
+        };
+        obs.common.namespace = Some(dejadb_core::authz::AUTHZ_NS.to_string());
+        obs.common.created_at = Some(now);
+        obs.common.context = Some(serde_json::json!({
+            "audit": "tier2",
+            "verb": verb,
+            "target": target,
+            "because": because.unwrap_or(""),
+            "grains_erased": count,
+        }));
+        self.store.lock().unwrap().add(&obs).map(|_| ())
+    }
+
     /// The namespace a JSON-built write lands in: the explicit `namespace`
     /// field, else the session default, else `"shared"` (the store default).
     /// This is the resource every write-verb check runs against.
@@ -1268,7 +1314,7 @@ impl CalStoreFacade for DejaDbFacade {
     /// Capped upstream by `CalExecutorConfig::allow_destructive_ops`; the
     /// session's `delete` grant on the grain's own namespace is the
     /// authorization.
-    fn cal_delete(&self, hash: &Hash) -> Result<()> {
+    fn cal_delete(&self, hash: &Hash, because: Option<&str>) -> Result<()> {
         if !self.authz.is_owner() {
             let ns = {
                 let g = self.store.lock().unwrap().get(hash)?;
@@ -1276,6 +1322,91 @@ impl CalStoreFacade for DejaDbFacade {
             };
             self.authz.check(Verb::Delete, &ns)?;
         }
-        self.store.lock().unwrap().forget(hash)
+        self.store.lock().unwrap().forget(hash)?;
+        self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
+
+    /// `FORGET SUBJECT` — identity-scoped erasure in the session namespace
+    /// (CAL 1.3 §8.14): every grain referencing the identity, its partition
+    /// keys, history, and dictionary entries; `text_mentions` extends it to
+    /// indexed-text mentions. Authorized by `erase` on that namespace.
+    fn cal_forget_user(
+        &self,
+        user_id: &str,
+        text_mentions: bool,
+        because: &str,
+    ) -> Result<crate::store_types::ErasureProof> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.authz.check(Verb::Erase, &ns)?;
+        let report = self.store.lock().unwrap().forget_subject_with(
+            &ns,
+            user_id,
+            dejadb_store::ErasureOptions { text_mentions },
+        )?;
+        self.audit_tier2(
+            "erase",
+            &format!("subject:{user_id} ns:{ns}"),
+            Some(because),
+            report.grains_erased,
+        )?;
+        Ok(crate::store_types::ErasureProof {
+            user_id: user_id.to_string(),
+            count: report.grains_erased as u64,
+            // Tombstone + index erasure, not key destruction — there is no
+            // key fingerprint to report on this path.
+            key_fingerprint: String::new(),
+            timestamp: now_epoch_ms(),
+            user_record_deleted: report.grains_erased > 0,
+        })
+    }
+
+    /// `PURGE OLDER THAN` — the retention sweep (CAL 1.3 §8.14), scoped to
+    /// one namespace (the statement's `IN`, else the session's, else
+    /// "shared" — never an implicit all-namespace sweep from CAL).
+    /// Authorized by `erase` on that namespace.
+    fn cal_purge_stale(
+        &self,
+        min_age_days: f64,
+        namespace: Option<&str>,
+        _batch_limit: usize,
+        grain_type: Option<&str>,
+        because: &str,
+    ) -> Result<usize> {
+        let ns = namespace
+            .or(self.namespace.as_deref())
+            .unwrap_or("shared")
+            .to_string();
+        self.authz.check(Verb::Erase, &ns)?;
+        let gtype = match grain_type {
+            None => None,
+            Some(t) => Some(dejadb_core::types::GrainType::from_str(t).ok_or_else(|| {
+                DejaDbError::Validation(format!("unknown grain type for PURGE: {t:?}"))
+            })?),
+        };
+        let cutoff_ms = now_epoch_ms() - (min_age_days * 86_400_000.0) as i64;
+        let report =
+            self.store
+                .lock()
+                .unwrap()
+                .forget_older_than(Some(&ns), cutoff_ms, gtype)?;
+        self.audit_tier2(
+            "erase",
+            &format!(
+                "older_than:{min_age_days}d ns:{ns}{}",
+                grain_type.map(|t| format!(" type:{t}")).unwrap_or_default()
+            ),
+            Some(because),
+            report.grains_erased,
+        )?;
+        Ok(report.grains_erased)
+    }
+}
+
+/// Wall-clock epoch ms for audit stamps and PURGE cutoffs — host-side time,
+/// deliberately outside the executor (which stays clock-free).
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

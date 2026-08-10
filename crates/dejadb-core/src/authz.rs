@@ -225,6 +225,19 @@ impl AuthzSet {
     }
 }
 
+/// The observer kind a principal label implies (`"agent"` / `"human"`),
+/// used for audit stamping wherever no credential record declares one. The
+/// answer always derives from the host-held label — never from statement or
+/// request text, which must not be able to claim humanity.
+pub fn observer_kind(principal: &str) -> &'static str {
+    for prefix in ["agent:", "bot:", "job:", "svc:", "engine:"] {
+        if principal.starts_with(prefix) {
+            return "agent";
+        }
+    }
+    "human"
+}
+
 /// The host-side credential map (`deja-auth.json`): tokens → principal
 /// names, nothing else. No verbs, no namespaces, no raw secrets — a token is
 /// referenced by its SHA-256 or by the env var that holds it, so the file is

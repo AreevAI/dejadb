@@ -6,11 +6,14 @@ primary API surface. It reads memory (`RECALL`, `ASSEMBLE`, `EXISTS`,
 store (`DESCRIBE`, `EXPLAIN`), and renders results into model-ready context —
 all through one text (or JSON-AST) surface.
 
-A defining property of CAL is that its destructive surface is **narrow and
-gated**: the only destructive statement is `FORGET <hash>` (a single-grain
-tombstone), there are no `DELETE`/`DROP`-table tokens in the grammar, no bulk or
-namespace erasure, and the whole surface can be switched off per-process
-(`--no-destructive-ops`) for untrusted input. See [§8](#8-deletion-narrow-and-gated).
+A defining property of CAL is that its destructive surface is **shaped and
+authorization-gated** (CAL 1.3): destruction takes a hash (`FORGET <hash>`),
+an identity (`FORGET SUBJECT`), or an age (`PURGE OLDER THAN`) — never a
+predicate — there are no `DELETE`/`DROP`-table tokens in the grammar, every
+execution writes an audit Observation, sessions bound to a principal need
+the matching `delete`/`erase` grant, and the whole surface can still be
+switched off per-process (`--no-destructive-ops`) for untrusted input. See
+[§8](#8-destruction-shaped-and-authorization-gated).
 This reference documents the language as implemented in `dejadb-cal`.
 
 For where CAL sits in the system, see [ARCHITECTURE.md](../ARCHITECTURE.md#5-cal-the-context-assembly-language).
@@ -82,7 +85,7 @@ index-layer state rebuilt from the audit chain, never author-written.
 CAL's AST defines 22 statement variants. The ones below are **reachable from
 text queries**. (A handful of variants exist in the AST for the JSON-CAL surface
 and internal use but are intentionally not reachable from text — see
-[§8](#8-deletion-narrow-and-gated).)
+[§8](#8-destruction-shaped-and-authorization-gated).)
 
 ### 3.1 Read statements
 
@@ -334,13 +337,13 @@ replacements against the current tip (resolved by hash or by
 FORGET sha256:684c6c9bda818630a870119d0726e4d242ed537af061658ef6f3acb158a2c67d
 ```
 
-The one destructive statement. Removes a single grain by content address (maps
-to `DejaDB::forget`). Unlike `SUPERSEDE`, this is a genuine tombstone — the
-grain is gone, not versioned. It is gated by the executor's
-`allow_destructive_ops` (on by default; disable per-process with
-`--no-destructive-ops`), refused inside saved-query bodies, and — when
-capability scopes are enforced — requires the `admin` scope. Only the hash form
-exists; there is no bulk/user/scope erasure from CAL (see [§8](#8-deletion-narrow-and-gated)).
+Removes a single grain by content address (maps to `DejaDB::forget`). Unlike
+`SUPERSEDE`, this is a genuine tombstone — the grain is gone, not versioned.
+An optional `BECAUSE "<why>"` is recorded in the audit Observation. The
+identity and age forms — `FORGET SUBJECT` and `PURGE OLDER THAN`, both with
+mandatory BECAUSE — plus the authorization and audit story are in
+[§8](#8-destruction-shaped-and-authorization-gated). All destruction is
+refused inside saved-query bodies and capped by `allow_destructive_ops`.
 
 ### 3.3 Introspection & management
 
@@ -603,44 +606,59 @@ bindings per query, each capped at 1000 grains.
 
 ---
 
-## 8. Deletion: narrow and gated
+## 8. Destruction: shaped and authorization-gated
 
-CAL has exactly one destructive statement — `FORGET <hash>`, a single-grain
-tombstone — and it is gated. There is no way to delete in bulk, drop a table,
-truncate, or erase a namespace from a query. Defense in depth:
+Destruction in CAL takes **a hash, an identity, or an age — never a
+predicate** (CAL 1.3 §8.14). Three statements exist, and nothing mutates a
+stored blob:
 
-1. **Lexer blocklist.** A set of destructive keywords has no statement token
-   in the grammar — they only ever lex as inert identifiers, which the parser
-   hard-rejects (`is_destructive_keyword`) before any dispatch. `DELETE` has
-   no token at all — the deletion verb is `FORGET`. The blocked set includes:
+```
+FORGET sha256:<hash> [BECAUSE "<why>"]
+FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "<why>"
+PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] BECAUSE "<why>"
+```
 
-   ```
-   DELETE  ERASE   DESTROY  TRUNCATE  INSERT   CREATE   WRITE   STORE
-   KEY     ENCRYPT DECRYPT  ROTATE    MASTER   DEK      SECRET  POLICY
-   SEAL    UNSEAL  GRANT    REVOKE    CONSENT  RESTRICT SCHEMA  PARTITION
-   INDEX   MIGRATION
-   ```
+- `FORGET <hash>` — a single-grain tombstone. BECAUSE optional but recorded.
+- `FORGET SUBJECT` — identity erasure in the session namespace: every grain
+  referencing the identity (history and partition keys included) plus its
+  dictionary entries; `WITH text_mentions` extends it to grains whose
+  indexed text mentions the identity. BECAUSE mandatory.
+- `PURGE OLDER THAN` — the retention sweep, scoped to one namespace (never
+  an implicit all-namespace sweep) and optionally one grain type. BECAUSE
+  mandatory. Ages read as one word: `90d`, `6h`, `30m`.
 
-2. **Parser.** Those identifiers are rejected with a dedicated error.
-   `FORGET <hash>` parses; the bulk forms `FORGET USER`/`FORGET SCOPE` and
-   `PURGE` have tokens but the text parser refuses them (they have no store
-   backing). `DROP` accepts only `DROP TEMPLATE`/`DROP QUERY`.
+**Every execution writes an audit Observation** in the reserved
+`agent:authz` namespace — the session principal, the verb, the target, the
+reason, and the erased count — recallable like any grain:
+`RECALL observations WHERE namespace = "agent:authz"`.
 
-3. **Execution gate.** `FORGET` runs only when the executor's
-   `allow_destructive_ops` is enabled. It is **on by default**, but any host can
-   turn it off per-process — `deja serve --mcp --no-destructive-ops` (likewise
-   `deja ui` and `deja cal`) — giving a read-only session in which `FORGET`
-   returns `Unsupported`. When capability scopes are enforced (server path),
-   `FORGET` additionally requires the `admin` scope.
+Defense in depth, unchanged in spirit:
 
-Additionally, saved-query bodies get a separate read-only verification pass, so
-a stored query can never carry a `FORGET`.
+1. **Lexer blocklist.** `DELETE` has no token at all, and a set of
+   destructive/credential keywords only ever lex as inert identifiers the
+   parser hard-rejects: `DELETE ERASE DESTROY TRUNCATE INSERT CREATE WRITE
+   STORE KEY ENCRYPT DECRYPT ROTATE MASTER DEK SECRET POLICY SEAL UNSEAL
+   CONSENT RESTRICT SCHEMA PARTITION INDEX MIGRATION …`.
+2. **Parser shape.** `FORGET USER`/`FORGET SCOPE` are refused (the one
+   spelled identity form is `SUBJECT`); `DROP` accepts only
+   `DROP TEMPLATE`/`DROP QUERY`; saved-query bodies get a separate
+   read-only verification pass, so a stored query can never carry
+   destruction.
+3. **Authorization.** A session bound to a principal executes destruction
+   only under its grants — `delete` for the hash form, `erase` for the bulk
+   forms, per namespace; the refusal is `AUT-E001`/`CAL-E121` naming the
+   missing verb. An unbound local session is the owner (everything).
+4. **The process cap.** `allow_destructive_ops` (**on by default**) still
+   turns all of it off per-process — `deja serve --mcp
+   --no-destructive-ops` (likewise `deja ui` and `deja cal`) — and a cap
+   set restrictive wins over any grant.
 
-**The same primitive backs every surface.** CAL `FORGET <hash>`, the Rust API
-`forget`, and the MCP [`dejadb_forget`](mcp-reference.md#dejadb_forget) tool all
-tombstone a single grain by content address. For untrusted input, disable the
-whole surface with one flag; superseded versions remain as append-only history
-(via `HISTORY`) regardless.
+**The same primitives back every surface.** CAL `FORGET <hash>`, the Rust
+API `forget`, and the MCP [`dejadb_forget`](mcp-reference.md#dejadb_forget)
+tool tombstone one grain; `FORGET SUBJECT`/`PURGE OLDER THAN` call the same
+store machinery as `deja forget-subject`/`deja purge-older-than` and the
+bindings' `forget_subject`/`forget_older_than`. Superseded versions remain
+as append-only history (via `HISTORY`) regardless.
 
 Two Unicode invariants also run before tokenization:
 

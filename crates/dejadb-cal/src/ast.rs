@@ -699,16 +699,27 @@ pub struct RevertStmt {
 // FORGET (Tier 2)
 // ---------------------------------------------------------------------------
 
-/// `FORGET <hash>`, `FORGET USER "<user_id>"`, or `FORGET SCOPE "<scope>"`.
+/// `FORGET <hash> [BECAUSE "<why>"]` or
+/// `FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "<why>"` (CAL 1.3
+/// §8.14 — the subject form parses into [`ForgetTarget::User`], the store's
+/// identity erasure).
 ///
-/// Gated by `CalExecutorConfig::allow_destructive_ops`. Only the `Hash`
-/// target is backed by the store (`DejaDB::forget`, a single-grain tombstone);
-/// `User`/`Scope` crypto-erasure is not implemented yet and returns
-/// `Unsupported`.
+/// Capped by `CalExecutorConfig::allow_destructive_ops`; authorized by the
+/// session's `delete` (hash) / `erase` (subject) grant. `Scope` stays
+/// unreachable from text. BECAUSE is optional-but-recorded on the hash form
+/// (it predates the requirement) and mandatory on the subject form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForgetStmt {
     /// What to forget (hash, user, or scope).
     pub target: ForgetTarget,
+    /// The recorded reason (BECAUSE). Mandatory for non-hash targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `WITH text_mentions` — extend a subject erasure to grains whose
+    /// indexed text mentions the identity (search symmetry; subject form
+    /// only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_mentions: bool,
     #[serde(skip)]
     pub span: Option<Span>,
 }
@@ -729,19 +740,26 @@ pub enum ForgetTarget {
 // PURGE (Tier 2)
 // ---------------------------------------------------------------------------
 
-/// `PURGE STALE [OLDER THAN <n> DAYS] [IN "<namespace>"] [LIMIT <n>]`
+/// `PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"]
+/// BECAUSE "<why>"` — the retention sweep (CAL 1.3 §8.14).
 ///
-/// Cleanup expired/stale grains using the decay curve engine.
-/// Gated by `CalExecutorConfig::allow_destructive_ops` (and not backed by the
-/// store yet — returns `Unsupported`; also not reachable from CAL text).
+/// Capped by `CalExecutorConfig::allow_destructive_ops`; authorized by the
+/// session's `erase` grant on the swept namespace. BECAUSE is mandatory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PurgeStmt {
-    /// Minimum age in days (from `OLDER THAN <n> DAYS`). Default: 30.
+    /// Minimum age in days (from `OLDER THAN <n><unit>`; h/m convert).
     pub min_age_days: Option<f64>,
-    /// Namespace scope (from `IN "<namespace>"`). Default: "default".
+    /// Namespace scope (from `IN "<namespace>"`). Default: the session
+    /// namespace, then "shared" — never an implicit all-namespace sweep.
     pub namespace: Option<String>,
     /// Maximum grains to purge (from `LIMIT <n>`). Default: 1000.
     pub limit: Option<usize>,
+    /// `TYPE <t>` — restrict the sweep to one grain type (e.g. `event`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain_type: Option<String>,
+    /// The recorded reason (BECAUSE). Mandatory from text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip)]
     pub span: Option<Span>,
 }

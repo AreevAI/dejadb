@@ -71,21 +71,24 @@ loop engine: deja-loop ← dejadb-loop (adapter) · dejadb-llm (providers) ┤
 2. **Canonical serialization is frozen** (NFC, sorted keys, compact keys,
    omit-defaults). Changing it silently changes every content address and
    breaks OMS conformance — see `crates/dejadb-core/CLAUDE.md`.
-3. **CAL destruction is gated, not structural** — the only destructive CAL
-   statement is `FORGET <hash>` (a single-grain tombstone), gated at execution
-   by `CalExecutorConfig::allow_destructive_ops` (**default on**; disable
-   per-process with `--no-destructive-ops` on `deja serve`/`ui`/`cal`, or the
-   MCP `dejadb_forget` tool). `DELETE`/`ERASE`/`TRUNCATE`/… remain lexer-blocked
-   non-tokens, `PURGE` stays out of the text grammar, `DROP` accepts only
-   TEMPLATE/QUERY, saved-query bodies stay read-only, and the server path still
-   requires the `admin` scope. Don't widen the destructive surface without a
-   design + OMS-conformance decision. **One such decision exists** (2026-08,
-   [`docs/erasure.md`](docs/erasure.md)): subject-scoped and age-scoped bulk
-   erasure (`forget_subject` / `forget_older_than`) are host-level
-   store/binding/CLI operations for right-to-erasure and retention
-   compliance — a documented OMS deviation that deliberately stays OUT of
-   the CAL grammar (the parser still refuses FORGET USER/SCOPE/PURGE and
-   the facade stubs stay unwired).
+3. **CAL destruction is authorization-gated, not structural** (CAL 1.3,
+   [`docs/cal-all-you-need-proposal.md`](docs/cal-all-you-need-proposal.md)).
+   The destructive statements are `FORGET <hash>` (single-grain tombstone,
+   `delete` verb), `FORGET SUBJECT "<id>" [WITH text_mentions]` (identity
+   erasure, `erase` verb), and `PURGE OLDER THAN <n><d|h|m> [TYPE t]`
+   (retention sweep, `erase` verb) — BECAUSE mandatory on the latter two,
+   optional-but-recorded on the hash form; every execution writes a Tier-2
+   audit Observation in `agent:authz`. Grants live in the file as
+   `mg:permits` Facts (`dejadb_core::authz`); the session's `AuthzSet`
+   decides, and `CalExecutorConfig::allow_destructive_ops` remains a
+   process-wide restrictive **cap** over any grant (`--no-destructive-ops`).
+   Destruction takes a hash, an identity, or an age — never a predicate:
+   `DELETE`/`ERASE`/`TRUNCATE`/… stay lexer-blocked non-tokens, `FORGET
+   USER/SCOPE` stay text-refused, `DROP` accepts only TEMPLATE/QUERY, and
+   saved-query bodies stay read-only. Statement classification has ONE
+   source of truth (`dejadb_cal::classify`, exhaustive, no wildcard).
+   [`docs/erasure.md`](docs/erasure.md) records the erasure requirements;
+   its former "out of CAL" deviation is retired by CAL 1.3.
 4. **CAL syntax is an OMS conformance contract** — no new CAL syntax
    without a spec-level decision.
 5. **One memory = one isolation unit** — a file on the embedded backend, a

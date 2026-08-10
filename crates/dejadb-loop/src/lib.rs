@@ -54,12 +54,10 @@ pub fn scopes_for(authz: &dejadb_core::authz::AuthzSet) -> deja_loop::ScopeSet {
 /// derivation — a *statement* must never be able to claim humanity, so the
 /// answer always comes from the host-held actor label, not request text).
 pub fn observer_for_principal(actor: &str) -> deja_loop::ObserverType {
-    for prefix in ["agent:", "bot:", "job:", "svc:", "engine:"] {
-        if actor.starts_with(prefix) {
-            return deja_loop::ObserverType::Agent;
-        }
+    match dejadb_core::authz::observer_kind(actor) {
+        "agent" => deja_loop::ObserverType::Agent,
+        _ => deja_loop::ObserverType::Human,
     }
-    deja_loop::ObserverType::Human
 }
 
 /// Wall-clock now in epoch milliseconds — the `now_ms` the engine's `run`,

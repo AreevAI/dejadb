@@ -1295,7 +1295,7 @@ impl CalExecutor {
                             found: hash.clone(),
                             span: forget.span,
                         })?;
-                        match store.cal_delete(&h) {
+                        match store.cal_delete(&h, forget.reason.as_deref()) {
                             Ok(()) => Ok(CalResultPayload::Forgotten {
                                 target: format!("hash:{hash}"),
                                 count: 1,
@@ -1307,14 +1307,23 @@ impl CalExecutor {
                         }
                     }
                     super::ast::ForgetTarget::User { user_id } => {
-                        match store.cal_forget_user(user_id) {
+                        // BECAUSE is mandatory on identity erasure (the text
+                        // parser enforces it; the JSON-CAL path enforces it
+                        // here).
+                        let because = match forget.reason.as_deref() {
+                            Some(r) if !r.trim().is_empty() => r,
+                            _ => {
+                                return Err(CalError::MissingReason { span: forget.span });
+                            }
+                        };
+                        match store.cal_forget_user(user_id, forget.text_mentions, because) {
                             Ok(proof) => Ok(CalResultPayload::Forgotten {
-                                target: format!("user:{user_id}"),
+                                target: format!("subject:{user_id}"),
                                 count: proof.count,
                             }),
                             Err(e) => Ok(CalResultPayload::Unsupported {
                                 statement: "forget".into(),
-                                message: format!("FORGET USER failed: {e}"),
+                                message: format!("FORGET SUBJECT failed: {e}"),
                             }),
                         }
                     }
@@ -1464,7 +1473,7 @@ impl CalExecutor {
             }
             CalStatement::RunQuery(run) => self.execute_run_query(run, store, query, exec_warnings),
 
-            // Tier 2 — PURGE STALE
+            // Tier 2 — PURGE OLDER THAN (the retention sweep).
             CalStatement::Purge(purge) => {
                 if !self.config.allow_destructive_ops {
                     return Ok(CalResultPayload::Unsupported {
@@ -1474,14 +1483,28 @@ impl CalExecutor {
                             .into(),
                     });
                 }
+                // BECAUSE is mandatory (the text parser enforces it; the
+                // JSON-CAL path enforces it here).
+                let because = match purge.reason.as_deref() {
+                    Some(r) if !r.trim().is_empty() => r,
+                    _ => {
+                        return Err(CalError::MissingReason { span: purge.span });
+                    }
+                };
                 let min_age = purge.min_age_days.unwrap_or(30.0);
                 let batch_limit = purge.limit.unwrap_or(1000);
                 let ns = purge.namespace.as_deref();
-                match store.cal_purge_stale(min_age, ns, batch_limit) {
+                match store.cal_purge_stale(
+                    min_age,
+                    ns,
+                    batch_limit,
+                    purge.grain_type.as_deref(),
+                    because,
+                ) {
                     Ok(count) => Ok(CalResultPayload::Purged { count }),
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "purge".into(),
-                        message: format!("PURGE STALE failed: {e}"),
+                        message: format!("PURGE failed: {e}"),
                     }),
                 }
             }

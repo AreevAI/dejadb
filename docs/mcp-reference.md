@@ -194,8 +194,11 @@ instead.
 ### `dejadb_cal`
 
 Execute a CAL statement (`RECALL` / `ASSEMBLE` / `EXISTS` / `HISTORY` / `ADD` /
-`SUPERSEDE` / …). **CAL is structurally incapable of deleting data** — see the
-[non-destructive guarantee](cal-reference.md#8-deletion-narrow-and-gated).
+`SUPERSEDE` / …). **CAL destruction is shaped and authorization-gated** — it
+takes a hash, an identity, or an age, never a predicate; can never rewrite
+history; and is refused without the session's `delete`/`erase` grant — see
+[the destruction model](cal-reference.md#8-destruction-shaped-and-authorization-gated).
+`--no-destructive-ops` still switches the whole surface off per-process.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
