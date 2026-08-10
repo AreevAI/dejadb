@@ -256,6 +256,56 @@ pub trait CalStoreFacade: Send + Sync {
         None
     }
 
+    /// `ENTITY … AT` (CAL 1.3 Wave 2): the as-of read. `axis` is
+    /// `"world"` or `"knowledge"`. Returns the grain as JSON, or None.
+    fn cal_entity_at(
+        &self,
+        _subject: &str,
+        _relation: &str,
+        _at_ms: i64,
+        _axis: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "as-of reads not available".into(),
+        ))
+    }
+
+    /// `RUN TRACE` (Wave 2): what a run recorded and what it produced —
+    /// `{ recorded: [...], produced: [...] }`.
+    fn cal_run_trace(&self, _run_id: &str, _limit: usize) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "run traces not available".into(),
+        ))
+    }
+
+    /// `RUNS TOUCHING` (Wave 2): run ids that produced or refined a grain.
+    fn cal_runs_touching(&self, _hash: &Hash, _depth: usize) -> Result<Vec<String>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "run joins not available".into(),
+        ))
+    }
+
+    /// `DERIVED FROM` (Wave 2): reverse provenance, as grain JSON rows.
+    fn cal_derived_from(&self, _hash: &Hash) -> Result<Vec<serde_json::Value>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "provenance reads not available".into(),
+        ))
+    }
+
+    /// `DESCRIBE STATS` (Wave 2): store counters as JSON.
+    fn cal_stats(&self) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "stats not available".into(),
+        ))
+    }
+
+    /// `DESCRIBE INTEGRITY` (Wave 2): integrity + content-address recheck.
+    fn cal_verify(&self) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "integrity checks not available".into(),
+        ))
+    }
+
     /// `REMEMBER` (CAL 1.3): capture free text as an Event grain with
     /// session/role/run metadata. Returns the Event's hash.
     fn cal_remember(

@@ -463,6 +463,18 @@ pub enum Token {
     #[token("REMEMBER", ignore(ascii_case))]
     Remember,
 
+    /// `ENTITY "<s>" RELATION "<r>" AT <ms>` (CAL 1.3) — the as-of read.
+    #[token("ENTITY", ignore(ascii_case))]
+    Entity,
+
+    /// `RUNS TOUCHING <hash>` (CAL 1.3) — the reverse run↔memory join.
+    #[token("RUNS", ignore(ascii_case))]
+    Runs,
+
+    /// `DERIVED FROM <hash>` (CAL 1.3) — reverse provenance.
+    #[token("DERIVED", ignore(ascii_case))]
+    Derived,
+
     /// Governance (CAL 1.3 §8.16): `APPROVE <hash> BECAUSE "<why>"`.
     #[token("APPROVE", ignore(ascii_case))]
     Approve,
@@ -931,6 +943,9 @@ impl Token {
             Token::Show => "SHOW".into(),
             Token::To => "TO".into(),
             Token::Remember => "REMEMBER".into(),
+            Token::Entity => "ENTITY".into(),
+            Token::Runs => "RUNS".into(),
+            Token::Derived => "DERIVED".into(),
             Token::Approve => "APPROVE".into(),
             Token::Reject => "REJECT".into(),
             Token::Apply => "APPLY".into(),

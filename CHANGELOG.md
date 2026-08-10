@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CAL 1.3 Wave-2 reads: time, runs, and provenance are in the
+  language.** `ENTITY "<s>" RELATION "<r>" AT <epoch-ms> [AXIS
+  world|knowledge]` is the bitemporal as-of read (what was true vs what
+  was known — `SINCE`/`UNTIL` filter grains; this resolves the head at
+  T). `RUN TRACE "<run-id>"` returns both halves of the run↔memory join
+  in one statement (recorded + produced); `RUNS TOUCHING <hash>` is the
+  reverse walk; `DERIVED FROM <hash>` is reverse provenance; `SHOW
+  FORKS` lists the open multi-head contradictions first-class; and
+  `DESCRIBE STATS`/`DESCRIBE INTEGRITY` bring the store counters and the
+  content-address recheck in-language. All plain reads under the
+  session's grants (the namespace-spanning ones need `read` on `*`); the
+  parity gate now pins 35 operations.
 - **Principals reach every surface.** `deja ui --auth deja-auth.json`
   serves the console in multi-principal mode: the credential map resolves
   bearer/Basic tokens to principal names (env refs or sha256 — no raw

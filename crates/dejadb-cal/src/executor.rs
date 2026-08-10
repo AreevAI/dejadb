@@ -213,6 +213,16 @@ pub enum CalResultPayload {
     RecRolledBack { hash: String },
     /// Result of `REMEMBER` — the captured Event's hash.
     Remembered { hash: String },
+    /// Result of `ENTITY … AT` — the as-of grain, or null.
+    EntityAt { grain: Option<serde_json::Value>, axis: String, at_ms: i64 },
+    /// Result of `RUN TRACE` — what a run recorded and produced.
+    RunTrace { run_id: String, trace: serde_json::Value },
+    /// Result of `RUNS TOUCHING` — run ids, most recent first.
+    RunsTouching { hash: String, runs: Vec<String> },
+    /// Result of `DERIVED FROM` — reverse provenance rows.
+    DerivedFrom { hash: String, grains: Vec<serde_json::Value> },
+    /// Result of `SHOW FORKS` — the open forks.
+    Forks { forks: Vec<serde_json::Value> },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -1539,6 +1549,77 @@ impl CalExecutor {
                     }),
                 }
             }
+
+            // Wave-2 reads (CAL 1.3): as-of, the run↔memory join, reverse
+            // provenance, the fork listing. All plain reads under the
+            // session's grants.
+            CalStatement::EntityAt(ea) => {
+                let axis = ea.axis.clone().unwrap_or_else(|| "world".to_string());
+                match store.cal_entity_at(&ea.subject, &ea.relation, ea.at_ms, &axis) {
+                    Ok(grain) => Ok(CalResultPayload::EntityAt { grain, axis, at_ms: ea.at_ms }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "entity_at".into(),
+                        message: format!("ENTITY AT failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunTrace(rt) => {
+                match store.cal_run_trace(&rt.run_id, rt.limit.unwrap_or(64).min(1024)) {
+                    Ok(trace) => Ok(CalResultPayload::RunTrace {
+                        run_id: rt.run_id.clone(),
+                        trace,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "run_trace".into(),
+                        message: format!("RUN TRACE failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunsTouching(rt) => {
+                let h = Hash::from_hex(&rt.hash).map_err(|_| CalError::InvalidHash {
+                    found: rt.hash.clone(),
+                    span: rt.span,
+                })?;
+                match store.cal_runs_touching(&h, rt.depth.unwrap_or(4).min(8)) {
+                    Ok(runs) => Ok(CalResultPayload::RunsTouching { hash: rt.hash.clone(), runs }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "runs_touching".into(),
+                        message: format!("RUNS TOUCHING failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::DerivedFrom(df) => {
+                let h = Hash::from_hex(&df.hash).map_err(|_| CalError::InvalidHash {
+                    found: df.hash.clone(),
+                    span: df.span,
+                })?;
+                match store.cal_derived_from(&h) {
+                    Ok(grains) => Ok(CalResultPayload::DerivedFrom { hash: df.hash.clone(), grains }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "derived_from".into(),
+                        message: format!("DERIVED FROM failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::ShowForks(_) => match store.open_forks() {
+                Ok(groups) => Ok(CalResultPayload::Forks {
+                    forks: groups
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "namespace": f.namespace,
+                                "subject": f.subject,
+                                "relation": f.relation,
+                                "heads": f.heads,
+                            })
+                        })
+                        .collect(),
+                }),
+                Err(e) => Ok(CalResultPayload::Unsupported {
+                    statement: "show_forks".into(),
+                    message: format!("SHOW FORKS failed: {e}"),
+                }),
+            },
 
             // REMEMBER (CAL 1.3) — the capture verb, an append-only write.
             CalStatement::Remember(rem) => {
@@ -3429,6 +3510,21 @@ impl CalExecutor {
                     })?,
                 }
             }
+            DescribeTarget::Stats | DescribeTarget::Integrity => {
+                let res = if matches!(&describe.target, DescribeTarget::Stats) {
+                    store.cal_stats()
+                } else {
+                    store.cal_verify()
+                };
+                res.map_err(|e| {
+                    let detail = e.to_string();
+                    if detail.contains("AUT-E") {
+                        CalError::NotAuthorized { detail, span: None }
+                    } else {
+                        CalError::InvalidQuery { detail, span: None }
+                    }
+                })?
+            }
             DescribeTarget::Grammar => serde_json::json!({
                 "grammar": "CAL/1 grammar (simplified BNF)",
                 "version": 1,
@@ -4796,6 +4892,11 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::RollbackRec(_) => "rollback",
         CalStatement::RunLoop(_) => "run_loop",
         CalStatement::Remember(_) => "remember",
+        CalStatement::EntityAt(_) => "entity_at",
+        CalStatement::RunTrace(_) => "run_trace",
+        CalStatement::RunsTouching(_) => "runs_touching",
+        CalStatement::DerivedFrom(_) => "derived_from",
+        CalStatement::ShowForks(_) => "show_forks",
     }
     .to_string()
 }
@@ -4815,7 +4916,12 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::Batch(_)
         | CalStatement::Coalesce(_)
         | CalStatement::RunQuery(_)
-        | CalStatement::ShowGrants(_) => "read",
+        | CalStatement::ShowGrants(_)
+        | CalStatement::EntityAt(_)
+        | CalStatement::RunTrace(_)
+        | CalStatement::RunsTouching(_)
+        | CalStatement::DerivedFrom(_)
+        | CalStatement::ShowForks(_) => "read",
 
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
@@ -4890,6 +4996,11 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::RecApplied { .. } => 1,
         CalResultPayload::RecRolledBack { .. } => 1,
         CalResultPayload::Remembered { .. } => 1,
+        CalResultPayload::EntityAt { grain, .. } => usize::from(grain.is_some()),
+        CalResultPayload::RunTrace { .. } => 1,
+        CalResultPayload::RunsTouching { runs, .. } => runs.len(),
+        CalResultPayload::DerivedFrom { grains, .. } => grains.len(),
+        CalResultPayload::Forks { forks } => forks.len(),
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,

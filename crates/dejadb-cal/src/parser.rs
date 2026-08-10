@@ -38,8 +38,9 @@ use super::ast::{
     UntilClause, Value, WhereClause, WithOption,
 };
 use super::ast::{
-    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, GovernanceStmt, GrantStmt,
-    PurgeStmt, QueryParam, RememberStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, ShowGrantsStmt,
+    DefineQueryStmt, DerivedFromStmt, DropQueryStmt, EntityAtStmt, ForgetStmt, ForgetTarget,
+    GovernanceStmt, GrantStmt, PurgeStmt, QueryParam, RememberStmt, RevokeStmt, RunLoopStmt,
+    RunQueryStmt, RunTraceStmt, RunsTouchingStmt, ShowForksStmt, ShowGrantsStmt,
     TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
@@ -194,6 +195,11 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         CalStatement::Accumulate(_) => write("ACCUMULATE"),
         CalStatement::Revert(_) => write("REVERT"),
         CalStatement::Remember(_) => write("REMEMBER"),
+        CalStatement::EntityAt(_)
+        | CalStatement::RunTrace(_)
+        | CalStatement::RunsTouching(_)
+        | CalStatement::DerivedFrom(_)
+        | CalStatement::ShowForks(_) => Ok(()),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
         // No DCL inside saved-query bodies — a stored GRANT executing with
@@ -1366,6 +1372,19 @@ impl Parser {
                 token: Token::Remember,
                 ..
             }) => self.parse_remember(),
+            // Wave-2 reads (CAL 1.3).
+            Some(SpannedToken {
+                token: Token::Entity,
+                ..
+            }) => self.parse_entity_at(),
+            Some(SpannedToken {
+                token: Token::Runs,
+                ..
+            }) => self.parse_runs_touching(),
+            Some(SpannedToken {
+                token: Token::Derived,
+                ..
+            }) => self.parse_derived_from(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -4121,6 +4140,12 @@ impl Parser {
                 } else if s.eq_ignore_ascii_case("policy") {
                     self.advance();
                     DescribeTarget::LoopPolicy
+                } else if s.eq_ignore_ascii_case("stats") {
+                    self.advance();
+                    DescribeTarget::Stats
+                } else if s.eq_ignore_ascii_case("integrity") {
+                    self.advance();
+                    DescribeTarget::Integrity
                 } else {
                     self.advance();
                     DescribeTarget::Schema
@@ -5774,6 +5799,213 @@ impl Parser {
         }))
     }
 
+    /// One optional `<IDENT>(<n>)`-free numeric suffix keyword, e.g.
+    /// `LIMIT 50` / `DEPTH 3`, where the keyword is a bare word.
+    fn parse_word_number(&mut self, word: &str) -> CalResult<Option<usize>> {
+        let matches_word = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) => w.eq_ignore_ascii_case(word),
+            Some(SpannedToken { token: Token::Limit, .. }) => word.eq_ignore_ascii_case("LIMIT"),
+            _ => false,
+        };
+        if !matches_word {
+            return Ok(None);
+        }
+        self.advance();
+        match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n >= 1.0 => {
+                let n = *n as usize;
+                self.advance();
+                Ok(Some(n))
+            }
+            other => Err(CalError::UnexpectedToken {
+                expected: format!("a positive number after {word}"),
+                found: other
+                    .map(|t| t.token.description())
+                    .unwrap_or_else(|| "end of input".into()),
+                span: other.map(|t| t.span),
+                suggestion: None,
+            }),
+        }
+    }
+
+    /// Parse `ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms>
+    /// [AXIS world|knowledge]` (CAL 1.3 Wave 2 — the as-of read).
+    fn parse_entity_at(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Entity)?;
+        let subject = self.parse_string_literal()?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("RELATION") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "RELATION".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the as-of read is spelled ENTITY \"<subject>\" RELATION \
+                         \"<relation>\" AT <epoch-ms> [AXIS world|knowledge]"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        let relation = self.parse_string_literal()?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) if w.eq_ignore_ascii_case("AT") => {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "AT".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        }
+        let at_ms = match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n >= 0.0 => {
+                let n = *n as i64;
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a point in time (epoch milliseconds)".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        let mut axis = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("AXIS") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(a), .. })
+                        if a.eq_ignore_ascii_case("world") || a.eq_ignore_ascii_case("knowledge") =>
+                    {
+                        axis = Some(a.to_ascii_lowercase());
+                        self.advance();
+                    }
+                    // KNOWLEDGE doubles as the relation-category keyword, so
+                    // it arrives as its own token, not an Ident.
+                    Some(SpannedToken { token: Token::Knowledge, .. }) => {
+                        axis = Some("knowledge".to_string());
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "world or knowledge".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::EntityAt(EntityAtStmt {
+            subject,
+            relation,
+            at_ms,
+            axis,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `RUN TRACE "<run-id>" [LIMIT <n>]` — the caller has seen
+    /// `RUN` followed by the ident `TRACE`.
+    fn parse_run_trace(&mut self, span_start: Span) -> CalResult<CalStatement> {
+        self.advance(); // TRACE
+        let run_id = self.parse_string_literal()?;
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunTrace(RunTraceStmt {
+            run_id,
+            limit,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `RUNS TOUCHING <hash> [DEPTH <n>]`.
+    fn parse_runs_touching(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Runs)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("TOUCHING") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "TOUCHING".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("the reverse join is spelled RUNS TOUCHING <hash> [DEPTH <n>]".into()),
+                });
+            }
+        }
+        let hash = self.parse_hash_literal()?;
+        let depth = self.parse_word_number("DEPTH")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunsTouching(RunsTouchingStmt {
+            hash,
+            depth,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `DERIVED FROM <hash>` — reverse provenance.
+    fn parse_derived_from(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Derived)?;
+        self.expect_exact(&Token::From)?;
+        let hash = self.parse_hash_literal()?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::DerivedFrom(DerivedFromStmt {
+            hash,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
     /// Parse `SHOW GRANTS [FOR "<principal>"]`.
     fn parse_show_grants(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
@@ -5784,14 +6016,28 @@ impl Parser {
             {
                 self.advance();
             }
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("FORKS") =>
+            {
+                self.advance();
+                let span_end = self.prev_span();
+                return Ok(CalStatement::ShowForks(ShowForksStmt {
+                    span: Some(Span::new(
+                        span_start.start,
+                        span_end.end,
+                        span_start.line,
+                        span_start.col,
+                    )),
+                }));
+            }
             other => {
                 return Err(CalError::UnexpectedToken {
-                    expected: "GRANTS".into(),
+                    expected: "GRANTS or FORKS".into(),
                     found: other
                         .map(|t| t.token.description())
                         .unwrap_or_else(|| "end of input".into()),
                     span: other.map(|t| t.span),
-                    suggestion: Some("the only SHOW form is SHOW GRANTS [FOR \"<principal>\"]".into()),
+                    suggestion: Some("SHOW GRANTS [FOR \"<principal>\"] | SHOW FORKS".into()),
                 });
             }
         }
@@ -6412,11 +6658,14 @@ impl Parser {
         let span_start = self.current_span();
         self.expect_exact(&Token::Run)?;
 
-        // `RUN LOOP` — the analysis trigger (CAL 1.3 §8.16) rides the RUN
-        // prefix; a string literal keeps meaning a saved query.
+        // `RUN LOOP` (governance) and `RUN TRACE` (the run↔memory join)
+        // ride the RUN prefix; a string literal keeps meaning a saved query.
         if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
             if w.eq_ignore_ascii_case("LOOP") {
                 return self.parse_run_loop(span_start);
+            }
+            if w.eq_ignore_ascii_case("TRACE") {
+                return self.parse_run_trace(span_start);
             }
         }
 

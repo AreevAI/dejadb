@@ -44,6 +44,13 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         // A saved query's body is structurally read-only (enforced at
         // definition and execution), so running one is a read.
         CalStatement::RunQuery(_) => StatementClass::Read,
+        // Wave-2 reads: as-of, the run↔memory join, reverse provenance,
+        // fork listing.
+        CalStatement::EntityAt(_)
+        | CalStatement::RunTrace(_)
+        | CalStatement::RunsTouching(_)
+        | CalStatement::DerivedFrom(_)
+        | CalStatement::ShowForks(_) => StatementClass::Read,
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
         | CalStatement::Supersede(_)

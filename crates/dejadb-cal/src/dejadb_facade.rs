@@ -1366,6 +1366,74 @@ impl CalStoreFacade for DejaDbFacade {
         self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
 
+    fn cal_entity_at(
+        &self,
+        subject: &str,
+        relation: &str,
+        at_ms: i64,
+        axis: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let axis = match axis {
+            "knowledge" => dejadb_store::Axis::Knowledge,
+            _ => dejadb_store::Axis::World,
+        };
+        let g = self
+            .store
+            .lock()
+            .unwrap()
+            .entity_at(&ns, subject, relation, at_ms, axis)?;
+        Ok(g.as_ref().map(grain_json))
+    }
+
+    fn cal_run_trace(&self, run_id: &str, limit: usize) -> Result<serde_json::Value> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let mut m = self.store.lock().unwrap();
+        let recorded: Vec<_> = m.run_trace(&ns, run_id, limit)?.iter().map(grain_json).collect();
+        let produced: Vec<_> = m.run_yield(&ns, run_id, limit)?.iter().map(grain_json).collect();
+        Ok(serde_json::json!({ "recorded": recorded, "produced": produced }))
+    }
+
+    fn cal_runs_touching(&self, hash: &Hash, depth: usize) -> Result<Vec<String>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        self.store.lock().unwrap().runs_touching(&ns, hash, depth)
+    }
+
+    fn cal_derived_from(&self, hash: &Hash) -> Result<Vec<serde_json::Value>> {
+        // Provenance spans namespaces — the read needs the wide grant.
+        self.check_verb(Verb::Read, "*")?;
+        let grains = self.store.lock().unwrap().grains_derived_from(hash)?;
+        Ok(grains.iter().map(grain_json).collect())
+    }
+
+    fn cal_stats(&self) -> Result<serde_json::Value> {
+        self.check_verb(Verb::Read, "*")?;
+        let s = self.store.lock().unwrap().stats()?;
+        Ok(serde_json::json!({
+            "grains": s.grains,
+            "current": s.current,
+            "triples": s.triples,
+            "terms": s.terms,
+            "ops": s.ops,
+            "events_indexed": s.events_indexed,
+        }))
+    }
+
+    fn cal_verify(&self) -> Result<serde_json::Value> {
+        self.check_verb(Verb::Read, "*")?;
+        let r = self.store.lock().unwrap().verify()?;
+        Ok(serde_json::json!({
+            "integrity": r.integrity,
+            "fts_notes": r.fts_notes,
+            "grains": r.grains,
+            "hash_mismatches": r.hash_mismatches,
+            "undecodable": r.undecodable,
+        }))
+    }
+
     /// `REMEMBER` (CAL 1.3) — capture into the session namespace via the
     /// same store path as `deja remember` and the bindings' `capture`. The
     /// observer is the bound principal; a `write` grant is the
@@ -1650,6 +1718,16 @@ fn parse_grant_parts(
         }
     }
     Ok(dejadb_core::authz::Grant { verbs: parsed, namespaces })
+}
+
+/// The grain-as-JSON shape shared by the Wave-2 reads:
+/// `{hash, type, fields}` — the same shape the MCP tools speak.
+fn grain_json(g: &DeserializedGrain) -> serde_json::Value {
+    serde_json::json!({
+        "hash": g.hash.to_hex(),
+        "type": g.grain_type.as_str(),
+        "fields": g.fields.clone().into_iter().collect::<serde_json::Map<_, _>>(),
+    })
 }
 
 /// Wall-clock epoch ms for audit stamps and PURGE cutoffs — host-side time,

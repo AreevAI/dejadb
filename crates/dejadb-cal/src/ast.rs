@@ -193,6 +193,23 @@ pub enum CalStatement {
     #[serde(alias = "REMEMBER")]
     Remember(RememberStmt),
 
+    // ── Wave-2 reads (CAL 1.3) ─────────────────────────────────────────
+    /// `ENTITY "<s>" RELATION "<r>" AT <ms> [AXIS …]`
+    #[serde(alias = "ENTITY_AT", alias = "EntityAt")]
+    EntityAt(EntityAtStmt),
+    /// `RUN TRACE "<run-id>"`
+    #[serde(alias = "RUN_TRACE")]
+    RunTrace(RunTraceStmt),
+    /// `RUNS TOUCHING <hash>`
+    #[serde(alias = "RUNS_TOUCHING")]
+    RunsTouching(RunsTouchingStmt),
+    /// `DERIVED FROM <hash>`
+    #[serde(alias = "DERIVED_FROM")]
+    DerivedFrom(DerivedFromStmt),
+    /// `SHOW FORKS`
+    #[serde(alias = "SHOW_FORKS")]
+    ShowForks(ShowForksStmt),
+
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
     DefineTemplate(DefineTemplateStmt),
@@ -508,6 +525,10 @@ pub enum DescribeTarget {
     Outcomes,
     /// `DESCRIBE POLICY` — the effective host loop policy (read-only).
     LoopPolicy,
+    /// `DESCRIBE STATS` — store counters.
+    Stats,
+    /// `DESCRIBE INTEGRITY` — integrity + content-address recheck.
+    Integrity,
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +827,67 @@ pub struct PurgeStmt {
     /// The recorded reason (BECAUSE). Mandatory from text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// Wave-2 reads (CAL 1.3): as-of, the run↔memory join, reverse provenance
+// ---------------------------------------------------------------------------
+
+/// `ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms>
+/// [AXIS world|knowledge]` — the bitemporal as-of read: what was true in
+/// the world at T (`world`, validity windows) or what the agent knew at T
+/// (`knowledge`, the supersession chain).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityAtStmt {
+    pub subject: String,
+    pub relation: String,
+    pub at_ms: i64,
+    /// `world` (default) | `knowledge`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUN TRACE "<run-id>" [LIMIT <n>]` — everything a run recorded, plus
+/// what it produced downstream (the join between execution history and
+/// semantic memory, in one statement).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunTraceStmt {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUNS TOUCHING <hash> [DEPTH <n>]` — which runs produced or refined a
+/// grain (walks provenance both ways; reads leave no grain and are not
+/// recorded).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunsTouchingStmt {
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `DERIVED FROM <hash>` — reverse provenance: the grains distilled from
+/// a source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedFromStmt {
+    pub hash: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `SHOW FORKS` — the open forks (subject+relation pairs with >1 live
+/// head), first-class.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowForksStmt {
     #[serde(skip)]
     pub span: Option<Span>,
 }

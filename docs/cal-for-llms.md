@@ -19,8 +19,14 @@ READ
   ASSEMBLE "topic" FROM facts WHERE subject = "j"      -- budgeted context
   HISTORY OF sha256:<hash>                             -- a value's versions
   EXISTS sha256:<hash>
+  ENTITY "alice" RELATION "employer" AT <epoch-ms>
+      AXIS knowledge                                   -- what was known at T
+  RUN TRACE "run-42"                                   -- what a run recorded + produced
+  RUNS TOUCHING sha256:<hash>                          -- which runs made this grain
+  DERIVED FROM sha256:<hash>                           -- what was distilled from it
+  SHOW FORKS                                           -- open contradictions (multi-head)
   DESCRIBE CAPABILITIES                                -- what this host supports
-  DESCRIBE facts | SCHEMA | FIELDS                     -- what is queryable
+  DESCRIBE facts | SCHEMA | FIELDS | STATS | INTEGRITY -- what is queryable / store health
 
 WRITE (append-only; REASON/BECAUSE is your provenance)
   REMEMBER "the caller asked about refunds"

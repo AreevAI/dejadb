@@ -47,6 +47,14 @@ fn every_governed_operation_has_a_cal_spelling() {
         ("loop-analyzers", "DESCRIBE ANALYZERS".into(), Read),
         ("loop-outcomes", "DESCRIBE OUTCOMES".into(), Read),
         ("loop-policy", "DESCRIBE POLICY".into(), Read),
+        // ── the wave-2 reads ──────────────────────────────────────────
+        ("entity-at", r#"ENTITY "alice" RELATION "employer" AT 1700000000000 AXIS knowledge"#.into(), Read),
+        ("run-trace", r#"RUN TRACE "run-42" LIMIT 50"#.into(), Read),
+        ("runs-touching", format!("RUNS TOUCHING {H} DEPTH 3"), Read),
+        ("provenance", format!("DERIVED FROM {H}"), Read),
+        ("forks", "SHOW FORKS".into(), Read),
+        ("stats", "DESCRIBE STATS".into(), Read),
+        ("verify", "DESCRIBE INTEGRITY".into(), Read),
         // ── host metadata (admin) ─────────────────────────────────────
         ("define-template", r#"DEFINE TEMPLATE brief AS "{{content}}""#.into(), Control),
         ("drop-template", r#"DROP TEMPLATE "brief""#.into(), Control),

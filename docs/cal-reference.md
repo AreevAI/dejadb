@@ -82,8 +82,8 @@ index-layer state rebuilt from the audit chain, never author-written.
 
 ## 3. Statement types
 
-CAL's AST defines 31 statement variants (CAL 1.3 added the destruction,
-control, governance, and capture statements). The ones below are **reachable
+CAL's AST defines 36 statement variants (CAL 1.3 added the destruction,
+control, governance, capture, and time/provenance statements). The ones below are **reachable
 from text queries**; access control and governance are in
 [§9](#9-access-control--governance-cal-13), destruction in
 [§8](#8-destruction-shaped-and-authorization-gated). (A couple of variants
@@ -267,6 +267,32 @@ COALESCE { RECALL facts WHERE subject = "john" AND relation = "seat" }
 
 Tries each branch in order, returning the first that yields results (with an
 optional `ELSE` fallback).
+
+#### Wave-2 reads (CAL 1.3): time, runs, provenance, forks
+
+```
+ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms> [AXIS world|knowledge]
+RUN TRACE "<run-id>" [LIMIT <n>]
+RUNS TOUCHING sha256:<hash> [DEPTH <n>]
+DERIVED FROM sha256:<hash>
+SHOW FORKS
+DESCRIBE STATS
+DESCRIBE INTEGRITY
+```
+
+- `ENTITY … AT` is the bitemporal as-of read: `world` answers "what was
+  true at T" (validity windows), `knowledge` answers "what did the agent
+  know at T" (the supersession chain). Distinct from `SINCE`/`UNTIL`, which
+  *filter grains by timestamp* rather than resolving the head at T.
+- `RUN TRACE` returns both halves of the run↔memory join in one statement:
+  `recorded` (the grains stamped with the run id) and `produced` (what was
+  distilled from them, via provenance). `RUNS TOUCHING` is the reverse
+  walk — which runs produced or refined a grain; reads leave no grain and
+  are never recorded.
+- `DERIVED FROM` is reverse provenance (requires `read` on `*` — provenance
+  spans namespaces), `SHOW FORKS` lists the open multi-head contradictions,
+  and the two `DESCRIBE` reads are the store counters and the
+  integrity/content-address recheck (`read` on `*`).
 
 ### 3.2 Write statements (append-only)
 
