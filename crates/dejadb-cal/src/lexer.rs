@@ -89,10 +89,12 @@ pub fn nfc_normalize(input: &str) -> String {
 pub fn is_destructive_keyword(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
-        // FORGET and DROP are first-class CAL statements (gated at execution
-        // by `allow_destructive_ops`), so they are not blocked here. PURGE is a
-        // token too, but the text parser still rejects it. DELETE stays blocked
-        // at the lexer — use `FORGET <hash>` instead.
+        // FORGET, PURGE, and DROP are first-class Tier-2 CAL statements
+        // (authorization-gated, capped by `allow_destructive_ops`), and
+        // GRANT/REVOKE are Tier-3 DCL (CAL 1.3) — none blocked here. DELETE
+        // stays blocked at the lexer — the deletion verbs are FORGET/PURGE.
+        // Credential and key vocabulary stays blocked forever: CAL never
+        // touches secrets.
         "DELETE"
             | "ERASE"
             | "DESTROY"
@@ -111,8 +113,7 @@ pub fn is_destructive_keyword(word: &str) -> bool {
             | "POLICY"
             | "SEAL"
             | "UNSEAL"
-            | "GRANT"
-            | "REVOKE"
+            | "TOKEN"
             | "CONSENT"
             | "RESTRICT"
             | "SCHEMA"
@@ -457,6 +458,22 @@ pub enum Token {
     Revert,
 
     // ── Tier 2 keywords (destructive statements) ─────────────────────────
+    /// Tier-3 DCL (CAL 1.3): `GRANT <verbs> ON <ns> TO "<principal>"`.
+    #[token("GRANT", ignore(ascii_case))]
+    Grant,
+
+    /// Tier-3 DCL (CAL 1.3): `REVOKE <verbs> ON <ns> FROM "<principal>"`.
+    #[token("REVOKE", ignore(ascii_case))]
+    Revoke,
+
+    /// `SHOW GRANTS [FOR "<principal>"]` (CAL 1.3).
+    #[token("SHOW", ignore(ascii_case))]
+    Show,
+
+    /// `TO` — the GRANT recipient marker.
+    #[token("TO", ignore(ascii_case))]
+    To,
+
     #[token("FORGET", ignore(ascii_case))]
     Forget,
 
@@ -888,6 +905,10 @@ impl Token {
             Token::Accumulate => "ACCUMULATE".into(),
             Token::Supersede => "SUPERSEDE".into(),
             Token::Revert => "REVERT".into(),
+            Token::Grant => "GRANT".into(),
+            Token::Revoke => "REVOKE".into(),
+            Token::Show => "SHOW".into(),
+            Token::To => "TO".into(),
             Token::Forget => "FORGET".into(),
             Token::Purge => "PURGE".into(),
             Token::Set => "SET".into(),
@@ -1457,8 +1478,7 @@ mod tests {
             "POLICY",
             "SEAL",
             "UNSEAL",
-            "GRANT",
-            "REVOKE",
+            "TOKEN",
             "CONSENT",
             "RESTRICT",
             "SCHEMA",
@@ -1479,6 +1499,14 @@ mod tests {
                 word
             );
         }
+        // CAL 1.3: GRANT/REVOKE left the blocklist and became Tier-3 DCL
+        // keywords — they lex as statement tokens now, not blocked idents.
+        assert!(!is_destructive_keyword("GRANT"));
+        assert!(!is_destructive_keyword("REVOKE"));
+        assert_eq!(
+            tok("GRANT revoke Show TO"),
+            vec![Token::Grant, Token::Revoke, Token::Show, Token::To]
+        );
     }
 
     #[test]

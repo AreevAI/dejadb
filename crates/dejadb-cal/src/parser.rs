@@ -38,11 +38,15 @@ use super::ast::{
     UntilClause, Value, WhereClause, WithOption,
 };
 use super::ast::{
-    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, PurgeStmt, QueryParam,
-    RunQueryStmt, TemplateSectionSources,
+    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, GrantStmt, PurgeStmt, QueryParam,
+    RevokeStmt, RunQueryStmt, ShowGrantsStmt, TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
+
+/// The parsed pieces of a GRANT/REVOKE body:
+/// `(verbs, namespaces, principal, reason)`.
+type DclBody = (Vec<String>, Vec<String>, String, Option<String>);
 
 // ---------------------------------------------------------------------------
 // Hard limits
@@ -168,6 +172,12 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         CalStatement::Revert(_) => write("REVERT"),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
+        // No DCL inside saved-query bodies — a stored GRANT executing with
+        // the invoker's rights would be a confused deputy. SHOW GRANTS is a
+        // read and fine.
+        CalStatement::Grant(_) => write("GRANT"),
+        CalStatement::Revoke(_) => write("REVOKE"),
+        CalStatement::ShowGrants(_) => Ok(()),
         CalStatement::DefineTemplate(_) => write("DEFINE TEMPLATE"),
         CalStatement::DropTemplate(_) => write("DROP TEMPLATE"),
         CalStatement::DefineQuery(_) => write("DEFINE QUERY"),
@@ -1282,6 +1292,19 @@ impl Parser {
                 token: Token::Purge,
                 ..
             }) => self.parse_purge(),
+            // Tier-3 DCL (CAL 1.3 §8.15).
+            Some(SpannedToken {
+                token: Token::Grant,
+                ..
+            }) => self.parse_grant(),
+            Some(SpannedToken {
+                token: Token::Revoke,
+                ..
+            }) => self.parse_revoke(),
+            Some(SpannedToken {
+                token: Token::Show,
+                ..
+            }) => self.parse_show_grants(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -4021,6 +4044,10 @@ impl Parser {
                 } else if s.eq_ignore_ascii_case("queries") {
                     self.advance();
                     DescribeTarget::Queries
+                } else if s.eq_ignore_ascii_case("principal") {
+                    self.advance();
+                    let name = self.parse_string_literal()?;
+                    DescribeTarget::Principal(name)
                 } else {
                     self.advance();
                     DescribeTarget::Schema
@@ -5289,6 +5316,208 @@ impl Parser {
             limit,
             grain_type,
             reason: Some(reason),
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// One DCL verb: an identifier, optionally dotted (`loop.review` lexes
+    /// as Ident Dot Ident and is rejoined here). Validation against the
+    /// verb registry happens at execution.
+    fn parse_dcl_verb(&mut self) -> CalResult<String> {
+        let head = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) => {
+                let w = w.to_ascii_lowercase();
+                self.advance();
+                w
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a verb (read, write, supersede, delete, erase, \
+                               loop.run, loop.review, loop.apply, admin)"
+                        .into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        if self.at_exact(&Token::Dot) {
+            self.advance();
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(tail), .. }) => {
+                    let tail = tail.to_ascii_lowercase();
+                    self.advance();
+                    Ok(format!("{head}.{tail}"))
+                }
+                other => Err(CalError::UnexpectedToken {
+                    expected: "the dotted verb tail (run, review, apply)".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                }),
+            }
+        } else {
+            Ok(head)
+        }
+    }
+
+    /// The shared body of GRANT/REVOKE:
+    /// `<verb>[, <verb>…] ON <ns|*>[, <ns>…] <TO|FROM> "<principal>"
+    /// [WITH because("<why>")]`.
+    fn parse_dcl_body(&mut self, recipient_token: &Token) -> CalResult<DclBody> {
+        let mut verbs = vec![self.parse_dcl_verb()?];
+        while self.at_exact(&Token::Comma) {
+            self.advance();
+            verbs.push(self.parse_dcl_verb()?);
+        }
+
+        self.expect_exact(&Token::On)?;
+        let mut namespaces = Vec::new();
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Asterisk, .. }) => {
+                    namespaces.push("*".to_string());
+                    self.advance();
+                }
+                Some(SpannedToken { token: Token::Ident(ns), .. }) => {
+                    namespaces.push(ns.clone());
+                    self.advance();
+                }
+                Some(SpannedToken { token: Token::StringLiteral(ns), .. }) => {
+                    namespaces.push(ns.clone());
+                    self.advance();
+                }
+                other => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "a namespace or *".into(),
+                        found: other
+                            .map(|t| t.token.description())
+                            .unwrap_or_else(|| "end of input".into()),
+                        span: other.map(|t| t.span),
+                        suggestion: None,
+                    });
+                }
+            }
+            if self.at_exact(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect_exact(recipient_token)?;
+        // Principals are string literals: they carry `:` and often `-`,
+        // which the identifier grammar does not.
+        let principal = self.parse_string_literal()?;
+
+        // Optional `WITH because("<why>")` — BECAUSE is a keyword token, so
+        // match it as one (the REASON alias works too).
+        let mut reason = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            if self.at_exact(&Token::Because) || self.at_exact(&Token::Reason) {
+                self.advance();
+                self.expect_exact(&Token::LParen)?;
+                reason = Some(self.parse_string_literal()?);
+                self.expect_exact(&Token::RParen)?;
+            } else {
+                let other = self.peek();
+                return Err(CalError::UnexpectedToken {
+                    expected: "because(\"<why>\")".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "GRANT/REVOKE support exactly one option: \
+                         WITH because(\"<why>\")"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        Ok((verbs, namespaces, principal, reason))
+    }
+
+    /// Parse `GRANT <verbs> ON <ns> TO "<principal>" [WITH because("…")]`.
+    fn parse_grant(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Grant)?;
+        let (verbs, namespaces, principal, reason) = self.parse_dcl_body(&Token::To)?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Grant(GrantStmt {
+            verbs,
+            namespaces,
+            principal,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REVOKE <verbs> ON <ns> FROM "<principal>" [WITH because("…")]`.
+    fn parse_revoke(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Revoke)?;
+        let (verbs, namespaces, principal, reason) = self.parse_dcl_body(&Token::From)?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Revoke(RevokeStmt {
+            verbs,
+            namespaces,
+            principal,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `SHOW GRANTS [FOR "<principal>"]`.
+    fn parse_show_grants(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Show)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("GRANTS") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "GRANTS".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("the only SHOW form is SHOW GRANTS [FOR \"<principal>\"]".into()),
+                });
+            }
+        }
+        let principal = if self.at_exact(&Token::For) {
+            self.advance();
+            Some(self.parse_string_literal()?)
+        } else {
+            None
+        };
+        let span_end = self.prev_span();
+        Ok(CalStatement::ShowGrants(ShowGrantsStmt {
+            principal,
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,
@@ -9603,7 +9832,9 @@ mod tests {
     /// everywhere it can appear, including as an output alias.
     #[test]
     fn test_format_alias_rejects_destructive_words() {
-        for word in ["delete", "erase", "truncate", "insert", "grant"] {
+        // "grant"/"revoke" left this list in CAL 1.3 — they are DCL
+        // keywords now, not blocked idents.
+        for word in ["delete", "erase", "truncate", "insert", "create"] {
             let q = format!("RECALL facts FORMAT [json AS {word}]");
             parse(&q).expect_err(&format!("{word} must not be usable as an alias"));
         }

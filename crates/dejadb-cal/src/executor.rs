@@ -197,6 +197,12 @@ pub enum CalResultPayload {
     Exists { exists: bool, hash: String },
     /// Result of a `| COUNT` pipeline stage.
     Count { count: usize },
+    /// Result of `GRANT` (CAL 1.3 §8.15).
+    Granted { principal: String, object: String, hash: String },
+    /// Result of `REVOKE`.
+    Revoked { principal: String, grants_touched: usize },
+    /// Result of `SHOW GRANTS` — one row per live grant grain.
+    GrantList { grants: Vec<serde_json::Value> },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -1505,6 +1511,98 @@ impl CalExecutor {
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "purge".into(),
                         message: format!("PURGE failed: {e}"),
+                    }),
+                }
+            }
+
+            // Tier 3 — DCL (CAL 1.3 §8.15). Append-only writes to the authz
+            // namespace: capped by the writes cap (`tier1_enabled`), gated
+            // by the session's `admin` grant at the facade, untouched by
+            // `allow_destructive_ops`.
+            CalStatement::Grant(grant) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "GRANT".into(),
+                        span: grant.span,
+                    });
+                }
+                match store.cal_grant(
+                    &grant.principal,
+                    &grant.verbs,
+                    &grant.namespaces,
+                    grant.reason.as_deref(),
+                ) {
+                    Ok(hash) => {
+                        let object = dejadb_core::authz::Grant {
+                            verbs: grant
+                                .verbs
+                                .iter()
+                                .filter_map(|v| dejadb_core::authz::Verb::parse(v).ok())
+                                .collect(),
+                            namespaces: grant.namespaces.clone(),
+                        }
+                        .to_object_string();
+                        Ok(CalResultPayload::Granted {
+                            principal: grant.principal.clone(),
+                            object,
+                            hash: hash.to_hex(),
+                        })
+                    }
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "grant".into(),
+                        message: format!("GRANT failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Revoke(revoke) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "REVOKE".into(),
+                        span: revoke.span,
+                    });
+                }
+                match store.cal_revoke(
+                    &revoke.principal,
+                    &revoke.verbs,
+                    &revoke.namespaces,
+                    revoke.reason.as_deref(),
+                ) {
+                    Ok(grants_touched) => Ok(CalResultPayload::Revoked {
+                        principal: revoke.principal.clone(),
+                        grants_touched,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "revoke".into(),
+                        message: format!("REVOKE failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::ShowGrants(show) => {
+                match store.cal_show_grants(show.principal.as_deref()) {
+                    Ok(rows) => Ok(CalResultPayload::GrantList {
+                        grants: rows
+                            .into_iter()
+                            .map(|row| {
+                                let parsed =
+                                    dejadb_core::authz::Grant::from_object_string(&row.object)
+                                        .ok();
+                                serde_json::json!({
+                                    "principal": row.principal,
+                                    "object": row.object,
+                                    "verbs": parsed.as_ref().map(|g| g
+                                        .verbs
+                                        .iter()
+                                        .map(|v| v.as_str())
+                                        .collect::<Vec<_>>()),
+                                    "namespaces": parsed.as_ref().map(|g| g.namespaces.clone()),
+                                    "hash": row.hash,
+                                })
+                            })
+                            .collect(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "show_grants".into(),
+                        message: format!("SHOW GRANTS failed: {e}"),
                     }),
                 }
             }
@@ -3150,6 +3248,40 @@ impl CalExecutor {
                     "body_size": entry.body.len(),
                 })
             }
+            // The self-discovery read (CAL 1.3 §8.15): what may this
+            // principal do, per namespace. Empty grants = the fail-closed
+            // answer, stated rather than implied.
+            DescribeTarget::Principal(name) => {
+                let rows = store.cal_show_grants(Some(name)).map_err(|e| {
+                    let detail = e.to_string();
+                    if detail.contains("AUT-E") {
+                        CalError::NotAuthorized { detail, span: None }
+                    } else {
+                        CalError::InvalidQuery { detail, span: None }
+                    }
+                })?;
+                let grants: Vec<serde_json::Value> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        let g =
+                            dejadb_core::authz::Grant::from_object_string(&row.object).ok()?;
+                        Some(serde_json::json!({
+                            "verbs": g.verbs.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+                            "namespaces": g.namespaces,
+                            "hash": row.hash,
+                        }))
+                    })
+                    .collect();
+                serde_json::json!({
+                    "principal": name,
+                    "grants": grants,
+                    "note": if grants.is_empty() {
+                        "no live grants — this principal can do nothing in a bound session"
+                    } else {
+                        "rights shown are the live grant heads; owner sessions bypass grants"
+                    },
+                })
+            }
             DescribeTarget::Grammar => serde_json::json!({
                 "grammar": "CAL/1 grammar (simplified BNF)",
                 "version": 1,
@@ -4497,6 +4629,9 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::DefineQuery(_) => "define_query",
         CalStatement::DropQuery(_) => "drop_query",
         CalStatement::RunQuery(_) => "run_query",
+        CalStatement::Grant(_) => "grant",
+        CalStatement::Revoke(_) => "revoke",
+        CalStatement::ShowGrants(_) => "show_grants",
     }
     .to_string()
 }
@@ -4515,7 +4650,8 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::Describe(_)
         | CalStatement::Batch(_)
         | CalStatement::Coalesce(_)
-        | CalStatement::RunQuery(_) => "read",
+        | CalStatement::RunQuery(_)
+        | CalStatement::ShowGrants(_) => "read",
 
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
@@ -4529,7 +4665,9 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::DefineTemplate(_)
         | CalStatement::DropTemplate(_)
         | CalStatement::DefineQuery(_)
-        | CalStatement::DropQuery(_) => "admin",
+        | CalStatement::DropQuery(_)
+        | CalStatement::Grant(_)
+        | CalStatement::Revoke(_) => "admin",
     }
 }
 
@@ -4574,6 +4712,9 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::Formatted { grain_count, .. } => *grain_count,
         CalResultPayload::MultiFormatted { grain_count, .. } => *grain_count,
         CalResultPayload::Added { .. } => 1,
+        CalResultPayload::Granted { .. } => 1,
+        CalResultPayload::Revoked { .. } => 1,
+        CalResultPayload::GrantList { grants } => grants.len(),
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,

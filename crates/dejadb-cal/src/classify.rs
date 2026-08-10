@@ -54,6 +54,10 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         | CalStatement::DropTemplate(_)
         | CalStatement::DefineQuery(_)
         | CalStatement::DropQuery(_) => StatementClass::Control,
+        // Tier-3 DCL: append-only writes to the authz namespace, admin-gated
+        // — control, never destructive. SHOW GRANTS is a read.
+        CalStatement::Grant(_) | CalStatement::Revoke(_) => StatementClass::Control,
+        CalStatement::ShowGrants(_) => StatementClass::Read,
         CalStatement::Forget(_) | CalStatement::Purge(_) => StatementClass::Destructive,
         CalStatement::Batch(b) => classify_batch(b),
     }

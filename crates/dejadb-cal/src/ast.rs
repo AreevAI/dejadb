@@ -153,11 +153,24 @@ pub enum CalStatement {
     Revert(RevertStmt),
 
     // ── Tier 2: Destructive statements (gated by allow_destructive_ops) ─
-    /// `FORGET <hash>` / `FORGET USER "<user_id>"` / `FORGET SCOPE "<scope>"`
+    /// `FORGET <hash>` / `FORGET SUBJECT "<id>"`
     Forget(ForgetStmt),
 
-    /// `PURGE STALE [OLDER THAN <n> DAYS] [IN "<namespace>"] [LIMIT <n>]`
+    /// `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<namespace>"] [LIMIT <n>]`
     Purge(PurgeStmt),
+
+    // ── Tier 3: Control (CAL 1.3 §8.15) ────────────────────────────────
+    /// `GRANT <verbs> ON <ns> TO "<principal>"`
+    #[serde(alias = "GRANT")]
+    Grant(GrantStmt),
+
+    /// `REVOKE <verbs> ON <ns> FROM "<principal>"`
+    #[serde(alias = "REVOKE")]
+    Revoke(RevokeStmt),
+
+    /// `SHOW GRANTS [FOR "<principal>"]`
+    #[serde(alias = "SHOW_GRANTS", alias = "ShowGrants")]
+    ShowGrants(ShowGrantsStmt),
 
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
@@ -462,6 +475,10 @@ pub enum DescribeTarget {
     Queries,
     /// `DESCRIBE QUERY "name"` — details of a specific saved query.
     Query(String),
+
+    // ── CAL 1.3 (Tier 3) ────────────────────────────────────────────────
+    /// `DESCRIBE PRINCIPAL "<name>"` — the principal's effective grants.
+    Principal(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +777,54 @@ pub struct PurgeStmt {
     /// The recorded reason (BECAUSE). Mandatory from text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// GRANT / REVOKE / SHOW GRANTS (Tier 3 — CAL 1.3 §8.15)
+// ---------------------------------------------------------------------------
+
+/// `GRANT <verb>[, <verb>…] ON <ns|*> TO "<principal>" [WITH because("…")]`
+///
+/// Writes a grant grain (`Fact + mg:permits` in the reserved `agent:authz`
+/// namespace). Append-only — Tier 3 is gated by the `admin` verb and capped
+/// by `tier1_enabled`, untouched by `allow_destructive_ops`. Verbs are
+/// validated against the verb registry at execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrantStmt {
+    pub verbs: Vec<String>,
+    /// Governed namespaces (`*` = every namespace).
+    pub namespaces: Vec<String>,
+    pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `REVOKE <verb>[, <verb>…] ON <ns|*> FROM "<principal>" [WITH because("…")]`
+///
+/// Retraction by supersession: each covering grant grain is superseded with
+/// the reduced grant (or a retraction record when nothing remains) — nothing
+/// is deleted; grant history stays append-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RevokeStmt {
+    pub verbs: Vec<String>,
+    pub namespaces: Vec<String>,
+    pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `SHOW GRANTS [FOR "<principal>"]` — the live grants, one row per grant
+/// grain. Sugar over recalling the `PERMISSION` relation in `agent:authz`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowGrantsStmt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     #[serde(skip)]
     pub span: Option<Span>,
 }

@@ -1326,6 +1326,155 @@ impl CalStoreFacade for DejaDbFacade {
         self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
 
+    /// `GRANT` (CAL 1.3 §8.15) — writes the grant grain: a Fact in the
+    /// reserved `agent:authz` namespace, subject = grantee, relation =
+    /// `mg:permits`, object = the canonical grant string, grantor + reason
+    /// in `context`. Authorized by `admin`. A session's own rights are
+    /// fixed at bind — a grant to the current principal applies to
+    /// sessions bound after it, like a new database connection.
+    fn cal_grant(
+        &self,
+        principal: &str,
+        verbs: &[String],
+        namespaces: &[String],
+        because: Option<&str>,
+    ) -> Result<Hash> {
+        self.authz.check(Verb::Admin, "*")?;
+        let grant = parse_grant_parts(principal, verbs, namespaces)?;
+        let mut fact = dejadb_core::types::Fact::new(
+            principal,
+            dejadb_core::authz::REL_PERMITS,
+            &grant.to_object_string(),
+        )
+        .namespace(dejadb_core::authz::AUTHZ_NS)
+        .created_at(now_epoch_ms());
+        fact.common.context = Some(serde_json::json!({
+            "grantor": self.authz.principal(),
+            "because": because.unwrap_or(""),
+        }));
+        self.store.lock().unwrap().add(&fact)
+    }
+
+    /// `REVOKE` (CAL 1.3 §8.15) — retraction by supersession. Each live
+    /// grant whose namespace scope is covered by the revoke loses the
+    /// revoked verbs: reduced grants supersede in place; a grant with
+    /// nothing left is superseded by a `revoked` retraction record. A grant
+    /// with a WIDER scope than the revoke is refused by name — no silent
+    /// splitting; revoke at the grant's own scope.
+    fn cal_revoke(
+        &self,
+        principal: &str,
+        verbs: &[String],
+        namespaces: &[String],
+        because: Option<&str>,
+    ) -> Result<usize> {
+        self.authz.check(Verb::Admin, "*")?;
+        let revoke = parse_grant_parts(principal, verbs, namespaces)?;
+        let revoke_all_ns = revoke.namespaces.iter().any(|n| n == "*");
+
+        let mut m = self.store.lock().unwrap();
+        let grains = m.recall(
+            dejadb_core::authz::AUTHZ_NS,
+            principal,
+            Some(dejadb_core::authz::REL_PERMITS),
+            256,
+        )?;
+        let mut touched = 0usize;
+        for g in &grains {
+            let Some(obj) = g.get_str("object") else { continue };
+            let Ok(existing) = dejadb_core::authz::Grant::from_object_string(obj) else {
+                continue; // retraction records and junk never carry rights
+            };
+            if !existing.verbs.iter().any(|v| revoke.verbs.contains(v)) {
+                continue;
+            }
+            let covered = revoke_all_ns
+                || existing
+                    .namespaces
+                    .iter()
+                    .all(|n| revoke.namespaces.contains(n));
+            if !covered {
+                return Err(DejaDbError::Validation(format!(
+                    "grant {obj:?} for {principal} spans more namespaces than the \
+                     revoke — revoke at the grant's own scope"
+                )));
+            }
+            let remaining: Vec<_> = existing
+                .verbs
+                .iter()
+                .copied()
+                .filter(|v| !revoke.verbs.contains(v))
+                .collect();
+            let object = if remaining.is_empty() {
+                // Nothing left: a retraction record. `authz_grants` skips it
+                // (it is not a parseable grant), so it conveys no rights —
+                // and the history stays append-only.
+                "revoked".to_string()
+            } else {
+                dejadb_core::authz::Grant {
+                    verbs: remaining,
+                    namespaces: existing.namespaces.clone(),
+                }
+                .to_object_string()
+            };
+            let mut replacement = dejadb_core::types::Fact::new(
+                principal,
+                dejadb_core::authz::REL_PERMITS,
+                &object,
+            )
+            .namespace(dejadb_core::authz::AUTHZ_NS)
+            .created_at(now_epoch_ms());
+            replacement.common.context = Some(serde_json::json!({
+                "grantor": self.authz.principal(),
+                "because": because.unwrap_or(""),
+                "revoked": revoke.to_object_string(),
+            }));
+            m.supersede(&g.hash, &mut replacement)?;
+            touched += 1;
+        }
+        Ok(touched)
+    }
+
+    /// `SHOW GRANTS` — the live grant rows. Reading the authz namespace
+    /// requires `read` on it (or the owner session).
+    fn cal_show_grants(&self, principal: Option<&str>) -> Result<Vec<crate::facade::GrantRow>> {
+        self.authz.check(Verb::Read, dejadb_core::authz::AUTHZ_NS)?;
+        let mut m = self.store.lock().unwrap();
+        let grains = match principal {
+            Some(p) => m.recall(
+                dejadb_core::authz::AUTHZ_NS,
+                p,
+                Some(dejadb_core::authz::REL_PERMITS),
+                256,
+            )?,
+            None => m.recent(
+                dejadb_core::authz::AUTHZ_NS,
+                Some(dejadb_core::types::GrainType::Fact),
+                1000,
+            )?,
+        };
+        let mut rows = Vec::new();
+        for g in &grains {
+            if g.get_str("relation") != Some(dejadb_core::authz::REL_PERMITS) {
+                continue;
+            }
+            let (Some(subject), Some(obj)) = (g.get_str("subject"), g.get_str("object")) else {
+                continue;
+            };
+            // Only parseable grants convey rights; retraction records and
+            // junk are history, not ACL.
+            if dejadb_core::authz::Grant::from_object_string(obj).is_err() {
+                continue;
+            }
+            rows.push(crate::facade::GrantRow {
+                principal: subject.to_string(),
+                object: obj.to_string(),
+                hash: g.hash.to_hex(),
+            });
+        }
+        Ok(rows)
+    }
+
     /// `FORGET SUBJECT` — identity-scoped erasure in the session namespace
     /// (CAL 1.3 §8.14): every grain referencing the identity, its partition
     /// keys, history, and dictionary entries; `text_mentions` extends it to
@@ -1400,6 +1549,41 @@ impl CalStoreFacade for DejaDbFacade {
         )?;
         Ok(report.grains_erased)
     }
+}
+
+/// Validate DCL parts into a canonical [`dejadb_core::authz::Grant`]: every
+/// verb must be in the verb registry, the principal non-empty, namespaces
+/// non-empty strings. Fail-closed — one bad part refuses the whole
+/// statement.
+fn parse_grant_parts(
+    principal: &str,
+    verbs: &[String],
+    namespaces: &[String],
+) -> Result<dejadb_core::authz::Grant> {
+    if principal.trim().is_empty() {
+        return Err(DejaDbError::Validation("empty principal".into()));
+    }
+    if verbs.is_empty() {
+        return Err(DejaDbError::Validation("no verbs named".into()));
+    }
+    let mut parsed = Vec::new();
+    for v in verbs {
+        let v = dejadb_core::authz::Verb::parse(v)?;
+        if !parsed.contains(&v) {
+            parsed.push(v);
+        }
+    }
+    let namespaces: Vec<String> = if namespaces.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        namespaces.to_vec()
+    };
+    for n in &namespaces {
+        if n.trim().is_empty() {
+            return Err(DejaDbError::Validation("empty namespace".into()));
+        }
+    }
+    Ok(dejadb_core::authz::Grant { verbs: parsed, namespaces })
 }
 
 /// Wall-clock epoch ms for audit stamps and PURGE cutoffs — host-side time,

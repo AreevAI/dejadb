@@ -8,6 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CAL 1.3 Tier-3 DCL: `GRANT`, `REVOKE`, `SHOW GRANTS`, and
+  `DESCRIBE PRINCIPAL` are CAL statements.** Access control now lives in
+  the language, SQL-style: `GRANT read, write ON caller TO
+  "agent:support-bot" WITH because("support rotation")` writes a grant
+  grain — an ordinary `mg:permits` Fact in the reserved `agent:authz`
+  namespace, carrying grantor and reason, recallable like anything else.
+  `REVOKE` is retraction-by-supersession: partial revokes supersede with
+  the reduced grant, full revokes leave a retraction record — grant
+  history is append-only, nothing is deleted; a revoke wider than a
+  grant's scope is refused by name rather than silently splitting it.
+  GRANT/REVOKE require the session's `admin` grant (owner sessions
+  included), are capped by the writes cap, never appear inside
+  saved-query bodies, and `GRANT`/`REVOKE` left the lexer blocklist —
+  while `DELETE` and all credential/key vocabulary (now incl. `TOKEN`)
+  stay blocked non-tokens forever. `SHOW GRANTS [FOR "<p>"]` and
+  `DESCRIBE PRINCIPAL "<p>"` are the read side: the live grant rows and a
+  principal's effective rights (an empty answer is stated, not implied).
 - **CAL 1.3 Tier-2 destruction: `FORGET SUBJECT` and `PURGE OLDER THAN` are
   CAL statements.** Bulk erasure was a documented OMS deviation living only
   on host surfaces (`deja forget-subject` / `purge-older-than`); the CAL 1.3

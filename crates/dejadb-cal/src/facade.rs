@@ -247,6 +247,40 @@ pub trait CalStoreFacade: Send + Sync {
         ))
     }
 
+    /// Tier-3 DCL (CAL 1.3 §8.15): write a grant grain for `principal`.
+    /// Verbs/namespaces are validated and canonicalized by the
+    /// implementation; returns the grant grain's hash.
+    fn cal_grant(
+        &self,
+        _principal: &str,
+        _verbs: &[String],
+        _namespaces: &[String],
+        _because: Option<&str>,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "control operations not available".into(),
+        ))
+    }
+
+    /// Tier-3 DCL: retraction-by-supersession of the covering grant
+    /// grain(s). Returns how many grants were touched.
+    fn cal_revoke(
+        &self,
+        _principal: &str,
+        _verbs: &[String],
+        _namespaces: &[String],
+        _because: Option<&str>,
+    ) -> Result<usize> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "control operations not available".into(),
+        ))
+    }
+
+    /// The live grant rows; `None` lists every principal.
+    fn cal_show_grants(&self, _principal: Option<&str>) -> Result<Vec<GrantRow>> {
+        Ok(Vec::new())
+    }
+
     /// The retention sweep. Maps to `DejaDB::forget_older_than()`.
     fn cal_purge_stale(
         &self,
@@ -334,6 +368,16 @@ pub struct AccumulateResult {
 
 /// Re-export for convenience.
 pub use super::templates::TemplateListEntry as TemplateInfo;
+
+/// One live grant row (`SHOW GRANTS` / `DESCRIBE PRINCIPAL`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GrantRow {
+    pub principal: String,
+    /// The canonical grant object string (`read,write ON caller`).
+    pub object: String,
+    /// The grant grain's content address (hex).
+    pub hash: String,
+}
 
 /// CAL engine capabilities and conformance level.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
