@@ -324,3 +324,31 @@ fn review_queue_is_severity_ordered_and_stable_across_runs() {
     assert_eq!(orders[0], orders[1], "order drifted between run 1 and 2");
     assert_eq!(orders[1], orders[2], "order drifted between run 2 and 3");
 }
+
+/// The substrate is the last line of defense under the engine's destructive
+/// gate: destructive CAL beyond the audited single-grain FORGET arm must be
+/// refused at validation AND at execution, so a mis-stamped proposal can
+/// never reach the process-permissive fallthrough executor.
+#[test]
+fn destructive_cal_beyond_forget_hash_is_refused() {
+    let (_dir, store) = open_temp();
+    let mut sub = DejaDbSubstrate::new(store, None);
+
+    let purge = r#"PURGE OLDER THAN 90d BECAUSE "retention""#;
+    let forget_subject = r#"FORGET SUBJECT "pat" BECAUSE "gdpr""#;
+
+    assert!(sub.validate_cal(purge).is_err(), "PURGE must fail validation");
+    assert!(
+        sub.validate_cal(forget_subject).is_err(),
+        "FORGET SUBJECT must fail validation (loop FORGET is hash-only)"
+    );
+    assert!(sub.execute_cal(purge).is_err(), "PURGE must fail execution");
+    assert!(
+        sub.execute_cal(forget_subject).is_err(),
+        "FORGET SUBJECT must fail execution"
+    );
+
+    // Reads and the writer's own statements still pass.
+    assert!(sub.validate_cal(r#"RECALL facts WHERE subject = "acme""#).is_ok());
+    assert!(sub.validate_cal(r#"ADD fact {"subject":"a","relation":"r","object":"o"}"#).is_ok());
+}

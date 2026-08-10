@@ -25,14 +25,22 @@ before you change code and before you commit.
    header,field_map}.rs`, assume you are changing the wire format and STOP to
    confirm it is intended. The serialize path enforces the same size/depth limits
    as the deserializer, so a grain that can be written can always be read.
-3. **CAL destruction is gated, not structural** — the only destructive CAL
-   statement is `FORGET <hash>` (single-grain tombstone), gated at execution by
-   `CalExecutorConfig::allow_destructive_ops` (default on; `--no-destructive-ops`
-   turns it off per-process). `DELETE`/`ERASE`/`TRUNCATE`/… stay lexer-blocked
-   non-tokens; `PURGE` and user/scope erasure stay out of the text grammar;
-   `DROP` accepts only TEMPLATE/QUERY; saved-query bodies stay read-only; the
-   server path still requires `admin` scope. Widening the destructive surface,
-   or any new CAL syntax, is a spec-level (OMS-conformance) decision.
+3. **CAL destruction is authorization-gated, not structural** (CAL 1.3) — the
+   destructive statements are `FORGET <hash>` (single-grain tombstone),
+   `FORGET SUBJECT "<id>" [WITH text_mentions]` (identity erasure), and
+   `PURGE OLDER THAN <n><d|h|m> [TYPE t]` (retention sweep). BECAUSE is
+   mandatory on the latter two; every execution writes a Tier-2 audit
+   Observation in `agent:authz`. Grants live in the file as `mg:permits`
+   Facts; the session's `AuthzSet` decides, and
+   `CalExecutorConfig::allow_destructive_ops` stays a process-wide restrictive
+   **cap** over any grant (`--no-destructive-ops`). Destruction takes a hash,
+   an identity, or an age — never a predicate: `DELETE`/`ERASE`/`TRUNCATE`/…
+   stay lexer-blocked non-tokens, `FORGET USER`/`SCOPE` stay text-refused,
+   `DROP` accepts only TEMPLATE/QUERY; saved-query bodies stay read-only.
+   Statement classification has ONE source of truth
+   (`dejadb_cal::classify`, exhaustive, no wildcard). Widening the
+   destructive surface, or any new CAL syntax, is a spec-level
+   (OMS-conformance) decision.
 4. **Error codes are append-only** — every user-facing error carries a stable
    `DOMAIN-Ennn` code (see `ERROR_CODES.md`). Never renumber or reuse one; add new
    codes at the end. Format/uniqueness are test-enforced.

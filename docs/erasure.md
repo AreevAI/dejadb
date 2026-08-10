@@ -49,14 +49,19 @@ This document is the requirement record for them.
   the HOST decides what to log. The engine writes no audit grain of its own
   — an engine-written record naming the subject would re-introduce the
   reference being erased.
-- **REQ-ERASE-6 (surface discipline).** Neither operation is reachable from
-  CAL text. The CAL grammar — an OMS conformance contract — is unchanged:
-  `FORGET USER`/`FORGET SCOPE`/`PURGE` remain refused by the parser, and the
-  facade stubs (`cal_forget_user`, `cal_forget_scope`) remain unwired. Bulk
-  erasure is a host-level library/CLI capability, gated by the host (the
-  CLI demands an explicit `--yes` and honors `--no-destructive-ops`). An
-  empty subject is refused outright — with prefix matching it would select
-  everything, and an unset variable must never read as "erase all".
+- **REQ-ERASE-6 (surface discipline).** *(Amended by CAL 1.3 — see the
+  status note above; the original "not reachable from CAL text" wording
+  described the pre-1.3 grammar.)* Destruction takes a hash, an identity,
+  or an age — **never a predicate**. In CAL both bulk operations are
+  authorization-gated Tier-2 statements (`erase` grant required, BECAUSE
+  mandatory, one audit Observation per execution); `FORGET USER`/`FORGET
+  SCOPE` stay text-refused, `DELETE`/`ERASE`/`TRUNCATE` stay lexer-blocked
+  non-tokens, and `cal_forget_scope` remains an unwired stub. On the host
+  surfaces the CLI demands an explicit `--yes`, and
+  `CalExecutorConfig::allow_destructive_ops` (`--no-destructive-ops`) stays
+  a process-wide restrictive cap over any grant. An empty subject is
+  refused outright — with prefix matching it would select everything, and
+  an unset variable must never read as "erase all".
 - **REQ-ERASE-7 (partition keys).** Hosts model composite records as
   identity-prefixed keys (`pat#visit1`, `pat:thread-2`). Identity matching
   MUST cover them: any dictionary term equal to the identity or starting

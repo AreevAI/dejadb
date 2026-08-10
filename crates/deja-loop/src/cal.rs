@@ -6,7 +6,8 @@
 
 use serde_json::{Map, Value};
 
-/// `FORGET <hash>` — the only destructive statement, single-grain (§6.4).
+/// `FORGET <hash>` — the only destructive statement the writer emits,
+/// single-grain (§6.4).
 pub fn forget(hash: &str) -> String {
     format!("FORGET {hash}")
 }
@@ -51,9 +52,28 @@ pub fn parse_own_supersede(
 /// Cheap engine-side destructive check (defense in depth; the substrate's
 /// `validate_cal` is authoritative). True if any statement is a FORGET.
 pub fn contains_forget(cal: &str) -> bool {
+    any_line_keyword(cal, &["FORGET"])
+}
+
+/// True if any statement is destructive: FORGET (single-grain or SUBJECT)
+/// or PURGE. `Recommendation::destructive` is stamped from this and the
+/// apply gate (admin scope + `allow_destructive`) keys off that stamp, so
+/// this list must cover every destructive statement a proposal could carry —
+/// LLM-enriched and `--analyzer-cmd` proposals are arbitrary CAL text, not
+/// just what this writer emits.
+pub fn contains_destructive(cal: &str) -> bool {
+    any_line_keyword(cal, &["FORGET", "PURGE"])
+}
+
+/// True if any line's leading keyword (case-insensitive) is in `keywords`.
+fn any_line_keyword(cal: &str, keywords: &[&str]) -> bool {
     cal.lines().any(|l| {
-        let t = l.trim_start();
-        t.len() >= 6 && t[..6].eq_ignore_ascii_case("FORGET")
+        let kw = l
+            .trim_start()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("");
+        keywords.iter().any(|k| kw.eq_ignore_ascii_case(k))
     })
 }
 
@@ -67,6 +87,17 @@ mod tests {
         assert!(contains_forget("FORGET sha256:abc"));
         assert!(contains_forget("ADD fact {}\nforget sha256:x"));
         assert!(!contains_forget("ADD fact {}\nSUPERSEDE a WITH fact {}"));
+    }
+
+    #[test]
+    fn destructive_covers_purge_and_forget_subject() {
+        assert!(contains_destructive("FORGET sha256:abc"));
+        assert!(contains_destructive(r#"FORGET SUBJECT "pat" BECAUSE "gdpr""#));
+        assert!(contains_destructive(r#"PURGE OLDER THAN 90d BECAUSE "retention""#));
+        assert!(contains_destructive("ADD fact {}\n  purge older than 30d because \"x\""));
+        assert!(!contains_destructive("ADD fact {}\nSUPERSEDE a WITH fact {}"));
+        // Keyword match, not substring: reads that mention the words don't trip it.
+        assert!(!contains_destructive(r#"RECALL facts WHERE subject = "purge""#));
     }
 
     #[test]

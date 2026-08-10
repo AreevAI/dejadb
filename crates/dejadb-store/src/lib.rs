@@ -2901,18 +2901,28 @@ impl DejaDB {
         // this hash to a new seq). ns/s/p are stale-safe — identical content
         // means an identical key.
         let rows = self.db.query(
-            "SELECT ns, s, p FROM grains WHERE hash = ?1",
+            "SELECT ns, s, p, blob FROM grains WHERE hash = ?1",
             vec![pb(hash.as_bytes().to_vec())],
         )?;
         let (ns, s, p) = match rows.first() {
             Some(row) => (row.i64(0), row.i64(1), row.i64(2)),
             None => return Err(DejaDbError::NotFound(*hash)),
         };
+        // The grain's own CAS attachments, read pre-transaction (stale-safe:
+        // identical hash means identical blob, so the ref list cannot drift).
+        let mut cas_candidates: Vec<String> = rows
+            .first()
+            .and_then(|row| row.blob(3))
+            .and_then(|b| deserialize_blob(&b).ok())
+            .map(|view| cas_hexes(&view))
+            .unwrap_or_default();
+        cas_candidates.sort_unstable();
+        cas_candidates.dedup();
         let ram_op = self.next_op;
         self.next_op += 1;
         let ram_hlc = self.next_hlc();
         let dbr = self.db.as_ref();
-        let doc_len = with_txn(dbr, || {
+        let txn_out = with_txn(dbr, || {
             let (op_seq, hlc) = match dbr.reserve_write(0, 1, 1, now_ms() << 16, 0)? {
                 Some(w) => (w.op0, w.hlc0),
                 None => (ram_op, ram_hlc),
@@ -2997,11 +3007,51 @@ impl DejaDB {
                 "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
                 vec![pi(op_seq), pi(hlc), pi(OP_FORGET), pb(hash.as_bytes().to_vec())],
             )?;
-            Ok(doc_len)
+            // Targeted CAS reclamation, mirroring erase_where: a tombstone
+            // that leaves the attachment bytes on disk is not a tombstone.
+            // This is also the replica path — import_bundle replays OP_FORGET
+            // through here, so an erasure's tombstones reach the replica's
+            // blob sidecar, not just its index rows. The store-wide reference
+            // scan runs only for blob-bearing grains; the common forget never
+            // pays it. Table deletes are transactional; filesystem deletes
+            // are decided here and executed post-commit.
+            let mut fs_blobs: Vec<String> = Vec::new();
+            if !cas_candidates.is_empty() {
+                let mut referenced: HashSet<String> = HashSet::new();
+                for row in dbr.query("SELECT blob FROM grains", vec![])? {
+                    if let Some(b) = row.blob(0) {
+                        if let Ok(view) = deserialize_blob(&b) {
+                            referenced.extend(cas_hexes(&view));
+                        }
+                    }
+                }
+                for hex in &cas_candidates {
+                    if referenced.contains(hex) {
+                        continue;
+                    }
+                    match &self.blob_store {
+                        BlobStore::Table => {
+                            if let Ok(raw) = hex::decode(hex) {
+                                dbr.execute("DELETE FROM blobs WHERE hash=?1", vec![pb(raw)])?;
+                            }
+                        }
+                        BlobStore::Fs(_) => fs_blobs.push(hex.clone()),
+                    }
+                }
+            }
+            Ok((doc_len, fs_blobs))
         })?;
+        let (doc_len, fs_blobs) = txn_out;
         if let Some(len) = doc_len {
             self.fts_docs = (self.fts_docs - 1).max(0);
             self.fts_total_len = (self.fts_total_len - len).max(0);
+        }
+        // Filesystem CAS deletes decided in-txn (single-writer file backend —
+        // no concurrent put can race this).
+        if let BlobStore::Fs(dir) = &self.blob_store {
+            for hex in &fs_blobs {
+                let _ = std::fs::remove_file(fs_blob_path(dir, hex));
+            }
         }
 
         // Scrub the telemetry sidecar so a forgotten grain never lingers there.
@@ -3037,9 +3087,9 @@ impl DejaDB {
     /// Scope contract (see docs/erasure.md): only dictionary-indexed
     /// references are findable. A free-text mention of the identity inside
     /// ANOTHER subject's grain is not — hosts that need erasure must keep
-    /// identity references in structured fields. This is a deliberate
-    /// host-level extension beyond the OMS single-grain tombstone; it is
-    /// not reachable from CAL text (REQ-ERASE in docs/erasure.md).
+    /// identity references in structured fields. Since CAL 1.3 this is also
+    /// reachable as `FORGET SUBJECT "<id>" BECAUSE "…"` — authorization-
+    /// gated and audit-logged (REQ-ERASE in docs/erasure.md).
     pub fn forget_subject(&mut self, ns: &str, subject: &str) -> Result<ErasureReport> {
         self.forget_subject_with(ns, subject, ErasureOptions::default())
     }

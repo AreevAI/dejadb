@@ -23,6 +23,7 @@
 //!    (no ns filter) enumerate via the op-log (`changes_since`), since `recent`
 //!    requires a namespace.
 
+use dejadb_cal::classify::{classify, StatementClass};
 use dejadb_cal::{parse, CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_core::format::deserialize::DeserializedGrain;
@@ -423,6 +424,18 @@ fn execute_cal(f: &DejaDbFacade, cal: &str) -> WResult<Vec<Value>> {
                 rows.push(serde_json::json!({ "hash": h.to_hex() }));
             }
             _ => {
+                // Defense in depth: the engine's destructive gate (admin +
+                // allow_destructive) runs before apply, but this executor is
+                // process-permissive — never let it run destructive text.
+                // Loop-applied destruction goes through the special-cased,
+                // Tier-2-audited arms above (FORGET today), one statement
+                // shape at a time.
+                let parsed = parse(line).map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                if classify(&parsed.statement) == StatementClass::Destructive {
+                    return Err(WErr::CalUnsupported(format!(
+                        "destructive CAL beyond FORGET <hash> is not executable through the loop substrate: {line}"
+                    )));
+                }
                 let ex = CalExecutor::new(CalExecutorConfig::default());
                 let res = ex
                     .execute(line, f)
@@ -444,13 +457,28 @@ fn validate_cal(cal: &str) -> WResult<()> {
         if line.is_empty() {
             continue;
         }
-        let (keyword, _) = split_keyword(line);
+        let (keyword, rest) = split_keyword(line);
         match keyword.to_ascii_uppercase().as_str() {
-            "ADD" | "SUPERSEDE" | "FORGET" => {}
+            "ADD" | "SUPERSEDE" => {}
+            // The loop's FORGET arm executes single-grain tombstones only —
+            // `FORGET SUBJECT "<id>"` must fail here, not at apply time.
+            "FORGET" => {
+                Hash::from_hex(rest.trim()).map_err(|_| {
+                    WErr::CalUnsupported(format!(
+                        "loop FORGET takes a single grain hash: {line}"
+                    ))
+                })?;
+            }
             _ => {
-                parse(line)
-                    .map(|_| ())
-                    .map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                let parsed = parse(line).map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                // Mirror execute_cal: destructive statements (PURGE, …) have
+                // no audited loop execution path, so they are invalid in a
+                // proposal — reject at validation, before review effort.
+                if classify(&parsed.statement) == StatementClass::Destructive {
+                    return Err(WErr::CalUnsupported(format!(
+                        "destructive CAL beyond FORGET <hash> is not executable through the loop substrate: {line}"
+                    )));
+                }
             }
         }
     }

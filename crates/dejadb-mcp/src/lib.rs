@@ -644,7 +644,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dejadb_cal",
-            "description": "Execute a CAL statement (RECALL/ASSEMBLE/EXISTS/HISTORY/ADD/SUPERSEDE/...). CAL is structurally incapable of deleting data.",
+            "description": "Execute a CAL statement (RECALL/ASSEMBLE/EXISTS/HISTORY/ADD/SUPERSEDE/...). Destructive statements (FORGET, FORGET SUBJECT, PURGE OLDER THAN) require a BECAUSE reason, are gated by the session's grants and the server's destructive-ops setting, and are audit-logged; destruction takes a hash, an identity, or an age — never a predicate.",
             "inputSchema": {"type": "object", "properties": {
                 "query": s("CAL text, e.g. RECALL facts WHERE subject = \"alice\" | COUNT")
             }, "required": ["query"]}

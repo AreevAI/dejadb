@@ -1654,7 +1654,7 @@ fn stamp(
     let target = TargetRef::parse(&d.target_ref)?;
     let dedup = dedup_key(m.family(), &d.target_ref, d.action_kind);
     let destructive = match &d.proposal {
-        Proposal::Cal { cal } => cal::contains_forget(cal),
+        Proposal::Cal { cal } => cal::contains_destructive(cal),
         _ => false,
     };
     let rollbackable = match &d.proposal {

@@ -72,7 +72,11 @@ top of that.
   sanitized to a single path component (no directory traversal). `--token-env`
   is **mandatory** for `deja hub`: unlike the console there is no
   trusted-local-operator default, because a hub exists to be written to by other
-  machines. A pushed segment can only ever *add* grains — import never deletes.
+  machines. A pushed segment is an **op-log replay**: it adds grains and
+  applies tombstones — including erasure tombstones, which is how a subject's
+  erasure reaches the hub's store (a tombstone deletes only the exact grain
+  hash it names, and its sole-referenced CAS attachments; it can never delete
+  by predicate).
 - The **web console** (`deja ui`) is unauthenticated by default (loopback,
   trusted local operator). Pass `--token-env <VAR>` to require a shared secret
   on **every** request — the console page, all reads, and all writes. Browsers

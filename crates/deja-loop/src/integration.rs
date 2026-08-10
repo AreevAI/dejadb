@@ -481,6 +481,95 @@ fn destructive_apply_requires_admin_and_flag() {
     assert!(!ok.rollbackable, "FORGET has no inverse");
 }
 
+/// A PURGE in a proposal must stamp `destructive` (and so hit the
+/// admin + allow_destructive apply gate) exactly like a FORGET — proposals
+/// from LLM enrichment or `--analyzer-cmd` are arbitrary CAL text, and a
+/// FORGET-only check would let bulk erasure ride through as "rollbackable".
+#[test]
+fn purge_proposal_is_stamped_destructive_and_gated() {
+    use crate::analyzer::{AnalyzeCtx, Analyzer};
+    use crate::manifest::{
+        AnalyzerManifest, AutoApplyClass, CadenceClass, TargetClass, Tier, TrustClass,
+    };
+    use crate::model::ActionKind;
+    use crate::recommendation::{Proposal, RecDraft, Summary};
+
+    struct PurgeProposer {
+        manifest: AnalyzerManifest,
+    }
+    impl Analyzer for PurgeProposer {
+        fn manifest(&self) -> &AnalyzerManifest {
+            &self.manifest
+        }
+        fn analyze(&self, _ctx: &AnalyzeCtx) -> crate::error::Result<Vec<RecDraft>> {
+            Ok(vec![RecDraft::new(
+                "grain:deadbeef",
+                ActionKind::Expire,
+                Summary::new("test.purge", serde_json::Map::new()),
+                Proposal::Cal {
+                    cal: r#"PURGE OLDER THAN 90d BECAUSE "retention""#.into(),
+                },
+            )])
+        }
+    }
+
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    let mut e = Engine::with_builtins();
+    e.register(Box::new(PurgeProposer {
+        manifest: AnalyzerManifest {
+            id: "test.purge/1".into(),
+            title: "Purge proposer".into(),
+            description: "test-only".into(),
+            tier: Tier::T0,
+            cadence: CadenceClass::Fast,
+            requires: vec![],
+            target_classes: vec![TargetClass::Memory],
+            auto_apply: AutoApplyClass::Never,
+            trust_class: TrustClass::Builtin,
+            params: vec![],
+            default_on: true,
+        },
+    }));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    let purge = recs
+        .iter()
+        .find(|r| r.analyzer == "test.purge/1")
+        .expect("the purge recommendation");
+    assert!(purge.destructive, "PURGE must stamp destructive");
+    assert!(!purge.rollbackable, "bulk erasure has no inverse");
+
+    let scopes = ScopeSet::all();
+    let hash = purge.hash.clone();
+    e.review(
+        &mut sub.inner,
+        &hash,
+        Decision::Approve,
+        "user:alice",
+        ObserverType::Human,
+        &scopes,
+        "retention",
+        11_000,
+    )
+    .unwrap();
+    let denied = e.apply(
+        &mut sub.inner,
+        &hash,
+        "user:alice",
+        ObserverType::Human,
+        &scopes,
+        "apply",
+        false,
+        12_000,
+    );
+    assert!(
+        matches!(denied, Err(Error::DestructiveGated(_))),
+        "destructive gate must hold for PURGE, got {denied:?}"
+    );
+}
+
 #[test]
 fn apply_on_pending_is_rejected() {
     let mut sub = TestSubstrate::new();
