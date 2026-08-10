@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Principals reach every surface.** `deja ui --auth deja-auth.json`
+  serves the console in multi-principal mode: the credential map resolves
+  bearer/Basic tokens to principal names (env refs or sha256 — no raw
+  secrets, no policy in the file), rights come from the memory's own grant
+  grains, requests bind per-request (the guard restores the default on
+  drop, panic included), unknown or missing tokens run as `anonymous`
+  (read-only unless the file grants more), `/api/loop/run` is gated on
+  `loop.run`, and in this mode the audit actor IS the bound principal — a
+  request body cannot claim an identity. `deja cal|repl|serve
+  --as <principal> [--auth FILE]` runs a session under the file's grants
+  (fail closed), `forget-subject`/`purge-older-than --as` check `erase`
+  before touching anything, and both bindings gain `principal=` /
+  `principal` on open — the loop actor follows the bound principal.
 - **`REMEMBER` is a CAL statement.** The onboarding verb, in the language:
   `REMEMBER "<content>" [WITH session("<id>"), role("<r>"), run("<id>")]`
   captures an Event through the same store path as `deja remember` and the

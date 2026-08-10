@@ -124,6 +124,13 @@ Files carry their own settings (text index, entity relations, embedding
 provenance) in an internal meta table; a bare open honors them.
 --index-text true|false explicitly re-stamps the file's declaration.
 
+Principals: add --as <principal> to cal/repl/serve/forget-subject/
+purge-older-than to run the session under the file's grants for that
+principal (fail closed; see GRANT in docs/cal-reference.md §9). --auth FILE
+validates the principal against a credential map, and `deja ui --auth FILE`
+serves the console in multi-principal mode (tokens → principals,
+unauthenticated = read-only \"anonymous\").
+
 Encryption at rest: add --passphrase-env <VAR> to any command to derive an
 AES-256 key (Argon2id) from the passphrase in environment variable VAR. The
 non-secret salt is kept in a <memory.db>.kdf sidecar — back it up with the db.
@@ -225,6 +232,27 @@ fn resolve_db(args: &HashMap<String, String>, require_explicit: bool) -> Result<
     }
     eprintln!("deja: using default memory {path} (override with -d/--db or $DEJADB_DB)");
     Ok(path)
+}
+
+/// Bind the session principal from `--as` (validated against `--auth`'s
+/// credential map when one is given): rights become exactly what the file's
+/// grant grains cover for that principal — fail closed. Absent `--as`, the
+/// local session stays the owner.
+fn apply_principal(
+    facade: dejadb_cal::DejaDbFacade,
+    flags: &std::collections::HashMap<String, String>,
+) -> Result<dejadb_cal::DejaDbFacade, String> {
+    let Some(p) = flag(flags, "as") else {
+        return Ok(facade);
+    };
+    if let Some(path) = flag(flags, "auth") {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("--auth {path}: {e}"))?;
+        let map = dejadb_core::authz::CredentialMap::from_json(&text).map_err(|e| e.to_string())?;
+        map.knows_principal(&p).map_err(|e| e.to_string())?;
+    }
+    let bound = facade.with_principal(&p).map_err(|e| e.to_string())?;
+    eprintln!("deja: session bound to principal '{p}' (rights from the file's grants)");
+    Ok(bound)
 }
 
 /// True when a `host:port` (or bare host) names a loopback interface. Used to
@@ -801,6 +829,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .clone();
             let facade = DejaDbFacade::with_session(m, Some(ns), None);
             report_meta_warnings(&facade);
+            let facade = apply_principal(facade, &flags)?;
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
@@ -1139,6 +1168,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     facade.mount(alias, store);
                 }
             }
+            let facade = apply_principal(facade, &flags)?;
             let mut server = dejadb_mcp::McpServer::new(facade, None);
             if flags.contains_key("no-destructive-ops") {
                 server = server.allow_destructive_ops(false);
@@ -1308,6 +1338,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             use std::io::{BufRead, Write as IoWrite};
             let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns.clone()), None);
             report_meta_warnings(&facade);
+            let facade = apply_principal(facade, &flags)?;
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
@@ -1411,6 +1442,17 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns), None);
             report_meta_warnings(&facade);
             let mut server = dejadb_server::UiServer::new(facade, db.clone());
+            if let Some(path) = flag(&flags, "auth") {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("--auth {path}: {e}"))?;
+                let map = dejadb_core::authz::CredentialMap::from_json(&text)
+                    .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "deja: credential map loaded ({} token(s)); rights come from the                      file's grant grains; unauthenticated requests run as 'anonymous'",
+                    map.tokens.len()
+                );
+                server = server.with_credentials(map);
+            }
             if allow_remote {
                 server = server.allow_remote(true);
             }
@@ -1589,6 +1631,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     .map(|v| !matches!(v.as_str(), "false" | "0" | "off" | "no"))
                     .unwrap_or(false),
             };
+            if let Some(principal) = flag(&flags, "as") {
+                let grants = m.authz_grants(&principal).map_err(|e| e.to_string())?;
+                dejadb_core::authz::AuthzSet::restricted(&principal, grants)
+                    .check(dejadb_core::authz::Verb::Erase, &ns)
+                    .map_err(|e| e.to_string())?;
+            }
             let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
             println!(
                 "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
@@ -1636,6 +1684,13 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .unwrap_or(0)
                 - days * 24 * 3600 * 1000;
             let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+            if let Some(principal) = flag(&flags, "as") {
+                let grants = m.authz_grants(&principal).map_err(|e| e.to_string())?;
+                // An all-namespace sweep needs erase on `*`.
+                dejadb_core::authz::AuthzSet::restricted(&principal, grants)
+                    .check(dejadb_core::authz::Verb::Erase, ns_opt.unwrap_or("*"))
+                    .map_err(|e| e.to_string())?;
+            }
             let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
             println!(
                 "erased {} grains ({} vocabulary tokens, {} blobs reclaimed)",

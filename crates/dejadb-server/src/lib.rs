@@ -53,6 +53,62 @@ pub struct UiServer {
     /// the closed default: nothing auto-applies, nothing is denied. Host
     /// config, never persisted in the memory file.
     loop_policy: Option<deja_loop::Policy>,
+    /// Multi-principal mode (`deja ui --auth deja-auth.json`): a credential
+    /// map resolving bearer/Basic tokens to principal names. Rights come
+    /// from the FILE's own grant grains — the map holds no policy and no
+    /// raw secrets. Unauthenticated requests run as `anonymous`
+    /// (read-only unless the file grants more). Takes precedence over the
+    /// single `--token-env` secret when both are configured.
+    credentials: Option<dejadb_core::authz::CredentialMap>,
+}
+
+/// Per-request principal binding. The server handles one request at a
+/// time, so rebinding the shared facade for the request's duration is
+/// race-free; the guard restores the owner default on drop — including on
+/// panic — so a failed handler can never leak a stray principal into the
+/// next request.
+struct RequestBinding<'a> {
+    facade: &'a DejaDbFacade,
+}
+
+impl<'a> RequestBinding<'a> {
+    fn bind(
+        facade: &'a DejaDbFacade,
+        map: &dejadb_core::authz::CredentialMap,
+        bearer: Option<&str>,
+    ) -> Self {
+        let principal = bearer.and_then(|t| map.resolve(t).ok().map(str::to_string));
+        match principal {
+            Some(p) => {
+                if facade.bind_principal(&p).is_err() {
+                    // A store failure reading grants fails toward LESS
+                    // privilege, never more.
+                    Self::bind_anonymous(facade);
+                }
+            }
+            None => Self::bind_anonymous(facade),
+        }
+        RequestBinding { facade }
+    }
+
+    /// `anonymous` = a read-only baseline plus whatever the file explicitly
+    /// grants the `anonymous` principal — the formalized version of the old
+    /// token-less read-only console.
+    fn bind_anonymous(facade: &DejaDbFacade) {
+        use dejadb_core::authz::{AuthzSet, Grant, Verb};
+        let mut grants = facade
+            .with_store(|m| m.authz_grants("anonymous"))
+            .unwrap_or_default();
+        grants.push(Grant { verbs: vec![Verb::Read], namespaces: vec!["*".to_string()] });
+        facade.bind(AuthzSet::restricted("anonymous", grants));
+    }
+}
+
+impl Drop for RequestBinding<'_> {
+    fn drop(&mut self) {
+        self.facade
+            .bind(dejadb_core::authz::AuthzSet::owner("user:console"));
+    }
 }
 
 impl UiServer {
@@ -67,7 +123,17 @@ impl UiServer {
             segment_dir: None,
             allow_remote: false,
             loop_policy: None,
+            credentials: None,
         }
+    }
+
+    /// Multi-principal mode: attach the credential map (`deja-auth.json`).
+    /// Tokens resolve to principal names; rights come from the memory
+    /// file's own grant grains; unauthenticated requests run as
+    /// `anonymous`. See `docs/cal-reference.md` §9.
+    pub fn with_credentials(mut self, map: dejadb_core::authz::CredentialMap) -> Self {
+        self.credentials = Some(map);
+        self
     }
 
     /// Attach a host loop policy to the console's loop routes, so a
@@ -308,10 +374,23 @@ impl UiServer {
     }
 
     fn route(&self, method: &str, path: &str, body: &[u8], bearer: Option<&str>) -> (&'static str, &'static str, Vec<u8>) {
+        // Credential-map mode: resolve this request's principal and bind
+        // the facade for the request's duration (the guard restores the
+        // owner default on drop). Every verb check downstream — CAL,
+        // loop scopes, the run gate below — now answers for THIS caller.
+        let _session = self
+            .credentials
+            .as_ref()
+            .map(|map| RequestBinding::bind(&self.facade, map, bearer));
+
         // Auth: console-auth mode (`auth_all`) guards every request; hub mode
         // guards only mutating + sync endpoints. The credential arrives as a
         // Bearer token or an HTTP Basic password (see `handle_request`).
-        if let Some(tok) = &self.token {
+        // Credential-map mode replaces both: the binding above IS the auth
+        // decision, and the verb checks downstream do the guarding.
+        if self.credentials.is_some() {
+            // bound above
+        } else if let Some(tok) = &self.token {
             let guarded = self.auth_all || method == "POST" || path.starts_with("/api/segment");
             let authorized = bearer.is_some_and(|b| ct_eq(b.as_bytes(), tok.as_bytes()));
             if guarded && !authorized {
@@ -723,13 +802,26 @@ impl UiServer {
                 }
             }
             ("POST", "/api/loop/run") => {
+                let authz = self.facade.authz();
+                if !authz.is_owner()
+                    && !authz.allows(dejadb_core::authz::Verb::LoopRun, deja_loop::LOOP_NS)
+                {
+                    return ("403 Forbidden", "application/json",
+                            br#"{"ok":false,"error":"AUT-E001: this session lacks loop.run"}"#.to_vec());
+                }
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 // The trigger is recorded as co-creator on LLM/external
                 // findings, so the same principal cannot later approve them.
-                let actor = serde_json::from_slice::<Value>(body)
-                    .ok()
-                    .and_then(|v| v.get("actor").and_then(Value::as_str).map(str::to_string))
-                    .unwrap_or_else(|| "user:console".to_string());
+                // In credential-map mode the actor IS the bound principal —
+                // a request cannot claim an identity.
+                let actor = if self.credentials.is_some() {
+                    authz.principal().to_string()
+                } else {
+                    serde_json::from_slice::<Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("actor").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_else(|| "user:console".to_string())
+                };
                 let opts = RunOptions { triggering_actor: Some(actor), ..Default::default() };
                 match self.engine().run(&mut sub, &opts, now_ms()) {
                     Ok(res) => ok_json(json!({"ok": true, "run": res})),
@@ -756,14 +848,20 @@ impl UiServer {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
-        let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
+        let bound = self.facade.authz();
+        let actor = if self.credentials.is_some() {
+            bound.principal().to_string()
+        } else {
+            req.get("actor").and_then(Value::as_str).unwrap_or("user:console").to_string()
+        };
+        let actor = actor.as_str();
         let decision = if req.get("decision").and_then(Value::as_str) == Some("reject") {
             Decision::Reject
         } else {
             Decision::Approve
         };
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let scopes = dejadb_loop::scopes_for(&self.facade.authz());
         let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().review(
             &mut sub, hash, decision, actor, observer, &scopes, because, now_ms(),
@@ -777,10 +875,16 @@ impl UiServer {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
-        let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
+        let bound = self.facade.authz();
+        let actor = if self.credentials.is_some() {
+            bound.principal().to_string()
+        } else {
+            req.get("actor").and_then(Value::as_str).unwrap_or("user:console").to_string()
+        };
+        let actor = actor.as_str();
         let allow_destructive = req.get("allow_destructive").and_then(Value::as_bool).unwrap_or(false);
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let scopes = dejadb_loop::scopes_for(&self.facade.authz());
         let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().apply(
             &mut sub, hash, actor, observer, &scopes, because, allow_destructive, now_ms(),
@@ -794,9 +898,15 @@ impl UiServer {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
-        let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
+        let bound = self.facade.authz();
+        let actor = if self.credentials.is_some() {
+            bound.principal().to_string()
+        } else {
+            req.get("actor").and_then(Value::as_str).unwrap_or("user:console").to_string()
+        };
+        let actor = actor.as_str();
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let scopes = dejadb_loop::scopes_for(&self.facade.authz());
         let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().rollback(
             &mut sub, hash, actor, observer, &scopes, because, now_ms(),
@@ -819,7 +929,7 @@ impl UiServer {
         // The update reads the same body; the extra `analyzer_id` key is ignored.
         let update: deja_loop::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match self.engine().set_analyzer_config(&mut sub, &id, update, &dejadb_loop::scopes_for(self.facade.authz())) {
+        match self.engine().set_analyzer_config(&mut sub, &id, update, &dejadb_loop::scopes_for(&self.facade.authz())) {
             Ok(cfg) => ok_json(json!({"ok": true, "config": cfg})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
         }
@@ -1198,5 +1308,93 @@ mod security_tests {
                 assert!(!s.contains('/') && s != ".." && s != ".", "unsafe: {s}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_route_tests {
+    use super::UiServer;
+    use dejadb_cal::DejaDbFacade;
+    use dejadb_core::authz::{CredentialMap, AUTHZ_NS, REL_PERMITS};
+    use dejadb_core::types::{Fact, Grain};
+    use dejadb_store::DejaDB;
+
+    /// A server in credential-map mode: two env-referenced tokens, rights
+    /// seeded as grant grains in the file itself.
+    fn server() -> UiServer {
+        std::env::set_var("DEJA_TEST_READER_TOK", "reader-secret");
+        std::env::set_var("DEJA_TEST_WRITER_TOK", "writer-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut store = DejaDB::open(path.to_str().unwrap()).unwrap();
+        store
+            .add(&Fact::new("user:reader", REL_PERMITS, "read ON *").namespace(AUTHZ_NS).created_at(1_000))
+            .unwrap();
+        store
+            .add(
+                &Fact::new("agent:writer", REL_PERMITS, "read,write ON caller")
+                    .namespace(AUTHZ_NS)
+                    .created_at(2_000),
+            )
+            .unwrap();
+        store.add(&Fact::new("acme", "tier", "Enterprise").namespace("caller").created_at(3_000)).unwrap();
+        std::mem::forget(dir);
+        let facade = DejaDbFacade::with_session(store, Some("caller".into()), None);
+        let map = CredentialMap::from_json(
+            r#"{"version":1,"tokens":[
+                {"env":"DEJA_TEST_READER_TOK","principal":"user:reader"},
+                {"env":"DEJA_TEST_WRITER_TOK","principal":"agent:writer"}
+            ]}"#,
+        )
+        .unwrap();
+        UiServer::new(facade, "test".into()).with_credentials(map)
+    }
+
+    fn text(r: &(&str, &str, Vec<u8>)) -> String {
+        String::from_utf8_lossy(&r.2).to_string()
+    }
+
+    const READ: &[u8] = br#"{"query":"RECALL facts WHERE subject = \"acme\""}"#;
+    const WRITE: &[u8] = br#"{"query":"ADD fact SET subject = \"x\" SET relation = \"r\" SET object = \"o\" SET namespace = \"caller\" REASON \"t\""}"#;
+
+    #[test]
+    fn tokens_bind_principals_and_verbs_decide() {
+        let s = server();
+
+        // The reader reads…
+        let r = s.route("POST", "/api/cal", READ, Some("reader-secret"));
+        assert!(r.0.starts_with("200"), "{}", text(&r));
+        assert!(text(&r).contains("grains"));
+        // …and cannot write.
+        let w = s.route("POST", "/api/cal", WRITE, Some("reader-secret"));
+        assert!(text(&w).contains("AUT-E001"), "reader write must be refused: {}", text(&w));
+
+        // The writer writes.
+        let w = s.route("POST", "/api/cal", WRITE, Some("writer-secret"));
+        assert!(text(&w).contains("added"), "writer write must land: {}", text(&w));
+
+        // Sequential isolation: the very next reader request is still
+        // read-only — nothing leaked from the writer's binding.
+        let w = s.route("POST", "/api/cal", WRITE, Some("reader-secret"));
+        assert!(text(&w).contains("AUT-E001"), "{}", text(&w));
+    }
+
+    #[test]
+    fn anonymous_is_read_only_and_loop_run_is_verb_gated() {
+        let s = server();
+        // No token → anonymous: reads work…
+        let r = s.route("POST", "/api/cal", READ, None);
+        assert!(r.0.starts_with("200"), "{}", text(&r));
+        assert!(text(&r).contains("grains"));
+        // …writes are verb-refused…
+        let w = s.route("POST", "/api/cal", WRITE, None);
+        assert!(text(&w).contains("AUT-E001"), "{}", text(&w));
+        // …and an unknown token is anonymous too, never an escalation.
+        let w = s.route("POST", "/api/cal", WRITE, Some("stolen-guess"));
+        assert!(text(&w).contains("AUT-E001"), "{}", text(&w));
+
+        // The analysis trigger needs loop.run — anonymous gets 403.
+        let run = s.route("POST", "/api/loop/run", b"{}", None);
+        assert!(run.0.starts_with("403"), "{}", text(&run));
     }
 }

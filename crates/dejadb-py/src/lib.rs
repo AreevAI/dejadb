@@ -242,7 +242,7 @@ struct DejaDB {
 impl DejaDB {
     #[new]
     #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None))]
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None, principal = None))]
     fn new(
         py: Python<'_>,
         path: String,
@@ -251,6 +251,7 @@ impl DejaDB {
         actor: String,
         telemetry: String,
         index_text: Option<bool>,
+        principal: Option<String>,
     ) -> PyResult<Self> {
         // Recall-telemetry sidecar (host capability, §8): agents are the main
         // telemetry producers, so the binding default is `aggregate`; pass
@@ -299,6 +300,18 @@ impl DejaDB {
             })
             .map_err(err)?;
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
+        // `principal=` binds the session to the file's grants for that
+        // principal (fail closed — CAL 1.3 §9). Absent, the handle is the
+        // owner, as ever. The loop actor follows the bound principal
+        // unless overridden explicitly.
+        let (facade, actor) = match principal {
+            Some(p) => {
+                let f = facade.with_principal(&p).map_err(err)?;
+                let actor = if actor == "user:local" { p } else { actor };
+                (f, actor)
+            }
+            None => (facade, actor),
+        };
         Ok(DejaDB { facade, ns, actor })
     }
 

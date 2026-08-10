@@ -476,7 +476,7 @@ impl McpServer {
                     let actor = "agent:mcp";
                     // Scopes derive from the session's grants (an owner
                     // session — today's only MCP mode — holds all of them).
-                    let scopes = dejadb_loop::scopes_for(self.facade.authz());
+                    let scopes = dejadb_loop::scopes_for(&self.facade.authz());
                     let mut sub = BorrowedSubstrate::new(&self.facade);
                     let now = now_ms();
                     match action {

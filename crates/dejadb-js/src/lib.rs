@@ -252,6 +252,7 @@ impl DejaDb {
         passphrase: Option<String>,
         actor: Option<String>,
         telemetry: Option<String>,
+        principal: Option<String>,
     ) -> napi::Result<Self> {
         let ns = ns.unwrap_or_else(|| "shared".to_string());
         let actor = actor.unwrap_or_else(|| "user:local".to_string());
@@ -291,9 +292,20 @@ impl DejaDb {
             }
             (false, None) => RustDejaDB::open_with_telemetry(&path, tel).map_err(err)?,
         };
-        let facade = std::sync::Arc::new(std::sync::Mutex::new(Some(std::sync::Arc::new(
-            DejaDbFacade::with_session(store, Some(ns.clone()), None),
-        ))));
+        // `principal` binds the session to the file's grants for that
+        // principal (fail closed — CAL 1.3 §9). Absent, the handle is the
+        // owner, as ever; the loop actor follows the bound principal
+        // unless `actor` was given explicitly.
+        let session = DejaDbFacade::with_session(store, Some(ns.clone()), None);
+        let (session, actor) = match principal {
+            Some(p) => {
+                let f = session.with_principal(&p).map_err(err)?;
+                let actor = if actor == "user:local" { p } else { actor };
+                (f, actor)
+            }
+            None => (session, actor),
+        };
+        let facade = std::sync::Arc::new(std::sync::Mutex::new(Some(std::sync::Arc::new(session))));
         Ok(DejaDb { facade, ns, actor })
     }
 

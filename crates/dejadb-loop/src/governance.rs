@@ -105,7 +105,7 @@ impl GovernanceHost for LoopGovernance {
     ) -> Result<()> {
         let facade = self.facade(store)?;
         let actor = facade.authz().principal().to_string();
-        let scopes = crate::scopes_for(facade.authz());
+        let scopes = crate::scopes_for(&facade.authz());
         let observer = crate::observer_for_principal(&actor);
         let mut sub = crate::BorrowedSubstrate::new(facade);
         let d = match decision {
@@ -121,7 +121,7 @@ impl GovernanceHost for LoopGovernance {
         let facade = self.facade(store)?;
         let authz = facade.authz();
         let actor = authz.principal().to_string();
-        let scopes = crate::scopes_for(authz);
+        let scopes = crate::scopes_for(&authz);
         let observer = crate::observer_for_principal(&actor);
         // The two-key rule, verb-shaped: a destructive apply needs
         // `loop.apply` (in scopes) AND the session's own destruction verbs.
@@ -147,7 +147,7 @@ impl GovernanceHost for LoopGovernance {
     fn rollback(&self, store: &dyn CalStoreFacade, rec_hash: &str, because: &str) -> Result<()> {
         let facade = self.facade(store)?;
         let actor = facade.authz().principal().to_string();
-        let scopes = crate::scopes_for(facade.authz());
+        let scopes = crate::scopes_for(&facade.authz());
         let observer = crate::observer_for_principal(&actor);
         let mut sub = crate::BorrowedSubstrate::new(facade);
         self.engine()
