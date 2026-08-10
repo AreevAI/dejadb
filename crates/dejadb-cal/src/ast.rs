@@ -172,6 +172,23 @@ pub enum CalStatement {
     #[serde(alias = "SHOW_GRANTS", alias = "ShowGrants")]
     ShowGrants(ShowGrantsStmt),
 
+    // ── Tier 3: Governance (CAL 1.3 §8.16) ─────────────────────────────
+    /// `APPROVE <hash> BECAUSE "…"`
+    #[serde(alias = "APPROVE")]
+    Approve(GovernanceStmt),
+    /// `REJECT <hash> BECAUSE "…"`
+    #[serde(alias = "REJECT")]
+    Reject(GovernanceStmt),
+    /// `APPLY <hash> BECAUSE "…"`
+    #[serde(alias = "APPLY")]
+    ApplyRec(GovernanceStmt),
+    /// `ROLLBACK <hash> BECAUSE "…"`
+    #[serde(alias = "ROLLBACK")]
+    RollbackRec(GovernanceStmt),
+    /// `RUN LOOP [FULL] [WITH …]`
+    #[serde(alias = "RUN_LOOP", alias = "RunLoop")]
+    RunLoop(RunLoopStmt),
+
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
     DefineTemplate(DefineTemplateStmt),
@@ -479,6 +496,14 @@ pub enum DescribeTarget {
     // ── CAL 1.3 (Tier 3) ────────────────────────────────────────────────
     /// `DESCRIBE PRINCIPAL "<name>"` — the principal's effective grants.
     Principal(String),
+    /// `DESCRIBE LOOP` — loop health (last run, queue depth).
+    Loop,
+    /// `DESCRIBE ANALYZERS` — registered analyzers + effective config.
+    Analyzers,
+    /// `DESCRIBE OUTCOMES` — the Verify gate's measured outcomes.
+    Outcomes,
+    /// `DESCRIBE POLICY` — the effective host loop policy (read-only).
+    LoopPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +802,45 @@ pub struct PurgeStmt {
     /// The recorded reason (BECAUSE). Mandatory from text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// Governance (Tier 3 — CAL 1.3 §8.16)
+// ---------------------------------------------------------------------------
+
+/// `APPROVE <hash> BECAUSE "…"` / `REJECT …` / `APPLY …` / `ROLLBACK …`.
+///
+/// The loop lifecycle in the language. BECAUSE is mandatory — a parse
+/// error without, matching the engine's own non-empty check (two layers).
+/// The actor, scopes, and observer come from the bound session, never from
+/// the statement; the four gates (separation of duties, self-approval
+/// block, two-key destructive apply, hash-chained audit) are enforced by
+/// the engine exactly as on every other surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GovernanceStmt {
+    /// The recommendation's content address.
+    pub hash: String,
+    /// The mandatory written reason.
+    pub reason: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUN LOOP [FULL] [WITH min_new(N), if_stale("6h")]` — trigger the
+/// analysis pass. Carries no credentials and no model names: LLM backends
+/// are host configuration, never statement text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunLoopStmt {
+    /// `FULL` — the whole-memory reflect sweep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_sweep: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_new: Option<u64>,
+    /// `if_stale` duration, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_stale_ms: Option<i64>,
     #[serde(skip)]
     pub span: Option<Span>,
 }

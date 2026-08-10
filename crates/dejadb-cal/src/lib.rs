@@ -9,6 +9,7 @@ pub mod assemble;
 pub mod ast;
 pub mod classify;
 pub mod errors;
+pub mod governance;
 pub mod executor;
 pub mod facade;
 pub mod humanize;

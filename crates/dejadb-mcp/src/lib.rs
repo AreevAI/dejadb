@@ -50,7 +50,8 @@ impl McpServer {
             .unwrap_or_else(|| "shared".to_string());
         McpServer {
             facade,
-            executor: CalExecutor::new(CalExecutorConfig::default()),
+            executor: CalExecutor::new(CalExecutorConfig::default())
+                .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new())),
             default_ns,
             allow_destructive_ops: true,
             locked_ns: None,
@@ -63,6 +64,8 @@ impl McpServer {
     /// `deja loop run --policy`.
     pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
         self.loop_policy = Some(policy);
+        // The CAL surface's governance host honors the same policy.
+        self.rebuild_executor();
         self
     }
 
@@ -76,13 +79,18 @@ impl McpServer {
 
     /// Rebuild the executor from the current gate settings. Called by every
     /// builder so `--lock-ns` and `--no-destructive-ops` compose instead of
-    /// clobbering each other's config.
+    /// clobbering each other's config — and the governance host survives
+    /// every rebuild.
     fn rebuild_executor(&mut self) {
         self.executor = CalExecutor::new(CalExecutorConfig {
             allow_destructive_ops: self.allow_destructive_ops,
             namespace_override: self.locked_ns.clone(),
             ..CalExecutorConfig::default()
-        });
+        })
+        .with_governance(std::sync::Arc::new(match &self.loop_policy {
+            Some(p) => dejadb_loop::LoopGovernance::with_policy(p.clone()),
+            None => dejadb_loop::LoopGovernance::new(),
+        }));
     }
 
     /// Permit or forbid destructive operations — the `dejadb_forget` tool and

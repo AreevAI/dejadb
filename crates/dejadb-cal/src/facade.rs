@@ -247,6 +247,15 @@ pub trait CalStoreFacade: Send + Sync {
         ))
     }
 
+    /// Concrete-type escape hatch for host layers that sit above this
+    /// crate (the governance seam): a `GovernanceHost` receives the store
+    /// as `&dyn CalStoreFacade` and needs the concrete facade back to
+    /// build its substrate view. Default `None` — only the real facade
+    /// answers.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Tier-3 DCL (CAL 1.3 §8.15): write a grant grain for `principal`.
     /// Verbs/namespaces are validated and canonicalized by the
     /// implementation; returns the grant grain's hash.

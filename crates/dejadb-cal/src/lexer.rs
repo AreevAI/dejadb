@@ -458,6 +458,22 @@ pub enum Token {
     Revert,
 
     // ── Tier 2 keywords (destructive statements) ─────────────────────────
+    /// Governance (CAL 1.3 §8.16): `APPROVE <hash> BECAUSE "<why>"`.
+    #[token("APPROVE", ignore(ascii_case))]
+    Approve,
+
+    /// Governance: `REJECT <hash> BECAUSE "<why>"`.
+    #[token("REJECT", ignore(ascii_case))]
+    Reject,
+
+    /// Governance: `APPLY <hash> BECAUSE "<why>"`.
+    #[token("APPLY", ignore(ascii_case))]
+    Apply,
+
+    /// Governance: `ROLLBACK <hash> BECAUSE "<why>"`.
+    #[token("ROLLBACK", ignore(ascii_case))]
+    Rollback,
+
     /// Tier-3 DCL (CAL 1.3): `GRANT <verbs> ON <ns> TO "<principal>"`.
     #[token("GRANT", ignore(ascii_case))]
     Grant,
@@ -909,6 +925,10 @@ impl Token {
             Token::Revoke => "REVOKE".into(),
             Token::Show => "SHOW".into(),
             Token::To => "TO".into(),
+            Token::Approve => "APPROVE".into(),
+            Token::Reject => "REJECT".into(),
+            Token::Apply => "APPLY".into(),
+            Token::Rollback => "ROLLBACK".into(),
             Token::Forget => "FORGET".into(),
             Token::Purge => "PURGE".into(),
             Token::Set => "SET".into(),

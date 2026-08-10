@@ -58,6 +58,15 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         // — control, never destructive. SHOW GRANTS is a read.
         CalStatement::Grant(_) | CalStatement::Revoke(_) => StatementClass::Control,
         CalStatement::ShowGrants(_) => StatementClass::Read,
+        // Governance: engine-gated lifecycle transitions and the analysis
+        // trigger — control. (An APPLY may execute a destructive proposal,
+        // but that path re-checks delete/erase inside the engine — the
+        // statement itself is control.)
+        CalStatement::Approve(_)
+        | CalStatement::Reject(_)
+        | CalStatement::ApplyRec(_)
+        | CalStatement::RollbackRec(_)
+        | CalStatement::RunLoop(_) => StatementClass::Control,
         CalStatement::Forget(_) | CalStatement::Purge(_) => StatementClass::Destructive,
         CalStatement::Batch(b) => classify_batch(b),
     }

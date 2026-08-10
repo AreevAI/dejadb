@@ -59,7 +59,8 @@ impl UiServer {
     pub fn new(facade: DejaDbFacade, db_label: String) -> Self {
         UiServer {
             facade,
-            executor: CalExecutor::new(CalExecutorConfig::default()),
+            executor: CalExecutor::new(CalExecutorConfig::default())
+                .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new())),
             db_label,
             token: None,
             auth_all: false,
@@ -73,7 +74,12 @@ impl UiServer {
     /// console-triggered run honors the same auto-apply grants, denies, and
     /// severity floors as `deja loop run --policy`.
     pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
-        self.loop_policy = Some(policy);
+        self.loop_policy = Some(policy.clone());
+        // The CAL surface's governance host honors the same policy.
+        self.executor = CalExecutor::new(CalExecutorConfig::default())
+            .with_governance(std::sync::Arc::new(
+                dejadb_loop::LoopGovernance::with_policy(policy),
+            ));
         self
     }
 
@@ -114,7 +120,11 @@ impl UiServer {
         self.executor = CalExecutor::new(CalExecutorConfig {
             allow_destructive_ops: allow,
             ..CalExecutorConfig::default()
-        });
+        })
+        .with_governance(std::sync::Arc::new(match &self.loop_policy {
+            Some(p) => dejadb_loop::LoopGovernance::with_policy(p.clone()),
+            None => dejadb_loop::LoopGovernance::new(),
+        }));
         self
     }
 

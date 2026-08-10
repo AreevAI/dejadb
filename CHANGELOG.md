@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CAL 1.3 governance: the loop lifecycle is CAL.** `RUN LOOP [FULL]
+  [WITH min_new(N), if_stale("6h")]` triggers the analysis pass;
+  `APPROVE`/`REJECT`/`APPLY`/`ROLLBACK <hash> BECAUSE "…"` are the review
+  actions, with the reason as *syntax* — a parse error without it, backed
+  by the engine's own non-empty check. `DESCRIBE LOOP` is the in-language
+  `deja loop list` (health plus the pending queue with hashes);
+  `DESCRIBE ANALYZERS|OUTCOMES|POLICY` are the other reads. Identity never
+  rides the statement: the executor's `GovernanceHost` seam
+  (`dejadb_loop::LoopGovernance`, attached on the CLI, MCP, and console
+  surfaces) derives actor, scopes, and observer from the bound session, so
+  the four gates — separation of duties, the self-approval block
+  (including the run-trigger co-creator), the two-key destructive apply
+  (`loop.apply` + the session's own delete/erase), the hash-chained
+  audit — run exactly as on every other surface. Loop *policy* writes stay
+  host-only (the policy gates CAL; CAL editing it would be
+  self-licensing), governance statements refuse saved-query bodies, and an
+  executor without a host says "governance is not wired" instead of
+  pretending. Everyday node names (`approve`, `reject`, `apply`, …) still
+  work in workflow definitions.
 - **CAL 1.3 Tier-3 DCL: `GRANT`, `REVOKE`, `SHOW GRANTS`, and
   `DESCRIBE PRINCIPAL` are CAL statements.** Access control now lives in
   the language, SQL-style: `GRANT read, write ON caller TO

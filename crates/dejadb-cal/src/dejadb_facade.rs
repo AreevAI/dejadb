@@ -570,6 +570,10 @@ impl DejaDbFacade {
 }
 
 impl CalStoreFacade for DejaDbFacade {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     /// Record one assembly-budget sample into the telemetry sidecar (feeds the
     /// `budget_pressure` analyzer). Best-effort: telemetry never fails a query.
     fn note_assembly_budget(&self, overflow: bool) {

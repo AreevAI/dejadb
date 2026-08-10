@@ -804,7 +804,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
-            });
+            })
+            .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new()));
             let res = ex.execute(&query, &facade).map_err(|e| e.to_string())?;
             let payload = serde_json::to_string_pretty(&res.result).map_err(|e| e.to_string())?;
             println!("{payload}");
@@ -1310,7 +1311,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
                 ..CalExecutorConfig::default()
-            });
+            })
+            .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new()));
             eprintln!("deja repl — namespace '{ns}' · CAL statements, or .stats .log .help .quit");
             let stdin = std::io::stdin();
             let mut lines = stdin.lock().lines();

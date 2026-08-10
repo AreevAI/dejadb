@@ -16,8 +16,10 @@
 //! println!("proposed {} recommendation(s)", result.stored);
 //! ```
 
+mod governance;
 mod substrate;
 
+pub use governance::LoopGovernance;
 pub use substrate::{BorrowedSubstrate, DejaDbSubstrate};
 
 use std::time::{SystemTime, UNIX_EPOCH};

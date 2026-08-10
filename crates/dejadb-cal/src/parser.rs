@@ -38,8 +38,9 @@ use super::ast::{
     UntilClause, Value, WhereClause, WithOption,
 };
 use super::ast::{
-    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, GrantStmt, PurgeStmt, QueryParam,
-    RevokeStmt, RunQueryStmt, ShowGrantsStmt, TemplateSectionSources,
+    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, GovernanceStmt, GrantStmt,
+    PurgeStmt, QueryParam, RevokeStmt, RunLoopStmt, RunQueryStmt, ShowGrantsStmt,
+    TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
@@ -47,6 +48,28 @@ use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Tok
 /// The parsed pieces of a GRANT/REVOKE body:
 /// `(verbs, namespaces, principal, reason)`.
 type DclBody = (Vec<String>, Vec<String>, String, Option<String>);
+
+/// Parse a `RUN LOOP WITH if_stale("…")` duration — `"300s"`, `"90m"`,
+/// `"6h"`, `"2d"` — to milliseconds. `None` on anything else.
+fn parse_stale_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: f64 = num.parse().ok()?;
+    if n < 0.0 || !n.is_finite() {
+        return None;
+    }
+    let ms = match unit {
+        "s" => n * 1000.0,
+        "m" => n * 60_000.0,
+        "h" => n * 3_600_000.0,
+        "d" => n * 86_400_000.0,
+        _ => return None,
+    };
+    Some(ms as i64)
+}
 
 // ---------------------------------------------------------------------------
 // Hard limits
@@ -178,6 +201,13 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         CalStatement::Grant(_) => write("GRANT"),
         CalStatement::Revoke(_) => write("REVOKE"),
         CalStatement::ShowGrants(_) => Ok(()),
+        // No governance in stored bodies either — the deliberate friction
+        // of one-statement-at-a-time review must not be macro-able.
+        CalStatement::Approve(_) => write("APPROVE"),
+        CalStatement::Reject(_) => write("REJECT"),
+        CalStatement::ApplyRec(_) => write("APPLY"),
+        CalStatement::RollbackRec(_) => write("ROLLBACK"),
+        CalStatement::RunLoop(_) => write("RUN LOOP"),
         CalStatement::DefineTemplate(_) => write("DEFINE TEMPLATE"),
         CalStatement::DropTemplate(_) => write("DROP TEMPLATE"),
         CalStatement::DefineQuery(_) => write("DEFINE QUERY"),
@@ -1292,6 +1322,32 @@ impl Parser {
                 token: Token::Purge,
                 ..
             }) => self.parse_purge(),
+            // Governance (CAL 1.3 §8.16): the loop lifecycle in the
+            // language, BECAUSE as syntax.
+            Some(SpannedToken {
+                token: Token::Approve,
+                ..
+            }) => Ok(CalStatement::Approve(
+                self.parse_governance_body(&Token::Approve)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Reject,
+                ..
+            }) => Ok(CalStatement::Reject(
+                self.parse_governance_body(&Token::Reject)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Apply,
+                ..
+            }) => Ok(CalStatement::ApplyRec(
+                self.parse_governance_body(&Token::Apply)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Rollback,
+                ..
+            }) => Ok(CalStatement::RollbackRec(
+                self.parse_governance_body(&Token::Rollback)?,
+            )),
             // Tier-3 DCL (CAL 1.3 §8.15).
             Some(SpannedToken {
                 token: Token::Grant,
@@ -4048,6 +4104,18 @@ impl Parser {
                     self.advance();
                     let name = self.parse_string_literal()?;
                     DescribeTarget::Principal(name)
+                } else if s.eq_ignore_ascii_case("loop") {
+                    self.advance();
+                    DescribeTarget::Loop
+                } else if s.eq_ignore_ascii_case("analyzers") {
+                    self.advance();
+                    DescribeTarget::Analyzers
+                } else if s.eq_ignore_ascii_case("outcomes") {
+                    self.advance();
+                    DescribeTarget::Outcomes
+                } else if s.eq_ignore_ascii_case("policy") {
+                    self.advance();
+                    DescribeTarget::LoopPolicy
                 } else {
                     self.advance();
                     DescribeTarget::Schema
@@ -4646,6 +4714,23 @@ impl Parser {
             }) => {
                 self.advance();
                 Ok("query".to_string())
+            }
+            // CAL 1.3 statement keywords that are everyday node names —
+            // review/approval workflows use exactly these words.
+            Some(SpannedToken {
+                token:
+                    t @ (Token::Approve
+                    | Token::Reject
+                    | Token::Apply
+                    | Token::Rollback
+                    | Token::Grant
+                    | Token::Revoke
+                    | Token::Show),
+                ..
+            }) => {
+                let name = t.description().to_ascii_lowercase();
+                self.advance();
+                Ok(name)
             }
             Some(SpannedToken {
                 token: Token::StringLiteral(_),
@@ -5488,6 +5573,128 @@ impl Parser {
         }))
     }
 
+    /// The shared body of the four governance statements (CAL 1.3 §8.16):
+    /// `<hash> BECAUSE "<why>"`. BECAUSE is mandatory — a parse error, so
+    /// the reason requirement is syntax, not convention.
+    fn parse_governance_body(&mut self, keyword: &Token) -> CalResult<GovernanceStmt> {
+        let span_start = self.current_span();
+        self.expect_exact(keyword)?;
+        let hash = self.parse_hash_literal()?;
+        if !self.at_exact(&Token::Because) && !self.at_exact(&Token::Reason) {
+            return Err(CalError::MissingReason {
+                span: Some(self.current_span()),
+            });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+        let span_end = self.prev_span();
+        Ok(GovernanceStmt {
+            hash,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        })
+    }
+
+    /// Parse `RUN LOOP [FULL] [WITH min_new(N), if_stale("<dur>")]` — the
+    /// caller has seen `RUN` followed by the ident `LOOP`.
+    fn parse_run_loop(&mut self, span_start: Span) -> CalResult<CalStatement> {
+        // Consume the LOOP ident.
+        self.advance();
+        let mut full_sweep = false;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("FULL") {
+                full_sweep = true;
+                self.advance();
+            }
+        }
+        let mut min_new: Option<u64> = None;
+        let mut if_stale_ms: Option<i64> = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            loop {
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(opt), .. })
+                        if opt.eq_ignore_ascii_case("min_new") =>
+                    {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        match self.peek() {
+                            Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                                if *n >= 0.0 =>
+                            {
+                                min_new = Some(*n as u64);
+                                self.advance();
+                            }
+                            other => {
+                                return Err(CalError::UnexpectedToken {
+                                    expected: "a number".into(),
+                                    found: other
+                                        .map(|t| t.token.description())
+                                        .unwrap_or_else(|| "end of input".into()),
+                                    span: other.map(|t| t.span),
+                                    suggestion: None,
+                                });
+                            }
+                        }
+                        self.expect_exact(&Token::RParen)?;
+                    }
+                    Some(SpannedToken { token: Token::Ident(opt), .. })
+                        if opt.eq_ignore_ascii_case("if_stale") =>
+                    {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        let dur = self.parse_string_literal()?;
+                        if_stale_ms = Some(parse_stale_duration_ms(&dur).ok_or_else(|| {
+                            CalError::UnexpectedToken {
+                                expected: "a duration like \"6h\", \"90m\", or \"2d\"".into(),
+                                found: dur.clone(),
+                                span: Some(self.prev_span()),
+                                suggestion: None,
+                            }
+                        })?);
+                        self.expect_exact(&Token::RParen)?;
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "min_new(N) or if_stale(\"<dur>\")".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: Some(
+                                "RUN LOOP supports WITH min_new(N), if_stale(\"6h\") — model \
+                                 and policy configuration is host-side, never statement text"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                if self.at_exact(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunLoop(RunLoopStmt {
+            full_sweep,
+            min_new,
+            if_stale_ms,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
     /// Parse `SHOW GRANTS [FOR "<principal>"]`.
     fn parse_show_grants(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
@@ -6125,6 +6332,14 @@ impl Parser {
     fn parse_run_query(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
         self.expect_exact(&Token::Run)?;
+
+        // `RUN LOOP` — the analysis trigger (CAL 1.3 §8.16) rides the RUN
+        // prefix; a string literal keeps meaning a saved query.
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("LOOP") {
+                return self.parse_run_loop(span_start);
+            }
+        }
 
         let name = self.parse_string_literal()?;
 

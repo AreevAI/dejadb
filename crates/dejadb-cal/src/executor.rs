@@ -203,6 +203,14 @@ pub enum CalResultPayload {
     Revoked { principal: String, grants_touched: usize },
     /// Result of `SHOW GRANTS` — one row per live grant grain.
     GrantList { grants: Vec<serde_json::Value> },
+    /// Result of `RUN LOOP` (CAL 1.3 §8.16) — the engine's run report.
+    LoopRan { run: serde_json::Value },
+    /// Result of `APPROVE`/`REJECT`.
+    Reviewed { hash: String, decision: String },
+    /// Result of `APPLY`.
+    RecApplied { hash: String, rollbackable: bool },
+    /// Result of `ROLLBACK`.
+    RecRolledBack { hash: String },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -574,12 +582,27 @@ impl Drop for LetScope {
 /// mutability).
 pub struct CalExecutor {
     config: CalExecutorConfig,
+    /// The governance seam (CAL 1.3 §8.16): loop lifecycle statements
+    /// execute only when a host attached one — `dejadb-loop` provides the
+    /// real implementation. Absent → those statements return
+    /// `Unsupported`.
+    governance: Option<std::sync::Arc<dyn crate::governance::GovernanceHost>>,
 }
 
 impl CalExecutor {
     /// Create a new executor with the given configuration.
     pub fn new(config: CalExecutorConfig) -> Self {
-        Self { config }
+        Self { config, governance: None }
+    }
+
+    /// Attach the governance host that backs `RUN LOOP`, `APPROVE`,
+    /// `REJECT`, `APPLY`, `ROLLBACK`, and the loop `DESCRIBE` reads.
+    pub fn with_governance(
+        mut self,
+        host: std::sync::Arc<dyn crate::governance::GovernanceHost>,
+    ) -> Self {
+        self.governance = Some(host);
+        self
     }
 
     /// The effective configuration (read-only; for observability surfaces).
@@ -1574,6 +1597,79 @@ impl CalExecutor {
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "revoke".into(),
                         message: format!("REVOKE failed: {e}"),
+                    }),
+                }
+            }
+            // Governance (CAL 1.3 §8.16) — executes through the attached
+            // GovernanceHost; identity comes from the bound session, never
+            // the statement. No host → Unsupported (this executor was not
+            // wired for governance).
+            CalStatement::Approve(g) | CalStatement::Reject(g) => {
+                let decision = if matches!(stmt, CalStatement::Approve(_)) {
+                    crate::governance::ReviewDecision::Approve
+                } else {
+                    crate::governance::ReviewDecision::Reject
+                };
+                let name = if decision == crate::governance::ReviewDecision::Approve {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired(name));
+                };
+                match host.review(store, &g.hash, decision, &g.reason) {
+                    Ok(()) => Ok(CalResultPayload::Reviewed {
+                        hash: g.hash.clone(),
+                        decision: name.into(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: name.into(),
+                        message: format!("{} failed: {e}", name.to_uppercase()),
+                    }),
+                }
+            }
+            CalStatement::ApplyRec(g) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("apply"));
+                };
+                match host.apply(store, &g.hash, &g.reason) {
+                    Ok(rollbackable) => Ok(CalResultPayload::RecApplied {
+                        hash: g.hash.clone(),
+                        rollbackable,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "apply".into(),
+                        message: format!("APPLY failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RollbackRec(g) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("rollback"));
+                };
+                match host.rollback(store, &g.hash, &g.reason) {
+                    Ok(()) => Ok(CalResultPayload::RecRolledBack { hash: g.hash.clone() }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "rollback".into(),
+                        message: format!("ROLLBACK failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunLoop(run) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("run_loop"));
+                };
+                let opts = crate::governance::RunLoopOptions {
+                    full_sweep: run.full_sweep,
+                    min_new: run.min_new,
+                    if_stale_ms: run.if_stale_ms,
+                };
+                match host.run_loop(store, &opts) {
+                    Ok(report) => Ok(CalResultPayload::LoopRan { run: report }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "run_loop".into(),
+                        message: format!("RUN LOOP failed: {e}"),
                     }),
                 }
             }
@@ -3282,6 +3378,33 @@ impl CalExecutor {
                     },
                 })
             }
+            // The loop reads (CAL 1.3 §8.16) — delegated to the governance
+            // host; unwired surfaces say so instead of pretending.
+            DescribeTarget::Loop
+            | DescribeTarget::Analyzers
+            | DescribeTarget::Outcomes
+            | DescribeTarget::LoopPolicy => {
+                let what = match &describe.target {
+                    DescribeTarget::Loop => crate::governance::LoopInfo::Loop,
+                    DescribeTarget::Analyzers => crate::governance::LoopInfo::Analyzers,
+                    DescribeTarget::Outcomes => crate::governance::LoopInfo::Outcomes,
+                    _ => crate::governance::LoopInfo::Policy,
+                };
+                match &self.governance {
+                    None => serde_json::json!({
+                        "error": "governance is not wired on this surface — no \
+                                  GovernanceHost attached",
+                    }),
+                    Some(host) => host.describe(store, what).map_err(|e| {
+                        let detail = e.to_string();
+                        if detail.contains("AUT-E") {
+                            CalError::NotAuthorized { detail, span: None }
+                        } else {
+                            CalError::InvalidQuery { detail, span: None }
+                        }
+                    })?,
+                }
+            }
             DescribeTarget::Grammar => serde_json::json!({
                 "grammar": "CAL/1 grammar (simplified BNF)",
                 "version": 1,
@@ -4604,6 +4727,17 @@ fn cal_value_to_json(val: &super::ast::Value) -> serde_json::Value {
     }
 }
 
+/// The payload for a governance statement on an executor no host wired.
+fn governance_unwired(statement: &str) -> CalResultPayload {
+    CalResultPayload::Unsupported {
+        statement: statement.into(),
+        message: "governance is not wired on this surface — the host attaches a \
+                  GovernanceHost (CalExecutor::with_governance) to back RUN LOOP, \
+                  APPROVE, REJECT, APPLY, ROLLBACK, and the loop DESCRIBE reads"
+            .into(),
+    }
+}
+
 /// Return the canonical statement type name as a lowercase string.
 fn statement_type_name(stmt: &CalStatement) -> String {
     match stmt {
@@ -4632,6 +4766,11 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::Grant(_) => "grant",
         CalStatement::Revoke(_) => "revoke",
         CalStatement::ShowGrants(_) => "show_grants",
+        CalStatement::Approve(_) => "approve",
+        CalStatement::Reject(_) => "reject",
+        CalStatement::ApplyRec(_) => "apply",
+        CalStatement::RollbackRec(_) => "rollback",
+        CalStatement::RunLoop(_) => "run_loop",
     }
     .to_string()
 }
@@ -4667,7 +4806,12 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::DefineQuery(_)
         | CalStatement::DropQuery(_)
         | CalStatement::Grant(_)
-        | CalStatement::Revoke(_) => "admin",
+        | CalStatement::Revoke(_)
+        | CalStatement::Approve(_)
+        | CalStatement::Reject(_)
+        | CalStatement::ApplyRec(_)
+        | CalStatement::RollbackRec(_)
+        | CalStatement::RunLoop(_) => "admin",
     }
 }
 
@@ -4715,6 +4859,10 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::Granted { .. } => 1,
         CalResultPayload::Revoked { .. } => 1,
         CalResultPayload::GrantList { grants } => grants.len(),
+        CalResultPayload::LoopRan { .. } => 1,
+        CalResultPayload::Reviewed { .. } => 1,
+        CalResultPayload::RecApplied { .. } => 1,
+        CalResultPayload::RecRolledBack { .. } => 1,
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,
