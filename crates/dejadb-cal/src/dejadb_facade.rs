@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use dejadb_core::authz::Verb;
 use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::DeserializedGrain;
 use dejadb_core::types::Grain;
@@ -179,6 +180,17 @@ impl DejaDbFacade {
         &self.authz
     }
 
+    /// The namespace a JSON-built write lands in: the explicit `namespace`
+    /// field, else the session default, else `"shared"` (the store default).
+    /// This is the resource every write-verb check runs against.
+    fn write_ns<'a>(&'a self, fields: &'a serde_json::Map<String, serde_json::Value>) -> &'a str {
+        fields
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .or(self.namespace.as_deref())
+            .unwrap_or("shared")
+    }
+
     /// Mount a read-only memory (an org/category replica) under an alias.
     /// CAL reaches it with `WHERE namespace = "<alias>.<inner-ns>"` — which
     /// is what makes single-statement ASSEMBLE span user + org files.
@@ -231,6 +243,7 @@ impl DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(Hash, bool)> {
+        self.authz.check(Verb::Write, self.write_ns(fields))?;
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(grain_type, fields, AddIfNovelSink { m: &mut m })
     }
@@ -300,6 +313,12 @@ impl DejaDbFacade {
         &self,
         entries: &[(String, serde_json::Map<String, serde_json::Value>)],
     ) -> Result<Vec<Hash>> {
+        // Every entry's namespace is checked before anything is written —
+        // a batch is all-or-nothing for authorization like it is for
+        // validation.
+        for (_, fields) in entries {
+            self.authz.check(Verb::Write, self.write_ns(fields))?;
+        }
         // Build every grain first so a bad entry is rejected before anything
         // is written, then hand the whole set to the store as one batch.
         let mut built: Vec<Box<dyn dejadb_store::AddableDyn>> = Vec::with_capacity(entries.len());
@@ -525,6 +544,8 @@ impl CalStoreFacade for DejaDbFacade {
         description: Option<&str>,
         params: &[QueryParam],
     ) -> Result<()> {
+        // Saved queries and templates are the host-config surface: admin.
+        self.authz.check(Verb::Admin, "*")?;
         let existing = self.snapshot_query(name);
         self.with_queries(|reg| reg.register(name, body, description.unwrap_or(""), params))
             .map_err(DejaDbError::Validation)?;
@@ -554,6 +575,7 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn drop_query(&self, name: &str) -> Result<()> {
+        self.authz.check(Verb::Admin, "*")?;
         // Snapshot before deleting: if the file write fails the registry has to
         // go back, or the entry is gone here and still on disk — it would
         // reappear on the next open, which reads as the drop never happening.
@@ -634,6 +656,7 @@ impl CalStoreFacade for DejaDbFacade {
         parent: Option<&str>,
         grain_types: &[String],
     ) -> Result<()> {
+        self.authz.check(Verb::Admin, "*")?;
         let existing = self.snapshot_template(name);
         self.with_templates(|reg| {
             reg.register(name, source, description.unwrap_or(""), parent)?;
@@ -674,6 +697,7 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn drop_template(&self, name: &str) -> Result<()> {
+        self.authz.check(Verb::Admin, "*")?;
         let existing = self.snapshot_template(name);
         self.with_templates(|reg| reg.delete(name))
             .map_err(|e| DejaDbError::Validation(e.to_string()))?;
@@ -759,6 +783,9 @@ impl CalStoreFacade for DejaDbFacade {
 
         // mount routing: "alias.inner" namespaces hit mounted replicas
         let requested = params.namespace.as_deref().or(self.namespace.as_deref());
+        // The read gate. A session with no namespace scope reads everything,
+        // so it needs a grant covering `*`; owner sessions pass untouched.
+        self.authz.check(Verb::Read, requested.unwrap_or("*"))?;
         let (mount_alias, ns_owned) = match requested {
             Some(full) => match full.split_once('.') {
                 Some((alias, inner)) if self.mounts.contains_key(alias) => {
@@ -1135,18 +1162,39 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn exists(&self, hash: &Hash) -> Result<bool> {
-        self.store.lock().unwrap().has(hash)
+        if self.authz.is_owner() {
+            return self.store.lock().unwrap().has(hash);
+        }
+        // An existence bit is a read, and a hash names no namespace — so a
+        // restricted session resolves the grain first and answers only for
+        // namespaces its grants can read.
+        let fetched = self.store.lock().unwrap().get(hash);
+        match fetched {
+            Ok(g) => {
+                self.authz
+                    .check(Verb::Read, g.get_str("namespace").unwrap_or("shared"))?;
+                Ok(true)
+            }
+            Err(DejaDbError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn get(&self, hash: &Hash) -> Result<DeserializedGrain> {
-        self.store.lock().unwrap().get(hash)
+        let g = self.store.lock().unwrap().get(hash)?;
+        self.authz
+            .check(Verb::Read, g.get_str("namespace").unwrap_or("shared"))?;
+        Ok(g)
     }
 
     fn count(&self) -> Result<usize> {
+        // A store-wide count spans every namespace.
+        self.authz.check(Verb::Read, "*")?;
         self.store.lock().unwrap().count()
     }
 
     fn get_history(&self, namespace: &str, subject: &str, relation: &str) -> Result<Vec<VersionEntry>> {
+        self.authz.check(Verb::Read, namespace)?;
         let entries = self.store.lock().unwrap().history(namespace, subject, relation)?;
         Ok(entries
             .into_iter()
@@ -1161,6 +1209,8 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn open_forks(&self) -> Result<Vec<ForkGroupInfo>> {
+        // The fork listing spans every namespace.
+        self.authz.check(Verb::Read, "*")?;
         let groups = self.with_store(|m| m.open_forks())?;
         Ok(groups
             .into_iter()
@@ -1190,6 +1240,7 @@ impl CalStoreFacade for DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Hash> {
+        self.authz.check(Verb::Write, self.write_ns(fields))?;
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(grain_type, fields, AddSink { m: &mut m })
     }
@@ -1200,6 +1251,7 @@ impl CalStoreFacade for DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Hash> {
+        self.authz.check(Verb::Supersede, self.write_ns(fields))?;
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(
             grain_type,
@@ -1213,8 +1265,17 @@ impl CalStoreFacade for DejaDbFacade {
 
     /// `FORGET <hash>` — tombstone a single grain by content address. Only
     /// ever hits the session store; mounts are read-only by construction.
-    /// Gated upstream by `CalExecutorConfig::allow_destructive_ops`.
+    /// Capped upstream by `CalExecutorConfig::allow_destructive_ops`; the
+    /// session's `delete` grant on the grain's own namespace is the
+    /// authorization.
     fn cal_delete(&self, hash: &Hash) -> Result<()> {
+        if !self.authz.is_owner() {
+            let ns = {
+                let g = self.store.lock().unwrap().get(hash)?;
+                g.get_str("namespace").unwrap_or("shared").to_string()
+            };
+            self.authz.check(Verb::Delete, &ns)?;
+        }
         self.store.lock().unwrap().forget(hash)
     }
 }

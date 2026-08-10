@@ -367,6 +367,14 @@ pub enum CalError {
     #[error("CAL-E120: Invalid JSON+CAL: {detail}")]
     InvalidJsonCal { detail: String, span: Option<Span> },
 
+    // ── Authorization (CAL-E121) ───────────────────────────────────────
+    /// CAL-E121 — The session's grants don't cover this statement. Carries
+    /// the store's `AUT-Ennn` detail verbatim: the refused verb, namespace,
+    /// and principal are the caller's own session facts and exactly what a
+    /// granting admin needs to fix it.
+    #[error("CAL-E121: Not authorized: {detail}")]
+    NotAuthorized { detail: String, span: Option<Span> },
+
     /// CAL-E070 — Query input contains invalid UTF-8 byte sequences or
     /// bidi-override characters. HTTP body extractors typically reject
     /// non-UTF-8 upstream; this variant covers in-band rejection
@@ -660,6 +668,7 @@ impl CalError {
             Self::TooManyTemplates { .. } => "CAL-E118",
             Self::CannotExtendData { .. } => "CAL-E119",
             Self::InvalidJsonCal { .. } => "CAL-E120",
+            Self::NotAuthorized { .. } => "CAL-E121",
             Self::InvalidUtf8 { .. } => "CAL-E070",
             Self::TemplateTooLarge { .. } => "CAL-E040",
             Self::TemplateNestedEach { .. } => "CAL-E041",
@@ -738,6 +747,7 @@ impl CalError {
             | Self::CoalesceTooManyBranches { span, .. }
             | Self::AssembleTimeout { span, .. }
             | Self::InvalidJsonCal { span, .. }
+            | Self::NotAuthorized { span, .. }
             | Self::TemplateTooLarge { span, .. }
             | Self::TemplateNestedEach { span, .. }
             | Self::TemplateUnknownVariable { span, .. }
@@ -1033,6 +1043,7 @@ impl CalError {
                 span: s,
             },
             Self::InvalidJsonCal { detail, .. } => Self::InvalidJsonCal { detail, span: s },
+            Self::NotAuthorized { detail, .. } => Self::NotAuthorized { detail, span: s },
             Self::TemplateTooLarge { size, max, .. } => {
                 Self::TemplateTooLarge { size, max, span: s }
             }
@@ -1215,6 +1226,13 @@ impl CalError {
             }
             Self::InvalidJsonCal { .. } => {
                 format!("{}: invalid JSON+CAL input{}", code, span_suffix)
+            }
+            Self::NotAuthorized { detail, .. } => {
+                // Deliberately unredacted: the detail names the caller's own
+                // principal, the refused verb, and the namespace — no
+                // internals, and it is the on-ramp to the GRANT that fixes
+                // it.
+                format!("{}: not authorized: {}{}", code, detail, span_suffix)
             }
             Self::TemplateSyntaxError { .. } => {
                 format!("{}: template syntax error{}", code, span_suffix)
@@ -1821,6 +1839,13 @@ mod tests {
                     span: None,
                 },
                 "CAL-E120",
+            ),
+            (
+                CalError::NotAuthorized {
+                    detail: "AUT-E001: principal agent:bot lacks write on namespace \"caller\"".into(),
+                    span: None,
+                },
+                "CAL-E121",
             ),
             (
                 CalError::AssembleTimeout {

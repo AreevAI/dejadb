@@ -18,7 +18,7 @@ use dejadb_core::error::Hash;
 use dejadb_store::{Axis, Capture, Direction};
 use dejadb_loop::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
-use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions};
 
 pub const SERVER_NAME: &str = "dejadb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -466,7 +466,9 @@ impl McpServer {
                         .and_then(Value::as_str)
                         .ok_or("dejadb_recommendations action requires 'because'")?;
                     let actor = "agent:mcp";
-                    let scopes = ScopeSet::all();
+                    // Scopes derive from the session's grants (an owner
+                    // session — today's only MCP mode — holds all of them).
+                    let scopes = dejadb_loop::scopes_for(self.facade.authz());
                     let mut sub = BorrowedSubstrate::new(&self.facade);
                     let now = now_ms();
                     match action {

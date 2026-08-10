@@ -1359,6 +1359,11 @@ impl CalExecutor {
                     )
                     .map_err(|e| {
                         let s = e.to_string();
+                        // An authorization refusal is neither a bad name nor
+                        // bad syntax — surface it as itself.
+                        if s.contains("AUT-E") {
+                            return CalError::NotAuthorized { detail: s, span: None };
+                        }
                         // If the inner error is already a CAL error about template
                         // validation (unknown variable, syntax, etc.), surface it
                         // directly instead of wrapping it as TemplateInvalidName.
@@ -1426,9 +1431,13 @@ impl CalExecutor {
                         def.description.as_deref(),
                         &def.params,
                     )
-                    .map_err(|e| CalError::InvalidQueryBody {
-                        detail: e.to_string(),
-                        span: None,
+                    .map_err(|e| {
+                        let detail = e.to_string();
+                        if detail.contains("AUT-E") {
+                            CalError::NotAuthorized { detail, span: None }
+                        } else {
+                            CalError::InvalidQueryBody { detail, span: None }
+                        }
                     })?;
                 Ok(CalResultPayload::QueryDefined {
                     name: def.name.clone(),

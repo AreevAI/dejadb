@@ -12,7 +12,7 @@ use std::time::Duration;
 use dejadb_cal::{CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_loop::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Value};
-use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, RecStatus, RunOptions};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 
@@ -738,8 +738,10 @@ impl UiServer {
         }
     }
 
-    /// The console is one principal (§5.7); authenticated requests hold all
-    /// scopes (local root of trust), actor `user:console` unless overridden.
+    /// The console session's scopes derive from its grants (an owner
+    /// session — today's only mode — holds all of them); actor
+    /// `user:console` unless overridden, observer derived from the actor
+    /// label, never from request text.
     fn loop_review(&self, body: &[u8]) -> (&'static str, &'static str, Vec<u8>) {
         let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let hash = req.get("hash").and_then(Value::as_str).unwrap_or("");
@@ -751,8 +753,10 @@ impl UiServer {
             Decision::Approve
         };
         let mut sub = BorrowedSubstrate::new(&self.facade);
+        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().review(
-            &mut sub, hash, decision, actor, ObserverType::Human, &ScopeSet::all(), because, now_ms(),
+            &mut sub, hash, decision, actor, observer, &scopes, because, now_ms(),
         ) {
             Ok(()) => ok_json(json!({"ok": true})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
@@ -766,8 +770,10 @@ impl UiServer {
         let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
         let allow_destructive = req.get("allow_destructive").and_then(Value::as_bool).unwrap_or(false);
         let mut sub = BorrowedSubstrate::new(&self.facade);
+        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().apply(
-            &mut sub, hash, actor, ObserverType::Human, &ScopeSet::all(), because, allow_destructive, now_ms(),
+            &mut sub, hash, actor, observer, &scopes, because, allow_destructive, now_ms(),
         ) {
             Ok(applied) => ok_json(json!({"ok": true, "rollbackable": applied.rollbackable})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
@@ -780,8 +786,10 @@ impl UiServer {
         let because = req.get("because").and_then(Value::as_str).unwrap_or("");
         let actor = req.get("actor").and_then(Value::as_str).unwrap_or("user:console");
         let mut sub = BorrowedSubstrate::new(&self.facade);
+        let scopes = dejadb_loop::scopes_for(self.facade.authz());
+        let observer = dejadb_loop::observer_for_principal(actor);
         match self.engine().rollback(
-            &mut sub, hash, actor, ObserverType::Human, &ScopeSet::all(), because, now_ms(),
+            &mut sub, hash, actor, observer, &scopes, because, now_ms(),
         ) {
             Ok(()) => ok_json(json!({"ok": true})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
@@ -801,7 +809,7 @@ impl UiServer {
         // The update reads the same body; the extra `analyzer_id` key is ignored.
         let update: deja_loop::AnalyzerConfigUpdate = serde_json::from_slice(body).unwrap_or_default();
         let mut sub = BorrowedSubstrate::new(&self.facade);
-        match self.engine().set_analyzer_config(&mut sub, &id, update, &ScopeSet::all()) {
+        match self.engine().set_analyzer_config(&mut sub, &id, update, &dejadb_loop::scopes_for(self.facade.authz())) {
             Ok(cfg) => ok_json(json!({"ok": true, "config": cfg})),
             Err(e) => ok_json(json!({"ok": false, "error": e.to_string(), "code": e.code()})),
         }

@@ -131,6 +131,7 @@ and are the source of truth. Ranges:
 | `CAL-E110`–`E116` | Multi-format, user vars, scope, LLM-dependent options |
 | `CAL-E117`–`E119` | Template limits and inheritance (OMS CAL §10.7–§10.8) |
 | `CAL-E120` | Invalid JSON+CAL |
+| `CAL-E121` | Not authorized — the session's grants don't cover this statement (carries the `AUT-Ennn` detail) |
 | `CAL-W001`–`W012` | Warnings (unknown relation, deprecated operator, `{{#each}}` cap, bounded `CONTRADICTIONS` scan, …) |
 | `CAL-W013` | `WITH auto_relate` accepted but not implemented — no relations are inferred |
 | `CAL-W014` | A `WITH` option parsed and ran but cannot change the result on this statement (e.g. `score_breakdown` on `RECALL`) |
