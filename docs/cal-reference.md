@@ -49,7 +49,9 @@ Comments start with `--` and run to end of line.
 ## 2. Grain types in CAL
 
 Statements name grain types by their **plural** form for reads and **singular**
-form for writes. The names are case-insensitive.
+form for writes. The names are case-insensitive. A `—` in the write column
+means the type is **engine-authored**: no host surface (CAL, CLI, bindings,
+MCP) can create one, by design.
 
 | Plural (read) | Singular (write) |
 |---|---|
@@ -291,6 +293,14 @@ Link grains explicitly via `related_to`, or widen at read time with
 There is also an `ADD workflow "name" ... graph ... BIND ... REASON "..."`
 form for DAG-shaped Workflow grains.
 
+> **Recording tool calls: use `record_tool_call`, not raw `ADD tool`.**
+> Grains are content-addressed, so byte-identical `ADD tool` writes collapse
+> to one grain — five identical retries of a failing call become a single
+> stored occurrence, which starves exactly the evidence
+> `loop.tool_failure` clusters on. The host API (`record_tool_call` on
+> every binding) stamps each call's own identity (`tool_call_id`) so retries
+> stay distinct; raw `ADD tool` does not.
+
 #### `SUPERSEDE` — evolve a grain
 
 ```
@@ -447,6 +457,13 @@ the same list as the table above and as `DESCRIBE`'s `pipeline_stages`.
 ---
 
 ## 5. `WITH` options
+
+> **Parsing is not support.** The grammar accepts the full CAL spec; what a
+> given host *executes* is narrower. An accepted-but-inert option never
+> changes results silently — it emits a `CAL-Wnnn` warning (returned under
+> `warnings` on every surface, bindings included), and `DESCRIBE
+> CAPABILITIES` reports exactly what the host supports before you rely on
+> it.
 
 `WITH` options tune recall behavior. There are roughly three dozen; a
 representative selection:

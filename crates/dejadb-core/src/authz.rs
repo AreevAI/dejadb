@@ -1,0 +1,473 @@
+//! Authorization primitives — principals, verbs, grants, and the host-side
+//! credential map.
+//!
+//! The model (design of record: `docs/cal-all-you-need-proposal.md`, D2–D4):
+//! *policy* (who may do what) lives **in the memory file** as grant grains,
+//! scoped per namespace; *credentials* (who is this caller) live host-side in
+//! a credential map that holds **no policy and no raw secrets** — tokens are
+//! referenced by SHA-256 or by env-var name. A memory with no grant grains
+//! grants nothing to anyone but the owner session (fail closed); the owner
+//! session — a local open with no principal asserted — is the implicit
+//! superuser, so the single-user path never meets any of this.
+//!
+//! This module is the shared vocabulary only. Building an [`AuthzSet`] from a
+//! file's grant grains is the store's job; enforcing it at dispatch is the
+//! facade's and the surfaces'.
+
+use crate::error::{DejaDbError, Result};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fmt;
+
+/// The reserved namespace grant grains live in. The OMS 1.6 spec draft
+/// (§12.6) is the source of truth for this name — it follows the spec's
+/// `agent:identity` / `agent:recommendations` reserved-namespace precedent.
+pub const AUTHZ_NS: &str = "agent:authz";
+/// Relation carried by a grant grain (OMS `PERMISSION` category).
+pub const REL_PERMITS: &str = "mg:permits";
+
+/// One operation class — the unit of granting, `GRANT SELECT`-style.
+///
+/// The string forms (`read`, `loop.review`, …) are the wire/CAL vocabulary;
+/// they appear in grant-grain objects and eventually in `GRANT` statements,
+/// so they are frozen once the spec ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verb {
+    Read,
+    Write,
+    Supersede,
+    Delete,
+    Erase,
+    LoopRun,
+    LoopReview,
+    LoopApply,
+    Admin,
+}
+
+impl Verb {
+    /// Every verb, in canonical display order.
+    pub const ALL: [Verb; 9] = [
+        Verb::Read,
+        Verb::Write,
+        Verb::Supersede,
+        Verb::Delete,
+        Verb::Erase,
+        Verb::LoopRun,
+        Verb::LoopReview,
+        Verb::LoopApply,
+        Verb::Admin,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verb::Read => "read",
+            Verb::Write => "write",
+            Verb::Supersede => "supersede",
+            Verb::Delete => "delete",
+            Verb::Erase => "erase",
+            Verb::LoopRun => "loop.run",
+            Verb::LoopReview => "loop.review",
+            Verb::LoopApply => "loop.apply",
+            Verb::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Verb> {
+        match s {
+            "read" => Ok(Verb::Read),
+            "write" => Ok(Verb::Write),
+            "supersede" => Ok(Verb::Supersede),
+            "delete" => Ok(Verb::Delete),
+            "erase" => Ok(Verb::Erase),
+            "loop.run" => Ok(Verb::LoopRun),
+            "loop.review" => Ok(Verb::LoopReview),
+            "loop.apply" => Ok(Verb::LoopApply),
+            "admin" => Ok(Verb::Admin),
+            other => Err(DejaDbError::Validation(format!(
+                "unknown verb {other:?} — one of: read, write, supersede, delete, erase, \
+                 loop.run, loop.review, loop.apply, admin"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for Verb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A set of verbs allowed on a set of namespaces, inside one memory.
+/// The memory axis is implicit — a grant lives in the file it governs (D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub verbs: Vec<Verb>,
+    /// Governed namespaces. `["*"]` (or empty) = every namespace.
+    pub namespaces: Vec<String>,
+}
+
+impl Grant {
+    pub fn covers(&self, verb: Verb, ns: &str) -> bool {
+        self.verbs.contains(&verb)
+            && (self.namespaces.is_empty()
+                || self.namespaces.iter().any(|n| n == "*" || n == ns))
+    }
+
+    /// The canonical object string a grant grain carries:
+    /// `read,write ON caller,shared` / `delete ON *`. Normative per OMS 1.6
+    /// §12.6: lowercase, comma-separated, **lexicographically sorted** verbs
+    /// and namespaces, duplicates dropped — so two implementations writing
+    /// the same grant produce the same content address.
+    pub fn to_object_string(&self) -> String {
+        let mut verbs: Vec<&str> = self.verbs.iter().map(Verb::as_str).collect();
+        verbs.sort_unstable();
+        verbs.dedup();
+        let ns = if self.namespaces.is_empty() {
+            "*".to_string()
+        } else {
+            let mut ns: Vec<&str> = self.namespaces.iter().map(String::as_str).collect();
+            ns.sort_unstable();
+            ns.dedup();
+            ns.join(",")
+        };
+        format!("{} ON {}", verbs.join(","), ns)
+    }
+
+    pub fn from_object_string(s: &str) -> Result<Grant> {
+        let (verbs_part, ns_part) = s.split_once(" ON ").ok_or_else(|| {
+            DejaDbError::Validation(format!(
+                "malformed grant object {s:?} — expected \"<verbs> ON <namespaces>\""
+            ))
+        })?;
+        let mut verbs = Vec::new();
+        for v in verbs_part.split(',') {
+            let v = Verb::parse(v.trim())?;
+            if !verbs.contains(&v) {
+                verbs.push(v);
+            }
+        }
+        if verbs.is_empty() {
+            return Err(DejaDbError::Validation(format!(
+                "grant object {s:?} names no verbs"
+            )));
+        }
+        let mut namespaces = Vec::new();
+        for n in ns_part.split(',') {
+            let n = n.trim();
+            if n.is_empty() {
+                return Err(DejaDbError::Validation(format!(
+                    "grant object {s:?} has an empty namespace"
+                )));
+            }
+            if !namespaces.iter().any(|x| x == n) {
+                namespaces.push(n.to_string());
+            }
+        }
+        Ok(Grant { verbs, namespaces })
+    }
+}
+
+/// The resolved rights of one session: a principal plus the grants that
+/// cover it. Every dispatch layer asks the same question:
+/// [`AuthzSet::check`].
+#[derive(Debug, Clone)]
+pub struct AuthzSet {
+    principal: String,
+    owner: bool,
+    grants: Vec<Grant>,
+}
+
+impl AuthzSet {
+    /// The implicit-superuser session: a local open with no principal
+    /// asserted (`root@localhost`). Every verb on every namespace.
+    pub fn owner(principal: impl Into<String>) -> Self {
+        AuthzSet {
+            principal: principal.into(),
+            owner: true,
+            grants: Vec::new(),
+        }
+    }
+
+    /// A restricted session: only what the grants cover. Zero grants =
+    /// nothing (fail closed).
+    pub fn restricted(principal: impl Into<String>, grants: Vec<Grant>) -> Self {
+        AuthzSet {
+            principal: principal.into(),
+            owner: false,
+            grants,
+        }
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    pub fn is_owner(&self) -> bool {
+        self.owner
+    }
+
+    pub fn allows(&self, verb: Verb, ns: &str) -> bool {
+        self.owner || self.grants.iter().any(|g| g.covers(verb, ns))
+    }
+
+    /// The one enforcement question. The refusal names the verb, the
+    /// resource, and the principal — the pieces a granting admin needs.
+    /// (Once `GRANT` parses, the message will also spell the statement that
+    /// fixes it — not before, to avoid pointing at unshipped syntax.)
+    pub fn check(&self, verb: Verb, ns: &str) -> Result<()> {
+        if self.allows(verb, ns) {
+            return Ok(());
+        }
+        Err(DejaDbError::AuthzDenied(format!(
+            "principal {} lacks {verb} on namespace {ns:?}",
+            self.principal
+        )))
+    }
+}
+
+/// The host-side credential map (`deja-auth.json`): tokens → principal
+/// names, nothing else. No verbs, no namespaces, no raw secrets — a token is
+/// referenced by its SHA-256 or by the env var that holds it, so the file is
+/// inert if stolen or synced.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialMap {
+    pub version: u32,
+    #[serde(default)]
+    pub tokens: Vec<CredentialEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialEntry {
+    /// Lowercase hex SHA-256 of the bearer token.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Name of the environment variable holding the bearer token.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// The principal this credential authenticates as.
+    pub principal: String,
+}
+
+impl CredentialMap {
+    /// Parse and validate. Fail closed: unknown keys, a bad version, an
+    /// entry with both or neither credential form, or a malformed digest all
+    /// refuse the whole map.
+    pub fn from_json(s: &str) -> Result<CredentialMap> {
+        let map: CredentialMap = serde_json::from_str(s)
+            .map_err(|e| DejaDbError::AuthzConfigInvalid(format!("credential map: {e}")))?;
+        if map.version != 1 {
+            return Err(DejaDbError::AuthzConfigInvalid(format!(
+                "credential map: unsupported version {} (expected 1)",
+                map.version
+            )));
+        }
+        for (i, t) in map.tokens.iter().enumerate() {
+            if t.principal.trim().is_empty() {
+                return Err(DejaDbError::AuthzConfigInvalid(format!(
+                    "credential map: entry {i} has an empty principal"
+                )));
+            }
+            match (&t.sha256, &t.env) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(DejaDbError::AuthzConfigInvalid(format!(
+                        "credential map: entry {i} ({}) must have exactly one of \
+                         \"sha256\" or \"env\"",
+                        t.principal
+                    )));
+                }
+                (Some(h), None) => {
+                    if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(DejaDbError::AuthzConfigInvalid(format!(
+                            "credential map: entry {i} ({}) sha256 must be 64 hex chars",
+                            t.principal
+                        )));
+                    }
+                }
+                (None, Some(_)) => {}
+            }
+        }
+        Ok(map)
+    }
+
+    /// Resolve a presented bearer token to its principal. The error carries
+    /// no part of the token — a refused secret must not leak into logs.
+    pub fn resolve(&self, presented: &str) -> Result<&str> {
+        let digest = hex::encode(Sha256::digest(presented.as_bytes()));
+        for t in &self.tokens {
+            let matched = match (&t.sha256, &t.env) {
+                (Some(h), None) => h.eq_ignore_ascii_case(&digest),
+                (None, Some(var)) => {
+                    std::env::var(var).is_ok_and(|v| v == presented)
+                }
+                _ => false,
+            };
+            if matched {
+                return Ok(&t.principal);
+            }
+        }
+        Err(DejaDbError::AuthzTokenUnrecognized)
+    }
+
+    /// Whether any credential authenticates as this principal — surfaces
+    /// that require a *known* principal name use this to refuse typos early.
+    pub fn knows_principal(&self, principal: &str) -> Result<()> {
+        if self.tokens.iter().any(|t| t.principal == principal) {
+            return Ok(());
+        }
+        Err(DejaDbError::AuthzUnknownPrincipal(principal.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbs_roundtrip_their_string_forms() {
+        for v in Verb::ALL {
+            assert_eq!(Verb::parse(v.as_str()).unwrap(), v);
+        }
+        assert!(Verb::parse("loop-run").is_err());
+        assert!(Verb::parse("").is_err());
+    }
+
+    #[test]
+    fn grant_object_string_roundtrips() {
+        let g = Grant {
+            verbs: vec![Verb::Read, Verb::Write],
+            namespaces: vec!["caller".into(), "shared".into()],
+        };
+        let s = g.to_object_string();
+        assert_eq!(s, "read,write ON caller,shared");
+        assert_eq!(Grant::from_object_string(&s).unwrap(), g);
+
+        let all = Grant { verbs: vec![Verb::Erase], namespaces: vec!["*".into()] };
+        assert_eq!(all.to_object_string(), "erase ON *");
+        assert_eq!(
+            Grant::from_object_string("erase ON *").unwrap().namespaces,
+            vec!["*".to_string()]
+        );
+
+        assert!(Grant::from_object_string("read caller").is_err());
+        assert!(Grant::from_object_string(" ON x").is_err());
+        assert!(Grant::from_object_string("read ON ").is_err());
+    }
+
+    #[test]
+    fn owner_allows_everything_restricted_fails_closed() {
+        let owner = AuthzSet::owner("user:local");
+        for v in Verb::ALL {
+            assert!(owner.check(v, "any-ns").is_ok());
+        }
+
+        let none = AuthzSet::restricted("agent:bot", Vec::new());
+        for v in Verb::ALL {
+            assert!(none.check(v, "caller").is_err(), "{v} must be refused");
+        }
+    }
+
+    #[test]
+    fn grants_cover_exactly_what_they_say() {
+        let set = AuthzSet::restricted(
+            "agent:bot",
+            vec![Grant {
+                verbs: vec![Verb::Read, Verb::Write],
+                namespaces: vec!["caller".into()],
+            }],
+        );
+        assert!(set.check(Verb::Read, "caller").is_ok());
+        assert!(set.check(Verb::Write, "caller").is_ok());
+        assert!(set.check(Verb::Write, "shared").is_err());
+        assert!(set.check(Verb::Delete, "caller").is_err());
+
+        let star = AuthzSet::restricted(
+            "job:sweep",
+            vec![Grant { verbs: vec![Verb::Erase], namespaces: vec!["*".into()] }],
+        );
+        assert!(star.check(Verb::Erase, "anything").is_ok());
+    }
+
+    #[test]
+    fn refusal_names_verb_namespace_and_principal_with_the_aut_code() {
+        let set = AuthzSet::restricted("agent:bot", Vec::new());
+        let err = set.check(Verb::Delete, "caller").unwrap_err();
+        assert_eq!(err.code(), "AUT-E001");
+        let msg = err.to_string();
+        for needle in ["delete", "caller", "agent:bot"] {
+            assert!(msg.contains(needle), "{msg:?} must name {needle}");
+        }
+    }
+
+    const MAP: &str = r#"{
+        "version": 1,
+        "tokens": [
+            { "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+              "principal": "user:anna" },
+            { "env": "DEJA_TEST_BOT_TOKEN", "principal": "agent:bot" }
+        ]
+    }"#;
+
+    #[test]
+    fn credential_map_loads_and_resolves_by_sha256() {
+        let map = CredentialMap::from_json(MAP).unwrap();
+        // sha256("test") — the digest above.
+        assert_eq!(map.resolve("test").unwrap(), "user:anna");
+        assert!(map.knows_principal("user:anna").is_ok());
+        assert_eq!(
+            map.knows_principal("user:nobody").unwrap_err().code(),
+            "AUT-E002"
+        );
+    }
+
+    #[test]
+    fn credential_map_resolves_by_env_var() {
+        let map = CredentialMap::from_json(MAP).unwrap();
+        // Unique var name per test binary run; set before resolve.
+        std::env::set_var("DEJA_TEST_BOT_TOKEN", "s3cret");
+        assert_eq!(map.resolve("s3cret").unwrap(), "agent:bot");
+        std::env::remove_var("DEJA_TEST_BOT_TOKEN");
+    }
+
+    #[test]
+    fn unrecognized_token_error_never_echoes_the_secret() {
+        let map = CredentialMap::from_json(MAP).unwrap();
+        let err = map.resolve("super-secret-value").unwrap_err();
+        assert_eq!(err.code(), "AUT-E004");
+        assert!(!err.to_string().contains("super-secret-value"));
+    }
+
+    #[test]
+    fn credential_map_fails_closed() {
+        // Unknown key.
+        assert_eq!(
+            CredentialMap::from_json(r#"{"version":1,"tokens":[],"roles":{}}"#)
+                .unwrap_err()
+                .code(),
+            "AUT-E003"
+        );
+        // Wrong version.
+        assert!(CredentialMap::from_json(r#"{"version":2,"tokens":[]}"#).is_err());
+        // Both credential forms.
+        assert!(CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"sha256":"00","env":"X","principal":"p"}]}"#
+        )
+        .is_err());
+        // Neither form.
+        assert!(CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"principal":"p"}]}"#
+        )
+        .is_err());
+        // Malformed digest.
+        assert!(CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"sha256":"zz","principal":"p"}]}"#
+        )
+        .is_err());
+        // Empty principal.
+        assert!(CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"env":"X","principal":"  "}]}"#
+        )
+        .is_err());
+    }
+}

@@ -841,23 +841,16 @@ fn ok_json(v: Value) -> (&'static str, &'static str, Vec<u8>) {
     ("200 OK", "application/json", v.to_string().into_bytes())
 }
 
-/// True when a `POST /api/cal` body is a read-only statement — checked by the
-/// *leading* keyword only (CAL is one statement per query; BATCH and the write
-/// verbs are treated as writes). Conservative and fail-closed: anything not
-/// clearly a read requires a token.
+/// True when a `POST /api/cal` body is a read-only statement. Classification
+/// is delegated to `dejadb-cal`'s exhaustive [`dejadb_cal::classify`] module —
+/// the single source of truth — so grammar growth cannot desynchronize this
+/// gate (a keyword sniff lived here before and would have silently
+/// misclassified any new statement). Fail closed: unparseable text is not
+/// read-only.
 fn cal_body_is_read_only(body: &[u8]) -> bool {
     let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let q = req.get("query").and_then(Value::as_str).unwrap_or("");
-    let first = q
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    matches!(
-        first.as_str(),
-        "RECALL" | "ASSEMBLE" | "EXPLAIN" | "HISTORY" | "EXISTS" | "DESCRIBE" | "COUNT"
-    )
+    dejadb_cal::classify::query_is_read_only(q)
 }
 
 fn status_from_str(s: &str) -> Option<RecStatus> {

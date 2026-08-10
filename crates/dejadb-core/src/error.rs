@@ -92,6 +92,15 @@ pub enum DejaDbError {
     AccumulateInternal(String),
     AccumulateBackpressureRejected,
     Internal(String),
+    /// A verb the session's grants don't cover (`authz::AuthzSet::check`).
+    AuthzDenied(String),
+    /// A principal name no credential authenticates.
+    AuthzUnknownPrincipal(String),
+    /// The credential map failed to load or validate (fail closed).
+    AuthzConfigInvalid(String),
+    /// A presented bearer token matched no credential. Deliberately carries
+    /// no payload: a refused secret must never reach a log line.
+    AuthzTokenUnrecognized,
 }
 
 impl DejaDbError {
@@ -117,6 +126,10 @@ impl DejaDbError {
             Self::AccumulateInternal(_) => "CAL-E084",
             Self::AccumulateBackpressureRejected => "CAL-E085",
             Self::Internal(_) => "SYS-E001",
+            Self::AuthzDenied(_) => "AUT-E001",
+            Self::AuthzUnknownPrincipal(_) => "AUT-E002",
+            Self::AuthzConfigInvalid(_) => "AUT-E003",
+            Self::AuthzTokenUnrecognized => "AUT-E004",
         }
     }
 }
@@ -139,6 +152,10 @@ impl std::fmt::Display for DejaDbError {
             Self::AccumulateInternal(m) => write!(f, "CAL-E084: ACCUMULATE internal failure: {m}"),
             Self::AccumulateBackpressureRejected => write!(f, "CAL-E085: ACCUMULATE backpressure: inflight cap exceeded"),
             Self::Internal(m) => write!(f, "SYS-E001: internal error: {m}"),
+            Self::AuthzDenied(m) => write!(f, "AUT-E001: authorization denied: {m}"),
+            Self::AuthzUnknownPrincipal(p) => write!(f, "AUT-E002: unknown principal: {p}"),
+            Self::AuthzConfigInvalid(m) => write!(f, "AUT-E003: {m}"),
+            Self::AuthzTokenUnrecognized => write!(f, "AUT-E004: token not recognized"),
         }
     }
 }
@@ -168,6 +185,10 @@ mod error_code_tests {
             DejaDbError::AccumulateInternal("x".into()),
             DejaDbError::AccumulateBackpressureRejected,
             DejaDbError::Internal("x".into()),
+            DejaDbError::AuthzDenied("x".into()),
+            DejaDbError::AuthzUnknownPrincipal("x".into()),
+            DejaDbError::AuthzConfigInvalid("x".into()),
+            DejaDbError::AuthzTokenUnrecognized,
         ]
     }
 
