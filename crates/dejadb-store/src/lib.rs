@@ -155,8 +155,16 @@ enum ErasureSelector {
     /// resolved INSIDE the erasure transaction, after the serialization
     /// point.
     Identity { ns_id: i64, subject: String, text_mentions: bool },
-    /// Everything older than the cutoff, optionally scoped.
-    OlderThan { ns_id: Option<i64>, cutoff_ms: i64, gtype: Option<i64> },
+    /// Everything older than the cutoff, optionally scoped. `limit` bounds
+    /// the sweep to the oldest N grains — CAL's `PURGE … LIMIT n`, which
+    /// exists so an operator can pilot a retention rule on a reviewable
+    /// batch instead of committing to the whole namespace.
+    OlderThan {
+        ns_id: Option<i64>,
+        cutoff_ms: i64,
+        gtype: Option<i64>,
+        limit: Option<usize>,
+    },
 }
 
 /// Options for [`DejaDB::forget_subject_with`].
@@ -3405,6 +3413,24 @@ impl DejaDB {
         cutoff_ms: i64,
         gtype: Option<dejadb_core::types::GrainType>,
     ) -> Result<ErasureReport> {
+        self.forget_older_than_capped(ns, cutoff_ms, gtype, None)
+    }
+
+    /// The same sweep bounded to at most `limit` grains, **oldest first** —
+    /// what CAL's `PURGE OLDER THAN … LIMIT n` means. A bounded sweep is how
+    /// an operator pilots a retention rule: erase a reviewable batch, check
+    /// the audit record, then widen. An ignored bound is not a smaller
+    /// erasure, it is the whole namespace.
+    pub fn forget_older_than_capped(
+        &mut self,
+        ns: Option<&str>,
+        cutoff_ms: i64,
+        gtype: Option<dejadb_core::types::GrainType>,
+        limit: Option<usize>,
+    ) -> Result<ErasureReport> {
+        if limit == Some(0) {
+            return Ok(ErasureReport::default());
+        }
         let ns_id = match ns {
             Some(n) => match self.term_lookup(n)? {
                 Some(x) => Some(x),
@@ -3413,7 +3439,10 @@ impl DejaDB {
             None => None,
         };
         let gt = gtype.map(|g| g as u8 as i64);
-        self.erase_where(ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype: gt }, None)
+        self.erase_where(
+            ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype: gt, limit },
+            None,
+        )
     }
 
     /// What the identity selector matched: dictionary ids, the matched
@@ -3573,7 +3602,7 @@ impl DejaDB {
                     out.identity_names = sel.identity_names;
                     sel.seqs
                 }
-                ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype } => {
+                ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype, limit } => {
                     let mut sql = String::from("SELECT seq FROM grains WHERE created_at < ?1");
                     let mut params = vec![pi(*cutoff_ms)];
                     if let Some(n) = ns_id {
@@ -3583,6 +3612,14 @@ impl DejaDB {
                     if let Some(g) = gtype {
                         sql.push_str(if ns_id.is_some() { " AND gtype = ?3" } else { " AND gtype = ?2" });
                         params.push(pi(*g));
+                    }
+                    // A bounded sweep takes the OLDEST matches, so repeating
+                    // it walks forward through the backlog deterministically
+                    // instead of re-rolling an arbitrary slice. The bound is
+                    // a Rust integer, never text — safe to inline, which
+                    // keeps the hand-numbered placeholders above intact.
+                    if let Some(n) = limit {
+                        sql.push_str(&format!(" ORDER BY created_at ASC, seq ASC LIMIT {n}"));
                     }
                     self.db.query(&sql, params)?.iter().filter_map(|r| r.i64(0)).collect()
                 }

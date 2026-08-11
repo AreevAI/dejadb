@@ -95,7 +95,11 @@ export declare class DejaDb {
   latest(subject: string, relation: string, ns?: string | undefined | null): Promise<string | null>
   /** Supersede old_hash with a new version (append-only evolution). */
   supersede(oldHash: string, grainType: string, fieldsJson: string, ns?: string | undefined | null): Promise<string>
-  /** Erase a grain from the hot store (tombstoned). Host-level op. */
+  /**
+   * Erase a grain from the hot store (tombstoned). Host-level op.
+   * Routed through the facade so it carries the same `delete` check and
+   * Tier-2 audit record as CAL's `FORGET <hash>`.
+   */
   forget(hash: string): Promise<void>
   /**
    * Right-to-erasure for one identity: erase every grain holding a

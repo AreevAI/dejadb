@@ -244,3 +244,100 @@ fn restrictive_caps_still_win_over_grants() {
         .unwrap_or(0);
     assert_eq!(n, 1, "capped FORGET must not tombstone");
 }
+
+/// SUPERSEDE authorizes the TARGET's namespace, not the replacement's.
+/// `SET namespace` names where the new value lands; letting it decide the
+/// check would let a principal rewrite any grain it can name simply by
+/// declaring the replacement into a namespace it does hold.
+#[test]
+fn supersede_is_gated_on_the_targets_namespace_not_the_replacements() {
+    let dir = TempDir::new().unwrap();
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+
+    // Owner seeds a grain in `hr` — a namespace the editor has no grant on.
+    let f = facade_for(&dir, None);
+    run(
+        &ex,
+        &f,
+        r#"ADD fact SET subject = "alice" SET relation = "salary" SET object = "200k" SET namespace = "hr" REASON "t""#,
+    )
+    .unwrap();
+    let hr_hash = {
+        let hits = ex
+            .execute(r#"RECALL facts WHERE subject = "alice" AND namespace = "hr""#, &f)
+            .unwrap();
+        serde_json::to_value(hits.payload_json().unwrap()).unwrap()["grains"][0]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let store = f.into_inner();
+
+    // The editor holds `supersede ON caller` only.
+    let f = DejaDbFacade::with_session(store, Some("caller".to_string()), None)
+        .with_principal("user:editor")
+        .unwrap();
+    assert_refused(
+        run(
+            &ex,
+            &f,
+            &format!(
+                r#"SUPERSEDE sha256:{hr_hash} SET object = "1" SET namespace = "caller" BECAUSE "laundered""#
+            ),
+        ),
+        "SUPERSEDE of an hr grain via a caller-namespaced replacement",
+    );
+
+    // The HR grain is untouched: still the live head in its own namespace.
+    // Checked as the owner — the editor cannot even read `hr`.
+    let store = f.into_inner();
+    let f = DejaDbFacade::with_session(store, Some("caller".to_string()), None);
+    let hits = ex
+        .execute(r#"RECALL facts WHERE subject = "alice" AND namespace = "hr""#, &f)
+        .unwrap();
+    let v = serde_json::to_value(hits.payload_json().unwrap()).unwrap();
+    assert_eq!(v["grains"][0]["hash"].as_str().unwrap(), hr_hash);
+}
+
+/// `PURGE … LIMIT n` must bound the sweep. An ignored bound is not a smaller
+/// erasure — it is the whole namespace, irreversibly.
+#[test]
+fn purge_honors_its_limit() {
+    let dir = TempDir::new().unwrap();
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+    let f = facade_for(&dir, None); // owner: the cap and grants are not what's under test
+
+    for i in 0..5 {
+        run(
+            &ex,
+            &f,
+            &format!(
+                r#"ADD fact SET subject = "s{i}" SET relation = "r" SET object = "o" SET namespace = "caller" SET created_at = {} REASON "t""#,
+                1_000 + i
+            ),
+        )
+        .unwrap();
+    }
+
+    let res = ex
+        .execute(
+            r#"PURGE OLDER THAN 1d IN "caller" LIMIT 2 BECAUSE "retention pilot""#,
+            &f,
+        )
+        .unwrap();
+    let v = serde_json::to_value(res.payload_json().unwrap()).unwrap();
+    assert_eq!(
+        v["count"].as_u64().unwrap(),
+        2,
+        "LIMIT 2 must erase two grains, not the namespace: {v}"
+    );
+
+    let hits = ex
+        .execute(r#"RECALL facts WHERE namespace = "caller""#, &f)
+        .unwrap();
+    let n = serde_json::to_value(hits.payload_json().unwrap()).unwrap()["grains"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(n, 3, "three grains must survive a LIMIT 2 sweep");
+}

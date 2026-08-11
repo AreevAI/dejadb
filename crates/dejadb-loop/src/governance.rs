@@ -78,6 +78,15 @@ impl GovernanceHost for LoopGovernance {
         opts: &RunLoopOptions,
     ) -> Result<serde_json::Value> {
         let facade = self.facade(store)?;
+        // A run analyzes the whole memory and writes recommendation, audit,
+        // and loop-state grains, so it is gated exactly as `POST
+        // /api/loop/run` is: `loop.run` on the loop namespace (owner
+        // passes). Without this the CAL surface is a way around the HTTP
+        // gate — a read-only principal refused at the route could still
+        // write grains via `RUN LOOP`.
+        facade
+            .authz()
+            .check(dejadb_core::authz::Verb::LoopRun, deja_loop::LOOP_NS)?;
         let mut sub = crate::BorrowedSubstrate::new(facade);
         let run_opts = RunOptions {
             min_new: opts.min_new,
@@ -117,16 +126,26 @@ impl GovernanceHost for LoopGovernance {
             .map_err(Self::wrap)
     }
 
-    fn apply(&self, store: &dyn CalStoreFacade, rec_hash: &str, because: &str) -> Result<bool> {
+    fn apply(
+        &self,
+        store: &dyn CalStoreFacade,
+        rec_hash: &str,
+        because: &str,
+        destructive_cap: bool,
+    ) -> Result<bool> {
         let facade = self.facade(store)?;
         let authz = facade.authz();
         let actor = authz.principal().to_string();
         let scopes = crate::scopes_for(&authz);
         let observer = crate::observer_for_principal(&actor);
         // The two-key rule, verb-shaped: a destructive apply needs
-        // `loop.apply` (in scopes) AND the session's own destruction verbs.
-        let allow_destructive = authz.allows(dejadb_core::authz::Verb::Delete, "*")
-            || authz.allows(dejadb_core::authz::Verb::Erase, "*");
+        // `loop.apply` (in scopes) AND the session's own destruction verbs —
+        // and, above both, the process-wide cap, which is restrictive over
+        // any grant. A `--no-destructive-ops` session must not be able to
+        // route a FORGET through a recommendation.
+        let allow_destructive = destructive_cap
+            && (authz.allows(dejadb_core::authz::Verb::Delete, "*")
+                || authz.allows(dejadb_core::authz::Verb::Erase, "*"));
         let mut sub = crate::BorrowedSubstrate::new(facade);
         let applied = self
             .engine()

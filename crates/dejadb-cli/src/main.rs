@@ -1554,7 +1554,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 let map = dejadb_core::authz::CredentialMap::from_json(&text)
                     .map_err(|e| e.to_string())?;
                 eprintln!(
-                    "deja: credential map loaded ({} token(s)); rights come from the                      file's grant grains; unauthenticated requests run as 'anonymous'",
+                    "deja: credential map loaded ({} token(s)); rights come from the \
+                     file's grant grains; unauthenticated requests run as 'anonymous'",
                     map.tokens.len()
                 );
                 server = server.with_credentials(map);

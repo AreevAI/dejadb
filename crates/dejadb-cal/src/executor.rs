@@ -970,7 +970,9 @@ impl CalExecutor {
                     .any(|o| matches!(o, super::ast::AddWithOption::Occurrence))
                 {
                     exec_warnings.push(
-                        "CAL-W014: WITH occurrence is inert here — tool occurrences are                          recorded via record_tool_call (every binding), which stamps the                          per-call identity that keeps retries distinct."
+                        "CAL-W014: WITH occurrence is inert here — tool occurrences are \
+                         recorded via record_tool_call (every binding), which stamps the \
+                         per-call identity that keeps retries distinct."
                             .to_string(),
                     );
                 }
@@ -1856,7 +1858,12 @@ impl CalExecutor {
                 let Some(host) = &self.governance else {
                     return Ok(governance_unwired("apply"));
                 };
-                match host.apply(store, &g.hash, &g.reason) {
+                match host.apply(
+                    store,
+                    &g.hash,
+                    &g.reason,
+                    self.config.allow_destructive_ops,
+                ) {
                     Ok(rollbackable) => Ok(CalResultPayload::RecApplied {
                         hash: g.hash.clone(),
                         rollbackable,

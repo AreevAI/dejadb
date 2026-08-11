@@ -57,9 +57,14 @@ pub struct UiServer {
     /// map resolving bearer/Basic tokens to principal names. Rights come
     /// from the FILE's own grant grains — the map holds no policy and no
     /// raw secrets. Unauthenticated requests run as `anonymous`
-    /// (read-only unless the file grants more). Takes precedence over the
-    /// single `--token-env` secret when both are configured.
+    /// (read-only unless the file grants more). It changes *who* a request
+    /// is, never *whether* the shared `--token-env` secret is required: when
+    /// both are configured the secret keeps its contract (implied admin, and
+    /// still demanded on the requests it guards).
     credentials: Option<dejadb_core::authz::CredentialMap>,
+    /// Whether destructive CAL is permitted, kept alongside the executor so
+    /// every builder can rebuild it without clobbering the others' settings.
+    allow_destructive_ops: bool,
 }
 
 /// Per-request principal binding. The server handles one request at a
@@ -124,7 +129,25 @@ impl UiServer {
             allow_remote: false,
             loop_policy: None,
             credentials: None,
+            allow_destructive_ops: CalExecutorConfig::default().allow_destructive_ops,
         }
+    }
+
+    /// Rebuild the executor from the current gate settings. Every builder
+    /// that touches the CAL surface goes through here so `--no-destructive-ops`
+    /// and `--policy` compose instead of clobbering each other's config —
+    /// and the governance host survives every rebuild. (Same shape as
+    /// `dejadb-mcp`'s; building `CalExecutorConfig::default()` in one builder
+    /// silently re-enabled destruction configured off by another.)
+    fn rebuild_executor(&mut self) {
+        self.executor = CalExecutor::new(CalExecutorConfig {
+            allow_destructive_ops: self.allow_destructive_ops,
+            ..CalExecutorConfig::default()
+        })
+        .with_governance(std::sync::Arc::new(match &self.loop_policy {
+            Some(p) => dejadb_loop::LoopGovernance::with_policy(p.clone()),
+            None => dejadb_loop::LoopGovernance::new(),
+        }));
     }
 
     /// Multi-principal mode: attach the credential map (`deja-auth.json`).
@@ -140,13 +163,21 @@ impl UiServer {
     /// console-triggered run honors the same auto-apply grants, denies, and
     /// severity floors as `deja loop run --policy`.
     pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
-        self.loop_policy = Some(policy.clone());
+        self.loop_policy = Some(policy);
         // The CAL surface's governance host honors the same policy.
-        self.executor = CalExecutor::new(CalExecutorConfig::default())
-            .with_governance(std::sync::Arc::new(
-                dejadb_loop::LoopGovernance::with_policy(policy),
-            ));
+        self.rebuild_executor();
         self
+    }
+
+    /// May this request's session read the raw sync surface? A segment is a
+    /// whole-memory op-log export, so it takes `read` on every namespace —
+    /// a principal granted read on one namespace must not be able to pull
+    /// the file wholesale through `/api/segment`. Owner sessions (every
+    /// non-credential-map deployment) pass unchanged.
+    fn session_may_sync(&self) -> bool {
+        self.facade
+            .authz()
+            .allows(dejadb_core::authz::Verb::Read, "*")
     }
 
     /// The loop engine for a request: builtins + the host policy when one
@@ -183,14 +214,8 @@ impl UiServer {
     /// Since the plain console is unauthenticated, disabling this is the safe
     /// choice when the console is exposed beyond a trusted local operator.
     pub fn allow_destructive_ops(mut self, allow: bool) -> Self {
-        self.executor = CalExecutor::new(CalExecutorConfig {
-            allow_destructive_ops: allow,
-            ..CalExecutorConfig::default()
-        })
-        .with_governance(std::sync::Arc::new(match &self.loop_policy {
-            Some(p) => dejadb_loop::LoopGovernance::with_policy(p.clone()),
-            None => dejadb_loop::LoopGovernance::new(),
-        }));
+        self.allow_destructive_ops = allow;
+        self.rebuild_executor();
         self
     }
 
@@ -374,30 +399,30 @@ impl UiServer {
     }
 
     fn route(&self, method: &str, path: &str, body: &[u8], bearer: Option<&str>) -> (&'static str, &'static str, Vec<u8>) {
-        // Credential-map mode: resolve this request's principal and bind
-        // the facade for the request's duration (the guard restores the
-        // owner default on drop). Every verb check downstream — CAL,
-        // loop scopes, the run gate below — now answers for THIS caller.
-        let _session = self
-            .credentials
-            .as_ref()
-            .map(|map| RequestBinding::bind(&self.facade, map, bearer));
-
         // Auth: console-auth mode (`auth_all`) guards every request; hub mode
         // guards only mutating + sync endpoints. The credential arrives as a
         // Bearer token or an HTTP Basic password (see `handle_request`).
-        // Credential-map mode replaces both: the binding above IS the auth
-        // decision, and the verb checks downstream do the guarding.
-        if self.credentials.is_some() {
-            // bound above
-        } else if let Some(tok) = &self.token {
+        //
+        // A credential map changes WHO a request is, not WHETHER the shared
+        // secret is required. When both are configured, a map token
+        // authenticates as its principal, the shared secret authenticates as
+        // the implied admin (`docs/cal-all-you-need-proposal.md` §5.2b), and
+        // anything else is refused — an attached map must never silently
+        // downgrade a `--token-env` console to an open `anonymous` one.
+        let mut shared_secret_ok = false;
+        if let Some(tok) = &self.token {
             let guarded = self.auth_all || method == "POST" || path.starts_with("/api/segment");
-            let authorized = bearer.is_some_and(|b| ct_eq(b.as_bytes(), tok.as_bytes()));
-            if guarded && !authorized {
+            shared_secret_ok = bearer.is_some_and(|b| ct_eq(b.as_bytes(), tok.as_bytes()));
+            let known = shared_secret_ok
+                || match (&self.credentials, bearer) {
+                    (Some(map), Some(b)) => map.resolve(b).is_ok(),
+                    _ => false,
+                };
+            if guarded && !known {
                 return ("401 Unauthorized", "application/json",
                         br#"{"ok":false,"error":"authentication required"}"#.to_vec());
             }
-        } else if method == "POST" {
+        } else if self.credentials.is_none() && method == "POST" {
             // §5.7: token-less `deja ui` is read-only. The ONLY POST allowed is
             // a read-only CAL statement; every write (any loop mutation, an
             // ADD/SUPERSEDE/FORGET CAL batch, etc.) requires --token-env. This
@@ -410,6 +435,18 @@ impl UiServer {
                         br#"{"ok":false,"error":"read-only console: restart deja ui with --token-env VAR to enable writes"}"#.to_vec());
             }
         }
+
+        // Credential-map mode: resolve this request's principal and bind
+        // the facade for the request's duration (the guard restores the
+        // owner default on drop). Every verb check downstream — CAL,
+        // loop scopes, the run gate below — now answers for THIS caller.
+        // A request authenticated by the shared secret keeps the owner
+        // session that secret has always carried.
+        let _session = match (&self.credentials, shared_secret_ok) {
+            (Some(map), false) => Some(RequestBinding::bind(&self.facade, map, bearer)),
+            _ => None,
+        };
+
         let (path, query) = match path.split_once('?') {
             Some((p, q)) => (p, q),
             None => (path, ""),
@@ -695,6 +732,19 @@ impl UiServer {
                 Err(e) => ok_json(json!({"ok": false, "error": e.to_string()})),
             },
             ("POST", "/api/segment") => {
+                // A pushed segment is imported straight into the live store,
+                // so it is a write — and one that never crosses the facade's
+                // verb checks. Gate it on the bound session's `write`, or a
+                // principal with no write grant could add grains here that
+                // `POST /api/cal` refuses it.
+                if let Err(e) = self
+                    .facade
+                    .authz()
+                    .check(dejadb_core::authz::Verb::Write, "*")
+                {
+                    return ("403 Forbidden", "application/json",
+                            json!({"ok": false, "error": e.to_string()}).to_string().into_bytes());
+                }
                 // push: body = raw MGB1 bundle; applied immediately + archived
                 let Some(dir) = &self.segment_dir else {
                     return ("400 Bad Request", "application/json",
@@ -715,6 +765,11 @@ impl UiServer {
                     Err(e) => ok_json(json!({"ok": false, "error": e.to_string()})),
                 }
             }
+            ("GET", "/api/segments") | ("GET", "/api/segment") if !self.session_may_sync() => (
+                "403 Forbidden",
+                "application/json",
+                br#"{"ok":false,"error":"AUT-E001: this session lacks read on the whole memory"}"#.to_vec(),
+            ),
             ("GET", "/api/segments") => {
                 let Some(dir) = &self.segment_dir else {
                     return ok_json(json!([]));
@@ -1420,5 +1475,84 @@ mod credential_route_tests {
         assert!(text(&r).contains("credentials"));
         let r = s.route("GET", "/api/whoami", b"", None);
         assert!(text(&r).contains("anonymous"), "{}", text(&r));
+    }
+
+    /// A credential map must not silently disable `--token-env`. Attaching
+    /// one changes WHO a request is; the operator who also asked for a
+    /// shared secret still gets authentication on every request.
+    #[test]
+    fn a_credential_map_does_not_disable_the_shared_secret() {
+        let s = server().with_auth("console-token".into());
+
+        // No credential at all: refused, not dropped to `anonymous`.
+        let r = s.route("POST", "/api/cal", READ, None);
+        assert!(r.0.starts_with("401"), "{}", text(&r));
+        let page = s.route("GET", "/", b"", None);
+        assert!(page.0.starts_with("401"), "the console page is guarded too");
+        // An unrecognized token is refused rather than downgraded.
+        let r = s.route("POST", "/api/cal", READ, Some("stolen-guess"));
+        assert!(r.0.starts_with("401"), "{}", text(&r));
+
+        // A map token still binds its principal and its verbs still decide.
+        let r = s.route("POST", "/api/cal", READ, Some("reader-secret"));
+        assert!(r.0.starts_with("200"), "{}", text(&r));
+        let w = s.route("POST", "/api/cal", WRITE, Some("reader-secret"));
+        assert!(text(&w).contains("AUT-E001"), "{}", text(&w));
+
+        // The shared secret is the implied admin (docs/cal-all-you-need
+        // -proposal.md §5.2b) — it keeps the owner session it always had.
+        let w = s.route("POST", "/api/cal", WRITE, Some("console-token"));
+        assert!(text(&w).contains("added"), "{}", text(&w));
+    }
+
+    /// `RUN LOOP` through CAL is gated exactly as `POST /api/loop/run` is —
+    /// otherwise the CAL surface is a way around the HTTP gate.
+    #[test]
+    fn run_loop_via_cal_is_verb_gated_like_the_route() {
+        let s = server();
+        let run = s.route("POST", "/api/loop/run", b"{}", None);
+        assert!(run.0.starts_with("403"), "{}", text(&run));
+        let cal = s.route("POST", "/api/cal", br#"{"query":"RUN LOOP"}"#, None);
+        assert!(
+            text(&cal).contains("AUT-E001"),
+            "anonymous must not run the loop through CAL either: {}",
+            text(&cal)
+        );
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::UiServer;
+    use dejadb_cal::DejaDbFacade;
+    use dejadb_store::DejaDB;
+
+    fn server() -> UiServer {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = DejaDB::open(path.to_str().unwrap()).unwrap();
+        std::mem::forget(dir);
+        UiServer::new(DejaDbFacade::with_session(store, Some("caller".into()), None), "t".into())
+    }
+
+    /// `deja ui --no-destructive-ops --policy FILE` calls these in this
+    /// order. A later builder must not re-enable destruction the operator
+    /// turned off — the console was announced as read-only.
+    #[test]
+    fn attaching_a_loop_policy_preserves_the_destructive_cap() {
+        let s = server()
+            .allow_destructive_ops(false)
+            .with_loop_policy(deja_loop::Policy::default());
+        let r = s.route(
+            "POST",
+            "/api/cal",
+            br#"{"query":"FORGET sha256:684c6c9bda818630a870119d0726e4d242ed537af061658ef6f3acb158a2c67d"}"#,
+            None,
+        );
+        let body = String::from_utf8_lossy(&r.2).to_string();
+        assert!(
+            body.contains("--no-destructive-ops") || r.0.starts_with("401"),
+            "destruction must stay disabled: {body}"
+        );
     }
 }

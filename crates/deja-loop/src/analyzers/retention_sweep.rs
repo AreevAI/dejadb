@@ -31,6 +31,14 @@ use serde_json::{json, Map};
 /// next run picks it up.
 const DEFAULT_MAX_GRAINS: i64 = 500;
 
+/// Namespaces a retention proposal must never name: the loop's own state and
+/// the OMS `agent:*` reserved space (`agent:authz` grants + audit records,
+/// `agent:identity`, …). Substrate-agnostic — the engine cannot know which
+/// concrete namespaces a host reserves, but these two shapes are spec-level.
+fn is_reserved_ns(ns: &str) -> bool {
+    ns == crate::LOOP_NS || ns.starts_with("agent:")
+}
+
 pub struct RetentionSweep {
     manifest: AnalyzerManifest,
 }
@@ -119,6 +127,16 @@ impl Analyzer for RetentionSweep {
         let mut by_ns: std::collections::BTreeMap<String, Vec<&crate::model::GrainRecord>> =
             std::collections::BTreeMap::new();
         for g in &grains {
+            // Reserved namespaces are the memory's own governance state —
+            // grants, audit records, identity — not user data under a
+            // retention policy. Tombstoning them locks principals out of the
+            // file and destroys the accountability record. A substrate
+            // SHOULD already withhold them; this is the second lock, because
+            // an analyzer that can propose erasing the audit trail is the
+            // one place a reader bug becomes unrecoverable.
+            if is_reserved_ns(&g.namespace) {
+                continue;
+            }
             // created_at_ms 0 means "unknown" on this reader — never treat a
             // missing timestamp as infinitely old.
             if g.created_at_ms > 0 && g.created_at_ms < cutoff {
@@ -210,6 +228,21 @@ mod tests {
         assert_eq!(cal.lines().count(), 2, "batch is capped");
         let rendered = drafts[0].summary.render();
         assert!(rendered.contains('3'), "the remainder is stated: {rendered}");
+    }
+
+    #[test]
+    fn never_proposes_erasing_governance_state() {
+        let mut sub = TestSubstrate::new();
+        sub.add_fact_at("agent:authz", "user:bot", "mg:permits", "read ON *", DAY);
+        sub.add_fact_at("caller", "old", "note", "ancient", DAY);
+        let drafts = sub.analyze_with(
+            &RetentionSweep::new(),
+            100 * DAY,
+            &[("max_age_days", serde_json::json!(30))],
+        );
+        assert_eq!(drafts.len(), 1, "only the user namespace: {drafts:?}");
+        let Proposal::Cal { cal } = &drafts[0].proposal else { panic!("expected CAL") };
+        assert_eq!(cal.lines().count(), 1, "the grant grain is not named: {cal}");
     }
 
     #[test]

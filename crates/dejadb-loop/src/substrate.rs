@@ -194,8 +194,14 @@ fn read_user_type(
     let mut out = Vec::new();
     for g in raw {
         let ns = grain_namespace(&g);
-        // Never surface loop-internal grains as user data.
-        if ns == LOOP_NS {
+        // Never surface loop-internal or governance grains as user data.
+        // `agent:authz` holds the file's own grant Facts and the Tier-2
+        // audit Observations; an analyzer that sees them as ordinary memory
+        // can propose tombstoning them (retention_sweep did), which locks
+        // every non-owner principal out of the file and destroys the very
+        // Art. 30 records the audit export exists to produce. Governance
+        // state is metadata about the memory, not memory.
+        if ns == LOOP_NS || ns == dejadb_core::authz::AUTHZ_NS {
             continue;
         }
         if opts.live_only && superseded.contains(&g.hash.to_hex()) {

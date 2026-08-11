@@ -280,9 +280,10 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .ok_or("dejadb_forget requires 'hash'")?;
                 let h = Hash::from_hex(h).map_err(|e| e.to_string())?;
-                self.facade
-                    .with_store(|m| m.forget(&h))
-                    .map_err(|e| e.to_string())?;
+                // Through the facade, not the raw store: the tool and CAL's
+                // `FORGET <hash>` must agree on the `delete` check and both
+                // must leave the same Tier-2 audit record.
+                self.facade.cal_delete(&h, None).map_err(|e| e.to_string())?;
                 Ok(json!({"forgotten": h.to_hex()}).to_string())
             }
             "dejadb_subject_report" => {

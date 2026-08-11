@@ -265,6 +265,19 @@ pub fn subject_fingerprint(identity: &str) -> String {
     hex_lower(&digest[..8])
 }
 
+/// Constant-time byte comparison — avoids leaking a bearer token through
+/// response timing. A length mismatch fails fast (token length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -395,7 +408,14 @@ impl CredentialMap {
                         )));
                     }
                 }
-                (None, Some(_)) => {}
+                (None, Some(v)) => {
+                    if v.trim().is_empty() {
+                        return Err(DejaDbError::AuthzConfigInvalid(format!(
+                            "credential map: entry {i} ({}) has an empty \"env\" variable name",
+                            t.principal
+                        )));
+                    }
+                }
             }
         }
         Ok(map)
@@ -404,13 +424,22 @@ impl CredentialMap {
     /// Resolve a presented bearer token to its principal. The error carries
     /// no part of the token — a refused secret must not leak into logs.
     pub fn resolve(&self, presented: &str) -> Result<&str> {
+        // An empty presented token can never authenticate. Without this, an
+        // env-referenced credential whose variable is exported *empty*
+        // (`Environment=DEJA_BOT_TOKEN=` in a unit file, `export VAR=` in a
+        // wrapper) matches the empty string an `Authorization: Bearer `
+        // header parses to, and every caller becomes that principal.
+        if presented.is_empty() {
+            return Err(DejaDbError::AuthzTokenUnrecognized);
+        }
         let digest = hex::encode(Sha256::digest(presented.as_bytes()));
         for t in &self.tokens {
             let matched = match (&t.sha256, &t.env) {
                 (Some(h), None) => h.eq_ignore_ascii_case(&digest),
-                (None, Some(var)) => {
-                    std::env::var(var).is_ok_and(|v| v == presented)
-                }
+                // The env var must actually hold a secret — an unset or
+                // empty variable authenticates nobody.
+                (None, Some(var)) => std::env::var(var)
+                    .is_ok_and(|v| !v.trim().is_empty() && ct_eq(v.as_bytes(), presented.as_bytes())),
                 _ => false,
             };
             if matched {
@@ -441,6 +470,30 @@ mod tests {
         }
         assert!(Verb::parse("loop-run").is_err());
         assert!(Verb::parse("").is_err());
+    }
+
+    #[test]
+    fn an_empty_env_credential_authenticates_nobody() {
+        // The variable name itself must be non-empty…
+        assert!(CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"env":"  ","principal":"agent:writer"}]}"#
+        )
+        .is_err());
+
+        // …and a variable exported EMPTY must not match the empty string an
+        // `Authorization: Bearer ` header parses to. Otherwise every caller
+        // becomes `agent:writer`.
+        std::env::set_var("DEJA_TEST_EMPTY_TOK", "");
+        let map = CredentialMap::from_json(
+            r#"{"version":1,"tokens":[{"env":"DEJA_TEST_EMPTY_TOK","principal":"agent:writer"}]}"#,
+        )
+        .unwrap();
+        assert!(map.resolve("").is_err(), "empty bearer must not authenticate");
+        assert!(map.resolve("anything").is_err());
+
+        // Unset behaves the same.
+        std::env::remove_var("DEJA_TEST_EMPTY_TOK");
+        assert!(map.resolve("").is_err());
     }
 
     #[test]

@@ -705,7 +705,7 @@ stored blob:
 ```
 FORGET sha256:<hash> [BECAUSE "<why>"]
 FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "<why>"
-PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] BECAUSE "<why>"
+PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] [LIMIT <n>] BECAUSE "<why>"
 ```
 
 - `FORGET <hash>` — a single-grain tombstone. BECAUSE optional but recorded.
@@ -715,7 +715,10 @@ PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] BECAUSE "<why
   indexed text mentions the identity. BECAUSE mandatory.
 - `PURGE OLDER THAN` — the retention sweep, scoped to one namespace (never
   an implicit all-namespace sweep) and optionally one grain type. BECAUSE
-  mandatory. Ages read as one word: `90d`, `6h`, `30m`.
+  mandatory. Ages read as one word: `90d`, `6h`, `30m`. `LIMIT n` bounds the
+  sweep to the **oldest** n matches (default 1000) — how you pilot a new
+  retention rule on a reviewable batch, and how you walk a large backlog
+  forward one deterministic slice at a time.
 
 **Every execution writes an audit Observation** in the reserved
 `agent:authz` namespace — the session principal, the verb, the target, the

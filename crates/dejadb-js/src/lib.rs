@@ -272,6 +272,19 @@ fn take_facade(slot: &FacadeSlot) -> napi::Result<std::sync::Arc<DejaDbFacade>> 
         })
 }
 
+/// Verb check for the binding methods that reach the store directly instead
+/// of through a gated `cal_*` facade method. `authFile`/`principal` is
+/// documented to fail closed (CAL 1.3 §9), so a sandboxed handle must not be
+/// able to erase — or export a subject's dossier — merely by calling the
+/// binding method rather than the CAL statement that does the same thing.
+fn check_verb(
+    facade: &DejaDbFacade,
+    verb: dejadb_core::authz::Verb,
+    ns: &str,
+) -> napi::Result<()> {
+    facade.authz().check(verb, ns).map_err(err)
+}
+
 #[napi]
 pub struct DejaDb {
     /// Shared so a queued job can hold the store open independently of the JS
@@ -772,13 +785,15 @@ impl DejaDb {
     }
 
     /// Erase a grain from the hot store (tombstoned). Host-level op.
+    /// Routed through the facade so it carries the same `delete` check and
+    /// Tier-2 audit record as CAL's `FORGET <hash>`.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn forget(&self, hash: String) -> napi::bindgen_prelude::AsyncTask<UnitJob> {
         let slot = self.facade.clone();
         UnitJob::spawn(move || {
             let facade = take_facade(&slot)?;
             let h = parse_hash(&hash)?;
-            facade.with_store(|m| m.forget(&h)).map_err(err)
+            facade.cal_delete(&h, None).map_err(err)
         })
     }
 
@@ -807,6 +822,7 @@ impl DejaDb {
         let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
+            check_verb(&facade, dejadb_core::authz::Verb::Erase, &ns)?;
             let rep =
                 facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)).map_err(err)?;
             Ok(serde_json::json!({
@@ -835,6 +851,8 @@ impl DejaDb {
         let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
+            // The DSAR read is `read`-gated, exactly as `REPORT SUBJECT` is.
+            check_verb(&facade, dejadb_core::authz::Verb::Read, &ns)?;
             let rep =
                 facade.with_store(|m| m.subject_report_with(&ns, &subject, opts)).map_err(err)?;
             let grains: Vec<serde_json::Value> = rep
@@ -869,6 +887,7 @@ impl DejaDb {
         let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
         StringJob::spawn(move || {
             let facade = take_facade(&slot)?;
+            check_verb(&facade, dejadb_core::authz::Verb::Read, &ns)?;
             let stats = facade
                 .with_store(|m| m.subject_bundle_with(&ns, &subject, opts, &path))
                 .map_err(err)?;
@@ -904,6 +923,12 @@ impl DejaDb {
                 None => None,
             };
             let ns_opt = if ns.is_empty() { None } else { Some(ns.as_str()) };
+            // ns="" sweeps every namespace, so it takes `erase` on all of them.
+            check_verb(
+                &facade,
+                dejadb_core::authz::Verb::Erase,
+                ns_opt.unwrap_or("*"),
+            )?;
             let rep = facade
                 .with_store(|m| m.forget_older_than(ns_opt, cutoff_ms, gt))
                 .map_err(err)?;

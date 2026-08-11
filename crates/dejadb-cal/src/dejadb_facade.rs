@@ -1318,7 +1318,25 @@ impl CalStoreFacade for DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Hash> {
-        self.check_verb(Verb::Supersede, self.write_ns(fields))?;
+        if !self.session_is_owner() {
+            // Authorize against the TARGET's namespace, the way `cal_delete`
+            // does — that is the grain this statement actually rewrites out
+            // of live recall. `SET namespace` names where the *replacement*
+            // lands, so checking only that lets a caller supersede a grain in
+            // a namespace it holds no supersede grant on simply by naming one
+            // it does.
+            let old_ns = {
+                let g = self.store.lock().unwrap().get(old_hash)?;
+                g.get_str("namespace").unwrap_or("shared").to_string()
+            };
+            self.check_verb(Verb::Supersede, &old_ns)?;
+            // A supersession that moves the value to another namespace also
+            // writes there, so that namespace needs the grant too.
+            let new_ns = self.write_ns(fields);
+            if new_ns != old_ns {
+                self.check_verb(Verb::Supersede, new_ns)?;
+            }
+        }
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(
             grain_type,
@@ -1725,7 +1743,7 @@ impl CalStoreFacade for DejaDbFacade {
         &self,
         min_age_days: f64,
         namespace: Option<&str>,
-        _batch_limit: usize,
+        batch_limit: usize,
         grain_type: Option<&str>,
         because: &str,
     ) -> Result<usize> {
@@ -1741,11 +1759,14 @@ impl CalStoreFacade for DejaDbFacade {
             })?),
         };
         let cutoff_ms = now_epoch_ms() - (min_age_days * 86_400_000.0) as i64;
-        let report =
-            self.store
-                .lock()
-                .unwrap()
-                .forget_older_than(Some(&ns), cutoff_ms, gtype)?;
+        // `LIMIT n` bounds the sweep to the oldest n matches — the operator
+        // asked for a reviewable batch, not the namespace.
+        let report = self.store.lock().unwrap().forget_older_than_capped(
+            Some(&ns),
+            cutoff_ms,
+            gtype,
+            Some(batch_limit),
+        )?;
         self.audit_tier2(
             "erase",
             &format!(

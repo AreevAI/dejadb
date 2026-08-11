@@ -124,6 +124,15 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// Verb check for the binding methods that reach the store directly instead
+/// of through a gated `cal_*` facade method. `principal=` is documented to
+/// fail closed (CAL 1.3 §9), so a sandboxed handle must not be able to erase
+/// — or export a subject's dossier — merely by calling the binding method
+/// rather than the CAL statement that does the same thing.
+fn check_verb(facade: &DejaDbFacade, verb: dejadb_core::authz::Verb, ns: &str) -> PyResult<()> {
+    facade.authz().check(verb, ns).map_err(err)
+}
+
 /// Resolve an LLM backend the same two ways the CLI does: a subprocess
 /// (`llm_cmd`, the zero-dependency escape hatch) or a built-in HTTP provider
 /// (`model`, key read from the environment). The subprocess wins when both are
@@ -649,10 +658,11 @@ impl DejaDB {
     }
 
     /// Erase a grain from the hot store (tombstoned). Host-level op.
+    /// Routed through the facade so it carries the same `delete` check and
+    /// Tier-2 audit record as CAL's `FORGET <hash>`.
     fn forget(&self, py: Python<'_>, hash: String) -> PyResult<()> {
         let h = parse_hash(&hash)?;
-        py.detach(|| self.facade.with_store(|m| m.forget(&h)))
-            .map_err(err)
+        py.detach(|| self.facade.cal_delete(&h, None)).map_err(err)
     }
 
     /// Right-to-erasure for one identity: erase every grain holding a
@@ -677,6 +687,7 @@ impl DejaDB {
         text_mentions: bool,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        check_verb(&self.facade, dejadb_core::authz::Verb::Erase, &ns)?;
         let opts = dejadb_store::ErasureOptions { text_mentions };
         let rep = py
             .detach(|| self.facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)))
@@ -703,6 +714,8 @@ impl DejaDB {
         text_mentions: bool,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        // The DSAR read is `read`-gated, exactly as `REPORT SUBJECT` is.
+        check_verb(&self.facade, dejadb_core::authz::Verb::Read, &ns)?;
         let opts = dejadb_store::ErasureOptions { text_mentions };
         let rep = py
             .detach(|| self.facade.with_store(|m| m.subject_report_with(&ns, &subject, opts)))
@@ -734,6 +747,7 @@ impl DejaDB {
         text_mentions: bool,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        check_verb(&self.facade, dejadb_core::authz::Verb::Read, &ns)?;
         let opts = dejadb_store::ErasureOptions { text_mentions };
         let stats = py
             .detach(|| {
@@ -770,6 +784,12 @@ impl DejaDB {
         };
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let ns_opt = if ns.is_empty() { None } else { Some(ns) };
+        // ns="" sweeps every namespace, so it takes `erase` on all of them.
+        check_verb(
+            &self.facade,
+            dejadb_core::authz::Verb::Erase,
+            ns_opt.as_deref().unwrap_or("*"),
+        )?;
         let rep = py
             .detach(|| {
                 self.facade

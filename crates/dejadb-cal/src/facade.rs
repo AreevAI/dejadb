@@ -411,7 +411,8 @@ pub trait CalStoreFacade: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// The retention sweep. Maps to `DejaDB::forget_older_than()`.
+    /// The retention sweep. Maps to `DejaDB::forget_older_than_capped()` —
+    /// `batch_limit` is `LIMIT n` and MUST bound the erasure.
     fn cal_purge_stale(
         &self,
         _min_age_days: f64,
@@ -552,7 +553,28 @@ impl Default for CalCapabilities {
                 // Saved queries and custom templates persist in the file's
                 // host metadata, so the engine can honestly claim them.
                 "DEFINE".into(),
+                // Also RUN LOOP and RUN TRACE — one leading keyword each,
+                // as everywhere else in this list.
                 "RUN".into(),
+                // CAL 1.3 Tier-3 DCL. SHOW covers SHOW GRANTS and SHOW FORKS.
+                "GRANT".into(),
+                "REVOKE".into(),
+                "SHOW".into(),
+                // CAL 1.3 evolution: free-text extraction and tip merge.
+                "REMEMBER".into(),
+                "MERGE".into(),
+                // CAL 1.3 Wave-2 reads: as-of, the run↔memory join, reverse
+                // provenance, graph neighbourhood, novelty.
+                "ENTITY".into(),
+                "RUNS".into(),
+                "DERIVED".into(),
+                "RELATED".into(),
+                "NOVELTY".into(),
+                // CAL 1.3 governance lifecycle (§8.16).
+                "APPROVE".into(),
+                "REJECT".into(),
+                "APPLY".into(),
+                "ROLLBACK".into(),
             ],
             max_sources: 8,
             max_let_bindings: 5,
@@ -965,7 +987,20 @@ mod tests {
         let caps = CalCapabilities::default();
         assert_eq!(caps.cal_version, 1);
         assert_eq!(caps.conformance_level, 2);
-        assert_eq!(caps.supported_statements.len(), 18);
+        assert_eq!(caps.supported_statements.len(), 32);
+        // Every statement a client can reach must be listed: an agent that
+        // runs `DESCRIBE CAPABILITIES` as its handshake will never emit a
+        // statement missing from here, so an omission hides a whole feature.
+        // Assert against the parser's own dispatch rather than a hand count.
+        for kw in [
+            "GRANT", "REVOKE", "SHOW", "REMEMBER", "MERGE", "ENTITY", "RUNS", "DERIVED",
+            "RELATED", "NOVELTY", "APPROVE", "REJECT", "APPLY", "ROLLBACK",
+        ] {
+            assert!(
+                caps.supported_statements.contains(&kw.to_string()),
+                "CAL 1.3 statement {kw} parses but is not advertised"
+            );
+        }
         // The DSAR read joined in the GDPR compliance pack (OMS 1.6 draft).
         assert!(caps.supported_statements.contains(&"REPORT".to_string()));
         assert!(caps.supported_statements.contains(&"RECALL".to_string()));

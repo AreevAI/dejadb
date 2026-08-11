@@ -90,6 +90,15 @@ top of that.
   compared in constant time, and a `401` carries `WWW-Authenticate: Basic` so
   browsers prompt. Naming an env var (not a flag) keeps the secret out of argv
   and shell history.
+- **Multi-principal console** (`deja ui --auth deja-auth.json`): the credential
+  map resolves a token to a *principal name*; the rights come from the memory
+  file's own grant grains, and unauthenticated requests run as `anonymous`
+  (read-only unless the file grants more). It changes **who** a request is, not
+  **whether** a secret is required: pass `--token-env` alongside it and every
+  request must still carry a recognized credential — either a map token (binds
+  that principal) or the shared secret (the implied admin). A credential whose
+  `env` variable is unset or **empty** authenticates nobody; an empty
+  `Authorization: Bearer ` never resolves.
 - Import is **DoS-hardened**: an untrusted `.mg` blob is size-capped and its
   msgpack framing is validated iteratively before decoding, so a hostile grain
   cannot cause a stack overflow (deep nesting) or a giant pre-allocation (a

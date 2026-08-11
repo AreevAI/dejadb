@@ -74,7 +74,19 @@ pub trait GovernanceHost: Send + Sync {
 
     /// `APPLY <hash> BECAUSE "…"`. Returns whether the apply is
     /// rollbackable.
-    fn apply(&self, store: &dyn CalStoreFacade, rec_hash: &str, because: &str) -> Result<bool>;
+    ///
+    /// `destructive_cap` is the session's `allow_destructive_ops` — the
+    /// process-wide restrictive cap (`--no-destructive-ops`) that sits over
+    /// every grant. An apply can execute a recommendation's `FORGET`, so the
+    /// cap has to reach it: without this the cap gates `FORGET` typed into
+    /// CAL but not the same `FORGET` routed through a recommendation.
+    fn apply(
+        &self,
+        store: &dyn CalStoreFacade,
+        rec_hash: &str,
+        because: &str,
+        destructive_cap: bool,
+    ) -> Result<bool>;
 
     /// `ROLLBACK <hash> BECAUSE "…"`.
     fn rollback(&self, store: &dyn CalStoreFacade, rec_hash: &str, because: &str) -> Result<()>;
