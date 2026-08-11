@@ -68,7 +68,7 @@ embed**, built so memory *can't* rot silently.
   reversible:
   [build an agent that learns](docs/cookbook.md#10-build-an-agent-that-learns-and-can-unlearn--by-hand).
 - **Self-improvement with governance — [Deja Loop](#deja-loop--governed-self-improvement-built-in),
-  built in**: eleven deterministic analyzers turn the agent's own history into
+  built in**: twelve deterministic analyzers turn the agent's own history into
   recommendations — *"this tool failed 71% of its calls"*, *"these two facts
   contradict"* — each citing the grains it was computed from, gated
   propose → review → apply → verify, undoable, and re-measured after apply.
@@ -76,10 +76,13 @@ embed**, built so memory *can't* rot silently.
   against the evidence and independently verified before a human ever sees
   them.
 - **CAL-native**: `RECALL` / `ASSEMBLE` / `EXISTS` / `HISTORY` / `ADD` /
-  `SUPERSEDE` — a query language with no bulk destruction: `DELETE` and `DROP`
-  are not tokens in the grammar, and the one destructive statement —
-  `FORGET <hash>`, a single-grain tombstone — is gated and can be disabled
-  per process.
+  `SUPERSEDE` — a query language where destruction is **shaped**: it takes a
+  hash, an identity, or an age, **never a predicate**. `DELETE` isn't a token
+  in the grammar; the three destructive statements each require an
+  authorization grant and a recorded reason, write an audit record, and can be
+  capped off per process. The right-to-erasure pair (`REPORT SUBJECT` /
+  `FORGET SUBJECT`) shares one selector, so what a data-subject request
+  discloses is exactly what an erasure removes — see [`docs/gdpr.md`](docs/gdpr.md).
 - **Fast where it matters** (measured, Apple M4 Max): structural recall **~30µs**,
   `entity_latest` **~9µs**, 50ms-cadence voice loop with live write-back
   **79µs p50 / 152µs p99** per frame recall.
@@ -239,7 +242,7 @@ db.apply_recommendation(<hash>, because="retries belong in the client")   # audi
 
 What that buys you:
 
-- **Your agent stops repeating what fails.** Eleven deterministic analyzers
+- **Your agent stops repeating what fails.** Twelve deterministic analyzers
   (ten default-on) cluster recurring tool failures into lessons, catch
   duplicate and contradictory facts, flag stale grains, and surface forks —
   computed over typed grains, never raw prose. With the recall-telemetry
@@ -508,26 +511,51 @@ with a projection for current Pi hardware:
 | [`docs/loop.md`](docs/loop.md) | Deja Loop — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
 | [`docs/loop-reflection.md`](docs/loop-reflection.md) | The reflection engine — how LLM proposals are grounded, verified, and measured |
 | [`docs/cal-reference.md`](docs/cal-reference.md) | The CAL query language reference |
-| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 8 tools |
+| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 14 tools |
 | [`docs/migrate.md`](docs/migrate.md) | Importing from mem0, Zep, Letta, LangMem, Basic Memory, JSONL |
 | [`docs/memory-tool.md`](docs/memory-tool.md) | The Anthropic memory-tool backend (Python / Node / CLI) |
 | [`docs/cookbook.md`](docs/cookbook.md) | Task-oriented recipes |
 | [`FAQ.md`](FAQ.md) | Questions & answers (also LLM-friendly) |
 | [`SECURITY.md`](SECURITY.md) · [`docs/security-model.md`](docs/security-model.md) | Security policy & threat model |
+| [`docs/gdpr.md`](docs/gdpr.md) · [`docs/erasure.md`](docs/erasure.md) | GDPR obligations → capabilities (for a DPIA), and the erasure requirement record |
 | [`AGENTS.md`](AGENTS.md) · [`llms.txt`](llms.txt) | For AI agents working in / with this repo |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute (DCO sign-off) |
 
 ## Security & privacy
 
 DejaDB is local-first and collects no telemetry. Optional **AES-256-GCM
-encryption at rest** protects the database (key derived from a passphrase via
-Argon2id); deleting a memory is a tombstone or **crypto-erasure**. The web
-console binds loopback with no auth by design and refuses to expose itself to the
-network without an explicit opt-in.
+encryption at rest** protects the database and its CAS attachment sidecar (key
+derived from a passphrase via Argon2id); deleting a memory is a tombstone or
+**crypto-erasure**. The web console binds loopback with no auth by design and
+refuses to expose itself to the network without an explicit opt-in.
 
 Read the honest [threat model](docs/security-model.md) before deploying beyond a
 local machine, and report vulnerabilities per our [security policy](SECURITY.md)
 — **please don't open public issues for them**.
+
+### Handling a data-subject request
+
+Software can't *be* GDPR-compliant — a deployment is. What DejaDB gives you is
+the mechanism, and the evidence:
+
+```bash
+deja subject-report "pat" --db memory.db --ns caller --out pat.jsonl --bundle pat.mgb
+deja forget-subject  "pat" --db memory.db --ns caller --yes --because "Art. 17 request #42"
+deja audit export --db memory.db --out evidence.jsonl
+```
+
+The report and the erasure run **one selector**, so what an access request
+discloses is exactly what an erasure removes — including partition keys
+(`pat#visit1`) and the full supersession history, and optionally prose
+mentions. The `.mgb` bundle is the Art. 20 portability artifact. The audit
+record names a *fingerprint* of the identity, not the identity: verifiable by
+recomputation, unusable for enumeration — because an immutable, replicating
+audit grain that named the subject would undo the erasure it records.
+
+[`docs/gdpr.md`](docs/gdpr.md) is the article→capability map to lift into a
+DPIA, including the deployment requirements (one hub per trust domain, TLS
+proxy off-loopback, a documented archive-retention window) and the limits
+stated honestly.
 
 ## Workspace
 

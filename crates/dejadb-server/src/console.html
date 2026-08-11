@@ -535,6 +535,10 @@
       <div class="health" id="health" title="check every stored memory against its content address">
         <span class="dot" id="hdot"></span><span id="htext">checking…</span>
       </div>
+      <div class="toggle-row" id="whorow" style="display:none">
+        <span id="whoami" title="the principal this session is bound to">…</span>
+        <button id="signbtn" style="background:none;border:0;color:var(--accent);cursor:pointer;font:inherit;padding:0">Sign in</button>
+      </div>
       <div class="toggle-row">
         <span>Developer mode</span>
         <button class="sw" id="devsw" aria-label="developer mode"><i></i></button>
@@ -753,6 +757,30 @@ async function api(url, opts) {
 }
 const cal = q => api('/api/cal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ query: q }) });
+
+/* Identity: in multi-principal mode (deja ui --auth) the rail shows who
+   this session is bound to; Sign in stores a bearer token, Sign out
+   drops back to the read-only anonymous session. */
+async function refreshWhoami() {
+  const w = await api('/api/whoami');
+  if (!w || !w.ok || w.mode !== 'credentials') return;
+  const row = $('whorow'); row.style.display = '';
+  $('whoami').textContent = w.owner ? 'Owner session' : w.principal;
+  $('signbtn').textContent = TOKEN ? 'Sign out' : 'Sign in';
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = $('signbtn');
+  if (btn) btn.addEventListener('click', () => {
+    if (TOKEN) { TOKEN = ''; sessionStorage.removeItem('dejadb.token'); }
+    else {
+      const t = window.prompt('Paste your access token:');
+      if (!t) return;
+      TOKEN = t; sessionStorage.setItem('dejadb.token', t);
+    }
+    location.reload();
+  });
+  refreshWhoami();
+});
 
 /* ══ helpers ══════════════════════════════════════════════════════════ */
 function toast(msg) {

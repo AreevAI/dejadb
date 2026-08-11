@@ -124,6 +124,15 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// Verb check for the binding methods that reach the store directly instead
+/// of through a gated `cal_*` facade method. `principal=` is documented to
+/// fail closed (CAL 1.3 §9), so a sandboxed handle must not be able to erase
+/// — or export a subject's dossier — merely by calling the binding method
+/// rather than the CAL statement that does the same thing.
+fn check_verb(facade: &DejaDbFacade, verb: dejadb_core::authz::Verb, ns: &str) -> PyResult<()> {
+    facade.authz().check(verb, ns).map_err(err)
+}
+
 /// Resolve an LLM backend the same two ways the CLI does: a subprocess
 /// (`llm_cmd`, the zero-dependency escape hatch) or a built-in HTTP provider
 /// (`model`, key read from the environment). The subprocess wins when both are
@@ -242,7 +251,7 @@ struct DejaDB {
 impl DejaDB {
     #[new]
     #[allow(clippy::too_many_arguments)] // a flat FFI surface; each knob is a distinct scalar
-    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None))]
+    #[pyo3(signature = (path, ns = "shared".to_string(), passphrase = None, actor = "user:local".to_string(), telemetry = "aggregate".to_string(), index_text = None, principal = None))]
     fn new(
         py: Python<'_>,
         path: String,
@@ -251,6 +260,7 @@ impl DejaDB {
         actor: String,
         telemetry: String,
         index_text: Option<bool>,
+        principal: Option<String>,
     ) -> PyResult<Self> {
         // Recall-telemetry sidecar (host capability, §8): agents are the main
         // telemetry producers, so the binding default is `aggregate`; pass
@@ -299,6 +309,18 @@ impl DejaDB {
             })
             .map_err(err)?;
         let facade = DejaDbFacade::with_session(store, Some(ns.clone()), None);
+        // `principal=` binds the session to the file's grants for that
+        // principal (fail closed — CAL 1.3 §9). Absent, the handle is the
+        // owner, as ever. The loop actor follows the bound principal
+        // unless overridden explicitly.
+        let (facade, actor) = match principal {
+            Some(p) => {
+                let f = facade.with_principal(&p).map_err(err)?;
+                let actor = if actor == "user:local" { p } else { actor };
+                (f, actor)
+            }
+            None => (facade, actor),
+        };
         Ok(DejaDB { facade, ns, actor })
     }
 
@@ -636,10 +658,11 @@ impl DejaDB {
     }
 
     /// Erase a grain from the hot store (tombstoned). Host-level op.
+    /// Routed through the facade so it carries the same `delete` check and
+    /// Tier-2 audit record as CAL's `FORGET <hash>`.
     fn forget(&self, py: Python<'_>, hash: String) -> PyResult<()> {
         let h = parse_hash(&hash)?;
-        py.detach(|| self.facade.with_store(|m| m.forget(&h)))
-            .map_err(err)
+        py.detach(|| self.facade.cal_delete(&h, None)).map_err(err)
     }
 
     /// Right-to-erasure for one identity: erase every grain holding a
@@ -664,6 +687,7 @@ impl DejaDB {
         text_mentions: bool,
     ) -> PyResult<String> {
         let ns = ns.unwrap_or_else(|| self.ns.clone());
+        check_verb(&self.facade, dejadb_core::authz::Verb::Erase, &ns)?;
         let opts = dejadb_store::ErasureOptions { text_mentions };
         let rep = py
             .detach(|| self.facade.with_store(|m| m.forget_subject_with(&ns, &subject, opts)))
@@ -673,6 +697,67 @@ impl DejaDB {
             "terms_removed": rep.terms_removed,
             "vocab_removed": rep.vocab_removed,
             "blobs_reclaimed": rep.blobs_reclaimed,
+        })
+        .to_string())
+    }
+
+    /// DSAR read (GDPR Art. 15/20): everything `forget_subject` WOULD erase
+    /// for one identity — exact + partition keys, full history — as
+    /// `{"identity_names": [...], "grains": [{hash, type, fields}, ...]}`.
+    /// The same selector as erasure, in show-me mode.
+    #[pyo3(signature = (subject, ns = None, text_mentions = false))]
+    fn subject_report(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        // The DSAR read is `read`-gated, exactly as `REPORT SUBJECT` is.
+        check_verb(&self.facade, dejadb_core::authz::Verb::Read, &ns)?;
+        let opts = dejadb_store::ErasureOptions { text_mentions };
+        let rep = py
+            .detach(|| self.facade.with_store(|m| m.subject_report_with(&ns, &subject, opts)))
+            .map_err(err)?;
+        let grains: Vec<serde_json::Value> = rep
+            .grains
+            .iter()
+            .map(|g| {
+                json!({
+                    "hash": g.hash.to_hex(),
+                    "type": g.grain_type.as_str(),
+                    "fields": g.fields.clone().into_iter().collect::<serde_json::Map<_, _>>(),
+                })
+            })
+            .collect();
+        Ok(json!({ "identity_names": rep.identity_names, "grains": grains }).to_string())
+    }
+
+    /// Export the subject selection as a portable MGB1 bundle (GDPR Art. 20
+    /// portability) — importable into any OMS store. Returns the bundle
+    /// stats JSON.
+    #[pyo3(signature = (path, subject, ns = None, text_mentions = false))]
+    fn subject_bundle(
+        &self,
+        py: Python<'_>,
+        path: String,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        check_verb(&self.facade, dejadb_core::authz::Verb::Read, &ns)?;
+        let opts = dejadb_store::ErasureOptions { text_mentions };
+        let stats = py
+            .detach(|| {
+                self.facade.with_store(|m| m.subject_bundle_with(&ns, &subject, opts, &path))
+            })
+            .map_err(err)?;
+        Ok(json!({
+            "ops": stats.ops,
+            "bytes": stats.bytes,
+            "last_op_seq": stats.last_op_seq,
         })
         .to_string())
     }
@@ -699,6 +784,12 @@ impl DejaDB {
         };
         let ns = ns.unwrap_or_else(|| self.ns.clone());
         let ns_opt = if ns.is_empty() { None } else { Some(ns) };
+        // ns="" sweeps every namespace, so it takes `erase` on all of them.
+        check_verb(
+            &self.facade,
+            dejadb_core::authz::Verb::Erase,
+            ns_opt.as_deref().unwrap_or("*"),
+        )?;
         let rep = py
             .detach(|| {
                 self.facade
@@ -1197,6 +1288,9 @@ impl DejaDB {
             if_stale_ms: if_stale.as_deref().and_then(parse_duration_ms),
             namespaces: Vec::new(),
             full_sweep,
+            // The handle's actor — the same identity review/apply stamp — so
+            // the trigger of an LLM/external finding cannot approve it.
+            triggering_actor: Some(self.actor.clone()),
         };
         // The longest call on this surface by far — a sweep plus, optionally,
         // several LLM round trips. Holding the interpreter lock across it would

@@ -179,6 +179,7 @@ macro_rules! for_each_conformance_case {
         $per_case!(pitr_max_hlc_cutoff_is_inclusive);
         // CAS blobs + hybrid legs
         $per_case!(cas_blob_roundtrip_and_gc);
+        $per_case!(forget_reclaims_sole_referenced_blob);
         $per_case!(bm25_leg_finds_text);
         $per_case!(vector_leg_roundtrip);
         // bulk erasure (right-to-erasure + retention)
@@ -186,6 +187,7 @@ macro_rules! for_each_conformance_case {
         $per_case!(partition_keys_and_text_mentions_erase);
         $per_case!(subject_erasure_replicates);
         $per_case!(retention_erases_only_older);
+        $per_case!(subject_report_mirrors_erasure);
     };
 }
 

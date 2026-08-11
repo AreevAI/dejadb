@@ -39,6 +39,7 @@ structured logging and interface envelopes.
 | `CAL` | CAL language: lexer, parser, executor, ASSEMBLE, templates, saved queries | `CalError` — `dejadb-cal/src/errors.rs` |
 | `SYS` | Internal / unexpected engine faults | `DejaDbError` |
 | `LOP` | Deja Loop self-improvement engine: analyzers, recommendation lifecycle, governance gates | `deja_loop::Error` — `crates/deja-loop/src/error.rs` |
+| `AUT` | Authorization: principals, verbs, grants, the credential map | `DejaDbError` — `dejadb-core/src/authz.rs` |
 
 The MCP server, HTTP console, CLI, and Python binding do not mint their own
 codes — they surface the underlying `DejaDbError` / `CalError` (and thus its
@@ -67,6 +68,10 @@ errors stay in the substrate's `CAL` domain; `LOP` covers engine semantics
 | `CAL-E083` | `AccumulateRetryExhausted` | ACCUMULATE retry budget exhausted (CAL-domain, bubbles through the store) |
 | `CAL-E084` | `AccumulateInternal` | ACCUMULATE internal failure |
 | `CAL-E085` | `AccumulateBackpressureRejected` | ACCUMULATE inflight cap exceeded |
+| `AUT-E001` | `AuthzDenied` | A verb the session's grants don't cover — names the verb, namespace, and principal |
+| `AUT-E002` | `AuthzUnknownPrincipal` | A principal name no credential authenticates |
+| `AUT-E003` | `AuthzConfigInvalid` | The credential map failed to load or validate (unknown key, bad version, malformed entry — fail closed) |
+| `AUT-E004` | `AuthzTokenUnrecognized` | A presented bearer token matched no credential (the message never echoes the token) |
 
 `deja_loop::Error` — Deja Loop engine (`crates/deja-loop/src/error.rs`), append-only:
 
@@ -126,6 +131,7 @@ and are the source of truth. Ranges:
 | `CAL-E110`–`E116` | Multi-format, user vars, scope, LLM-dependent options |
 | `CAL-E117`–`E119` | Template limits and inheritance (OMS CAL §10.7–§10.8) |
 | `CAL-E120` | Invalid JSON+CAL |
+| `CAL-E121` | Not authorized — the session's grants don't cover this statement (carries the `AUT-Ennn` detail) |
 | `CAL-W001`–`W012` | Warnings (unknown relation, deprecated operator, `{{#each}}` cap, bounded `CONTRADICTIONS` scan, …) |
 | `CAL-W013` | `WITH auto_relate` accepted but not implemented — no relations are inferred |
 | `CAL-W014` | A `WITH` option parsed and ran but cannot change the result on this statement (e.g. `score_breakdown` on `RECALL`) |

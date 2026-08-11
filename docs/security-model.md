@@ -49,10 +49,15 @@ top of that.
 
 ### Known limitations at rest
 
-- ⚠️ **The `.blobs` CAS sidecar is NOT encrypted.** Large binary payloads
-  stored via `put_blob` land in a plaintext sidecar directory even when the
-  database is encrypted. Keep sensitive media out of blobs until blob
-  encryption lands; the engine emits a runtime warning when encryption is on.
+- **The `.blobs` CAS sidecar is encrypted** when the memory is: AES-256-GCM
+  under a key HKDF-derived from the page-cipher key (domain-separated, so a
+  leaked blob key does not open the database), with the content address bound
+  in as associated data. The `cas://sha256:` address stays the digest of the
+  **plaintext** so addresses are stable across encrypted and plaintext stores
+  — the documented cost is that a blob filename is a content-equality oracle
+  (someone holding a candidate file can tell whether this memory stores it).
+  ⚠️ Attachments written by a build from before this landed stay plaintext
+  until migrated: run `deja blobs encrypt` and check `open_warnings()`.
 - ⚠️ **The encryption feature depends on the storage engine's *experimental*
   AES-GCM implementation** (a pinned Turso dependency). Treat encryption at
   rest as **defense-in-depth**, not a replacement for full-disk encryption on
@@ -72,7 +77,11 @@ top of that.
   sanitized to a single path component (no directory traversal). `--token-env`
   is **mandatory** for `deja hub`: unlike the console there is no
   trusted-local-operator default, because a hub exists to be written to by other
-  machines. A pushed segment can only ever *add* grains — import never deletes.
+  machines. A pushed segment is an **op-log replay**: it adds grains and
+  applies tombstones — including erasure tombstones, which is how a subject's
+  erasure reaches the hub's store (a tombstone deletes only the exact grain
+  hash it names, and its sole-referenced CAS attachments; it can never delete
+  by predicate).
 - The **web console** (`deja ui`) is unauthenticated by default (loopback,
   trusted local operator). Pass `--token-env <VAR>` to require a shared secret
   on **every** request — the console page, all reads, and all writes. Browsers
@@ -81,6 +90,15 @@ top of that.
   compared in constant time, and a `401` carries `WWW-Authenticate: Basic` so
   browsers prompt. Naming an env var (not a flag) keeps the secret out of argv
   and shell history.
+- **Multi-principal console** (`deja ui --auth deja-auth.json`): the credential
+  map resolves a token to a *principal name*; the rights come from the memory
+  file's own grant grains, and unauthenticated requests run as `anonymous`
+  (read-only unless the file grants more). It changes **who** a request is, not
+  **whether** a secret is required: pass `--token-env` alongside it and every
+  request must still carry a recognized credential — either a map token (binds
+  that principal) or the shared secret (the implied admin). A credential whose
+  `env` variable is unset or **empty** authenticates nobody; an empty
+  `Authorization: Bearer ` never resolves.
 - Import is **DoS-hardened**: an untrusted `.mg` blob is size-capped and its
   msgpack framing is validated iteratively before decoding, so a hostile grain
   cannot cause a stack overflow (deep nesting) or a giant pre-allocation (a
@@ -113,15 +131,21 @@ top of that.
 
 ## Input handling
 
-- **CAL** (the query language) has a single, gated destructive verb —
-  `FORGET <hash>` (a one-grain tombstone), controlled by the executor's
-  `allow_destructive_ops` switch (default on; disable per-process with
-  `--no-destructive-ops` for a read-only session, e.g. when serving untrusted
-  input over MCP). `DELETE`/`ERASE`/`TRUNCATE`/… are not grammar tokens, there
-  is no bulk/namespace erasure from a query, and the server path requires the
-  `admin` scope for FORGET. CAL is otherwise hardened against abuse (max query
-  length, nesting depth, LET-binding and result-size caps, Unicode bidi-override
-  rejection, NFC normalization).
+- **CAL** (the query language) destroys only in **shaped** forms — by hash
+  (`FORGET <hash>`), by identity (`FORGET SUBJECT "<id>"`), or by age
+  (`PURGE OLDER THAN <n>d`) — **never by predicate**. Each is authorized by
+  the session's `delete`/`erase` grant, requires a recorded BECAUSE (the
+  bulk forms mandatorily), and writes a Tier-2 audit Observation naming a
+  subject **fingerprint**, not the identity. The executor's
+  `allow_destructive_ops` switch (default on; `--no-destructive-ops`) is a
+  process-wide restrictive **cap** over any grant — use it for a read-only
+  session, e.g. when serving untrusted input over MCP.
+  `DELETE`/`ERASE`/`TRUNCATE`/… are not grammar tokens, `FORGET USER/SCOPE`
+  are refused from text, and the server path requires the `admin` scope.
+  `REPORT SUBJECT` — the read-only DSAR mirror — classifies as a read and is
+  gated by `read`, deliberately not by the destructive cap. CAL is otherwise
+  hardened against abuse (max query length, nesting depth, LET-binding and
+  result-size caps, Unicode bidi-override rejection, NFC normalization).
 - The store issues **parameterized SQL** exclusively; user strings are
   dictionary-encoded to integer term-ids before reaching the triple queries, so
   there is no SQL-injection surface.
@@ -141,7 +165,8 @@ top of that.
 
 - An already-compromised host, physical access, or a malicious local process
   running with the same privileges as DejaDB.
-- Confidentiality of the plaintext `.blobs` sidecar (documented limitation).
+- Whether a memory stores a *specific known* attachment: blob filenames are
+  plaintext content addresses (see the sidecar note above).
 - Network confidentiality without an operator-provided TLS proxy (by design).
 - Forged grain provenance when syncing with an untrusted peer (integrity is
   guaranteed; authenticity is not, until signing lands).
@@ -182,7 +207,6 @@ boundary. See [`loop.md`](loop.md) for the surfaces; the invariants:
 
 ## Roadmap
 
-- Blob (`.blobs`) encryption at rest.
 - Enforced grain signing / authenticity verification on import (COSE).
 - First-class TLS for the hub.
 

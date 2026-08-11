@@ -89,10 +89,12 @@ pub fn nfc_normalize(input: &str) -> String {
 pub fn is_destructive_keyword(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
-        // FORGET and DROP are first-class CAL statements (gated at execution
-        // by `allow_destructive_ops`), so they are not blocked here. PURGE is a
-        // token too, but the text parser still rejects it. DELETE stays blocked
-        // at the lexer — use `FORGET <hash>` instead.
+        // FORGET, PURGE, and DROP are first-class Tier-2 CAL statements
+        // (authorization-gated, capped by `allow_destructive_ops`), and
+        // GRANT/REVOKE are Tier-3 DCL (CAL 1.3) — none blocked here. DELETE
+        // stays blocked at the lexer — the deletion verbs are FORGET/PURGE.
+        // Credential and key vocabulary stays blocked forever: CAL never
+        // touches secrets.
         "DELETE"
             | "ERASE"
             | "DESTROY"
@@ -111,8 +113,7 @@ pub fn is_destructive_keyword(word: &str) -> bool {
             | "POLICY"
             | "SEAL"
             | "UNSEAL"
-            | "GRANT"
-            | "REVOKE"
+            | "TOKEN"
             | "CONSENT"
             | "RESTRICT"
             | "SCHEMA"
@@ -457,11 +458,76 @@ pub enum Token {
     Revert,
 
     // ── Tier 2 keywords (destructive statements) ─────────────────────────
+    /// `REMEMBER "<content>"` (CAL 1.3) — capture an Event, the
+    /// highest-frequency onboarding verb.
+    #[token("REMEMBER", ignore(ascii_case))]
+    Remember,
+
+    /// `ENTITY "<s>" RELATION "<r>" AT <ms>` (CAL 1.3) — the as-of read.
+    #[token("ENTITY", ignore(ascii_case))]
+    Entity,
+
+    /// `MERGE "<s>" RELATION "<r>" TO "<o>"` (CAL 1.3) — close a fork.
+    #[token("MERGE", ignore(ascii_case))]
+    Merge,
+
+    /// `RELATED "<start>" VIA "<relations>"` (CAL 1.3) — the graph walk.
+    #[token("RELATED", ignore(ascii_case))]
+    Related,
+
+    /// `NOVELTY "<text>"` (CAL 1.3) — nearest existing grains.
+    #[token("NOVELTY", ignore(ascii_case))]
+    Novelty,
+
+    /// `RUNS TOUCHING <hash>` (CAL 1.3) — the reverse run↔memory join.
+    #[token("RUNS", ignore(ascii_case))]
+    Runs,
+
+    /// `DERIVED FROM <hash>` (CAL 1.3) — reverse provenance.
+    #[token("DERIVED", ignore(ascii_case))]
+    Derived,
+
+    /// Governance (CAL 1.3 §8.16): `APPROVE <hash> BECAUSE "<why>"`.
+    #[token("APPROVE", ignore(ascii_case))]
+    Approve,
+
+    /// Governance: `REJECT <hash> BECAUSE "<why>"`.
+    #[token("REJECT", ignore(ascii_case))]
+    Reject,
+
+    /// Governance: `APPLY <hash> BECAUSE "<why>"`.
+    #[token("APPLY", ignore(ascii_case))]
+    Apply,
+
+    /// Governance: `ROLLBACK <hash> BECAUSE "<why>"`.
+    #[token("ROLLBACK", ignore(ascii_case))]
+    Rollback,
+
+    /// Tier-3 DCL (CAL 1.3): `GRANT <verbs> ON <ns> TO "<principal>"`.
+    #[token("GRANT", ignore(ascii_case))]
+    Grant,
+
+    /// Tier-3 DCL (CAL 1.3): `REVOKE <verbs> ON <ns> FROM "<principal>"`.
+    #[token("REVOKE", ignore(ascii_case))]
+    Revoke,
+
+    /// `SHOW GRANTS [FOR "<principal>"]` (CAL 1.3).
+    #[token("SHOW", ignore(ascii_case))]
+    Show,
+
+    /// `TO` — the GRANT recipient marker.
+    #[token("TO", ignore(ascii_case))]
+    To,
+
     #[token("FORGET", ignore(ascii_case))]
     Forget,
 
     #[token("PURGE", ignore(ascii_case))]
     Purge,
+
+    /// `REPORT SUBJECT` — the read-only DSAR selection (OMS 1.6 draft).
+    #[token("REPORT", ignore(ascii_case))]
+    Report,
 
     #[token("SET", ignore(ascii_case))]
     Set,
@@ -888,8 +954,24 @@ impl Token {
             Token::Accumulate => "ACCUMULATE".into(),
             Token::Supersede => "SUPERSEDE".into(),
             Token::Revert => "REVERT".into(),
+            Token::Grant => "GRANT".into(),
+            Token::Revoke => "REVOKE".into(),
+            Token::Show => "SHOW".into(),
+            Token::To => "TO".into(),
+            Token::Remember => "REMEMBER".into(),
+            Token::Entity => "ENTITY".into(),
+            Token::Merge => "MERGE".into(),
+            Token::Related => "RELATED".into(),
+            Token::Novelty => "NOVELTY".into(),
+            Token::Runs => "RUNS".into(),
+            Token::Derived => "DERIVED".into(),
+            Token::Approve => "APPROVE".into(),
+            Token::Reject => "REJECT".into(),
+            Token::Apply => "APPLY".into(),
+            Token::Rollback => "ROLLBACK".into(),
             Token::Forget => "FORGET".into(),
             Token::Purge => "PURGE".into(),
+            Token::Report => "REPORT".into(),
             Token::Set => "SET".into(),
             Token::Reason => "REASON".into(),
             Token::Because => "BECAUSE".into(),
@@ -998,6 +1080,7 @@ impl Token {
                 | Token::Revert
                 | Token::Forget
                 | Token::Purge
+                | Token::Report
                 | Token::Drop
                 | Token::Run
         )
@@ -1457,8 +1540,7 @@ mod tests {
             "POLICY",
             "SEAL",
             "UNSEAL",
-            "GRANT",
-            "REVOKE",
+            "TOKEN",
             "CONSENT",
             "RESTRICT",
             "SCHEMA",
@@ -1479,6 +1561,14 @@ mod tests {
                 word
             );
         }
+        // CAL 1.3: GRANT/REVOKE left the blocklist and became Tier-3 DCL
+        // keywords — they lex as statement tokens now, not blocked idents.
+        assert!(!is_destructive_keyword("GRANT"));
+        assert!(!is_destructive_keyword("REVOKE"));
+        assert_eq!(
+            tok("GRANT revoke Show TO"),
+            vec![Token::Grant, Token::Revoke, Token::Show, Token::To]
+        );
     }
 
     #[test]

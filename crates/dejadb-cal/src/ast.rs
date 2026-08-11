@@ -152,12 +152,76 @@ pub enum CalStatement {
     #[serde(alias = "REVERT", alias = "Revert")]
     Revert(RevertStmt),
 
+    /// `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only DSAR
+    /// mirror of `FORGET SUBJECT` (OMS 1.6 draft).
+    ReportSubject(ReportSubjectStmt),
+
     // ── Tier 2: Destructive statements (gated by allow_destructive_ops) ─
-    /// `FORGET <hash>` / `FORGET USER "<user_id>"` / `FORGET SCOPE "<scope>"`
+    /// `FORGET <hash>` / `FORGET SUBJECT "<id>"`
     Forget(ForgetStmt),
 
-    /// `PURGE STALE [OLDER THAN <n> DAYS] [IN "<namespace>"] [LIMIT <n>]`
+    /// `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<namespace>"] [LIMIT <n>]`
     Purge(PurgeStmt),
+
+    // ── Tier 3: Control (CAL 1.3 §8.15) ────────────────────────────────
+    /// `GRANT <verbs> ON <ns> TO "<principal>"`
+    #[serde(alias = "GRANT")]
+    Grant(GrantStmt),
+
+    /// `REVOKE <verbs> ON <ns> FROM "<principal>"`
+    #[serde(alias = "REVOKE")]
+    Revoke(RevokeStmt),
+
+    /// `SHOW GRANTS [FOR "<principal>"]`
+    #[serde(alias = "SHOW_GRANTS", alias = "ShowGrants")]
+    ShowGrants(ShowGrantsStmt),
+
+    // ── Tier 3: Governance (CAL 1.3 §8.16) ─────────────────────────────
+    /// `APPROVE <hash> BECAUSE "…"`
+    #[serde(alias = "APPROVE")]
+    Approve(GovernanceStmt),
+    /// `REJECT <hash> BECAUSE "…"`
+    #[serde(alias = "REJECT")]
+    Reject(GovernanceStmt),
+    /// `APPLY <hash> BECAUSE "…"`
+    #[serde(alias = "APPLY")]
+    ApplyRec(GovernanceStmt),
+    /// `ROLLBACK <hash> BECAUSE "…"`
+    #[serde(alias = "ROLLBACK")]
+    RollbackRec(GovernanceStmt),
+    /// `RUN LOOP [FULL] [WITH …]`
+    #[serde(alias = "RUN_LOOP", alias = "RunLoop")]
+    RunLoop(RunLoopStmt),
+
+    /// `REMEMBER "<content>" [WITH …]`
+    #[serde(alias = "REMEMBER")]
+    Remember(RememberStmt),
+
+    // ── Wave-2 reads (CAL 1.3) ─────────────────────────────────────────
+    /// `ENTITY "<s>" RELATION "<r>" AT <ms> [AXIS …]`
+    #[serde(alias = "ENTITY_AT", alias = "EntityAt")]
+    EntityAt(EntityAtStmt),
+    /// `RUN TRACE "<run-id>"`
+    #[serde(alias = "RUN_TRACE")]
+    RunTrace(RunTraceStmt),
+    /// `RUNS TOUCHING <hash>`
+    #[serde(alias = "RUNS_TOUCHING")]
+    RunsTouching(RunsTouchingStmt),
+    /// `DERIVED FROM <hash>`
+    #[serde(alias = "DERIVED_FROM")]
+    DerivedFrom(DerivedFromStmt),
+    /// `SHOW FORKS`
+    #[serde(alias = "SHOW_FORKS")]
+    ShowForks(ShowForksStmt),
+    /// `MERGE "<s>" RELATION "<r>" TO "<o>" BECAUSE "…"`
+    #[serde(alias = "MERGE")]
+    Merge(MergeStmt),
+    /// `RELATED "<start>" VIA "<relations>"`
+    #[serde(alias = "RELATED")]
+    Related(RelatedStmt),
+    /// `NOVELTY "<text>"`
+    #[serde(alias = "NOVELTY")]
+    Novelty(NoveltyStmt),
 
     // ── Template management ──────────────────────────────────────────────
     /// `DEFINE TEMPLATE "name" [DESCRIPTION "..."] [EXTENDS "parent"] [FOR facts, events] AS "source"`
@@ -462,6 +526,22 @@ pub enum DescribeTarget {
     Queries,
     /// `DESCRIBE QUERY "name"` — details of a specific saved query.
     Query(String),
+
+    // ── CAL 1.3 (Tier 3) ────────────────────────────────────────────────
+    /// `DESCRIBE PRINCIPAL "<name>"` — the principal's effective grants.
+    Principal(String),
+    /// `DESCRIBE LOOP` — loop health (last run, queue depth).
+    Loop,
+    /// `DESCRIBE ANALYZERS` — registered analyzers + effective config.
+    Analyzers,
+    /// `DESCRIBE OUTCOMES` — the Verify gate's measured outcomes.
+    Outcomes,
+    /// `DESCRIBE POLICY` — the effective host loop policy (read-only).
+    LoopPolicy,
+    /// `DESCRIBE STATS` — store counters.
+    Stats,
+    /// `DESCRIBE INTEGRITY` — integrity + content-address recheck.
+    Integrity,
 }
 
 // ---------------------------------------------------------------------------
@@ -699,16 +779,27 @@ pub struct RevertStmt {
 // FORGET (Tier 2)
 // ---------------------------------------------------------------------------
 
-/// `FORGET <hash>`, `FORGET USER "<user_id>"`, or `FORGET SCOPE "<scope>"`.
+/// `FORGET <hash> [BECAUSE "<why>"]` or
+/// `FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "<why>"` (CAL 1.3
+/// §8.14 — the subject form parses into [`ForgetTarget::User`], the store's
+/// identity erasure).
 ///
-/// Gated by `CalExecutorConfig::allow_destructive_ops`. Only the `Hash`
-/// target is backed by the store (`DejaDB::forget`, a single-grain tombstone);
-/// `User`/`Scope` crypto-erasure is not implemented yet and returns
-/// `Unsupported`.
+/// Capped by `CalExecutorConfig::allow_destructive_ops`; authorized by the
+/// session's `delete` (hash) / `erase` (subject) grant. `Scope` stays
+/// unreachable from text. BECAUSE is optional-but-recorded on the hash form
+/// (it predates the requirement) and mandatory on the subject form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForgetStmt {
     /// What to forget (hash, user, or scope).
     pub target: ForgetTarget,
+    /// The recorded reason (BECAUSE). Mandatory for non-hash targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `WITH text_mentions` — extend a subject erasure to grains whose
+    /// indexed text mentions the identity (search symmetry; subject form
+    /// only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_mentions: bool,
     #[serde(skip)]
     pub span: Option<Span>,
 }
@@ -729,19 +820,271 @@ pub enum ForgetTarget {
 // PURGE (Tier 2)
 // ---------------------------------------------------------------------------
 
-/// `PURGE STALE [OLDER THAN <n> DAYS] [IN "<namespace>"] [LIMIT <n>]`
+/// `PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"]
+/// BECAUSE "<why>"` — the retention sweep (CAL 1.3 §8.14).
 ///
-/// Cleanup expired/stale grains using the decay curve engine.
-/// Gated by `CalExecutorConfig::allow_destructive_ops` (and not backed by the
-/// store yet — returns `Unsupported`; also not reachable from CAL text).
+/// Capped by `CalExecutorConfig::allow_destructive_ops`; authorized by the
+/// session's `erase` grant on the swept namespace. BECAUSE is mandatory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PurgeStmt {
-    /// Minimum age in days (from `OLDER THAN <n> DAYS`). Default: 30.
+    /// Minimum age in days (from `OLDER THAN <n><unit>`; h/m convert).
     pub min_age_days: Option<f64>,
-    /// Namespace scope (from `IN "<namespace>"`). Default: "default".
+    /// Namespace scope (from `IN "<namespace>"`). Default: the session
+    /// namespace, then "shared" — never an implicit all-namespace sweep.
     pub namespace: Option<String>,
     /// Maximum grains to purge (from `LIMIT <n>`). Default: 1000.
     pub limit: Option<usize>,
+    /// `TYPE <t>` — restrict the sweep to one grain type (e.g. `event`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain_type: Option<String>,
+    /// The recorded reason (BECAUSE). Mandatory from text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// REPORT SUBJECT (read-only DSAR)
+// ---------------------------------------------------------------------------
+
+/// `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only DSAR
+/// selection (OMS 1.6 draft): everything `FORGET SUBJECT` would erase for
+/// one identity — exact + partition keys, full history — hydrated instead
+/// of erased (GDPR Art. 15 access / Art. 20 portability). A pure read:
+/// classifies `Read`, needs the `read` grant only, and is available on the
+/// token-less read-only console.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportSubjectStmt {
+    /// The identity to report on.
+    pub subject_id: String,
+    /// `WITH text_mentions` — extend the selection to grains whose indexed
+    /// text mentions the identity (search symmetry with the erasure form).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_mentions: bool,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// Wave-2 reads (CAL 1.3): as-of, the run↔memory join, reverse provenance
+// ---------------------------------------------------------------------------
+
+/// `ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms>
+/// [AXIS world|knowledge]` — the bitemporal as-of read: what was true in
+/// the world at T (`world`, validity windows) or what the agent knew at T
+/// (`knowledge`, the supersession chain).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityAtStmt {
+    pub subject: String,
+    pub relation: String,
+    pub at_ms: i64,
+    /// `world` (default) | `knowledge`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUN TRACE "<run-id>" [LIMIT <n>]` — everything a run recorded, plus
+/// what it produced downstream (the join between execution history and
+/// semantic memory, in one statement).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunTraceStmt {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUNS TOUCHING <hash> [DEPTH <n>]` — which runs produced or refined a
+/// grain (walks provenance both ways; reads leave no grain and are not
+/// recorded).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunsTouchingStmt {
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `DERIVED FROM <hash>` — reverse provenance: the grains distilled from
+/// a source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedFromStmt {
+    pub hash: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `MERGE "<subject>" RELATION "<relation>" TO "<object>"
+/// [CONFIDENCE <n>] BECAUSE "<why>"` — close an open fork: a resolved
+/// value that supersedes every live tip (the merge grain records all
+/// parents). Requires the `supersede` grant; refuses when no fork is
+/// open (a merge of one head would be a plain supersede).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MergeStmt {
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    pub reason: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both] [DEPTH <n>]
+/// [LIMIT <n>]` — the bounded k-hop entity walk. `in`/`both` only see
+/// relations the file declares entity-valued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedStmt {
+    pub start: String,
+    /// Comma-separated relation list, as written.
+    pub relations: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"] [LIMIT <k>]` — the
+/// paraphrase check: nearest existing grains to a candidate text.
+/// Requires a host-installed embedder; a clean refusal otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoveltyStmt {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `SHOW FORKS` — the open forks (subject+relation pairs with >1 live
+/// head), first-class.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowForksStmt {
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// REMEMBER (Tier 1 — CAL 1.3)
+// ---------------------------------------------------------------------------
+
+/// `REMEMBER "<content>" [WITH session("<id>"), role("<r>"), run("<id>")]`
+///
+/// Capture free text as an Event grain — the onboarding verb, in the
+/// language. The observer is the bound session's principal (never
+/// statement text); LLM fact extraction stays a host concern
+/// (`deja remember --model …`), so the statement carries no model names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RememberStmt {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// `user` | `assistant` | `system` | `tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// Governance (Tier 3 — CAL 1.3 §8.16)
+// ---------------------------------------------------------------------------
+
+/// `APPROVE <hash> BECAUSE "…"` / `REJECT …` / `APPLY …` / `ROLLBACK …`.
+///
+/// The loop lifecycle in the language. BECAUSE is mandatory — a parse
+/// error without, matching the engine's own non-empty check (two layers).
+/// The actor, scopes, and observer come from the bound session, never from
+/// the statement; the four gates (separation of duties, self-approval
+/// block, two-key destructive apply, hash-chained audit) are enforced by
+/// the engine exactly as on every other surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GovernanceStmt {
+    /// The recommendation's content address.
+    pub hash: String,
+    /// The mandatory written reason.
+    pub reason: String,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `RUN LOOP [FULL] [WITH min_new(N), if_stale("6h")]` — trigger the
+/// analysis pass. Carries no credentials and no model names: LLM backends
+/// are host configuration, never statement text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunLoopStmt {
+    /// `FULL` — the whole-memory reflect sweep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_sweep: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_new: Option<u64>,
+    /// `if_stale` duration, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_stale_ms: Option<i64>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// GRANT / REVOKE / SHOW GRANTS (Tier 3 — CAL 1.3 §8.15)
+// ---------------------------------------------------------------------------
+
+/// `GRANT <verb>[, <verb>…] ON <ns|*> TO "<principal>" [WITH because("…")]`
+///
+/// Writes a grant grain (`Fact + mg:permits` in the reserved `agent:authz`
+/// namespace). Append-only — Tier 3 is gated by the `admin` verb and capped
+/// by `tier1_enabled`, untouched by `allow_destructive_ops`. Verbs are
+/// validated against the verb registry at execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrantStmt {
+    pub verbs: Vec<String>,
+    /// Governed namespaces (`*` = every namespace).
+    pub namespaces: Vec<String>,
+    pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `REVOKE <verb>[, <verb>…] ON <ns|*> FROM "<principal>" [WITH because("…")]`
+///
+/// Retraction by supersession: each covering grant grain is superseded with
+/// the reduced grant (or a retraction record when nothing remains) — nothing
+/// is deleted; grant history stays append-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RevokeStmt {
+    pub verbs: Vec<String>,
+    pub namespaces: Vec<String>,
+    pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+/// `SHOW GRANTS [FOR "<principal>"]` — the live grants, one row per grant
+/// grain. Sugar over recalling the `PERMISSION` relation in `agent:authz`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShowGrantsStmt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     #[serde(skip)]
     pub span: Option<Span>,
 }
@@ -1294,6 +1637,11 @@ pub enum AddWithOption {
     ExtractMemories,
     /// Force immediate commit (bypass write batch buffer).
     Sync,
+    /// `WITH occurrence` (ADD tool only): stamp a synthetic per-call
+    /// identity so byte-identical retries stay distinct occurrences
+    /// instead of collapsing to one content address — the #66 semantics,
+    /// reachable from CAL.
+    Occurrence,
 }
 
 // ---------------------------------------------------------------------------

@@ -657,10 +657,65 @@ structural curation with no model- or tool-derived free text. Full guide:
 
 ---
 
+## 13. Answer a data-subject request (access, portability, erasure)
+
+The access request and the erasure run **one selector**, so what you disclose
+is exactly what you delete. Three commands, one audit trail:
+
+```bash
+# 1. Art. 15 access + Art. 20 portability — nothing is modified.
+deja subject-report "pat" --db memory.db --ns caller \
+     --out pat.jsonl --bundle pat.mgb
+
+# 2. Art. 17 erasure — history, partition keys (pat#visit1), dictionary
+#    entries, and sole-referenced attachments, replicating as tombstones.
+deja forget-subject "pat" --db memory.db --ns caller --yes \
+     --because "Art. 17 request #42"
+
+# 3. Art. 5(2)/30 evidence — who erased what, when, and why.
+deja audit export --db memory.db --out evidence.jsonl
+```
+
+Add `--text-mentions` to both the report and the erasure to reach grains
+whose *indexed text* mentions the identity (needs the text index on and fully
+built; it errors rather than answering partially). The `.mgb` is a portable
+bundle any OMS store can import — that is the portability deliverable, not a
+screenshot.
+
+The audit record names a **fingerprint** of the identity, not the identity:
+
+```bash
+deja audit export --db memory.db | head -1
+# {"trail":"destruction","verb":"erase","target":"subject:68d753f055b1a15b ns:caller",
+#  "subject_ref":"sha256-64/hex","because":"Art. 17 request #42","grains_erased":2,...}
+
+# Verify a record refers to "pat" by recomputing the digest:
+python3 -c 'import hashlib; print(hashlib.sha256(b"pat").hexdigest()[:16])'
+# 68d753f055b1a15b
+```
+
+That is deliberate: an audit grain is immutable, replicates, and lands in
+archives, so writing the identifier there would undo the erasure it records.
+The fingerprint is verifiable from a candidate identity but not enumerable.
+
+To make the erasure reach your archives too, run streaming with a retention
+window — each checkpoint snapshots the already-erased store, and generations
+older than the window are dropped whole:
+
+```bash
+deja stream --db memory.db --to /var/lib/deja/archive --checkpoint --retain 30d
+```
+
+Full obligation map, deployment requirements, and honest limits:
+[`gdpr.md`](gdpr.md).
+
+---
+
 ## See also
 
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — how DejaDB is built
 - [`cal-reference.md`](cal-reference.md) — the CAL query language
 - [`mcp-reference.md`](mcp-reference.md) — the MCP tools
+- [`gdpr.md`](gdpr.md) — GDPR obligations → capabilities (for a DPIA)
 - [`../FAQ.md`](../FAQ.md) — concepts and comparisons
 - [`../SECURITY.md`](../SECURITY.md) — trust model and hardening

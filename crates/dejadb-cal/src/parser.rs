@@ -38,11 +38,39 @@ use super::ast::{
     UntilClause, Value, WhereClause, WithOption,
 };
 use super::ast::{
-    DefineQueryStmt, DropQueryStmt, ForgetStmt, ForgetTarget, QueryParam, RunQueryStmt,
-    TemplateSectionSources,
+    DefineQueryStmt, DerivedFromStmt, DropQueryStmt, EntityAtStmt, ForgetStmt, ForgetTarget,
+    GovernanceStmt, GrantStmt, MergeStmt, NoveltyStmt, PurgeStmt, QueryParam, RelatedStmt,
+    RememberStmt, ReportSubjectStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, RunTraceStmt,
+    RunsTouchingStmt, ShowForksStmt, ShowGrantsStmt, TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
+
+/// The parsed pieces of a GRANT/REVOKE body:
+/// `(verbs, namespaces, principal, reason)`.
+type DclBody = (Vec<String>, Vec<String>, String, Option<String>);
+
+/// Parse a `RUN LOOP WITH if_stale("…")` duration — `"300s"`, `"90m"`,
+/// `"6h"`, `"2d"` — to milliseconds. `None` on anything else.
+fn parse_stale_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: f64 = num.parse().ok()?;
+    if n < 0.0 || !n.is_finite() {
+        return None;
+    }
+    let ms = match unit {
+        "s" => n * 1000.0,
+        "m" => n * 60_000.0,
+        "h" => n * 3_600_000.0,
+        "d" => n * 86_400_000.0,
+        _ => return None,
+    };
+    Some(ms as i64)
+}
 
 // ---------------------------------------------------------------------------
 // Hard limits
@@ -166,8 +194,31 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         CalStatement::Supersede(_) | CalStatement::SupersedeWorkflow(_) => write("SUPERSEDE"),
         CalStatement::Accumulate(_) => write("ACCUMULATE"),
         CalStatement::Revert(_) => write("REVERT"),
+        CalStatement::Remember(_) => write("REMEMBER"),
+        CalStatement::EntityAt(_)
+        | CalStatement::RunTrace(_)
+        | CalStatement::RunsTouching(_)
+        | CalStatement::DerivedFrom(_)
+        | CalStatement::ShowForks(_)
+        | CalStatement::Related(_)
+        | CalStatement::Novelty(_)
+        | CalStatement::ReportSubject(_) => Ok(()),
+        CalStatement::Merge(_) => write("MERGE"),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
+        // No DCL inside saved-query bodies — a stored GRANT executing with
+        // the invoker's rights would be a confused deputy. SHOW GRANTS is a
+        // read and fine.
+        CalStatement::Grant(_) => write("GRANT"),
+        CalStatement::Revoke(_) => write("REVOKE"),
+        CalStatement::ShowGrants(_) => Ok(()),
+        // No governance in stored bodies either — the deliberate friction
+        // of one-statement-at-a-time review must not be macro-able.
+        CalStatement::Approve(_) => write("APPROVE"),
+        CalStatement::Reject(_) => write("REJECT"),
+        CalStatement::ApplyRec(_) => write("APPLY"),
+        CalStatement::RollbackRec(_) => write("ROLLBACK"),
+        CalStatement::RunLoop(_) => write("RUN LOOP"),
         CalStatement::DefineTemplate(_) => write("DEFINE TEMPLATE"),
         CalStatement::DropTemplate(_) => write("DROP TEMPLATE"),
         CalStatement::DefineQuery(_) => write("DEFINE QUERY"),
@@ -1269,30 +1320,93 @@ impl Parser {
                 token: Token::Revert,
                 ..
             }) => self.parse_revert(),
-            // FORGET <hash> — Tier-2 tombstone, gated at execution by
-            // `allow_destructive_ops`. PURGE remains outside the text grammar.
+            // FORGET <hash> / FORGET SUBJECT — Tier-2 destruction, capped by
+            // `allow_destructive_ops` and authorized by the session's
+            // delete/erase grants at execution.
             Some(SpannedToken {
                 token: Token::Forget,
                 ..
             }) => self.parse_forget(),
+            // PURGE OLDER THAN — the retention sweep (CAL 1.3 §8.14),
+            // authorization-gated at execution like every Tier-2 statement.
             Some(SpannedToken {
                 token: Token::Purge,
-                span,
                 ..
-            }) => {
-                let span = *span;
-                Err(CalError::UnexpectedToken {
-                    expected: "RECALL, EXISTS, ASSEMBLE, HISTORY, EXPLAIN, DESCRIBE, BATCH, COALESCE, ADD, SUPERSEDE, REVERT, FORGET, DEFINE, DROP, or STREAM".into(),
-                    found: "PURGE".into(),
-                    span: Some(span),
-                    suggestion: Some(
-                        "PURGE is not part of CAL grammar. Use FORGET <hash> to \
-                         tombstone a single grain; bulk erasure is a host-level \
-                         operation."
-                            .into(),
-                    ),
-                })
-            }
+            }) => self.parse_purge(),
+            // REPORT SUBJECT — the read-only DSAR selection (OMS 1.6
+            // draft): the erasure selector in show-me mode.
+            Some(SpannedToken {
+                token: Token::Report,
+                ..
+            }) => self.parse_report_subject(),
+            // Governance (CAL 1.3 §8.16): the loop lifecycle in the
+            // language, BECAUSE as syntax.
+            Some(SpannedToken {
+                token: Token::Approve,
+                ..
+            }) => Ok(CalStatement::Approve(
+                self.parse_governance_body(&Token::Approve)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Reject,
+                ..
+            }) => Ok(CalStatement::Reject(
+                self.parse_governance_body(&Token::Reject)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Apply,
+                ..
+            }) => Ok(CalStatement::ApplyRec(
+                self.parse_governance_body(&Token::Apply)?,
+            )),
+            Some(SpannedToken {
+                token: Token::Rollback,
+                ..
+            }) => Ok(CalStatement::RollbackRec(
+                self.parse_governance_body(&Token::Rollback)?,
+            )),
+            // Tier-3 DCL (CAL 1.3 §8.15).
+            Some(SpannedToken {
+                token: Token::Grant,
+                ..
+            }) => self.parse_grant(),
+            Some(SpannedToken {
+                token: Token::Revoke,
+                ..
+            }) => self.parse_revoke(),
+            Some(SpannedToken {
+                token: Token::Show,
+                ..
+            }) => self.parse_show_grants(),
+            Some(SpannedToken {
+                token: Token::Remember,
+                ..
+            }) => self.parse_remember(),
+            // Wave-2 reads (CAL 1.3).
+            Some(SpannedToken {
+                token: Token::Entity,
+                ..
+            }) => self.parse_entity_at(),
+            Some(SpannedToken {
+                token: Token::Runs,
+                ..
+            }) => self.parse_runs_touching(),
+            Some(SpannedToken {
+                token: Token::Derived,
+                ..
+            }) => self.parse_derived_from(),
+            Some(SpannedToken {
+                token: Token::Merge,
+                ..
+            }) => self.parse_merge(),
+            Some(SpannedToken {
+                token: Token::Related,
+                ..
+            }) => self.parse_related(),
+            Some(SpannedToken {
+                token: Token::Novelty,
+                ..
+            }) => self.parse_novelty(),
             Some(SpannedToken {
                 token: Token::Define,
                 ..
@@ -4032,6 +4146,28 @@ impl Parser {
                 } else if s.eq_ignore_ascii_case("queries") {
                     self.advance();
                     DescribeTarget::Queries
+                } else if s.eq_ignore_ascii_case("principal") {
+                    self.advance();
+                    let name = self.parse_string_literal()?;
+                    DescribeTarget::Principal(name)
+                } else if s.eq_ignore_ascii_case("loop") {
+                    self.advance();
+                    DescribeTarget::Loop
+                } else if s.eq_ignore_ascii_case("analyzers") {
+                    self.advance();
+                    DescribeTarget::Analyzers
+                } else if s.eq_ignore_ascii_case("outcomes") {
+                    self.advance();
+                    DescribeTarget::Outcomes
+                } else if s.eq_ignore_ascii_case("policy") {
+                    self.advance();
+                    DescribeTarget::LoopPolicy
+                } else if s.eq_ignore_ascii_case("stats") {
+                    self.advance();
+                    DescribeTarget::Stats
+                } else if s.eq_ignore_ascii_case("integrity") {
+                    self.advance();
+                    DescribeTarget::Integrity
                 } else {
                     self.advance();
                     DescribeTarget::Schema
@@ -4631,6 +4767,28 @@ impl Parser {
                 self.advance();
                 Ok("query".to_string())
             }
+            // CAL 1.3 statement keywords that are everyday node names —
+            // review/approval workflows use exactly these words.
+            Some(SpannedToken {
+                token:
+                    t @ (Token::Approve
+                    | Token::Reject
+                    | Token::Apply
+                    | Token::Rollback
+                    | Token::Grant
+                    | Token::Revoke
+                    | Token::Show
+                    | Token::Merge
+                    | Token::Related
+                    | Token::Novelty
+                    | Token::Remember
+                    | Token::Entity),
+                ..
+            }) => {
+                let name = t.description().to_ascii_lowercase();
+                self.advance();
+                Ok(name)
+            }
             Some(SpannedToken {
                 token: Token::StringLiteral(_),
                 ..
@@ -4745,6 +4903,12 @@ impl Parser {
             }) => {
                 self.advance();
                 Ok(Some(AddWithOption::Sync))
+            }
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("occurrence") =>
+            {
+                self.advance();
+                Ok(Some(AddWithOption::Occurrence))
             }
             Some(st) => {
                 let found = st.token.description();
@@ -5047,10 +5211,1106 @@ impl Parser {
     fn parse_forget(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
         self.expect_exact(&Token::Forget)?;
+
+        // `FORGET SUBJECT "<id>"` — identity-scoped erasure (CAL 1.3 §8.14).
+        // USER/SCOPE remain out of the text grammar: SUBJECT is the one
+        // spelled form, matching the host verbs and the spec.
+        if let Some(SpannedToken { token: Token::Ident(word), span, .. }) = self.peek() {
+            let word_up = word.to_ascii_uppercase();
+            let span = *span;
+            match word_up.as_str() {
+                "SUBJECT" => {
+                    self.advance();
+                    let user_id = self.parse_string_literal()?;
+                    // Optional `WITH text_mentions`.
+                    let mut text_mentions = false;
+                    if self.at_exact(&Token::With) {
+                        self.advance();
+                        match self.peek() {
+                            Some(SpannedToken { token: Token::Ident(opt), .. })
+                                if opt.eq_ignore_ascii_case("text_mentions") =>
+                            {
+                                self.advance();
+                                text_mentions = true;
+                            }
+                            other => {
+                                return Err(CalError::UnexpectedToken {
+                                    expected: "text_mentions".into(),
+                                    found: other
+                                        .map(|t| t.token.description())
+                                        .unwrap_or_else(|| "end of input".into()),
+                                    span: other.map(|t| t.span),
+                                    suggestion: Some(
+                                        "FORGET SUBJECT supports exactly one option: \
+                                         WITH text_mentions"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    // BECAUSE is mandatory on the subject form — an identity
+                    // erasure without a recorded reason is not auditable.
+                    if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+                        return Err(CalError::MissingReason {
+                            span: Some(self.current_span()),
+                        });
+                    }
+                    self.advance();
+                    let reason = self.parse_string_literal()?;
+                    let span_end = self.prev_span();
+                    return Ok(CalStatement::Forget(ForgetStmt {
+                        target: ForgetTarget::User { user_id },
+                        reason: Some(reason),
+                        text_mentions,
+                        span: Some(Span::new(
+                            span_start.start,
+                            span_end.end,
+                            span_start.line,
+                            span_start.col,
+                        )),
+                    }));
+                }
+                "USER" | "SCOPE" => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "a grain hash or SUBJECT".into(),
+                        found: word_up,
+                        span: Some(span),
+                        suggestion: Some(
+                            "identity erasure is spelled FORGET SUBJECT \"<id>\" \
+                             BECAUSE \"<why>\"; scope erasure is not part of the \
+                             text grammar"
+                                .into(),
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         let hash = self.parse_hash_literal()?;
+        // BECAUSE is optional on the hash form (it predates the requirement)
+        // but recorded when given.
+        let reason = if self.at_exact(&Token::Reason) || self.at_exact(&Token::Because) {
+            self.advance();
+            Some(self.parse_string_literal()?)
+        } else {
+            None
+        };
         let span_end = self.prev_span();
         Ok(CalStatement::Forget(ForgetStmt {
             target: ForgetTarget::Hash { hash },
+            reason,
+            text_mentions: false,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only
+    /// DSAR selection (OMS 1.6 draft). No BECAUSE: it is a pure read, and
+    /// reads don't carry reasons.
+    fn parse_report_subject(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Report)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(word), .. })
+                if word.eq_ignore_ascii_case("SUBJECT") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "SUBJECT".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the DSAR read is spelled REPORT SUBJECT \"<id>\" \
+                         [WITH text_mentions]"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        let subject_id = self.parse_string_literal()?;
+        let mut text_mentions = false;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(opt), .. })
+                    if opt.eq_ignore_ascii_case("text_mentions") =>
+                {
+                    self.advance();
+                    text_mentions = true;
+                }
+                other => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "text_mentions".into(),
+                        found: other
+                            .map(|t| t.token.description())
+                            .unwrap_or_else(|| "end of input".into()),
+                        span: other.map(|t| t.span),
+                        suggestion: Some(
+                            "REPORT SUBJECT supports exactly one option: \
+                             WITH text_mentions"
+                                .into(),
+                        ),
+                    });
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::ReportSubject(ReportSubjectStmt {
+            subject_id,
+            text_mentions,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>]
+    /// [IN "<namespace>"] [LIMIT <n>] BECAUSE "<why>"` (CAL 1.3 §8.14).
+    fn parse_purge(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Purge)?;
+
+        let expect_word = |me: &mut Self, word: &str| -> CalResult<()> {
+            match me.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case(word) =>
+                {
+                    me.advance();
+                    Ok(())
+                }
+                other => Err(CalError::UnexpectedToken {
+                    expected: word.into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the retention sweep is spelled PURGE OLDER THAN <n><d|h|m> \
+                         [TYPE <t>] [IN \"<ns>\"] BECAUSE \"<why>\""
+                            .into(),
+                    ),
+                }),
+            }
+        };
+        expect_word(self, "OLDER")?;
+        expect_word(self, "THAN")?;
+
+        // `90d` lexes as NumberLiteral(90) + Ident("d").
+        let n = match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n > 0.0 => {
+                let n = *n;
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a positive age like 90d, 6h, or 30m".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        let min_age_days = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(u), .. }) => {
+                let unit = u.to_ascii_lowercase();
+                let days = match unit.as_str() {
+                    "d" => n,
+                    "h" => n / 24.0,
+                    "m" => n / 1440.0,
+                    _ => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "an age unit: d, h, or m".into(),
+                            found: u.clone(),
+                            span: self.peek().map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                };
+                self.advance();
+                days
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "an age unit: d, h, or m".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("write the age as one word, e.g. 90d".into()),
+                });
+            }
+        };
+
+        // Optional TYPE <grain-type>, IN "<ns>", LIMIT <n> — any order.
+        let mut grain_type: Option<String> = None;
+        let mut namespace: Option<String> = None;
+        let mut limit: Option<usize> = None;
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("TYPE") && grain_type.is_none() =>
+                {
+                    self.advance();
+                    match self.peek() {
+                        Some(SpannedToken { token: Token::Ident(t), .. }) => {
+                            grain_type = Some(t.to_ascii_lowercase());
+                            self.advance();
+                        }
+                        other => {
+                            return Err(CalError::UnexpectedToken {
+                                expected: "a grain type, e.g. event".into(),
+                                found: other
+                                    .map(|t| t.token.description())
+                                    .unwrap_or_else(|| "end of input".into()),
+                                span: other.map(|t| t.span),
+                                suggestion: None,
+                            });
+                        }
+                    }
+                }
+                Some(SpannedToken { token: Token::In, .. }) if namespace.is_none() => {
+                    self.advance();
+                    namespace = Some(self.parse_string_literal()?);
+                }
+                Some(SpannedToken { token: Token::Limit, .. }) if limit.is_none() => {
+                    self.advance();
+                    match self.peek() {
+                        Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                            if *n >= 1.0 =>
+                        {
+                            limit = Some(*n as usize);
+                            self.advance();
+                        }
+                        other => {
+                            return Err(CalError::UnexpectedToken {
+                                expected: "a positive LIMIT".into(),
+                                found: other
+                                    .map(|t| t.token.description())
+                                    .unwrap_or_else(|| "end of input".into()),
+                                span: other.map(|t| t.span),
+                                suggestion: None,
+                            });
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // BECAUSE is mandatory — a retention sweep without a recorded reason
+        // is not auditable.
+        if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+            return Err(CalError::MissingReason {
+                span: Some(self.current_span()),
+            });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+
+        let span_end = self.prev_span();
+        Ok(CalStatement::Purge(PurgeStmt {
+            min_age_days: Some(min_age_days),
+            namespace,
+            limit,
+            grain_type,
+            reason: Some(reason),
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// One DCL verb: an identifier, optionally dotted (`loop.review` lexes
+    /// as Ident Dot Ident and is rejoined here). Validation against the
+    /// verb registry happens at execution.
+    fn parse_dcl_verb(&mut self) -> CalResult<String> {
+        let head = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) => {
+                let w = w.to_ascii_lowercase();
+                self.advance();
+                w
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a verb (read, write, supersede, delete, erase, \
+                               loop.run, loop.review, loop.apply, admin)"
+                        .into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        if self.at_exact(&Token::Dot) {
+            self.advance();
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(tail), .. }) => {
+                    let tail = tail.to_ascii_lowercase();
+                    self.advance();
+                    Ok(format!("{head}.{tail}"))
+                }
+                other => Err(CalError::UnexpectedToken {
+                    expected: "the dotted verb tail (run, review, apply)".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                }),
+            }
+        } else {
+            Ok(head)
+        }
+    }
+
+    /// The shared body of GRANT/REVOKE:
+    /// `<verb>[, <verb>…] ON <ns|*>[, <ns>…] <TO|FROM> "<principal>"
+    /// [WITH because("<why>")]`.
+    fn parse_dcl_body(&mut self, recipient_token: &Token) -> CalResult<DclBody> {
+        let mut verbs = vec![self.parse_dcl_verb()?];
+        while self.at_exact(&Token::Comma) {
+            self.advance();
+            verbs.push(self.parse_dcl_verb()?);
+        }
+
+        self.expect_exact(&Token::On)?;
+        let mut namespaces = Vec::new();
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Asterisk, .. }) => {
+                    namespaces.push("*".to_string());
+                    self.advance();
+                }
+                Some(SpannedToken { token: Token::Ident(ns), .. }) => {
+                    namespaces.push(ns.clone());
+                    self.advance();
+                }
+                Some(SpannedToken { token: Token::StringLiteral(ns), .. }) => {
+                    namespaces.push(ns.clone());
+                    self.advance();
+                }
+                other => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "a namespace or *".into(),
+                        found: other
+                            .map(|t| t.token.description())
+                            .unwrap_or_else(|| "end of input".into()),
+                        span: other.map(|t| t.span),
+                        suggestion: None,
+                    });
+                }
+            }
+            if self.at_exact(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect_exact(recipient_token)?;
+        // Principals are string literals: they carry `:` and often `-`,
+        // which the identifier grammar does not.
+        let principal = self.parse_string_literal()?;
+
+        // Optional `WITH because("<why>")` — BECAUSE is a keyword token, so
+        // match it as one (the REASON alias works too).
+        let mut reason = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            if self.at_exact(&Token::Because) || self.at_exact(&Token::Reason) {
+                self.advance();
+                self.expect_exact(&Token::LParen)?;
+                reason = Some(self.parse_string_literal()?);
+                self.expect_exact(&Token::RParen)?;
+            } else {
+                let other = self.peek();
+                return Err(CalError::UnexpectedToken {
+                    expected: "because(\"<why>\")".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "GRANT/REVOKE support exactly one option: \
+                         WITH because(\"<why>\")"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        Ok((verbs, namespaces, principal, reason))
+    }
+
+    /// Parse `GRANT <verbs> ON <ns> TO "<principal>" [WITH because("…")]`.
+    fn parse_grant(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Grant)?;
+        let (verbs, namespaces, principal, reason) = self.parse_dcl_body(&Token::To)?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Grant(GrantStmt {
+            verbs,
+            namespaces,
+            principal,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REVOKE <verbs> ON <ns> FROM "<principal>" [WITH because("…")]`.
+    fn parse_revoke(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Revoke)?;
+        let (verbs, namespaces, principal, reason) = self.parse_dcl_body(&Token::From)?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Revoke(RevokeStmt {
+            verbs,
+            namespaces,
+            principal,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// The shared body of the four governance statements (CAL 1.3 §8.16):
+    /// `<hash> BECAUSE "<why>"`. BECAUSE is mandatory — a parse error, so
+    /// the reason requirement is syntax, not convention.
+    fn parse_governance_body(&mut self, keyword: &Token) -> CalResult<GovernanceStmt> {
+        let span_start = self.current_span();
+        self.expect_exact(keyword)?;
+        let hash = self.parse_hash_literal()?;
+        if !self.at_exact(&Token::Because) && !self.at_exact(&Token::Reason) {
+            return Err(CalError::MissingReason {
+                span: Some(self.current_span()),
+            });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+        let span_end = self.prev_span();
+        Ok(GovernanceStmt {
+            hash,
+            reason,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        })
+    }
+
+    /// Parse `RUN LOOP [FULL] [WITH min_new(N), if_stale("<dur>")]` — the
+    /// caller has seen `RUN` followed by the ident `LOOP`.
+    fn parse_run_loop(&mut self, span_start: Span) -> CalResult<CalStatement> {
+        // Consume the LOOP ident.
+        self.advance();
+        let mut full_sweep = false;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("FULL") {
+                full_sweep = true;
+                self.advance();
+            }
+        }
+        let mut min_new: Option<u64> = None;
+        let mut if_stale_ms: Option<i64> = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            loop {
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(opt), .. })
+                        if opt.eq_ignore_ascii_case("min_new") =>
+                    {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        match self.peek() {
+                            Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                                if *n >= 0.0 =>
+                            {
+                                min_new = Some(*n as u64);
+                                self.advance();
+                            }
+                            other => {
+                                return Err(CalError::UnexpectedToken {
+                                    expected: "a number".into(),
+                                    found: other
+                                        .map(|t| t.token.description())
+                                        .unwrap_or_else(|| "end of input".into()),
+                                    span: other.map(|t| t.span),
+                                    suggestion: None,
+                                });
+                            }
+                        }
+                        self.expect_exact(&Token::RParen)?;
+                    }
+                    Some(SpannedToken { token: Token::Ident(opt), .. })
+                        if opt.eq_ignore_ascii_case("if_stale") =>
+                    {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        let dur = self.parse_string_literal()?;
+                        if_stale_ms = Some(parse_stale_duration_ms(&dur).ok_or_else(|| {
+                            CalError::UnexpectedToken {
+                                expected: "a duration like \"6h\", \"90m\", or \"2d\"".into(),
+                                found: dur.clone(),
+                                span: Some(self.prev_span()),
+                                suggestion: None,
+                            }
+                        })?);
+                        self.expect_exact(&Token::RParen)?;
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "min_new(N) or if_stale(\"<dur>\")".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: Some(
+                                "RUN LOOP supports WITH min_new(N), if_stale(\"6h\") — model \
+                                 and policy configuration is host-side, never statement text"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                if self.at_exact(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunLoop(RunLoopStmt {
+            full_sweep,
+            min_new,
+            if_stale_ms,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REMEMBER "<content>" [WITH session("<id>"), role("<r>"),
+    /// run("<id>")]`.
+    fn parse_remember(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Remember)?;
+        let content = self.parse_string_literal()?;
+        let mut session_id = None;
+        let mut role = None;
+        let mut run_id = None;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            loop {
+                let opt = match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(w), .. }) => w.to_ascii_lowercase(),
+                    // RUN is a keyword token; `run("<id>")` must still work.
+                    Some(SpannedToken { token: Token::Run, .. }) => "run".to_string(),
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "session(\"<id>\"), role(\"<r>\"), or run(\"<id>\")".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                };
+                match opt.as_str() {
+                    "session" | "role" | "run" => {
+                        self.advance();
+                        self.expect_exact(&Token::LParen)?;
+                        let value = self.parse_string_literal()?;
+                        self.expect_exact(&Token::RParen)?;
+                        match opt.as_str() {
+                            "session" => session_id = Some(value),
+                            "role" => role = Some(value),
+                            _ => run_id = Some(value),
+                        }
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "session(\"<id>\"), role(\"<r>\"), or run(\"<id>\")".into(),
+                            found: other.to_string(),
+                            span: self.peek().map(|t| t.span),
+                            suggestion: Some(
+                                "REMEMBER carries capture metadata only — fact extraction \
+                                 is host configuration (deja remember --model …)"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                if self.at_exact(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::Remember(RememberStmt {
+            content,
+            session_id,
+            role,
+            run_id,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// One optional `<IDENT>(<n>)`-free numeric suffix keyword, e.g.
+    /// `LIMIT 50` / `DEPTH 3`, where the keyword is a bare word.
+    fn parse_word_number(&mut self, word: &str) -> CalResult<Option<usize>> {
+        let matches_word = match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) => w.eq_ignore_ascii_case(word),
+            Some(SpannedToken { token: Token::Limit, .. }) => word.eq_ignore_ascii_case("LIMIT"),
+            _ => false,
+        };
+        if !matches_word {
+            return Ok(None);
+        }
+        self.advance();
+        match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n >= 1.0 => {
+                let n = *n as usize;
+                self.advance();
+                Ok(Some(n))
+            }
+            other => Err(CalError::UnexpectedToken {
+                expected: format!("a positive number after {word}"),
+                found: other
+                    .map(|t| t.token.description())
+                    .unwrap_or_else(|| "end of input".into()),
+                span: other.map(|t| t.span),
+                suggestion: None,
+            }),
+        }
+    }
+
+    /// Expect a specific bare-word identifier (case-insensitive).
+    fn expect_word(&mut self, word: &str, form: &str) -> CalResult<()> {
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case(word) =>
+            {
+                self.advance();
+                Ok(())
+            }
+            other => Err(CalError::UnexpectedToken {
+                expected: word.into(),
+                found: other
+                    .map(|t| t.token.description())
+                    .unwrap_or_else(|| "end of input".into()),
+                span: other.map(|t| t.span),
+                suggestion: Some(form.into()),
+            }),
+        }
+    }
+
+    /// Parse `MERGE "<subject>" RELATION "<relation>" TO "<object>"
+    /// [CONFIDENCE <n>] BECAUSE "<why>"` — close an open fork.
+    fn parse_merge(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Merge)?;
+        const FORM: &str = "a merge is spelled MERGE \"<subject>\" RELATION \"<relation>\" \
+                            TO \"<object>\" [CONFIDENCE <n>] BECAUSE \"<why>\"";
+        let subject = self.parse_string_literal()?;
+        self.expect_word("RELATION", FORM)?;
+        let relation = self.parse_string_literal()?;
+        self.expect_exact(&Token::To)?;
+        let object = self.parse_string_literal()?;
+        let mut confidence = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("CONFIDENCE") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::NumberLiteral(n), .. })
+                        if (0.0..=1.0).contains(n) =>
+                    {
+                        confidence = Some(*n);
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "a confidence between 0 and 1".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        // Every write carries its reason; a fork resolution doubly so.
+        if !self.at_exact(&Token::Reason) && !self.at_exact(&Token::Because) {
+            return Err(CalError::MissingReason { span: Some(self.current_span()) });
+        }
+        self.advance();
+        let reason = self.parse_string_literal()?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Merge(MergeStmt {
+            subject,
+            relation,
+            object,
+            confidence,
+            reason,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
+    }
+
+    /// Parse `RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both]
+    /// [DEPTH <n>] [LIMIT <n>]` — the bounded graph walk.
+    fn parse_related(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Related)?;
+        const FORM: &str = "the graph walk is spelled RELATED \"<start>\" VIA \
+                            \"<r1,r2>\" [DIRECTION out|in|both] [DEPTH <n>] [LIMIT <n>]";
+        let start = self.parse_string_literal()?;
+        self.expect_word("VIA", FORM)?;
+        let relations = self.parse_string_literal()?;
+        let mut direction = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("DIRECTION") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(d), .. })
+                        if ["out", "in", "both"].iter().any(|x| d.eq_ignore_ascii_case(x)) =>
+                    {
+                        direction = Some(d.to_ascii_lowercase());
+                        self.advance();
+                    }
+                    // IN doubles as the list-membership keyword token.
+                    Some(SpannedToken { token: Token::In, .. }) => {
+                        direction = Some("in".to_string());
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "out, in, or both".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        let depth = self.parse_word_number("DEPTH")?;
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Related(RelatedStmt {
+            start,
+            relations,
+            direction,
+            depth,
+            limit,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
+    }
+
+    /// Parse `NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"]
+    /// [LIMIT <k>]` — the paraphrase check.
+    fn parse_novelty(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Novelty)?;
+        let text = self.parse_string_literal()?;
+        let mut subject = None;
+        let mut relation = None;
+        loop {
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("SUBJECT") && subject.is_none() =>
+                {
+                    self.advance();
+                    subject = Some(self.parse_string_literal()?);
+                }
+                Some(SpannedToken { token: Token::Ident(w), .. })
+                    if w.eq_ignore_ascii_case("RELATION") && relation.is_none() =>
+                {
+                    self.advance();
+                    relation = Some(self.parse_string_literal()?);
+                }
+                _ => break,
+            }
+        }
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::Novelty(NoveltyStmt {
+            text,
+            subject,
+            relation,
+            limit,
+            span: Some(Span::new(span_start.start, span_end.end, span_start.line, span_start.col)),
+        }))
+    }
+
+    /// Parse `ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms>
+    /// [AXIS world|knowledge]` (CAL 1.3 Wave 2 — the as-of read).
+    fn parse_entity_at(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Entity)?;
+        let subject = self.parse_string_literal()?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("RELATION") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "RELATION".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the as-of read is spelled ENTITY \"<subject>\" RELATION \
+                         \"<relation>\" AT <epoch-ms> [AXIS world|knowledge]"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        let relation = self.parse_string_literal()?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. }) if w.eq_ignore_ascii_case("AT") => {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "AT".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        }
+        let at_ms = match self.peek() {
+            Some(SpannedToken { token: Token::NumberLiteral(n), .. }) if *n >= 0.0 => {
+                let n = *n as i64;
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "a point in time (epoch milliseconds)".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: None,
+                });
+            }
+        };
+        let mut axis = None;
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("AXIS") {
+                self.advance();
+                match self.peek() {
+                    Some(SpannedToken { token: Token::Ident(a), .. })
+                        if a.eq_ignore_ascii_case("world") || a.eq_ignore_ascii_case("knowledge") =>
+                    {
+                        axis = Some(a.to_ascii_lowercase());
+                        self.advance();
+                    }
+                    // KNOWLEDGE doubles as the relation-category keyword, so
+                    // it arrives as its own token, not an Ident.
+                    Some(SpannedToken { token: Token::Knowledge, .. }) => {
+                        axis = Some("knowledge".to_string());
+                        self.advance();
+                    }
+                    other => {
+                        return Err(CalError::UnexpectedToken {
+                            expected: "world or knowledge".into(),
+                            found: other
+                                .map(|t| t.token.description())
+                                .unwrap_or_else(|| "end of input".into()),
+                            span: other.map(|t| t.span),
+                            suggestion: None,
+                        });
+                    }
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::EntityAt(EntityAtStmt {
+            subject,
+            relation,
+            at_ms,
+            axis,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `RUN TRACE "<run-id>" [LIMIT <n>]` — the caller has seen
+    /// `RUN` followed by the ident `TRACE`.
+    fn parse_run_trace(&mut self, span_start: Span) -> CalResult<CalStatement> {
+        self.advance(); // TRACE
+        let run_id = self.parse_string_literal()?;
+        let limit = self.parse_word_number("LIMIT")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunTrace(RunTraceStmt {
+            run_id,
+            limit,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `RUNS TOUCHING <hash> [DEPTH <n>]`.
+    fn parse_runs_touching(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Runs)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("TOUCHING") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "TOUCHING".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("the reverse join is spelled RUNS TOUCHING <hash> [DEPTH <n>]".into()),
+                });
+            }
+        }
+        let hash = self.parse_hash_literal()?;
+        let depth = self.parse_word_number("DEPTH")?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::RunsTouching(RunsTouchingStmt {
+            hash,
+            depth,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `DERIVED FROM <hash>` — reverse provenance.
+    fn parse_derived_from(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Derived)?;
+        self.expect_exact(&Token::From)?;
+        let hash = self.parse_hash_literal()?;
+        let span_end = self.prev_span();
+        Ok(CalStatement::DerivedFrom(DerivedFromStmt {
+            hash,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `SHOW GRANTS [FOR "<principal>"]`.
+    fn parse_show_grants(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Show)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("GRANTS") =>
+            {
+                self.advance();
+            }
+            Some(SpannedToken { token: Token::Ident(w), .. })
+                if w.eq_ignore_ascii_case("FORKS") =>
+            {
+                self.advance();
+                let span_end = self.prev_span();
+                return Ok(CalStatement::ShowForks(ShowForksStmt {
+                    span: Some(Span::new(
+                        span_start.start,
+                        span_end.end,
+                        span_start.line,
+                        span_start.col,
+                    )),
+                }));
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "GRANTS or FORKS".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some("SHOW GRANTS [FOR \"<principal>\"] | SHOW FORKS".into()),
+                });
+            }
+        }
+        let principal = if self.at_exact(&Token::For) {
+            self.advance();
+            Some(self.parse_string_literal()?)
+        } else {
+            None
+        };
+        let span_end = self.prev_span();
+        Ok(CalStatement::ShowGrants(ShowGrantsStmt {
+            principal,
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,
@@ -5658,6 +6918,17 @@ impl Parser {
     fn parse_run_query(&mut self) -> CalResult<CalStatement> {
         let span_start = self.current_span();
         self.expect_exact(&Token::Run)?;
+
+        // `RUN LOOP` (governance) and `RUN TRACE` (the run↔memory join)
+        // ride the RUN prefix; a string literal keeps meaning a saved query.
+        if let Some(SpannedToken { token: Token::Ident(w), .. }) = self.peek() {
+            if w.eq_ignore_ascii_case("LOOP") {
+                return self.parse_run_loop(span_start);
+            }
+            if w.eq_ignore_ascii_case("TRACE") {
+                return self.parse_run_trace(span_start);
+            }
+        }
 
         let name = self.parse_string_literal()?;
 
@@ -9365,7 +10636,9 @@ mod tests {
     /// everywhere it can appear, including as an output alias.
     #[test]
     fn test_format_alias_rejects_destructive_words() {
-        for word in ["delete", "erase", "truncate", "insert", "grant"] {
+        // "grant"/"revoke" left this list in CAL 1.3 — they are DCL
+        // keywords now, not blocked idents.
+        for word in ["delete", "erase", "truncate", "insert", "create"] {
             let q = format!("RECALL facts FORMAT [json AS {word}]");
             parse(&q).expect_err(&format!("{word} must not be usable as an alias"));
         }

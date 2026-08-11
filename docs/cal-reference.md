@@ -6,11 +6,14 @@ primary API surface. It reads memory (`RECALL`, `ASSEMBLE`, `EXISTS`,
 store (`DESCRIBE`, `EXPLAIN`), and renders results into model-ready context —
 all through one text (or JSON-AST) surface.
 
-A defining property of CAL is that its destructive surface is **narrow and
-gated**: the only destructive statement is `FORGET <hash>` (a single-grain
-tombstone), there are no `DELETE`/`DROP`-table tokens in the grammar, no bulk or
-namespace erasure, and the whole surface can be switched off per-process
-(`--no-destructive-ops`) for untrusted input. See [§8](#8-deletion-narrow-and-gated).
+A defining property of CAL is that its destructive surface is **shaped and
+authorization-gated** (CAL 1.3): destruction takes a hash (`FORGET <hash>`),
+an identity (`FORGET SUBJECT`), or an age (`PURGE OLDER THAN`) — never a
+predicate — there are no `DELETE`/`DROP`-table tokens in the grammar, every
+execution writes an audit Observation, sessions bound to a principal need
+the matching `delete`/`erase` grant, and the whole surface can still be
+switched off per-process (`--no-destructive-ops`) for untrusted input. See
+[§8](#8-destruction-shaped-and-authorization-gated).
 This reference documents the language as implemented in `dejadb-cal`.
 
 For where CAL sits in the system, see [ARCHITECTURE.md](../ARCHITECTURE.md#5-cal-the-context-assembly-language).
@@ -49,7 +52,9 @@ Comments start with `--` and run to end of line.
 ## 2. Grain types in CAL
 
 Statements name grain types by their **plural** form for reads and **singular**
-form for writes. The names are case-insensitive.
+form for writes. The names are case-insensitive. A `—` in the write column
+means the type is **engine-authored**: no host surface (CAL, CLI, bindings,
+MCP) can create one, by design.
 
 | Plural (read) | Singular (write) |
 |---|---|
@@ -77,10 +82,13 @@ index-layer state rebuilt from the audit chain, never author-written.
 
 ## 3. Statement types
 
-CAL's AST defines 22 statement variants. The ones below are **reachable from
-text queries**. (A handful of variants exist in the AST for the JSON-CAL surface
-and internal use but are intentionally not reachable from text — see
-[§8](#8-deletion-narrow-and-gated).)
+CAL's AST defines 39 statement variants (CAL 1.3 added the destruction,
+control, governance, capture, time/provenance, and graph statements). The ones below are **reachable
+from text queries**; access control and governance are in
+[§9](#9-access-control--governance-cal-13), destruction in
+[§8](#8-destruction-shaped-and-authorization-gated). (A couple of variants
+exist in the AST for the JSON-CAL surface only — `FORGET SCOPE` stays out of
+the text grammar.)
 
 ### 3.1 Read statements
 
@@ -260,6 +268,68 @@ COALESCE { RECALL facts WHERE subject = "john" AND relation = "seat" }
 Tries each branch in order, returning the first that yields results (with an
 optional `ELSE` fallback).
 
+#### Wave-2/3 reads (CAL 1.3): time, runs, provenance, forks, the graph
+
+```
+ENTITY "<subject>" RELATION "<relation>" AT <epoch-ms> [AXIS world|knowledge]
+RUN TRACE "<run-id>" [LIMIT <n>]
+RUNS TOUCHING sha256:<hash> [DEPTH <n>]
+DERIVED FROM sha256:<hash>
+SHOW FORKS
+RELATED "<start>" VIA "<r1,r2>" [DIRECTION out|in|both] [DEPTH <n>] [LIMIT <n>]
+NOVELTY "<text>" [SUBJECT "<s>"] [RELATION "<r>"] [LIMIT <k>]
+DESCRIBE STATS
+DESCRIBE INTEGRITY
+```
+
+- `ENTITY … AT` is the bitemporal as-of read: `world` answers "what was
+  true at T" (validity windows), `knowledge` answers "what did the agent
+  know at T" (the supersession chain). Distinct from `SINCE`/`UNTIL`, which
+  *filter grains by timestamp* rather than resolving the head at T.
+- `RUN TRACE` returns both halves of the run↔memory join in one statement:
+  `recorded` (the grains stamped with the run id) and `produced` (what was
+  distilled from them, via provenance). `RUNS TOUCHING` is the reverse
+  walk — which runs produced or refined a grain; reads leave no grain and
+  are never recorded.
+- `DERIVED FROM` is reverse provenance (requires `read` on `*` — provenance
+  spans namespaces), `SHOW FORKS` lists the open multi-head contradictions,
+  and the two `DESCRIBE` reads are the store counters and the
+  integrity/content-address recheck (`read` on `*`).
+- `RELATED` is the bounded k-hop entity walk (depth 1–4; `in`/`both` only
+  see relations the file declares entity-valued). `NOVELTY` is the
+  paraphrase check — nearest existing grains to a candidate text; it needs
+  a host-installed embedder and refuses cleanly without one.
+
+#### `REPORT SUBJECT` — the DSAR read (OMS 1.6 draft)
+
+```
+REPORT SUBJECT "<id>" [WITH text_mentions]
+```
+
+```sql
+REPORT SUBJECT "pat"
+REPORT SUBJECT "pat" WITH text_mentions
+```
+
+Everything `FORGET SUBJECT` would erase for one identity — the exact
+subject, its partition-style keys (`pat`, `pat#visit1` — never `patricia`),
+and the full history — hydrated instead of erased: the GDPR Art. 15
+(access) / Art. 20 (portability) answer. `WITH text_mentions` extends the
+selection to grains whose indexed text mentions the identity, with the same
+hard precondition as the erasure form (the text index must be on and fully
+built — never a silent partial answer).
+
+The report and the erasure run **one selector**, so "show me everything,
+then delete it" is this statement followed by `FORGET SUBJECT` over exactly
+the same set. A pure read: session-namespace-scoped, gated by the `read`
+grant only, available on the token-less read-only console, and it writes no
+audit grain — the audit obligation is on destruction, not access. The
+result carries `identity_names` (every matched dictionary string) and
+`grains` (`{hash, type, fields}`). Host spellings: `deja subject-report`
+(with `--out`/`--bundle` for JSONL and portable-bundle export), MCP
+`dejadb_subject_report`, Python `subject_report`/`subject_bundle`, Node
+`subjectReport`/`subjectBundle`.
+
 ### 3.2 Write statements (append-only)
 
 Every write requires a `REASON` (or `BECAUSE`) clause — the provenance of a
@@ -290,6 +360,39 @@ Link grains explicitly via `related_to`, or widen at read time with
 `WITH multi_hop(n)`.
 There is also an `ADD workflow "name" ... graph ... BIND ... REASON "..."`
 form for DAG-shaped Workflow grains.
+
+#### `MERGE` — close an open fork (CAL 1.3)
+
+```
+MERGE "<subject>" RELATION "<relation>" TO "<object>" [CONFIDENCE <n>] BECAUSE "<why>"
+```
+
+Writes the resolved value as a merge grain superseding **every** live tip
+of the fork (all parents recorded in the grain). Requires an actual fork
+(≥2 tips — a merge of one head would be a plain `SUPERSEDE`, so it refuses
+instead), the `supersede` grant, and a written reason. `SHOW FORKS` before,
+`MERGE` after — detection and resolution in the same language.
+
+> **Recording tool calls: use `record_tool_call`, not raw `ADD tool`.**
+> Grains are content-addressed, so byte-identical `ADD tool` writes collapse
+> to one grain — five identical retries of a failing call become a single
+> stored occurrence, which starves exactly the evidence
+> `loop.tool_failure` clusters on. The host API (`record_tool_call` on
+> every binding) stamps each call's own identity (`tool_call_id`) so retries
+> stay distinct; raw `ADD tool` does not.
+
+#### `REMEMBER` — capture free text (CAL 1.3)
+
+```
+REMEMBER "<content>" [WITH session("<id>"), role("<user|assistant|system|tool>"), run("<run-id>")]
+```
+
+Stores the text as an Event grain in the session namespace — the same
+capture path as `deja remember` and the bindings' `capture`, so the Event
+lands in the thread index (`session`) and the run↔memory join (`run`). The
+observer is the bound session's principal, never statement text. LLM fact
+extraction stays host configuration (`deja remember --model …`) — the
+statement carries no model names. Requires the `write` grant.
 
 #### `SUPERSEDE` — evolve a grain
 
@@ -324,13 +427,13 @@ replacements against the current tip (resolved by hash or by
 FORGET sha256:684c6c9bda818630a870119d0726e4d242ed537af061658ef6f3acb158a2c67d
 ```
 
-The one destructive statement. Removes a single grain by content address (maps
-to `DejaDB::forget`). Unlike `SUPERSEDE`, this is a genuine tombstone — the
-grain is gone, not versioned. It is gated by the executor's
-`allow_destructive_ops` (on by default; disable per-process with
-`--no-destructive-ops`), refused inside saved-query bodies, and — when
-capability scopes are enforced — requires the `admin` scope. Only the hash form
-exists; there is no bulk/user/scope erasure from CAL (see [§8](#8-deletion-narrow-and-gated)).
+Removes a single grain by content address (maps to `DejaDB::forget`). Unlike
+`SUPERSEDE`, this is a genuine tombstone — the grain is gone, not versioned.
+An optional `BECAUSE "<why>"` is recorded in the audit Observation. The
+identity and age forms — `FORGET SUBJECT` and `PURGE OLDER THAN`, both with
+mandatory BECAUSE — plus the authorization and audit story are in
+[§8](#8-destruction-shaped-and-authorization-gated). All destruction is
+refused inside saved-query bodies and capped by `allow_destructive_ops`.
 
 ### 3.3 Introspection & management
 
@@ -447,6 +550,13 @@ the same list as the table above and as `DESCRIBE`'s `pipeline_stages`.
 ---
 
 ## 5. `WITH` options
+
+> **Parsing is not support.** The grammar accepts the full CAL spec; what a
+> given host *executes* is narrower. An accepted-but-inert option never
+> changes results silently — it emits a `CAL-Wnnn` warning (returned under
+> `warnings` on every surface, bindings included), and `DESCRIBE
+> CAPABILITIES` reports exactly what the host supports before you rely on
+> it.
 
 `WITH` options tune recall behavior. There are roughly three dozen; a
 representative selection:
@@ -586,44 +696,66 @@ bindings per query, each capped at 1000 grains.
 
 ---
 
-## 8. Deletion: narrow and gated
+## 8. Destruction: shaped and authorization-gated
 
-CAL has exactly one destructive statement — `FORGET <hash>`, a single-grain
-tombstone — and it is gated. There is no way to delete in bulk, drop a table,
-truncate, or erase a namespace from a query. Defense in depth:
+Destruction in CAL takes **a hash, an identity, or an age — never a
+predicate** (CAL 1.3 §8.14). Three statements exist, and nothing mutates a
+stored blob:
 
-1. **Lexer blocklist.** A set of destructive keywords has no statement token
-   in the grammar — they only ever lex as inert identifiers, which the parser
-   hard-rejects (`is_destructive_keyword`) before any dispatch. `DELETE` has
-   no token at all — the deletion verb is `FORGET`. The blocked set includes:
+```
+FORGET sha256:<hash> [BECAUSE "<why>"]
+FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "<why>"
+PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] [LIMIT <n>] BECAUSE "<why>"
+```
 
-   ```
-   DELETE  ERASE   DESTROY  TRUNCATE  INSERT   CREATE   WRITE   STORE
-   KEY     ENCRYPT DECRYPT  ROTATE    MASTER   DEK      SECRET  POLICY
-   SEAL    UNSEAL  GRANT    REVOKE    CONSENT  RESTRICT SCHEMA  PARTITION
-   INDEX   MIGRATION
-   ```
+- `FORGET <hash>` — a single-grain tombstone. BECAUSE optional but recorded.
+- `FORGET SUBJECT` — identity erasure in the session namespace: every grain
+  referencing the identity (history and partition keys included) plus its
+  dictionary entries; `WITH text_mentions` extends it to grains whose
+  indexed text mentions the identity. BECAUSE mandatory.
+- `PURGE OLDER THAN` — the retention sweep, scoped to one namespace (never
+  an implicit all-namespace sweep) and optionally one grain type. BECAUSE
+  mandatory. Ages read as one word: `90d`, `6h`, `30m`. `LIMIT n` bounds the
+  sweep to the **oldest** n matches (default 1000) — how you pilot a new
+  retention rule on a reviewable batch, and how you walk a large backlog
+  forward one deterministic slice at a time.
 
-2. **Parser.** Those identifiers are rejected with a dedicated error.
-   `FORGET <hash>` parses; the bulk forms `FORGET USER`/`FORGET SCOPE` and
-   `PURGE` have tokens but the text parser refuses them (they have no store
-   backing). `DROP` accepts only `DROP TEMPLATE`/`DROP QUERY`.
+**Every execution writes an audit Observation** in the reserved
+`agent:authz` namespace — the session principal, the verb, the target, the
+reason, and the erased count — recallable like any grain:
+`RECALL observations WHERE namespace = "agent:authz"`.
 
-3. **Execution gate.** `FORGET` runs only when the executor's
-   `allow_destructive_ops` is enabled. It is **on by default**, but any host can
-   turn it off per-process — `deja serve --mcp --no-destructive-ops` (likewise
-   `deja ui` and `deja cal`) — giving a read-only session in which `FORGET`
-   returns `Unsupported`. When capability scopes are enforced (server path),
-   `FORGET` additionally requires the `admin` scope.
+The read-only mirror of `FORGET SUBJECT` is [`REPORT SUBJECT`](#report-
+subject--the-dsar-read-oms-16-draft) — the same selector in show-me mode,
+for DSAR access/portability before (or without) erasure.
 
-Additionally, saved-query bodies get a separate read-only verification pass, so
-a stored query can never carry a `FORGET`.
+Defense in depth, unchanged in spirit:
 
-**The same primitive backs every surface.** CAL `FORGET <hash>`, the Rust API
-`forget`, and the MCP [`dejadb_forget`](mcp-reference.md#dejadb_forget) tool all
-tombstone a single grain by content address. For untrusted input, disable the
-whole surface with one flag; superseded versions remain as append-only history
-(via `HISTORY`) regardless.
+1. **Lexer blocklist.** `DELETE` has no token at all, and a set of
+   destructive/credential keywords only ever lex as inert identifiers the
+   parser hard-rejects: `DELETE ERASE DESTROY TRUNCATE INSERT CREATE WRITE
+   STORE KEY ENCRYPT DECRYPT ROTATE MASTER DEK SECRET POLICY SEAL UNSEAL
+   CONSENT RESTRICT SCHEMA PARTITION INDEX MIGRATION …`.
+2. **Parser shape.** `FORGET USER`/`FORGET SCOPE` are refused (the one
+   spelled identity form is `SUBJECT`); `DROP` accepts only
+   `DROP TEMPLATE`/`DROP QUERY`; saved-query bodies get a separate
+   read-only verification pass, so a stored query can never carry
+   destruction.
+3. **Authorization.** A session bound to a principal executes destruction
+   only under its grants — `delete` for the hash form, `erase` for the bulk
+   forms, per namespace; the refusal is `AUT-E001`/`CAL-E121` naming the
+   missing verb. An unbound local session is the owner (everything).
+4. **The process cap.** `allow_destructive_ops` (**on by default**) still
+   turns all of it off per-process — `deja serve --mcp
+   --no-destructive-ops` (likewise `deja ui` and `deja cal`) — and a cap
+   set restrictive wins over any grant.
+
+**The same primitives back every surface.** CAL `FORGET <hash>`, the Rust
+API `forget`, and the MCP [`dejadb_forget`](mcp-reference.md#dejadb_forget)
+tool tombstone one grain; `FORGET SUBJECT`/`PURGE OLDER THAN` call the same
+store machinery as `deja forget-subject`/`deja purge-older-than` and the
+bindings' `forget_subject`/`forget_older_than`. Superseded versions remain
+as append-only history (via `HISTORY`) regardless.
 
 Two Unicode invariants also run before tokenization:
 
@@ -631,6 +763,62 @@ Two Unicode invariants also run before tokenization:
   (U+202A–202E, U+2066–2069) are rejected, defeating visual query spoofing.
 - **NFC normalization** — the query is Unicode-NFC-normalized before lexing (and
   again when computing the audit hash).
+
+---
+
+## 9. Access control & governance (CAL 1.3)
+
+Sessions bind to a **principal** (`with_principal` in Rust, `--as` on the
+CLI once wired; an unbound local session is the owner, with every right).
+Rights are per-verb — `read, write, supersede, delete, erase, loop.run,
+loop.review, loop.apply, admin` — scoped to namespaces, and live **in the
+memory file** as ordinary `mg:permits` Facts in the reserved `agent:authz`
+namespace: they sync, replicate, and RECALL like anything else. A refused
+statement returns `AUT-E001` (wrapped as `CAL-E121`) naming the missing
+verb, the namespace, and the principal — exactly what a granting admin
+needs.
+
+### DCL
+
+```
+GRANT <verb>[, <verb>…] ON <ns|*> TO "<principal>" [WITH because("<why>")]
+REVOKE <verb>[, <verb>…] ON <ns|*> FROM "<principal>" [WITH because("<why>")]
+SHOW GRANTS [FOR "<principal>"]
+DESCRIBE PRINCIPAL "<principal>"
+```
+
+Principals are quoted strings (`"agent:support-bot"` — they carry `:` and
+`-`). `GRANT`/`REVOKE` require the `admin` grant. A grant grain records the
+grantor and reason; `REVOKE` is **retraction by supersession** — a partial
+revoke supersedes with the reduced grant, a full revoke leaves a retraction
+record, and revoking narrower than a grant's scope is refused by name
+(revoke at the grant's own scope). Grant history survives under
+`WITH superseded`. A session's rights are fixed when it binds, like a
+database connection. No DCL inside saved-query bodies.
+
+### Governance — the loop lifecycle
+
+```
+RUN LOOP [FULL] [WITH min_new(N), if_stale("6h")]
+DESCRIBE LOOP | ANALYZERS | OUTCOMES | POLICY
+APPROVE  sha256:<rec> BECAUSE "<why>"
+REJECT   sha256:<rec> BECAUSE "<why>"
+APPLY    sha256:<rec> BECAUSE "<why>"
+ROLLBACK sha256:<rec> BECAUSE "<why>"
+```
+
+`DESCRIBE LOOP` is the in-language `deja loop list`: health plus the
+pending queue with the hashes a reviewer acts on. `BECAUSE` is **syntax** —
+a parse error when missing. Identity never rides the statement: the actor,
+scopes, and observer derive from the bound session, and the engine's four
+gates run unchanged — `loop.review` to approve/reject, `loop.apply` to
+apply/rollback (a destructive apply additionally needs the session's own
+`delete`/`erase`), self-approval blocked against the creator *and* the
+principal that triggered the run. `RUN LOOP` is the deterministic pass;
+model-attached reflection stays on host surfaces where credentials live,
+and the loop's *policy* is never writable from CAL. Governance statements
+are refused inside saved-query bodies, and a surface that has not attached
+a governance host answers "governance is not wired" instead of pretending.
 
 ---
 

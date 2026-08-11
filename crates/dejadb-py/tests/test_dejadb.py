@@ -990,3 +990,28 @@ def test_per_analyzer_config_round_trips(tmp_path):
     assert {a["id"]: a["enabled"] for a in json.loads(m.loop_analyzers())}["loop.staleness/1"] is False
     m.set_analyzer_config("loop.staleness/1", enabled=True)
     assert {a["id"]: a["enabled"] for a in json.loads(m.loop_analyzers())}["loop.staleness/1"] is True
+
+
+def test_subject_report_mirrors_erasure(tmp_path):
+    # The DSAR read (GDPR Art. 15/20): the erasure selector in show-me mode.
+    m = make_db(tmp_path)
+    m.add_fact("pat", "prefers", "tea")
+    m.add_fact("pat#visit1", "note", "arrived late")
+    m.add_fact("mary", "prefers", "juice")
+
+    report = json.loads(m.subject_report("pat"))
+    assert len(report["grains"]) == 2  # exact + partition key, never mary
+    assert "pat#visit1" in report["identity_names"]
+    subjects = {g["fields"]["subject"] for g in report["grains"]}
+    assert "mary" not in subjects
+    assert all(len(g["hash"]) == HEX64 for g in report["grains"])
+
+    # The bundle is the Art. 20 portability artifact.
+    bundle = str(tmp_path / "pat.mgb")
+    stats = json.loads(m.subject_bundle(bundle, "pat"))
+    assert stats["ops"] == 2
+
+    # Erasure removes exactly what the report showed.
+    erased = json.loads(m.forget_subject("pat"))
+    assert erased["grains_erased"] == len(report["grains"])
+    assert json.loads(m.subject_report("pat"))["grains"] == []

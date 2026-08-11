@@ -51,7 +51,7 @@ per line to stdout. It handles these methods:
 |---|---|
 | `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
 | `ping` | Returns an empty result |
-| `tools/list` | Returns the eight tool definitions (with input schemas) |
+| `tools/list` | Returns the fourteen tool definitions (with input schemas) |
 | `tools/call` | Invokes a tool by `name` with `arguments` |
 
 Conventions:
@@ -98,7 +98,7 @@ multi-tenant host gives an agent a session it must not escape.
 
 ---
 
-## The eight tools
+## The fourteen tools
 
 ### `dejadb_recall`
 
@@ -166,6 +166,26 @@ server's destructive-ops flag (on by default — disable with
 
 Returns `{ "forgotten": "<hash>" }`.
 
+### `dejadb_subject_report`
+
+The DSAR read (GDPR Art. 15 access / Art. 20 portability): everything
+`FORGET SUBJECT` **would** erase for one identity — the exact subject, its
+partition-style keys (`pat`, `pat#visit1` — never `patricia`), and the full
+history — hydrated instead of erased. Read-only: it is **not** behind the
+destructive-ops flag, needs only the session's `read` grant, and writes no
+audit grain (the audit obligation is on destruction, not access). The CAL
+spelling is `REPORT SUBJECT "<id>" [WITH text_mentions]`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | **yes** | The identity to report on |
+| `text_mentions` | boolean | no | Also include grains whose indexed text mentions the identity (needs the text index on and fully built) |
+
+Returns `{ "subject", "identity_names": [...], "count", "grains": [{hash, type, fields}, ...] }`.
+
+The report and `FORGET SUBJECT` run one selector, so "show me everything,
+then delete it" is two calls over exactly the same set.
+
 ### `dejadb_remember`
 
 Store raw conversational content as an **Event** grain (a transcript entry).
@@ -194,8 +214,11 @@ instead.
 ### `dejadb_cal`
 
 Execute a CAL statement (`RECALL` / `ASSEMBLE` / `EXISTS` / `HISTORY` / `ADD` /
-`SUPERSEDE` / …). **CAL is structurally incapable of deleting data** — see the
-[non-destructive guarantee](cal-reference.md#8-deletion-narrow-and-gated).
+`SUPERSEDE` / …). **CAL destruction is shaped and authorization-gated** — it
+takes a hash, an identity, or an age, never a predicate; can never rewrite
+history; and is refused without the session's `delete`/`erase` grant — see
+[the destruction model](cal-reference.md#8-destruction-shaped-and-authorization-gated).
+`--no-destructive-ops` still switches the whole surface off per-process.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -246,6 +269,69 @@ blocked (self-approval, `LOP-E021`) — run a reviewer process with distinct
 | `action` | string | no | `apply` \| `approve` \| `reject` (omit to list) |
 | `hash` | string | for an action | recommendation hash |
 | `because` | string | for an action | mandatory written reason |
+
+### The graph, time, and run↔memory reads
+
+Five read-only tools expose the graph walk, the as-of axis, and the join
+between execution history and semantic memory. All take an optional
+`namespace`.
+
+#### `dejadb_related`
+
+Walk the entity graph from a starting term (bounded k-hop, breadth-first).
+`in`/`both` directions only see relations the file declares entity-valued.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `start` | string | **yes** | entity term to start from, e.g. `"alice"` |
+| `relations` | string | **yes** | comma-separated, e.g. `"reports_to,mg:knows"` |
+| `direction` | string | no | `out` (default) \| `in` \| `both` |
+| `depth` | integer | no | hops to walk, 1–4 (default 2) |
+| `limit` | integer | no | max entities returned (default 64) |
+
+#### `dejadb_entity_at`
+
+As-of read on two axes: what was true in the world at T (`world`), or what
+the agent knew at T (`knowledge`).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | **yes** | entity, e.g. `"alice"` |
+| `relation` | string | **yes** | relation, e.g. `"employer"` |
+| `at` | integer | **yes** | point in time, epoch milliseconds |
+| `axis` | string | no | `world` (default) \| `knowledge` |
+
+#### `dejadb_step_actions`
+
+Execution records for a workflow: which grains ran which of its nodes.
+Retries appear as several records for one node.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `workflow` | string | **yes** | content address (64-hex) of the Workflow grain |
+| `node` | string | no | narrow to one node id |
+| `limit` | integer | no | max records returned (default 64) |
+
+#### `dejadb_run_trace`
+
+Everything recorded during a run, plus what the run produced downstream
+(facts/lessons derived from it).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `run_id` | string | **yes** | the run identifier recorded on the run's grains |
+| `include_yield` | boolean | no | also return derived grains (default true) |
+| `limit` | integer | no | max grains per section (default 64) |
+
+#### `dejadb_runs_touching`
+
+Which runs produced or refined a grain — the reverse join. Runs that merely
+read the grain are not recorded: a read leaves no grain.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `hash` | string | **yes** | content address (64-hex) of the grain |
+| `depth` | integer | no | provenance hops to walk, max 8 (default 4) |
 
 ---
 

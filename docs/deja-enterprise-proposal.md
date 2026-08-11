@@ -108,7 +108,7 @@ question.
 `pip/npm/cargo install dejadb`; `deja migrate` imports from mem0 (with real
 supersession history), LangGraph/LangMem, Letta (+archival), Zep/Graphiti,
 basic-memory, generic JSONL, and OpenAI-style tool logs — idempotent, so
-re-running is safe; the MCP server (13 tools) and the Anthropic memory-tool
+re-running is safe; the MCP server (14 tools) and the Anthropic memory-tool
 adapter plug into stacks we'll never see; the Hermes provider slots into an
 existing Hermes install with two commands.
 
@@ -269,10 +269,12 @@ Two gaps the sweep found, worth folding into E0/E1:
 - `changes_since` (the op-log cursor read) is exposed in Rust, the CLI, and
   the HTTP API — but **not in the Python or Node bindings**. Add it; the
   audit story should be reachable from every surface.
-- A `deja audit export` verb: op-log slice + the Deja Loop audit chains with
-  hash-chain verification, as one JSON evidence bundle. It's a formatting of
-  data that already exists, and it's the artifact a compliance reviewer
-  actually asks for.
+- ~~A `deja audit export` verb~~ — **shipped** with the GDPR compliance pack:
+  the Tier-2 destruction trail plus the Deja Loop lifecycle chain as JSONL,
+  hash-chain verified (a record whose named predecessor is absent from the
+  export is flagged, because evidence that cannot say it was truncated is
+  worse than none). `--since`/`--until` window it; `--out` writes the file.
+  See [`gdpr.md`](gdpr.md) §1.
 
 ---
 

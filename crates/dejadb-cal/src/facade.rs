@@ -222,14 +222,19 @@ pub trait CalStoreFacade: Send + Sync {
     // ── Tier 2 destructive operations (DELETE, FORGET) ────────────────────
 
     /// Delete a single grain by hash. Maps to `DejaDB::forget()`.
-    fn cal_delete(&self, _hash: &Hash) -> Result<()> {
+    fn cal_delete(&self, _hash: &Hash, _because: Option<&str>) -> Result<()> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),
         ))
     }
 
     /// Crypto-erase all data for a user. Maps to `DejaDB::forget_user()`.
-    fn cal_forget_user(&self, _user_id: &str) -> Result<crate::store_types::ErasureProof> {
+    fn cal_forget_user(
+        &self,
+        _user_id: &str,
+        _text_mentions: bool,
+        _because: &str,
+    ) -> Result<crate::store_types::ErasureProof> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),
         ))
@@ -242,12 +247,179 @@ pub trait CalStoreFacade: Send + Sync {
         ))
     }
 
-    /// Purge stale grains using decay curve. Maps to `DejaDB::forget_stale()`.
+    /// `REPORT SUBJECT` — the read-only DSAR selection: everything
+    /// `cal_forget_user` would erase, hydrated instead of erased. Maps to
+    /// `DejaDB::subject_report_with()`. A read (gated by the `read` grant),
+    /// not a destructive op.
+    fn cal_subject_report(
+        &self,
+        _subject_id: &str,
+        _text_mentions: bool,
+    ) -> Result<crate::store_types::SubjectReportResult> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "subject report not available on this facade".into(),
+        ))
+    }
+
+    /// Concrete-type escape hatch for host layers that sit above this
+    /// crate (the governance seam): a `GovernanceHost` receives the store
+    /// as `&dyn CalStoreFacade` and needs the concrete facade back to
+    /// build its substrate view. Default `None` — only the real facade
+    /// answers.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// `MERGE` (CAL 1.3 Wave 3): close an open fork with a resolved
+    /// value. Returns the merge grain's hash.
+    fn cal_merge(
+        &self,
+        _subject: &str,
+        _relation: &str,
+        _object: &str,
+        _confidence: f64,
+        _because: &str,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "merge not available".into(),
+        ))
+    }
+
+    /// `RELATED` (Wave 3): the bounded k-hop entity walk.
+    fn cal_related(
+        &self,
+        _start: &str,
+        _relations: &[&str],
+        _direction: &str,
+        _depth: usize,
+        _limit: usize,
+    ) -> Result<Vec<String>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "graph walks not available".into(),
+        ))
+    }
+
+    /// `NOVELTY` (Wave 3): nearest existing grains to a candidate text.
+    /// Rows are `(hash-hex, similarity)`.
+    fn cal_novelty(
+        &self,
+        _text: &str,
+        _subject: Option<&str>,
+        _relation: Option<&str>,
+        _k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "novelty checks not available".into(),
+        ))
+    }
+
+    /// `ENTITY … AT` (CAL 1.3 Wave 2): the as-of read. `axis` is
+    /// `"world"` or `"knowledge"`. Returns the grain as JSON, or None.
+    fn cal_entity_at(
+        &self,
+        _subject: &str,
+        _relation: &str,
+        _at_ms: i64,
+        _axis: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "as-of reads not available".into(),
+        ))
+    }
+
+    /// `RUN TRACE` (Wave 2): what a run recorded and what it produced —
+    /// `{ recorded: [...], produced: [...] }`.
+    fn cal_run_trace(&self, _run_id: &str, _limit: usize) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "run traces not available".into(),
+        ))
+    }
+
+    /// `RUNS TOUCHING` (Wave 2): run ids that produced or refined a grain.
+    fn cal_runs_touching(&self, _hash: &Hash, _depth: usize) -> Result<Vec<String>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "run joins not available".into(),
+        ))
+    }
+
+    /// `DERIVED FROM` (Wave 2): reverse provenance, as grain JSON rows.
+    fn cal_derived_from(&self, _hash: &Hash) -> Result<Vec<serde_json::Value>> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "provenance reads not available".into(),
+        ))
+    }
+
+    /// `DESCRIBE STATS` (Wave 2): store counters as JSON.
+    fn cal_stats(&self) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "stats not available".into(),
+        ))
+    }
+
+    /// `DESCRIBE INTEGRITY` (Wave 2): integrity + content-address recheck.
+    fn cal_verify(&self) -> Result<serde_json::Value> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "integrity checks not available".into(),
+        ))
+    }
+
+    /// `REMEMBER` (CAL 1.3): capture free text as an Event grain with
+    /// session/role/run metadata. Returns the Event's hash.
+    fn cal_remember(
+        &self,
+        _content: &str,
+        _session_id: Option<&str>,
+        _role: Option<&str>,
+        _run_id: Option<&str>,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "remember not available".into(),
+        ))
+    }
+
+    /// Tier-3 DCL (CAL 1.3 §8.15): write a grant grain for `principal`.
+    /// Verbs/namespaces are validated and canonicalized by the
+    /// implementation; returns the grant grain's hash.
+    fn cal_grant(
+        &self,
+        _principal: &str,
+        _verbs: &[String],
+        _namespaces: &[String],
+        _because: Option<&str>,
+    ) -> Result<Hash> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "control operations not available".into(),
+        ))
+    }
+
+    /// Tier-3 DCL: retraction-by-supersession of the covering grant
+    /// grain(s). Returns how many grants were touched.
+    fn cal_revoke(
+        &self,
+        _principal: &str,
+        _verbs: &[String],
+        _namespaces: &[String],
+        _because: Option<&str>,
+    ) -> Result<usize> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "control operations not available".into(),
+        ))
+    }
+
+    /// The live grant rows; `None` lists every principal.
+    fn cal_show_grants(&self, _principal: Option<&str>) -> Result<Vec<GrantRow>> {
+        Ok(Vec::new())
+    }
+
+    /// The retention sweep. Maps to `DejaDB::forget_older_than_capped()` —
+    /// `batch_limit` is `LIMIT n` and MUST bound the erasure.
     fn cal_purge_stale(
         &self,
         _min_age_days: f64,
         _namespace: Option<&str>,
         _batch_limit: usize,
+        _grain_type: Option<&str>,
+        _because: &str,
     ) -> Result<usize> {
         Err(dejadb_core::error::DejaDbError::Internal(
             "destructive operations not available".into(),
@@ -328,6 +500,16 @@ pub struct AccumulateResult {
 /// Re-export for convenience.
 pub use super::templates::TemplateListEntry as TemplateInfo;
 
+/// One live grant row (`SHOW GRANTS` / `DESCRIBE PRINCIPAL`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GrantRow {
+    pub principal: String,
+    /// The canonical grant object string (`read,write ON caller`).
+    pub object: String,
+    /// The grant grain's content address (hex).
+    pub hash: String,
+}
+
 /// CAL engine capabilities and conformance level.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CalCapabilities {
@@ -365,11 +547,34 @@ impl Default for CalCapabilities {
                 "REVERT".into(),
                 "FORGET".into(),
                 "PURGE".into(),
+                // The read-only DSAR selection (OMS 1.6 draft).
+                "REPORT".into(),
                 "DROP".into(),
                 // Saved queries and custom templates persist in the file's
                 // host metadata, so the engine can honestly claim them.
                 "DEFINE".into(),
+                // Also RUN LOOP and RUN TRACE — one leading keyword each,
+                // as everywhere else in this list.
                 "RUN".into(),
+                // CAL 1.3 Tier-3 DCL. SHOW covers SHOW GRANTS and SHOW FORKS.
+                "GRANT".into(),
+                "REVOKE".into(),
+                "SHOW".into(),
+                // CAL 1.3 evolution: free-text extraction and tip merge.
+                "REMEMBER".into(),
+                "MERGE".into(),
+                // CAL 1.3 Wave-2 reads: as-of, the run↔memory join, reverse
+                // provenance, graph neighbourhood, novelty.
+                "ENTITY".into(),
+                "RUNS".into(),
+                "DERIVED".into(),
+                "RELATED".into(),
+                "NOVELTY".into(),
+                // CAL 1.3 governance lifecycle (§8.16).
+                "APPROVE".into(),
+                "REJECT".into(),
+                "APPLY".into(),
+                "ROLLBACK".into(),
             ],
             max_sources: 8,
             max_let_bindings: 5,
@@ -782,7 +987,22 @@ mod tests {
         let caps = CalCapabilities::default();
         assert_eq!(caps.cal_version, 1);
         assert_eq!(caps.conformance_level, 2);
-        assert_eq!(caps.supported_statements.len(), 17);
+        assert_eq!(caps.supported_statements.len(), 32);
+        // Every statement a client can reach must be listed: an agent that
+        // runs `DESCRIBE CAPABILITIES` as its handshake will never emit a
+        // statement missing from here, so an omission hides a whole feature.
+        // Assert against the parser's own dispatch rather than a hand count.
+        for kw in [
+            "GRANT", "REVOKE", "SHOW", "REMEMBER", "MERGE", "ENTITY", "RUNS", "DERIVED",
+            "RELATED", "NOVELTY", "APPROVE", "REJECT", "APPLY", "ROLLBACK",
+        ] {
+            assert!(
+                caps.supported_statements.contains(&kw.to_string()),
+                "CAL 1.3 statement {kw} parses but is not advertised"
+            );
+        }
+        // The DSAR read joined in the GDPR compliance pack (OMS 1.6 draft).
+        assert!(caps.supported_statements.contains(&"REPORT".to_string()));
         assert!(caps.supported_statements.contains(&"RECALL".to_string()));
         // Saved queries and templates persist in the file's host metadata.
         assert!(caps.supported_statements.contains(&"DEFINE".to_string()));

@@ -24,24 +24,36 @@ Two entry points must stay in sync: `execute` (text) and `execute_parsed`
 (JSON-CAL AST) duplicate the LET/pipeline/format sequence — including filling
 `let_values`.
 
-## The safety pillar: destruction is narrow and gated
+## The safety pillar: destruction is shaped and authorization-gated
 
-The only destructive CAL statement is `FORGET <hash>` (a single-grain
-tombstone → `DejaDB::forget`). Everything else stays blocked:
-1. **Lexer**: `is_destructive_keyword` (lexer.rs) hard-blocks 26 words
-   (DELETE, ERASE, INSERT, CREATE, GRANT, …) — DELETE has no token at all.
+Destruction takes **a hash, an identity, or an age — never a predicate**
+(CAL 1.3). Three statements: `FORGET <hash>` (single-grain tombstone →
+`DejaDB::forget`), `FORGET SUBJECT "<id>" [WITH text_mentions]` (identity
+erasure → `forget_subject_with`), `PURGE OLDER THAN <n><d|h|m> [TYPE t]
+[IN "<ns>"]` (retention sweep → `forget_older_than`). BECAUSE is mandatory
+on the latter two, optional-but-recorded on the hash form.
+1. **Lexer**: `is_destructive_keyword` (lexer.rs) hard-blocks DELETE, ERASE,
+   INSERT, CREATE, … — DELETE has no token at all.
 2. **Parser**: `parse_statement` fast-rejects those idents with CAL-E002.
-   `FORGET <hash>` parses (`parse_forget`); `FORGET USER/SCOPE` and `PURGE` are
-   AST/token forms the text parser still refuses. `DROP` accepts only
-   TEMPLATE/QUERY.
-3. **Execution gate**: FORGET/DROP/PURGE run only when
-   `CalExecutorConfig::allow_destructive_ops` is set (**default true**; the CLI
-   `--no-destructive-ops` flag flips it off). When off they return
-   `Ok(Unsupported)`. When scopes are enforced (server path), FORGET also
-   requires the `admin` scope.
-Saved-query bodies get an extra `check_statement_read_only` pass (FORGET/PURGE
-are refused there regardless of the gate). Only the `Hash` FORGET target is
-store-backed; `User`/`Scope` erasure is an unimplemented stub.
+   `FORGET USER/SCOPE` are refused from text with a pointer to SUBJECT.
+   `DROP` accepts only TEMPLATE/QUERY.
+3. **Authorization**: the session's `delete` (hash) / `erase` (subject, age)
+   grant decides, and `CalExecutorConfig::allow_destructive_ops` (**default
+   true**; `--no-destructive-ops`) is a process-wide restrictive **cap** over
+   any grant. Capped/ungranted → `Ok(Unsupported)`.
+4. **Audit**: every execution writes a Tier-2 Observation in `agent:authz`
+   via `dejadb_core::authz::audit_observation` — the one builder every
+   surface shares. Subject erasures record a **fingerprint**
+   (`subject_fingerprint`), never the identity: the audit grain is immutable
+   and replicates, so a raw identifier there would undo the erasure it
+   records.
+5. **Classification**: `classify.rs` is the single source of truth
+   (exhaustive, no wildcard). `REPORT SUBJECT` — the read-only DSAR mirror of
+   `FORGET SUBJECT` — classifies `Read` and is `read`-gated, deliberately
+   NOT behind the destructive cap.
+Saved-query bodies get an extra `check_statement_read_only` pass (destructive
+statements are refused there regardless of the gate). `cal_forget_scope`
+remains an unwired stub.
 
 Security invariants in the lexer: **S-1** bidi-control rejection
 (`check_bidi`, U+202A–202E / U+2066–2069) and **S-6** NFC normalization —
@@ -90,9 +102,9 @@ json.rs (wire form) → store_types.rs (if the store contract grows) → tests �
 - `CalResultPayload::Unsupported` is returned as **Ok** for Tier-1 runtime
   failures (bad grain type, unresolved param) — check the payload, not just
   Ok/Err.
-- FORGET/PURGE/REVERT exist in the AST/facade/executor but are unreachable
-  from text (parser rejects; REVERT always returns Unsupported). AST coverage
-  ≠ reachable surface.
+- REVERT exists in the AST/facade/executor but always returns Unsupported
+  from text, and `cal_forget_scope` is an unwired stub. AST coverage ≠
+  reachable surface.
 - ADD requires a `REASON`/`BECAUSE` clause (missing → CAL-E018) and uses
   repeated `SET field = value`.
 - Many keywords double as field names (ON, WHEN, PRIORITY, SCOPE) via

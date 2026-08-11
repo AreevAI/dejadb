@@ -31,6 +31,13 @@ pub struct LoopPersisted {
     /// The creating actor per recommendation (for the self-approval block).
     #[serde(default)]
     pub creators: BTreeMap<String, String>,
+    /// The principal that triggered the run which stored an LLM or
+    /// external-command recommendation — the self-approval block fires
+    /// against these too (the trigger must not approve their own model's
+    /// output). Omitted when empty: deterministic-only histories never
+    /// carry the key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub co_creators: BTreeMap<String, String>,
     /// Rejection cooldowns keyed by dedup_key → cooldown-until epoch-ms.
     #[serde(default)]
     pub cooldowns: BTreeMap<String, i64>,
@@ -66,6 +73,7 @@ impl Default for LoopPersisted {
             status_index: BTreeMap::new(),
             audit_heads: BTreeMap::new(),
             creators: BTreeMap::new(),
+            co_creators: BTreeMap::new(),
             cooldowns: BTreeMap::new(),
             cooldown_strikes: BTreeMap::new(),
             applied: BTreeMap::new(),

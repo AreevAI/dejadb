@@ -18,7 +18,7 @@ use dejadb_core::error::Hash;
 use dejadb_store::{Axis, Capture, Direction};
 use dejadb_loop::{now_ms, BorrowedSubstrate};
 use serde_json::{json, Map, Value};
-use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions, ScopeSet};
+use deja_loop::{Decision, Engine, ObserverType, RecStatus, RunOptions};
 
 pub const SERVER_NAME: &str = "dejadb";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,7 +50,8 @@ impl McpServer {
             .unwrap_or_else(|| "shared".to_string());
         McpServer {
             facade,
-            executor: CalExecutor::new(CalExecutorConfig::default()),
+            executor: CalExecutor::new(CalExecutorConfig::default())
+                .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new())),
             default_ns,
             allow_destructive_ops: true,
             locked_ns: None,
@@ -63,6 +64,8 @@ impl McpServer {
     /// `deja loop run --policy`.
     pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
         self.loop_policy = Some(policy);
+        // The CAL surface's governance host honors the same policy.
+        self.rebuild_executor();
         self
     }
 
@@ -76,13 +79,18 @@ impl McpServer {
 
     /// Rebuild the executor from the current gate settings. Called by every
     /// builder so `--lock-ns` and `--no-destructive-ops` compose instead of
-    /// clobbering each other's config.
+    /// clobbering each other's config — and the governance host survives
+    /// every rebuild.
     fn rebuild_executor(&mut self) {
         self.executor = CalExecutor::new(CalExecutorConfig {
             allow_destructive_ops: self.allow_destructive_ops,
             namespace_override: self.locked_ns.clone(),
             ..CalExecutorConfig::default()
-        });
+        })
+        .with_governance(std::sync::Arc::new(match &self.loop_policy {
+            Some(p) => dejadb_loop::LoopGovernance::with_policy(p.clone()),
+            None => dejadb_loop::LoopGovernance::new(),
+        }));
     }
 
     /// Permit or forbid destructive operations — the `dejadb_forget` tool and
@@ -272,10 +280,32 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .ok_or("dejadb_forget requires 'hash'")?;
                 let h = Hash::from_hex(h).map_err(|e| e.to_string())?;
-                self.facade
-                    .with_store(|m| m.forget(&h))
-                    .map_err(|e| e.to_string())?;
+                // Through the facade, not the raw store: the tool and CAL's
+                // `FORGET <hash>` must agree on the `delete` check and both
+                // must leave the same Tier-2 audit record.
+                self.facade.cal_delete(&h, None).map_err(|e| e.to_string())?;
                 Ok(json!({"forgotten": h.to_hex()}).to_string())
+            }
+            "dejadb_subject_report" => {
+                // The DSAR read (GDPR Art. 15/20): the erasure selector in
+                // show-me mode. Read-only — not behind allow_destructive_ops.
+                let subject = args
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_subject_report requires 'subject'")?;
+                let text_mentions =
+                    args.get("text_mentions").and_then(|v| v.as_bool()).unwrap_or(false);
+                let report = self
+                    .facade
+                    .cal_subject_report(subject, text_mentions)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "subject": subject,
+                    "identity_names": report.identity_names,
+                    "count": report.grains.len(),
+                    "grains": report.grains,
+                })
+                .to_string())
             }
             "dejadb_related" => {
                 let start = args
@@ -439,6 +469,10 @@ impl McpServer {
                     if_stale_ms: None,
                     namespaces: Vec::new(),
                     full_sweep: args.get("full_sweep").and_then(Value::as_bool).unwrap_or(false),
+                    // Same identity the review/apply path uses below — the
+                    // agent that runs the loop cannot approve what its run's
+                    // LLM/external analyzers authored.
+                    triggering_actor: Some("agent:mcp".to_string()),
                 };
                 let mut sub = BorrowedSubstrate::new(&self.facade);
                 let engine = self.engine();
@@ -462,7 +496,9 @@ impl McpServer {
                         .and_then(Value::as_str)
                         .ok_or("dejadb_recommendations action requires 'because'")?;
                     let actor = "agent:mcp";
-                    let scopes = ScopeSet::all();
+                    // Scopes derive from the session's grants (an owner
+                    // session — today's only MCP mode — holds all of them).
+                    let scopes = dejadb_loop::scopes_for(&self.facade.authz());
                     let mut sub = BorrowedSubstrate::new(&self.facade);
                     let now = now_ms();
                     match action {
@@ -559,10 +595,18 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dejadb_forget",
-            "description": "Erase a grain from the hot store (tombstoned in the op-log). Host-level operation — not reachable from CAL.",
+            "description": "Erase a grain from the hot store (tombstoned in the op-log). The CAL spelling is FORGET <hash> [BECAUSE \"why\"].",
             "inputSchema": {"type": "object", "properties": {
                 "hash": s("content address (64-hex) to forget")
             }, "required": ["hash"]}
+        }),
+        json!({
+            "name": "dejadb_subject_report",
+            "description": "DSAR read (GDPR Art. 15/20): everything subject erasure WOULD remove for one identity — exact + partition keys, full history — as {hash, type, fields} grains. Read-only; the CAL spelling is REPORT SUBJECT \"<id>\" [WITH text_mentions], and the erasure mirror is FORGET SUBJECT.",
+            "inputSchema": {"type": "object", "properties": {
+                "subject": s("the identity to report on"),
+                "text_mentions": {"type": "boolean", "description": "also include grains whose indexed text mentions the identity (needs the text index)"}
+            }, "required": ["subject"]}
         }),
         json!({
             "name": "dejadb_related",
@@ -630,7 +674,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dejadb_cal",
-            "description": "Execute a CAL statement (RECALL/ASSEMBLE/EXISTS/HISTORY/ADD/SUPERSEDE/...). CAL is structurally incapable of deleting data.",
+            "description": "Execute a CAL statement (RECALL/ASSEMBLE/EXISTS/HISTORY/ADD/SUPERSEDE/...). Destructive statements (FORGET, FORGET SUBJECT, PURGE OLDER THAN) require a BECAUSE reason, are gated by the session's grants and the server's destructive-ops setting, and are audit-logged; destruction takes a hash, an identity, or an age — never a predicate.",
             "inputSchema": {"type": "object", "properties": {
                 "query": s("CAL text, e.g. RECALL facts WHERE subject = \"alice\" | COUNT")
             }, "required": ["query"]}

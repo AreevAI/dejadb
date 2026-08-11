@@ -48,11 +48,11 @@ loop engine: deja-loop ← dejadb-loop (adapter) · dejadb-llm (providers) ┤
 | Crate | What | CLAUDE.md |
 |---|---|---|
 | `dejadb-core` | `.mg` format, canonical serialization, content addressing, 12 grain types, tool-schema rendering | yes |
-| `dejadb-store` | The store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs, memory-tool adapter, migration importers. Backend-agnostic logic over an internal `Db` seam — embedded Turso (default) or PostgreSQL (`feature = "postgres"`, one memory = one schema, advisory-locked single writer, pgvector) | yes |
+| `dejadb-store` | The store: dictionary-encoded triples, hybrid recall, heads/forks, bundles, CAS blobs (encrypted under an HKDF-derived subkey when the memory is), DSAR `subject_report`, declarative `retention:<ns>` policies, memory-tool adapter, migration importers. Backend-agnostic logic over an internal `Db` seam — embedded Turso (default) or PostgreSQL (`feature = "postgres"`, one memory = one schema, advisory-locked single writer, pgvector) | yes |
 | `dejadb-conformance` | Backend-parameterized conformance suite (`publish = false`) — one case list (forks, replication, tombstones, PITR, BM25, vectors, CAS, CAL smoke) run against BOTH backends; the Pg runner needs `DATABASE_URL`/`DEJADB_PG_URL` and hard-fails when `CI=true` without one | — |
 | `dejadb-cal` | CAL lexer/parser/executor, ASSEMBLE, `DejaDbFacade` + mounts | yes |
 | `dejadb-context` | Budget-aware SML/TOON/Markdown/JSON rendering | yes |
-| `deja-loop` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 11 analyzers, four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/loop.md` | — |
+| `deja-loop` | Substrate-agnostic self-improvement engine: `OmsSubstrate`/`LlmBackend` traits, 12 analyzers (incl. default-off `retention_sweep`), four gates, recommendation lifecycle, LLM DISCOVER→GROUND→VERIFY verifier, outcome measurement (no DejaDB deps) — `docs/loop.md` | — |
 | `dejadb-loop` | DejaDB substrate adapter for Deja Loop (`deja_loop::OmsSubstrate` over `DejaDbFacade`) + recall-telemetry sidecar | — |
 | `dejadb-llm` | Out-of-box LLM backends (OpenAI-compatible/Anthropic/Ollama over a small blocking HTTP client) for Deja Loop + the `remember()` free-text→Fact extraction (`extract.rs`) | — |
 | `dejadb-mcp` | Stdio MCP server (see below) | — |
@@ -71,21 +71,31 @@ loop engine: deja-loop ← dejadb-loop (adapter) · dejadb-llm (providers) ┤
 2. **Canonical serialization is frozen** (NFC, sorted keys, compact keys,
    omit-defaults). Changing it silently changes every content address and
    breaks OMS conformance — see `crates/dejadb-core/CLAUDE.md`.
-3. **CAL destruction is gated, not structural** — the only destructive CAL
-   statement is `FORGET <hash>` (a single-grain tombstone), gated at execution
-   by `CalExecutorConfig::allow_destructive_ops` (**default on**; disable
-   per-process with `--no-destructive-ops` on `deja serve`/`ui`/`cal`, or the
-   MCP `dejadb_forget` tool). `DELETE`/`ERASE`/`TRUNCATE`/… remain lexer-blocked
-   non-tokens, `PURGE` stays out of the text grammar, `DROP` accepts only
-   TEMPLATE/QUERY, saved-query bodies stay read-only, and the server path still
-   requires the `admin` scope. Don't widen the destructive surface without a
-   design + OMS-conformance decision. **One such decision exists** (2026-08,
-   [`docs/erasure.md`](docs/erasure.md)): subject-scoped and age-scoped bulk
-   erasure (`forget_subject` / `forget_older_than`) are host-level
-   store/binding/CLI operations for right-to-erasure and retention
-   compliance — a documented OMS deviation that deliberately stays OUT of
-   the CAL grammar (the parser still refuses FORGET USER/SCOPE/PURGE and
-   the facade stubs stay unwired).
+3. **CAL destruction is authorization-gated, not structural** (CAL 1.3,
+   [`docs/cal-all-you-need-proposal.md`](docs/cal-all-you-need-proposal.md)).
+   The destructive statements are `FORGET <hash>` (single-grain tombstone,
+   `delete` verb), `FORGET SUBJECT "<id>" [WITH text_mentions]` (identity
+   erasure, `erase` verb), and `PURGE OLDER THAN <n><d|h|m> [TYPE t]`
+   (retention sweep, `erase` verb) — BECAUSE mandatory on the latter two,
+   optional-but-recorded on the hash form; every execution writes a Tier-2
+   audit Observation in `agent:authz`. Grants live in the file as
+   `mg:permits` Facts (`dejadb_core::authz`); the session's `AuthzSet`
+   decides, and `CalExecutorConfig::allow_destructive_ops` remains a
+   process-wide restrictive **cap** over any grant (`--no-destructive-ops`).
+   Destruction takes a hash, an identity, or an age — never a predicate:
+   `DELETE`/`ERASE`/`TRUNCATE`/… stay lexer-blocked non-tokens, `FORGET
+   USER/SCOPE` stay text-refused, `DROP` accepts only TEMPLATE/QUERY, and
+   saved-query bodies stay read-only. Statement classification has ONE
+   source of truth (`dejadb_cal::classify`, exhaustive, no wildcard).
+   [`docs/erasure.md`](docs/erasure.md) records the erasure requirements;
+   its former "out of CAL" deviation is retired by CAL 1.3. Audit records
+   name a subject **fingerprint** (`authz::subject_fingerprint`), never the
+   identity — an immutable, replicating grain naming the erased subject
+   would undo the erasure it records. The read-only mirror is `REPORT
+   SUBJECT` (classifies `Read`, `read`-gated, not behind the destructive
+   cap): the report and the erasure share ONE selector, so a DSAR discloses
+   exactly what an erasure removes. [`docs/gdpr.md`](docs/gdpr.md) is the
+   article→capability map.
 4. **CAL syntax is an OMS conformance contract** — no new CAL syntax
    without a spec-level decision.
 5. **One memory = one isolation unit** — a file on the embedded backend, a
@@ -127,9 +137,11 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
 
 ## Smaller crates
 
-- **dejadb-mcp**: 11 tools (`dejadb_recall/add/supersede/forget/remember/cal`,
-  the graph/time reads `dejadb_related/entity_at/step_actions`, and the
-  run<->memory join `dejadb_run_trace/runs_touching`)
+- **dejadb-mcp**: 14 tools (`dejadb_recall/add/supersede/forget/remember/cal`,
+  the DSAR read `dejadb_subject_report`,
+  the graph/time reads `dejadb_related/entity_at/step_actions`, the
+  run<->memory join `dejadb_run_trace/runs_touching`, and the loop pair
+  `dejadb_loop/recommendations`)
   over newline-delimited JSON-RPC 2.0 on stdio, protocol rev `2025-06-18`.
   Convention: tool failures are `isError: true` *results*; only protocol
   errors are JSON-RPC errors. Notifications (no id) get no response. No
@@ -154,9 +166,10 @@ renumber or reuse one. Source of truth for text is inline on `DejaDbError`
   reconciliation warnings.
   `tests/multichannel_tests.rs` is the §8 acceptance test (voice + WhatsApp +
   email sharing one memory via the hub).
-- **dejadb**: ~28 verbs (incl. `hub`, `migrate` from other memory systems,
-  `reindex`, the graph/time reads `related`/`entity-at`/`step-actions`, and
-  the join `run-trace`/`runs-touching`), hand-rolled `parse_args` → HashMap; global `--embed-cmd` installs
+- **dejadb**: ~29 verbs (incl. `hub`, `migrate` from other memory systems,
+  `reindex`, the graph/time reads `related`/`entity-at`/`step-actions`, the
+  join `run-trace`/`runs-touching`, and the DSAR read `subject-report`),
+  hand-rolled `parse_args` → HashMap; global `--embed-cmd` installs
   a `CommandEmbed` for vector recall on any verb. Opens honor
   the file's meta declarations; `--index-text true|false` explicitly
   re-stamps; open warnings print to stderr.

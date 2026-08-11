@@ -171,7 +171,7 @@ arrive pre-armed.*
 
 ## 7. The analyzers — hygiene, then utility
 
-**Eleven built-in analyzers, all deterministic, ten on by default.**
+**Twelve built-in analyzers, all deterministic, ten on by default.**
 
 | Hygiene (is memory correct?) | Utility (is memory used — does it help?) |
 |---|---|
@@ -445,7 +445,7 @@ substrate but with no verification or governance workflow on top.*
 
 ## 16. Roadmap — shipped vs. next (ranked by user demand)
 
-**Shipped (PR #20 + the follow-up pass, on main):** the engine + 11 analyzers ·
+**Shipped (PR #20 + the follow-up pass, on main):** the engine + 12 analyzers ·
 four gates + policy auto-apply (value-identity-checked, attachable to CLI /
 console / MCP) · recall-telemetry sidecar + 3 utility analyzers ·
 multi-horizon Verify gate (tool-error + contradiction recurrence) · LLM

@@ -70,6 +70,9 @@ fn builtin_template(id: &str) -> Option<&'static str> {
         "budget.pressure" => {
             "Assembly budget overflowed on {overflow_rate}% of {samples} recalls — raise the budget or curate memory"
         }
+        "retention.overdue" => {
+            "Retention: {count} grain(s) in \"{namespace}\" exceed the {max_age_days}d policy (oldest {oldest_days}d); {remaining} more await a later pass"
+        }
         "outcome.regression" => {
             "Applied recommendation regressed: {metric} moved {baseline} → {current}"
         }

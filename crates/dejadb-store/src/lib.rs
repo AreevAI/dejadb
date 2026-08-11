@@ -18,6 +18,7 @@ pub mod pg;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dejadb_core::authz;
 use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::{deserialize_blob, DeserializedGrain};
 use dejadb_core::format::serialize::serialize_grain;
@@ -139,6 +140,14 @@ fn cas_hexes(view: &DeserializedGrain) -> Vec<String> {
     out
 }
 
+/// What the identity selector matched (see `DejaDB::select_identity`).
+#[derive(Default)]
+struct IdentitySelection {
+    identity_ids: Vec<i64>,
+    identity_names: Vec<String>,
+    seqs: Vec<i64>,
+}
+
 /// What a bulk erasure targets (internal to the erasure core).
 enum ErasureSelector {
     /// Every structured reference to one identity in one namespace. The
@@ -146,8 +155,16 @@ enum ErasureSelector {
     /// resolved INSIDE the erasure transaction, after the serialization
     /// point.
     Identity { ns_id: i64, subject: String, text_mentions: bool },
-    /// Everything older than the cutoff, optionally scoped.
-    OlderThan { ns_id: Option<i64>, cutoff_ms: i64, gtype: Option<i64> },
+    /// Everything older than the cutoff, optionally scoped. `limit` bounds
+    /// the sweep to the oldest N grains — CAL's `PURGE … LIMIT n`, which
+    /// exists so an operator can pilot a retention rule on a reviewable
+    /// batch instead of committing to the whole namespace.
+    OlderThan {
+        ns_id: Option<i64>,
+        cutoff_ms: i64,
+        gtype: Option<i64>,
+        limit: Option<usize>,
+    },
 }
 
 /// Options for [`DejaDB::forget_subject_with`].
@@ -160,6 +177,25 @@ pub struct ErasureOptions {
     /// distinctive ids (contact codes, phone fragments). Requires text
     /// indexing to be on.
     pub text_mentions: bool,
+}
+
+/// A declared retention policy for one namespace (GDPR Art. 5(1)(e)).
+/// Serialized as the JSON value of a `retention:<ns>` meta row, so it
+/// travels with the file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RetentionPolicy {
+    /// Maximum age in days. Grains with `created_at` older than this are
+    /// erased by a sweep. Fractional days are allowed (tests, hourly data).
+    pub days: f64,
+    /// Restrict the sweep to one grain type (e.g. `"event"`). `None` sweeps
+    /// every type in the namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain_type: Option<String>,
+    /// Free-text note: why this policy exists. Carried for the operator and
+    /// for the BECAUSE of a governed purge — a retention rule with no
+    /// recorded rationale is not auditable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub because: Option<String>,
 }
 
 /// Result of a bulk erasure ([`DejaDB::forget_subject`] /
@@ -176,6 +212,21 @@ pub struct ErasureReport {
     pub vocab_removed: usize,
     /// CAS blobs reclaimed because only erased grains referenced them.
     pub blobs_reclaimed: usize,
+}
+
+/// Result of [`DejaDB::subject_report`] — the read-only DSAR mirror of
+/// [`DejaDB::forget_subject`]: everything the erasure selector would match
+/// for one identity, hydrated instead of erased (GDPR Art. 15 access /
+/// Art. 20 portability; see docs/gdpr.md). "Show me everything, then delete
+/// it" is this then that, over ONE selection.
+#[derive(Debug, Default)]
+pub struct SubjectReport {
+    /// Every dictionary string the identity matched: the exact subject plus
+    /// partition-style keys (`pat`, `pat#visit1` — never `patricia`).
+    pub identity_names: Vec<String>,
+    /// The matched grains — full history, not just heads — in insertion
+    /// order, deserialized for export.
+    pub grains: Vec<DeserializedGrain>,
 }
 
 /// Pluggable embedding backend. The host owns the model;
@@ -657,6 +708,10 @@ const LEGACY_MAX_GRAIN_BYTE: u8 = 0x0B;
 /// makes about itself, which `open_warnings()` surfaces. It cannot help builds
 /// that shipped before the check existed — for those the only safe posture is
 /// not to sync a file containing new grain types.
+/// `meta` key prefix for declared retention policies — one row per
+/// namespace, the same file-truth pattern as `qry:` / `tpl:`.
+const RETENTION_PREFIX: &str = "retention:";
+
 const MIN_READER_VERSION_KEY: &str = "min_reader_version";
 
 /// File-truth: the link indexes (`prov_idx`, `run_idx`, `related_to`
@@ -688,8 +743,10 @@ pub struct DejaDbOptions {
     /// file — a bare `open()` cannot supply it, so
     /// encrypted files must be opened with `open_with`/`open_encrypted`.
     /// Destroying the key destroys the memory (crypto-erasure). Covers the
-    /// memory database (grains, indexes, op-log, WAL); the `.blobs` CAS
-    /// sidecar is not yet encrypted.
+    /// memory database (grains, indexes, op-log, WAL), the telemetry
+    /// sidecar, and — under an HKDF-derived subkey — the `.blobs` CAS
+    /// sidecar. Attachments written before blob encryption landed stay
+    /// plaintext until [`DejaDB::encrypt_blobs`] migrates them.
     pub encryption_key: Option<[u8; 32]>,
     /// Recall-telemetry retention for the `<file>.telemetry.db` sidecar.
     /// Host-only capability (never persisted in the file, like the embedder):
@@ -1238,6 +1295,11 @@ pub struct DejaDB {
     /// on the write path costs one bool after the first newer-than-1.4 grain.
     needs_min_reader_stamp: bool,
     blob_store: BlobStore,
+    /// Blob-encryption key for the `.blobs` CAS sidecar, HKDF-derived from
+    /// the page-cipher key (`blobcrypt`). `None` for a plaintext memory.
+    /// This is deliberately NOT the page key — see `blobcrypt` for why the
+    /// handle retains a derived key rather than a copy of the original.
+    blob_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
     telemetry: Option<Telemetry>,
@@ -1310,9 +1372,10 @@ impl DejaDB {
         let mut warnings: Vec<String> = Vec::new();
         if enc_key.is_some() {
             warnings.push(
-                "encryption-at-rest ON (AES-256-GCM): the memory database is encrypted; the \
-                 .blobs CAS sidecar is NOT yet encrypted — keep sensitive media out of this file \
-                 (or avoid put_blob) until blob encryption lands"
+                "encryption-at-rest ON (AES-256-GCM): the memory database and the .blobs CAS \
+                 sidecar are both encrypted (blobs under an HKDF-derived key). Attachments \
+                 written by a build before blob encryption landed stay plaintext until \
+                 migrated — run `deja blobs encrypt` on such a file"
                     .into(),
             );
         }
@@ -1412,6 +1475,11 @@ impl DejaDB {
         mut warnings: Vec<String>,
         file_guard: Option<OpenFileGuard>,
     ) -> Result<Self> {
+        // Derive the sidecar key BEFORE the page key is zeroized below.
+        let blob_key = explicit
+            .as_ref()
+            .and_then(|o| o.encryption_key.as_ref())
+            .map(blobcrypt::derive_blob_key);
         // ---- file-carried declarations (meta k/v) --------------------
         let meta: HashMap<String, String> = {
             let mut m = HashMap::new();
@@ -1532,6 +1600,7 @@ impl DejaDB {
             warnings,
             needs_min_reader_stamp: !meta.contains_key(MIN_READER_VERSION_KEY),
             blob_store,
+            blob_key,
             telemetry,
             _file_guard: file_guard,
         };
@@ -1734,6 +1803,90 @@ impl DejaDB {
     pub fn meta_delete(&self, key: &str) -> Result<()> {
         self.db.execute("DELETE FROM meta WHERE k = ?1", vec![pt(key)])?;
         Ok(())
+    }
+
+    /// Declared retention policies (GDPR Art. 5(1)(e), storage limitation),
+    /// one per namespace, newest read wins: `[(namespace, RetentionPolicy)]`
+    /// sorted by namespace.
+    ///
+    /// Policy is a **file-truth**, stored as `retention:<ns>` meta rows
+    /// exactly like saved queries and templates: it travels with the memory,
+    /// so a file that says "events here live 90 days" keeps saying it after
+    /// a copy, a sync, or a restore on a different host. Enforcement is a
+    /// separate, explicit act ([`sweep_retention`](Self::sweep_retention) or
+    /// the loop's governed queue) — declaring a policy never silently
+    /// deletes anything.
+    pub fn retention_policies(&self) -> Result<Vec<(String, RetentionPolicy)>> {
+        let mut out = Vec::new();
+        for (ns, raw) in self.meta_scan(RETENTION_PREFIX)? {
+            match serde_json::from_str::<RetentionPolicy>(&raw) {
+                Ok(p) => out.push((ns, p)),
+                // A policy this build cannot parse must not silently mean
+                // "no policy" — that would read as "keep forever" on a file
+                // whose owner asked for deletion. Refuse loudly instead.
+                Err(e) => {
+                    return Err(DejaDbError::Validation(format!(
+                        "unreadable retention policy for namespace '{ns}': {e}"
+                    )))
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Declare (or replace) the retention policy for one namespace.
+    pub fn set_retention_policy(&self, ns: &str, policy: &RetentionPolicy) -> Result<()> {
+        if ns.trim().is_empty() {
+            return Err(DejaDbError::Validation(
+                "retention policy needs a namespace".into(),
+            ));
+        }
+        // 0 is legal and means "no minimum age" — the same semantics as
+        // `deja purge-older-than 0`. Negative or non-finite is a caller bug:
+        // a cutoff in the future would erase grains that are not yet due.
+        if policy.days < 0.0 || !policy.days.is_finite() {
+            return Err(DejaDbError::Validation(format!(
+                "retention days must be a non-negative, finite number, got {}",
+                policy.days
+            )));
+        }
+        let json = serde_json::to_string(policy).map_err(db_err)?;
+        self.meta_put(&format!("{RETENTION_PREFIX}{ns}"), &json)
+    }
+
+    /// Remove the retention policy for one namespace. Missing is not an error.
+    pub fn clear_retention_policy(&self, ns: &str) -> Result<()> {
+        self.meta_delete(&format!("{RETENTION_PREFIX}{ns}"))
+    }
+
+    /// Enforce every declared retention policy. Returns one
+    /// `(namespace, days, ErasureReport)` per policy applied, in namespace
+    /// order.
+    ///
+    /// This is the cron-shaped path; the governed path is the loop's
+    /// `retention_sweep` analyzer, which proposes the same purge through
+    /// review + BECAUSE + audit instead of doing it directly. Both end in
+    /// [`forget_older_than`](Self::forget_older_than), so the semantics —
+    /// exclusive cutoff, namespace and type scoping, replicating tombstones —
+    /// are identical.
+    pub fn sweep_retention(&mut self, now_ms: i64) -> Result<Vec<(String, f64, ErasureReport)>> {
+        let policies = self.retention_policies()?;
+        let mut out = Vec::new();
+        for (ns, policy) in policies {
+            let cutoff = now_ms - (policy.days * 86_400_000.0) as i64;
+            let gtype = match policy.grain_type.as_deref() {
+                None => None,
+                Some(t) => Some(dejadb_core::types::GrainType::from_str(t).ok_or_else(|| {
+                    DejaDbError::Validation(format!(
+                        "retention policy for '{ns}' names an unknown grain type: {t:?}"
+                    ))
+                })?),
+            };
+            let report = self.forget_older_than(Some(&ns), cutoff, gtype)?;
+            out.push((ns, policy.days, report));
+        }
+        Ok(out)
     }
 
     /// Suspend BM25 posting writes ahead of a bulk load.
@@ -2862,6 +3015,35 @@ impl DejaDB {
         Ok(new_hash)
     }
 
+    /// How many grant grains one principal may carry — a sanity bound, far
+    /// above any real ACL.
+    const AUTHZ_GRANT_CAP: usize = 256;
+
+    /// The live grants for one principal: the `mg:permits` heads in the
+    /// reserved `agent:authz` namespace (OMS 1.6 §12.6), parsed from their
+    /// canonical object strings. Recall reads heads only, so a revoked
+    /// grant — a retraction by supersession — simply stops appearing.
+    /// A malformed grant grain is skipped: under-granting is the safe
+    /// failure. Zero grants = the principal can do nothing (callers build a
+    /// fail-closed `AuthzSet::restricted` from this).
+    pub fn authz_grants(&mut self, principal: &str) -> Result<Vec<authz::Grant>> {
+        let grains = self.recall(
+            authz::AUTHZ_NS,
+            principal,
+            Some(authz::REL_PERMITS),
+            Self::AUTHZ_GRANT_CAP,
+        )?;
+        let mut grants = Vec::new();
+        for g in &grains {
+            if let Some(obj) = g.get_str("object") {
+                if let Ok(grant) = authz::Grant::from_object_string(obj) {
+                    grants.push(grant);
+                }
+            }
+        }
+        Ok(grants)
+    }
+
     /// Forget (erase from hot store) — writes a tombstone to the op-log.
     /// File-level crypto-erasure remains the strong path.
     pub fn forget(&mut self, hash: &Hash) -> Result<()> {
@@ -2871,18 +3053,28 @@ impl DejaDB {
         // this hash to a new seq). ns/s/p are stale-safe — identical content
         // means an identical key.
         let rows = self.db.query(
-            "SELECT ns, s, p FROM grains WHERE hash = ?1",
+            "SELECT ns, s, p, blob FROM grains WHERE hash = ?1",
             vec![pb(hash.as_bytes().to_vec())],
         )?;
         let (ns, s, p) = match rows.first() {
             Some(row) => (row.i64(0), row.i64(1), row.i64(2)),
             None => return Err(DejaDbError::NotFound(*hash)),
         };
+        // The grain's own CAS attachments, read pre-transaction (stale-safe:
+        // identical hash means identical blob, so the ref list cannot drift).
+        let mut cas_candidates: Vec<String> = rows
+            .first()
+            .and_then(|row| row.blob(3))
+            .and_then(|b| deserialize_blob(&b).ok())
+            .map(|view| cas_hexes(&view))
+            .unwrap_or_default();
+        cas_candidates.sort_unstable();
+        cas_candidates.dedup();
         let ram_op = self.next_op;
         self.next_op += 1;
         let ram_hlc = self.next_hlc();
         let dbr = self.db.as_ref();
-        let doc_len = with_txn(dbr, || {
+        let txn_out = with_txn(dbr, || {
             let (op_seq, hlc) = match dbr.reserve_write(0, 1, 1, now_ms() << 16, 0)? {
                 Some(w) => (w.op0, w.hlc0),
                 None => (ram_op, ram_hlc),
@@ -2967,11 +3159,51 @@ impl DejaDB {
                 "INSERT INTO oplog(op_seq,hlc,op,hash) VALUES (?1,?2,?3,?4)",
                 vec![pi(op_seq), pi(hlc), pi(OP_FORGET), pb(hash.as_bytes().to_vec())],
             )?;
-            Ok(doc_len)
+            // Targeted CAS reclamation, mirroring erase_where: a tombstone
+            // that leaves the attachment bytes on disk is not a tombstone.
+            // This is also the replica path — import_bundle replays OP_FORGET
+            // through here, so an erasure's tombstones reach the replica's
+            // blob sidecar, not just its index rows. The store-wide reference
+            // scan runs only for blob-bearing grains; the common forget never
+            // pays it. Table deletes are transactional; filesystem deletes
+            // are decided here and executed post-commit.
+            let mut fs_blobs: Vec<String> = Vec::new();
+            if !cas_candidates.is_empty() {
+                let mut referenced: HashSet<String> = HashSet::new();
+                for row in dbr.query("SELECT blob FROM grains", vec![])? {
+                    if let Some(b) = row.blob(0) {
+                        if let Ok(view) = deserialize_blob(&b) {
+                            referenced.extend(cas_hexes(&view));
+                        }
+                    }
+                }
+                for hex in &cas_candidates {
+                    if referenced.contains(hex) {
+                        continue;
+                    }
+                    match &self.blob_store {
+                        BlobStore::Table => {
+                            if let Ok(raw) = hex::decode(hex) {
+                                dbr.execute("DELETE FROM blobs WHERE hash=?1", vec![pb(raw)])?;
+                            }
+                        }
+                        BlobStore::Fs(_) => fs_blobs.push(hex.clone()),
+                    }
+                }
+            }
+            Ok((doc_len, fs_blobs))
         })?;
+        let (doc_len, fs_blobs) = txn_out;
         if let Some(len) = doc_len {
             self.fts_docs = (self.fts_docs - 1).max(0);
             self.fts_total_len = (self.fts_total_len - len).max(0);
+        }
+        // Filesystem CAS deletes decided in-txn (single-writer file backend —
+        // no concurrent put can race this).
+        if let BlobStore::Fs(dir) = &self.blob_store {
+            for hex in &fs_blobs {
+                let _ = std::fs::remove_file(fs_blob_path(dir, hex));
+            }
         }
 
         // Scrub the telemetry sidecar so a forgotten grain never lingers there.
@@ -3007,9 +3239,9 @@ impl DejaDB {
     /// Scope contract (see docs/erasure.md): only dictionary-indexed
     /// references are findable. A free-text mention of the identity inside
     /// ANOTHER subject's grain is not — hosts that need erasure must keep
-    /// identity references in structured fields. This is a deliberate
-    /// host-level extension beyond the OMS single-grain tombstone; it is
-    /// not reachable from CAL text (REQ-ERASE in docs/erasure.md).
+    /// identity references in structured fields. Since CAL 1.3 this is also
+    /// reachable as `FORGET SUBJECT "<id>" BECAUSE "…"` — authorization-
+    /// gated and audit-logged (REQ-ERASE in docs/erasure.md).
     pub fn forget_subject(&mut self, ns: &str, subject: &str) -> Result<ErasureReport> {
         self.forget_subject_with(ns, subject, ErasureOptions::default())
     }
@@ -3026,29 +3258,7 @@ impl DejaDB {
         subject: &str,
         opts: ErasureOptions,
     ) -> Result<ErasureReport> {
-        // An empty identity is a caller bug (an unset variable), and with
-        // prefix matching it would otherwise select EVERY punctuation-
-        // prefixed term. Refuse loudly — a silent mass-erasure is the worst
-        // possible reading of "".
-        if subject.trim().is_empty() {
-            return Err(DejaDbError::Validation(
-                "forget_subject needs a non-empty subject".into(),
-            ));
-        }
-        // Capability errors before scope shortcuts: a mistyped namespace
-        // must not turn the documented Validation error into a silent
-        // zero-count success. `fts_deferred` counts as indexing-off — a
-        // deferred bulk load has grains with no postings yet, and erasing
-        // through a partial index is the silent partial erasure REQ-ERASE-8
-        // forbids.
-        if opts.text_mentions && (!self.index_text || self.fts_deferred) {
-            return Err(DejaDbError::Validation(
-                "text-mention erasure needs the text index on and fully built for this \
-                 memory (the BM25 index is what makes prose mentions findable; finish the \
-                 deferred rebuild first)"
-                    .into(),
-            ));
-        }
+        self.check_subject_selector("forget_subject", subject, opts.text_mentions)?;
         let Some(ns_id) = self.term_lookup(ns)? else {
             return Ok(ErasureReport::default());
         };
@@ -3062,6 +3272,137 @@ impl DejaDB {
         )
     }
 
+    /// Shared preconditions for the subject selector — erasure AND the
+    /// read-only report must refuse identically, or "show me" and "erase"
+    /// drift apart. An empty identity is a caller bug (an unset variable),
+    /// and with prefix matching it would otherwise select EVERY
+    /// punctuation-prefixed term — a silent mass-selection is the worst
+    /// possible reading of "". Capability errors come before scope
+    /// shortcuts: a mistyped namespace must not turn the documented
+    /// Validation error into a silent zero-count success. `fts_deferred`
+    /// counts as indexing-off — a deferred bulk load has grains with no
+    /// postings yet, and selecting through a partial index is the silent
+    /// partial coverage REQ-ERASE-8 forbids.
+    fn check_subject_selector(&self, op: &str, subject: &str, text_mentions: bool) -> Result<()> {
+        if subject.trim().is_empty() {
+            return Err(DejaDbError::Validation(format!("{op} needs a non-empty subject")));
+        }
+        if text_mentions && (!self.index_text || self.fts_deferred) {
+            return Err(DejaDbError::Validation(
+                "text-mention erasure needs the text index on and fully built for this \
+                 memory (the BM25 index is what makes prose mentions findable; finish the \
+                 deferred rebuild first)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read-only DSAR mirror of [`forget_subject`](Self::forget_subject):
+    /// everything the erasure selector would match for `subject` in `ns` —
+    /// exact identity + partition keys, full history — hydrated instead of
+    /// erased (GDPR Art. 15 access / Art. 20 portability). "Show me
+    /// everything, then delete it" is this method then that one, over ONE
+    /// audited selection. Unknown namespace returns an empty report, the
+    /// same contract as erasure.
+    pub fn subject_report(&mut self, ns: &str, subject: &str) -> Result<SubjectReport> {
+        self.subject_report_with(ns, subject, ErasureOptions::default())
+    }
+
+    /// [`subject_report`](Self::subject_report) with options —
+    /// `text_mentions` extends the selection to indexed-text mentions with
+    /// the same hard preconditions as erasure (never a silent partial
+    /// answer).
+    pub fn subject_report_with(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        opts: ErasureOptions,
+    ) -> Result<SubjectReport> {
+        self.check_subject_selector("subject_report", subject, opts.text_mentions)?;
+        let Some(ns_id) = self.term_lookup(ns)? else {
+            return Ok(SubjectReport::default());
+        };
+        let sel = self.select_identity(ns_id, subject, opts.text_mentions)?;
+        let mut seqs = sel.seqs;
+        seqs.sort_unstable();
+        seqs.dedup();
+        let mut grains = Vec::with_capacity(seqs.len());
+        if !seqs.is_empty() {
+            let csv = seq_csv(&seqs);
+            for row in self
+                .db
+                .query(&format!("SELECT blob FROM grains WHERE seq IN ({csv}) ORDER BY seq"), vec![])?
+            {
+                if let Some(b) = row.blob(0) {
+                    grains.push(deserialize_blob(&b)?);
+                }
+            }
+        }
+        Ok(SubjectReport { identity_names: sel.identity_names, grains })
+    }
+
+    /// Export the subject selection as a portable MGB1 bundle — the
+    /// Art. 20 (data portability) artifact: the same record format
+    /// [`bundle_since`](Self::bundle_since) writes, restricted to the
+    /// grains the DSAR selector matched, importable into any OMS store.
+    /// Tombstones are never exported — a DSAR bundle carries the subject's
+    /// data (history included), not deletions.
+    pub fn subject_bundle_with(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        opts: ErasureOptions,
+        path: &str,
+    ) -> Result<BundleStats> {
+        self.check_subject_selector("subject_bundle", subject, opts.text_mentions)?;
+        let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+        out.extend_from_slice(BUNDLE_MAGIC);
+        let mut ops = 0usize;
+        let mut last = 0i64;
+        if let Some(ns_id) = self.term_lookup(ns)? {
+            let sel = self.select_identity(ns_id, subject, opts.text_mentions)?;
+            let mut seqs = sel.seqs;
+            seqs.sort_unstable();
+            seqs.dedup();
+            if !seqs.is_empty() {
+                let csv = seq_csv(&seqs);
+                // The matched grains' own op-log records (ADD or SUPERSEDE),
+                // in op order so supersession chains replay causally. The
+                // grains join excludes forgotten hashes; OP_FORGET is
+                // excluded explicitly so a forget + re-add of identical
+                // content never smuggles a tombstone into the export.
+                for row in self.db.query(
+                    &format!(
+                        "SELECT o.op_seq, o.hlc, o.op, g.hash, g.blob \
+                         FROM oplog o JOIN grains g ON g.hash = o.hash \
+                         WHERE g.seq IN ({csv}) AND o.op != ?1 ORDER BY o.op_seq"
+                    ),
+                    vec![pi(OP_FORGET)],
+                )? {
+                    let (Some(op_seq), Some(hlc), Some(op), Some(hash), Some(blob)) =
+                        (row.i64(0), row.i64(1), row.i64(2), row.blob(3), row.blob(4))
+                    else {
+                        continue;
+                    };
+                    out.push(op as u8);
+                    out.extend_from_slice(&hlc.to_le_bytes());
+                    out.extend_from_slice(&hash);
+                    out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&blob);
+                    ops += 1;
+                    last = op_seq;
+                }
+            }
+        }
+        std::fs::write(path, &out).map_err(db_err)?;
+        Ok(BundleStats {
+            ops,
+            bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            last_op_seq: last,
+        })
+    }
+
     /// Erase every grain older than `cutoff_ms` (`created_at < cutoff`),
     /// optionally scoped to one namespace and/or grain type — the
     /// retention-sweep primitive (nightly age-based deletion). Same erasure
@@ -3072,6 +3413,24 @@ impl DejaDB {
         cutoff_ms: i64,
         gtype: Option<dejadb_core::types::GrainType>,
     ) -> Result<ErasureReport> {
+        self.forget_older_than_capped(ns, cutoff_ms, gtype, None)
+    }
+
+    /// The same sweep bounded to at most `limit` grains, **oldest first** —
+    /// what CAL's `PURGE OLDER THAN … LIMIT n` means. A bounded sweep is how
+    /// an operator pilots a retention rule: erase a reviewable batch, check
+    /// the audit record, then widen. An ignored bound is not a smaller
+    /// erasure, it is the whole namespace.
+    pub fn forget_older_than_capped(
+        &mut self,
+        ns: Option<&str>,
+        cutoff_ms: i64,
+        gtype: Option<dejadb_core::types::GrainType>,
+        limit: Option<usize>,
+    ) -> Result<ErasureReport> {
+        if limit == Some(0) {
+            return Ok(ErasureReport::default());
+        }
         let ns_id = match ns {
             Some(n) => match self.term_lookup(n)? {
                 Some(x) => Some(x),
@@ -3080,7 +3439,108 @@ impl DejaDB {
             None => None,
         };
         let gt = gtype.map(|g| g as u8 as i64);
-        self.erase_where(ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype: gt }, None)
+        self.erase_where(
+            ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype: gt, limit },
+            None,
+        )
+    }
+
+    /// What the identity selector matched: dictionary ids, the matched
+    /// STRINGS (exact + partition keys), and the grain seqs. Shared by
+    /// [`erase_where`](Self::erase_where) (erasure mode) and
+    /// [`subject_report_with`](Self::subject_report_with) (read-only DSAR
+    /// mode), so "show me everything" and "erase everything" are provably
+    /// ONE selection. `seqs` is returned unsorted and may hold duplicates;
+    /// callers sort/dedup.
+    fn select_identity(
+        &mut self,
+        ns_id: i64,
+        subject: &str,
+        text_mentions: bool,
+    ) -> Result<IdentitySelection> {
+        let mut sel = IdentitySelection::default();
+        // Resolve the identity's dictionary ids: the exact term plus every
+        // PARTITION-STYLE key — `subject` followed by a non-alphanumeric
+        // separator (`pat#visit1`, `pat:thread-2`), never a longer word
+        // (`patricia`). The LIKE is a coarse prefilter (case-insensitive on
+        // the embedded engine); the Rust boundary check decides,
+        // case-exactly, identically on every backend.
+        let like = format!("{}%", like_escape(subject));
+        for row in self.db.query(
+            "SELECT id, term FROM terms WHERE term LIKE ?1 ESCAPE '\\'",
+            vec![pt(&like)],
+        )? {
+            let (Some(id), Some(term)) = (row.i64(0), row.text(1)) else {
+                continue;
+            };
+            let matched = term == subject
+                || (term.starts_with(subject)
+                    && term[subject.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| !c.is_alphanumeric()));
+            if matched {
+                sel.identity_ids.push(id);
+                sel.identity_names.push(term.to_string());
+            }
+        }
+        // Telemetry keys on the subject STRING even when the dictionary
+        // never interned it (ring-log query text), so the bare subject
+        // always joins the matched-name list.
+        if !sel.identity_names.iter().any(|n| n == subject) {
+            sel.identity_names.push(subject.to_string());
+        }
+        if !sel.identity_ids.is_empty() {
+            let idcsv = seq_csv(&sel.identity_ids);
+            sel.seqs.extend(
+                self.db
+                    .query(
+                        &format!(
+                            "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND \
+                               (s IN ({idcsv}) OR o IN ({idcsv})) \
+                             UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session IN ({idcsv}) \
+                             UNION SELECT seq FROM run_idx WHERE ns=?1 AND run IN ({idcsv})"
+                        ),
+                        vec![pi(ns_id)],
+                    )?
+                    .iter()
+                    .filter_map(|r| r.i64(0)),
+            );
+        }
+        // Search symmetry, opt-in: whatever the BM25 leg can find by the
+        // identity's tokens, the selection covers — a grain whose INDEXED
+        // TEXT mentions the identity joins when every token occurs in it.
+        if text_mentions {
+            let mut tokens = tokenize(subject);
+            tokens.sort_unstable();
+            tokens.dedup();
+            let mut inter: Option<HashSet<i64>> = None;
+            for t in &tokens {
+                let set: HashSet<i64> = match self.fts_term_lookup(t)? {
+                    Some(vid) => self
+                        .db
+                        .query(
+                            "SELECT seq FROM fts_post WHERE term=?1 AND ns=?2",
+                            vec![pi(vid), pi(ns_id)],
+                        )?
+                        .iter()
+                        .filter_map(|r| r.i64(0))
+                        .collect(),
+                    None => HashSet::new(),
+                };
+                inter = Some(match inter {
+                    None => set,
+                    Some(p) => p.intersection(&set).copied().collect(),
+                });
+                if inter.as_ref().is_some_and(|s| s.is_empty()) {
+                    break;
+                }
+            }
+            if let Some(set) = inter {
+                sel.seqs.extend(set);
+            }
+        }
+        Ok(sel)
     }
 
     /// Shared bulk-erasure core. Enumeration happens INSIDE the transaction,
@@ -3134,93 +3594,15 @@ impl DejaDB {
             let mut identity_ids: Vec<i64> = Vec::new();
             let mut seqs: Vec<i64> = match &selector {
                 ErasureSelector::Identity { ns_id, subject, text_mentions } => {
-                    // Resolve the identity's dictionary ids in-txn: the exact
-                    // term plus every PARTITION-STYLE key — `subject` followed
-                    // by a non-alphanumeric separator (`pat#visit1`,
-                    // `pat:thread-2`), never a longer word (`patricia`). The
-                    // LIKE is a coarse prefilter (case-insensitive on the
-                    // embedded engine); the Rust boundary check decides,
-                    // case-exactly, identically on every backend.
-                    let like = format!("{}%", like_escape(subject));
-                    for row in self.db.query(
-                        "SELECT id, term FROM terms WHERE term LIKE ?1 ESCAPE '\\'",
-                        vec![pt(&like)],
-                    )? {
-                        let (Some(id), Some(term)) = (row.i64(0), row.text(1)) else {
-                            continue;
-                        };
-                        let matched = term == subject
-                            || (term.starts_with(subject.as_str())
-                                && term[subject.len()..]
-                                    .chars()
-                                    .next()
-                                    .is_some_and(|c| !c.is_alphanumeric()));
-                        if matched {
-                            identity_ids.push(id);
-                            out.identity_names.push(term.to_string());
-                        }
-                    }
-                    // Telemetry keys on the subject STRING even when the
-                    // dictionary never interned it (ring-log query text), so
-                    // the bare subject always joins the post-commit scrub.
-                    if !out.identity_names.iter().any(|n| n == subject) {
-                        out.identity_names.push(subject.clone());
-                    }
-                    let mut seqs: Vec<i64> = Vec::new();
-                    if !identity_ids.is_empty() {
-                        let idcsv = seq_csv(&identity_ids);
-                        seqs.extend(
-                            self.db
-                                .query(
-                                    &format!(
-                                        "SELECT DISTINCT seq FROM triples WHERE ns=?1 AND \
-                                           (s IN ({idcsv}) OR o IN ({idcsv})) \
-                                         UNION SELECT seq FROM thread_idx WHERE ns=?1 AND session IN ({idcsv}) \
-                                         UNION SELECT seq FROM run_idx WHERE ns=?1 AND run IN ({idcsv})"
-                                    ),
-                                    vec![pi(*ns_id)],
-                                )?
-                                .iter()
-                                .filter_map(|r| r.i64(0)),
-                        );
-                    }
-                    // Search symmetry, opt-in: whatever the BM25 leg can find
-                    // by the identity's tokens, erasure removes — a grain
-                    // whose INDEXED TEXT mentions the identity is a candidate
-                    // when every token of the identity occurs in it.
-                    if *text_mentions {
-                        let mut tokens = tokenize(subject);
-                        tokens.sort_unstable();
-                        tokens.dedup();
-                        let mut inter: Option<HashSet<i64>> = None;
-                        for t in &tokens {
-                            let set: HashSet<i64> = match self.fts_term_lookup(t)? {
-                                Some(vid) => self
-                                    .db
-                                    .query(
-                                        "SELECT seq FROM fts_post WHERE term=?1 AND ns=?2",
-                                        vec![pi(vid), pi(*ns_id)],
-                                    )?
-                                    .iter()
-                                    .filter_map(|r| r.i64(0))
-                                    .collect(),
-                                None => HashSet::new(),
-                            };
-                            inter = Some(match inter {
-                                None => set,
-                                Some(p) => p.intersection(&set).copied().collect(),
-                            });
-                            if inter.as_ref().is_some_and(|s| s.is_empty()) {
-                                break;
-                            }
-                        }
-                        if let Some(set) = inter {
-                            seqs.extend(set);
-                        }
-                    }
-                    seqs
+                    // The shared selector, run in-txn after the serialization
+                    // point — the SAME selection the read-only subject report
+                    // hydrates (select_identity), here feeding the deletes.
+                    let sel = self.select_identity(*ns_id, subject, *text_mentions)?;
+                    identity_ids = sel.identity_ids;
+                    out.identity_names = sel.identity_names;
+                    sel.seqs
                 }
-                ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype } => {
+                ErasureSelector::OlderThan { ns_id, cutoff_ms, gtype, limit } => {
                     let mut sql = String::from("SELECT seq FROM grains WHERE created_at < ?1");
                     let mut params = vec![pi(*cutoff_ms)];
                     if let Some(n) = ns_id {
@@ -3230,6 +3612,14 @@ impl DejaDB {
                     if let Some(g) = gtype {
                         sql.push_str(if ns_id.is_some() { " AND gtype = ?3" } else { " AND gtype = ?2" });
                         params.push(pi(*g));
+                    }
+                    // A bounded sweep takes the OLDEST matches, so repeating
+                    // it walks forward through the backlog deterministically
+                    // instead of re-rolling an arbitrary slice. The bound is
+                    // a Rust integer, never text — safe to inline, which
+                    // keeps the hand-numbered placeholders above intact.
+                    if let Some(n) = limit {
+                        sql.push_str(&format!(" ORDER BY created_at ASC, seq ASC LIMIT {n}"));
                     }
                     self.db.query(&sql, params)?.iter().filter_map(|r| r.i64(0)).collect()
                 }
@@ -5193,20 +5583,24 @@ impl DejaDB {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(bytes);
         let hex = hex::encode(digest);
+        // Sealed under the sidecar key when this memory is encrypted; the
+        // ADDRESS stays the plaintext digest so it is stable across
+        // encrypted and plaintext stores (see `blobcrypt`).
+        let stored = blobcrypt::write_bytes(self.blob_key.as_deref(), &hex, bytes)?;
         match &self.blob_store {
             BlobStore::Fs(dir) => {
                 let path = fs_blob_path(dir, &hex);
                 if !path.exists() {
                     std::fs::create_dir_all(path.parent().unwrap()).map_err(db_err)?;
                     let tmp = path.with_extension("tmp");
-                    std::fs::write(&tmp, bytes).map_err(db_err)?;
+                    std::fs::write(&tmp, &stored).map_err(db_err)?;
                     std::fs::rename(&tmp, &path).map_err(db_err)?;
                 }
             }
             BlobStore::Table => {
                 self.db.execute(
                     "INSERT OR IGNORE INTO blobs(hash, body) VALUES (?1, ?2)",
-                    vec![pb(digest.to_vec()), pb(bytes.to_vec())],
+                    vec![pb(digest.to_vec()), pb(stored)],
                 )?;
             }
         }
@@ -5237,10 +5631,80 @@ impl DejaDB {
                     .ok_or_else(|| DejaDbError::Storage(format!("blob missing: {uri}")))?
             }
         };
+        // Decrypt first (a plaintext blob from an older build passes
+        // through), then verify the content address over the CLEAR bytes —
+        // so both the AEAD tag and the address independently catch tampering.
+        let bytes = blobcrypt::read_maybe_sealed(self.blob_key.as_deref(), hex, bytes)?;
         if hex::encode(Sha256::digest(&bytes)) != hex {
             return Err(DejaDbError::Storage(format!("blob corrupt: {uri}")));
         }
         Ok(bytes)
+    }
+
+    /// Encrypt any `.blobs` attachments still stored in the clear, under
+    /// this memory's derived sidecar key. Returns `(encrypted, already)`.
+    ///
+    /// Attachments written before blob encryption landed stay readable
+    /// (the read path passes plaintext through), so migration is a separate,
+    /// resumable step rather than a breaking open — but a file that has not
+    /// run it still has cleartext media on disk beside an encrypted
+    /// database, which is the Art. 32 finding this closes.
+    ///
+    /// Idempotent: sealed blobs are skipped, so re-running is free. Requires
+    /// an encrypted memory — on a plaintext one there is no key to seal
+    /// under, and silently doing nothing would read as success.
+    pub fn encrypt_blobs(&mut self) -> Result<(usize, usize)> {
+        let Some(key) = self.blob_key.as_deref().copied() else {
+            return Err(DejaDbError::Validation(
+                "encrypt_blobs needs an encrypted memory — open it with its key \
+                 (open_encrypted / --passphrase-env) first"
+                    .into(),
+            ));
+        };
+        let mut encrypted = 0usize;
+        let mut already = 0usize;
+        match &self.blob_store {
+            BlobStore::Fs(dir) => {
+                let dir = dir.clone();
+                let Ok(shards) = std::fs::read_dir(&dir) else { return Ok((0, 0)) };
+                for shard in shards.flatten() {
+                    let prefix = shard.file_name().to_string_lossy().to_string();
+                    let Ok(files) = std::fs::read_dir(shard.path()) else { continue };
+                    for f in files.flatten() {
+                        let path = f.path();
+                        let rest = f.file_name().to_string_lossy().to_string();
+                        let hex = format!("{prefix}{rest}");
+                        // Skip the tmp files put_blob renames from, and
+                        // anything that isn't a content address.
+                        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            continue;
+                        }
+                        let raw = std::fs::read(&path).map_err(db_err)?;
+                        if blobcrypt::is_sealed(&raw) {
+                            already += 1;
+                            continue;
+                        }
+                        let sealed = blobcrypt::seal(&key, &hex, &raw)?;
+                        // tmp + rename: a crash mid-migration leaves the
+                        // original readable, never a truncated blob.
+                        let tmp = path.with_extension("tmp");
+                        std::fs::write(&tmp, &sealed).map_err(db_err)?;
+                        std::fs::rename(&tmp, &path).map_err(db_err)?;
+                        encrypted += 1;
+                    }
+                }
+            }
+            BlobStore::Table => {
+                // Postgres keeps blobs in-schema, where the database's own
+                // encryption (TDE/pgcrypto) covers them — see docs/gdpr.md §5.
+                return Err(DejaDbError::Validation(
+                    "blob encryption is file-backend-only; on postgres the blobs table is \
+                     covered by the database's own encryption at rest"
+                        .into(),
+                ));
+            }
+        }
+        Ok((encrypted, already))
     }
 
     /// Remove CAS blobs not referenced by any live grain's `content_refs`.
@@ -5708,6 +6172,7 @@ impl Drop for DejaDB {
     }
 }
 
+mod blobcrypt;
 pub mod asyncdb;
 pub mod memory_tool;
 pub mod migrate;

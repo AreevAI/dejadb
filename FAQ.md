@@ -80,10 +80,14 @@ Because the format is open, your memories are portable and not locked to DejaDB.
 
 **CAL** (Context Assembly Language) is DejaDB's query language. Statements
 include `RECALL`, `ASSEMBLE`, `EXISTS`, `HISTORY`, `ADD`, `SUPERSEDE`, and
-`DESCRIBE`, plus pipeline stages like `| COUNT`. A key property: **CAL has no
-bulk destruction** — `DELETE` and `DROP` are not tokens in the grammar, and
-the only destructive statement is `FORGET <hash>`, a single-grain tombstone
-gated at execution (disable with `--no-destructive-ops`). `ASSEMBLE` can gather memories from several sources into a single
+`DESCRIBE`, plus pipeline stages like `| COUNT`. A key property:
+**destruction is shaped** — it takes a hash (`FORGET <hash>`), an identity
+(`FORGET SUBJECT "<id>"`), or an age (`PURGE OLDER THAN 90d`), and **never a
+predicate**. `DELETE` is not a token in the grammar. Each destructive
+statement needs the session's grant plus a recorded `BECAUSE`, writes an audit
+record, and can be switched off per process with `--no-destructive-ops`. The
+read-only mirror `REPORT SUBJECT` answers data-subject access requests over
+the same selector the erasure uses (see [`docs/gdpr.md`](docs/gdpr.md)). `ASSEMBLE` can gather memories from several sources into a single
 budgeted prompt in one statement. See [`docs/cal-reference.md`](docs/cal-reference.md).
 
 ```

@@ -481,6 +481,95 @@ fn destructive_apply_requires_admin_and_flag() {
     assert!(!ok.rollbackable, "FORGET has no inverse");
 }
 
+/// A PURGE in a proposal must stamp `destructive` (and so hit the
+/// admin + allow_destructive apply gate) exactly like a FORGET — proposals
+/// from LLM enrichment or `--analyzer-cmd` are arbitrary CAL text, and a
+/// FORGET-only check would let bulk erasure ride through as "rollbackable".
+#[test]
+fn purge_proposal_is_stamped_destructive_and_gated() {
+    use crate::analyzer::{AnalyzeCtx, Analyzer};
+    use crate::manifest::{
+        AnalyzerManifest, AutoApplyClass, CadenceClass, TargetClass, Tier, TrustClass,
+    };
+    use crate::model::ActionKind;
+    use crate::recommendation::{Proposal, RecDraft, Summary};
+
+    struct PurgeProposer {
+        manifest: AnalyzerManifest,
+    }
+    impl Analyzer for PurgeProposer {
+        fn manifest(&self) -> &AnalyzerManifest {
+            &self.manifest
+        }
+        fn analyze(&self, _ctx: &AnalyzeCtx) -> crate::error::Result<Vec<RecDraft>> {
+            Ok(vec![RecDraft::new(
+                "grain:deadbeef",
+                ActionKind::Expire,
+                Summary::new("test.purge", serde_json::Map::new()),
+                Proposal::Cal {
+                    cal: r#"PURGE OLDER THAN 90d BECAUSE "retention""#.into(),
+                },
+            )])
+        }
+    }
+
+    let mut sub = TestSubstrate::new();
+    sub.add_fact("acme", "tier", "Enterprise");
+    let mut e = Engine::with_builtins();
+    e.register(Box::new(PurgeProposer {
+        manifest: AnalyzerManifest {
+            id: "test.purge/1".into(),
+            title: "Purge proposer".into(),
+            description: "test-only".into(),
+            tier: Tier::T0,
+            cadence: CadenceClass::Fast,
+            requires: vec![],
+            target_classes: vec![TargetClass::Memory],
+            auto_apply: AutoApplyClass::Never,
+            trust_class: TrustClass::Builtin,
+            params: vec![],
+            default_on: true,
+        },
+    }));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+
+    let recs = e.recommendations(&sub.inner, None).unwrap();
+    let purge = recs
+        .iter()
+        .find(|r| r.analyzer == "test.purge/1")
+        .expect("the purge recommendation");
+    assert!(purge.destructive, "PURGE must stamp destructive");
+    assert!(!purge.rollbackable, "bulk erasure has no inverse");
+
+    let scopes = ScopeSet::all();
+    let hash = purge.hash.clone();
+    e.review(
+        &mut sub.inner,
+        &hash,
+        Decision::Approve,
+        "user:alice",
+        ObserverType::Human,
+        &scopes,
+        "retention",
+        11_000,
+    )
+    .unwrap();
+    let denied = e.apply(
+        &mut sub.inner,
+        &hash,
+        "user:alice",
+        ObserverType::Human,
+        &scopes,
+        "apply",
+        false,
+        12_000,
+    );
+    assert!(
+        matches!(denied, Err(Error::DestructiveGated(_))),
+        "destructive gate must hold for PURGE, got {denied:?}"
+    );
+}
+
 #[test]
 fn apply_on_pending_is_rejected() {
     let mut sub = TestSubstrate::new();
@@ -547,6 +636,84 @@ fn self_approval_blocked_against_creator() {
             ObserverType::Human,
             &ScopeSet::all(),
             "ok",
+            11_000
+        )
+        .is_ok());
+}
+
+#[test]
+fn llm_rec_blocks_approval_by_triggering_actor() {
+    use crate::model::Origin;
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"],"confidence":0.9}}
+        ]}}"#
+    );
+    let ground = r#"{"results":[{"id":0,"supported":true,"reason":"entailed"}]}"#.to_string();
+    let verify =
+        r#"{"results":[{"id":0,"keep":true,"confidence":0.88,"reason":"real"}]}"#.to_string();
+    let enrich = r#"{"notes":[]}"#.to_string();
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm { discover, ground, verify, enrich }));
+
+    let opts = RunOptions {
+        triggering_actor: Some("user:sam".into()),
+        ..Default::default()
+    };
+    e.run(&mut sub.inner, &opts, 10_000).unwrap();
+
+    let recs = e.recommendations(&sub.inner, Some(RecStatus::Pending)).unwrap();
+    let llm = recs
+        .iter()
+        .find(|r| matches!(r.origin, Origin::Llm { .. }))
+        .expect("an llm-origin recommendation");
+    let det = recs
+        .iter()
+        .find(|r| matches!(r.origin, Origin::Builtin))
+        .expect("a deterministic recommendation");
+
+    // The trigger of the LLM run cannot approve the model's own output —
+    // the creator string is engine:loop.llm/1, so before co_creators this
+    // approval sailed through.
+    let blocked = e.review(
+        &mut sub.inner,
+        &llm.hash,
+        Decision::Approve,
+        "user:sam",
+        ObserverType::Human,
+        &ScopeSet::all(),
+        "looks right to me",
+        11_000,
+    );
+    assert!(matches!(blocked, Err(Error::SelfApproval(_))));
+
+    // A different reviewer can.
+    assert!(e
+        .review(
+            &mut sub.inner,
+            &llm.hash,
+            Decision::Approve,
+            "user:review",
+            ObserverType::Human,
+            &ScopeSet::all(),
+            "verified against the fork",
+            11_000
+        )
+        .is_ok());
+
+    // The deterministic finding stays approvable by the trigger — it is
+    // computed, not authored, so its creator remains the engine.
+    assert!(e
+        .review(
+            &mut sub.inner,
+            &det.hash,
+            Decision::Approve,
+            "user:sam",
+            ObserverType::Human,
+            &ScopeSet::all(),
+            "resolve to latest",
             11_000
         )
         .is_ok());

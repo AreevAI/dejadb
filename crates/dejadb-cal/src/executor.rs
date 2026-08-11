@@ -56,6 +56,12 @@ pub struct CalExecutorConfig {
     /// and emit audit events, preserving compliance invariants.
     /// When `false`, they return `Unsupported`. REVERT always returns
     /// `Unsupported` regardless of this flag (semantics undefined).
+    ///
+    /// Under the grants model (`docs/cal-all-you-need-proposal.md`) this is
+    /// a **process-wide restrictive cap**, not the authorization mechanism:
+    /// the session's grants decide who may write, and this flag set `false`
+    /// still wins over any grant — belt-and-suspenders for "serve untrusted
+    /// callers read-only".
     pub tier1_enabled: bool,
     /// Namespace override injected from the auth/capability token.
     ///
@@ -74,6 +80,10 @@ pub struct CalExecutorConfig {
     /// per-process host config (invariant #5) — never persisted in the file.
     /// Set it to `false` to make a session read-only, e.g.
     /// `deja serve --mcp --no-destructive-ops`.
+    ///
+    /// Under the grants model this is a **process-wide restrictive cap**:
+    /// the session's grants (`DejaDbFacade::authz`) decide who may destroy,
+    /// and this flag set `false` still wins over any grant.
     pub allow_destructive_ops: bool,
     /// When `true`, ASSEMBLE results strip internal budget metadata
     /// (tokens_allocated, tokens_used) from the `sources` array.
@@ -187,6 +197,38 @@ pub enum CalResultPayload {
     Exists { exists: bool, hash: String },
     /// Result of a `| COUNT` pipeline stage.
     Count { count: usize },
+    /// Result of `GRANT` (CAL 1.3 §8.15).
+    Granted { principal: String, object: String, hash: String },
+    /// Result of `REVOKE`.
+    Revoked { principal: String, grants_touched: usize },
+    /// Result of `SHOW GRANTS` — one row per live grant grain.
+    GrantList { grants: Vec<serde_json::Value> },
+    /// Result of `RUN LOOP` (CAL 1.3 §8.16) — the engine's run report.
+    LoopRan { run: serde_json::Value },
+    /// Result of `APPROVE`/`REJECT`.
+    Reviewed { hash: String, decision: String },
+    /// Result of `APPLY`.
+    RecApplied { hash: String, rollbackable: bool },
+    /// Result of `ROLLBACK`.
+    RecRolledBack { hash: String },
+    /// Result of `REMEMBER` — the captured Event's hash.
+    Remembered { hash: String },
+    /// Result of `ENTITY … AT` — the as-of grain, or null.
+    EntityAt { grain: Option<serde_json::Value>, axis: String, at_ms: i64 },
+    /// Result of `RUN TRACE` — what a run recorded and produced.
+    RunTrace { run_id: String, trace: serde_json::Value },
+    /// Result of `RUNS TOUCHING` — run ids, most recent first.
+    RunsTouching { hash: String, runs: Vec<String> },
+    /// Result of `DERIVED FROM` — reverse provenance rows.
+    DerivedFrom { hash: String, grains: Vec<serde_json::Value> },
+    /// Result of `SHOW FORKS` — the open forks.
+    Forks { forks: Vec<serde_json::Value> },
+    /// Result of `MERGE` — the resolved head.
+    Merged { hash: String, subject: String, relation: String, object: String },
+    /// Result of `RELATED` — the reachable entities.
+    RelatedEntities { start: String, entities: Vec<String> },
+    /// Result of `NOVELTY` — nearest matches, most similar first.
+    NoveltyMatches { matches: Vec<serde_json::Value> },
     /// Result of `HISTORY OF`.
     History { versions: Vec<CalVersionResult> },
     /// Result of `DESCRIBE`.
@@ -283,6 +325,13 @@ pub enum CalResultPayload {
     Forgotten { target: String, count: u64 },
     /// Result of `PURGE STALE` (Tier 2).
     Purged { count: usize },
+    /// Result of `REPORT SUBJECT` — the read-only DSAR selection: the
+    /// matched identity strings and grains (`{hash, type, fields}`).
+    SubjectReport {
+        subject: String,
+        identity_names: Vec<String>,
+        grains: Vec<serde_json::Value>,
+    },
     /// Returned for Tier 1/2 statements (S-2) or genuinely unsupported paths.
     Unsupported { statement: String, message: String },
 }
@@ -558,12 +607,27 @@ impl Drop for LetScope {
 /// mutability).
 pub struct CalExecutor {
     config: CalExecutorConfig,
+    /// The governance seam (CAL 1.3 §8.16): loop lifecycle statements
+    /// execute only when a host attached one — `dejadb-loop` provides the
+    /// real implementation. Absent → those statements return
+    /// `Unsupported`.
+    governance: Option<std::sync::Arc<dyn crate::governance::GovernanceHost>>,
 }
 
 impl CalExecutor {
     /// Create a new executor with the given configuration.
     pub fn new(config: CalExecutorConfig) -> Self {
-        Self { config }
+        Self { config, governance: None }
+    }
+
+    /// Attach the governance host that backs `RUN LOOP`, `APPROVE`,
+    /// `REJECT`, `APPLY`, `ROLLBACK`, and the loop `DESCRIBE` reads.
+    pub fn with_governance(
+        mut self,
+        host: std::sync::Arc<dyn crate::governance::GovernanceHost>,
+    ) -> Self {
+        self.governance = Some(host);
+        self
     }
 
     /// The effective configuration (read-only; for observability surfaces).
@@ -891,6 +955,25 @@ impl CalExecutor {
                     fields.insert(
                         "add_reason".into(),
                         serde_json::Value::String(add.reason.clone()),
+                    );
+                }
+                // `WITH occurrence` — honest inert-option handling: tool
+                // grains are not ADD-able from text (add_via_set is false;
+                // the shape check above already refused them), and the host
+                // API that IS the tool-call path (`record_tool_call`)
+                // stamps per-call identity itself. The option exists so an
+                // agent pasting the pattern gets a warning that names the
+                // right tool, not silence.
+                if add
+                    .with_options
+                    .iter()
+                    .any(|o| matches!(o, super::ast::AddWithOption::Occurrence))
+                {
+                    exec_warnings.push(
+                        "CAL-W014: WITH occurrence is inert here — tool occurrences are \
+                         recorded via record_tool_call (every binding), which stamps the \
+                         per-call identity that keeps retries distinct."
+                            .to_string(),
                     );
                 }
                 self.inject_write_namespace(&mut fields, store);
@@ -1285,7 +1368,7 @@ impl CalExecutor {
                             found: hash.clone(),
                             span: forget.span,
                         })?;
-                        match store.cal_delete(&h) {
+                        match store.cal_delete(&h, forget.reason.as_deref()) {
                             Ok(()) => Ok(CalResultPayload::Forgotten {
                                 target: format!("hash:{hash}"),
                                 count: 1,
@@ -1297,14 +1380,23 @@ impl CalExecutor {
                         }
                     }
                     super::ast::ForgetTarget::User { user_id } => {
-                        match store.cal_forget_user(user_id) {
+                        // BECAUSE is mandatory on identity erasure (the text
+                        // parser enforces it; the JSON-CAL path enforces it
+                        // here).
+                        let because = match forget.reason.as_deref() {
+                            Some(r) if !r.trim().is_empty() => r,
+                            _ => {
+                                return Err(CalError::MissingReason { span: forget.span });
+                            }
+                        };
+                        match store.cal_forget_user(user_id, forget.text_mentions, because) {
                             Ok(proof) => Ok(CalResultPayload::Forgotten {
-                                target: format!("user:{user_id}"),
+                                target: format!("subject:{user_id}"),
                                 count: proof.count,
                             }),
                             Err(e) => Ok(CalResultPayload::Unsupported {
                                 statement: "forget".into(),
-                                message: format!("FORGET USER failed: {e}"),
+                                message: format!("FORGET SUBJECT failed: {e}"),
                             }),
                         }
                     }
@@ -1349,6 +1441,11 @@ impl CalExecutor {
                     )
                     .map_err(|e| {
                         let s = e.to_string();
+                        // An authorization refusal is neither a bad name nor
+                        // bad syntax — surface it as itself.
+                        if s.contains("AUT-E") {
+                            return CalError::NotAuthorized { detail: s, span: None };
+                        }
                         // If the inner error is already a CAL error about template
                         // validation (unknown variable, syntax, etc.), surface it
                         // directly instead of wrapping it as TemplateInvalidName.
@@ -1416,9 +1513,13 @@ impl CalExecutor {
                         def.description.as_deref(),
                         &def.params,
                     )
-                    .map_err(|e| CalError::InvalidQueryBody {
-                        detail: e.to_string(),
-                        span: None,
+                    .map_err(|e| {
+                        let detail = e.to_string();
+                        if detail.contains("AUT-E") {
+                            CalError::NotAuthorized { detail, span: None }
+                        } else {
+                            CalError::InvalidQueryBody { detail, span: None }
+                        }
                     })?;
                 Ok(CalResultPayload::QueryDefined {
                     name: def.name.clone(),
@@ -1445,7 +1546,7 @@ impl CalExecutor {
             }
             CalStatement::RunQuery(run) => self.execute_run_query(run, store, query, exec_warnings),
 
-            // Tier 2 — PURGE STALE
+            // Tier 2 — PURGE OLDER THAN (the retention sweep).
             CalStatement::Purge(purge) => {
                 if !self.config.allow_destructive_ops {
                     return Ok(CalResultPayload::Unsupported {
@@ -1455,14 +1556,379 @@ impl CalExecutor {
                             .into(),
                     });
                 }
+                // BECAUSE is mandatory (the text parser enforces it; the
+                // JSON-CAL path enforces it here).
+                let because = match purge.reason.as_deref() {
+                    Some(r) if !r.trim().is_empty() => r,
+                    _ => {
+                        return Err(CalError::MissingReason { span: purge.span });
+                    }
+                };
                 let min_age = purge.min_age_days.unwrap_or(30.0);
                 let batch_limit = purge.limit.unwrap_or(1000);
                 let ns = purge.namespace.as_deref();
-                match store.cal_purge_stale(min_age, ns, batch_limit) {
+                match store.cal_purge_stale(
+                    min_age,
+                    ns,
+                    batch_limit,
+                    purge.grain_type.as_deref(),
+                    because,
+                ) {
                     Ok(count) => Ok(CalResultPayload::Purged { count }),
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "purge".into(),
-                        message: format!("PURGE STALE failed: {e}"),
+                        message: format!("PURGE failed: {e}"),
+                    }),
+                }
+            }
+
+            // REPORT SUBJECT — the read-only DSAR selection (OMS 1.6
+            // draft): a pure read under the session's `read` grant, no
+            // destructive gate and no BECAUSE.
+            CalStatement::ReportSubject(rs) => {
+                match store.cal_subject_report(&rs.subject_id, rs.text_mentions) {
+                    Ok(report) => Ok(CalResultPayload::SubjectReport {
+                        subject: rs.subject_id.clone(),
+                        identity_names: report.identity_names,
+                        grains: report.grains,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "report_subject".into(),
+                        message: format!("REPORT SUBJECT failed: {e}"),
+                    }),
+                }
+            }
+
+            // Wave-2 reads (CAL 1.3): as-of, the run↔memory join, reverse
+            // provenance, the fork listing. All plain reads under the
+            // session's grants.
+            CalStatement::EntityAt(ea) => {
+                let axis = ea.axis.clone().unwrap_or_else(|| "world".to_string());
+                match store.cal_entity_at(&ea.subject, &ea.relation, ea.at_ms, &axis) {
+                    Ok(grain) => Ok(CalResultPayload::EntityAt { grain, axis, at_ms: ea.at_ms }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "entity_at".into(),
+                        message: format!("ENTITY AT failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunTrace(rt) => {
+                match store.cal_run_trace(&rt.run_id, rt.limit.unwrap_or(64).min(1024)) {
+                    Ok(trace) => Ok(CalResultPayload::RunTrace {
+                        run_id: rt.run_id.clone(),
+                        trace,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "run_trace".into(),
+                        message: format!("RUN TRACE failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunsTouching(rt) => {
+                let h = Hash::from_hex(&rt.hash).map_err(|_| CalError::InvalidHash {
+                    found: rt.hash.clone(),
+                    span: rt.span,
+                })?;
+                match store.cal_runs_touching(&h, rt.depth.unwrap_or(4).min(8)) {
+                    Ok(runs) => Ok(CalResultPayload::RunsTouching { hash: rt.hash.clone(), runs }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "runs_touching".into(),
+                        message: format!("RUNS TOUCHING failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::DerivedFrom(df) => {
+                let h = Hash::from_hex(&df.hash).map_err(|_| CalError::InvalidHash {
+                    found: df.hash.clone(),
+                    span: df.span,
+                })?;
+                match store.cal_derived_from(&h) {
+                    Ok(grains) => Ok(CalResultPayload::DerivedFrom { hash: df.hash.clone(), grains }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "derived_from".into(),
+                        message: format!("DERIVED FROM failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Merge(mg) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "MERGE".into(),
+                        span: mg.span,
+                    });
+                }
+                match store.cal_merge(
+                    &mg.subject,
+                    &mg.relation,
+                    &mg.object,
+                    mg.confidence.unwrap_or(0.9),
+                    &mg.reason,
+                ) {
+                    Ok(hash) => Ok(CalResultPayload::Merged {
+                        hash: hash.to_hex(),
+                        subject: mg.subject.clone(),
+                        relation: mg.relation.clone(),
+                        object: mg.object.clone(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "merge".into(),
+                        message: format!("MERGE failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Related(rel) => {
+                let relations: Vec<&str> = rel
+                    .relations
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .collect();
+                match store.cal_related(
+                    &rel.start,
+                    &relations,
+                    rel.direction.as_deref().unwrap_or("out"),
+                    rel.depth.unwrap_or(2),
+                    rel.limit.unwrap_or(64),
+                ) {
+                    Ok(entities) => Ok(CalResultPayload::RelatedEntities {
+                        start: rel.start.clone(),
+                        entities,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "related".into(),
+                        message: format!("RELATED failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Novelty(nv) => {
+                match store.cal_novelty(
+                    &nv.text,
+                    nv.subject.as_deref(),
+                    nv.relation.as_deref(),
+                    nv.limit.unwrap_or(5),
+                ) {
+                    Ok(rows) => Ok(CalResultPayload::NoveltyMatches {
+                        matches: rows
+                            .into_iter()
+                            .map(|(hash, similarity)| {
+                                serde_json::json!({ "hash": hash, "similarity": similarity })
+                            })
+                            .collect(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "novelty".into(),
+                        message: format!("NOVELTY failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::ShowForks(_) => match store.open_forks() {
+                Ok(groups) => Ok(CalResultPayload::Forks {
+                    forks: groups
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "namespace": f.namespace,
+                                "subject": f.subject,
+                                "relation": f.relation,
+                                "heads": f.heads,
+                            })
+                        })
+                        .collect(),
+                }),
+                Err(e) => Ok(CalResultPayload::Unsupported {
+                    statement: "show_forks".into(),
+                    message: format!("SHOW FORKS failed: {e}"),
+                }),
+            },
+
+            // REMEMBER (CAL 1.3) — the capture verb, an append-only write.
+            CalStatement::Remember(rem) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "REMEMBER".into(),
+                        span: rem.span,
+                    });
+                }
+                match store.cal_remember(
+                    &rem.content,
+                    rem.session_id.as_deref(),
+                    rem.role.as_deref(),
+                    rem.run_id.as_deref(),
+                ) {
+                    Ok(hash) => Ok(CalResultPayload::Remembered { hash: hash.to_hex() }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "remember".into(),
+                        message: format!("REMEMBER failed: {e}"),
+                    }),
+                }
+            }
+
+            // Tier 3 — DCL (CAL 1.3 §8.15). Append-only writes to the authz
+            // namespace: capped by the writes cap (`tier1_enabled`), gated
+            // by the session's `admin` grant at the facade, untouched by
+            // `allow_destructive_ops`.
+            CalStatement::Grant(grant) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "GRANT".into(),
+                        span: grant.span,
+                    });
+                }
+                match store.cal_grant(
+                    &grant.principal,
+                    &grant.verbs,
+                    &grant.namespaces,
+                    grant.reason.as_deref(),
+                ) {
+                    Ok(hash) => {
+                        let object = dejadb_core::authz::Grant {
+                            verbs: grant
+                                .verbs
+                                .iter()
+                                .filter_map(|v| dejadb_core::authz::Verb::parse(v).ok())
+                                .collect(),
+                            namespaces: grant.namespaces.clone(),
+                        }
+                        .to_object_string();
+                        Ok(CalResultPayload::Granted {
+                            principal: grant.principal.clone(),
+                            object,
+                            hash: hash.to_hex(),
+                        })
+                    }
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "grant".into(),
+                        message: format!("GRANT failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::Revoke(revoke) => {
+                if !self.config.tier1_enabled {
+                    return Err(CalError::Tier1NotEnabled {
+                        statement: "REVOKE".into(),
+                        span: revoke.span,
+                    });
+                }
+                match store.cal_revoke(
+                    &revoke.principal,
+                    &revoke.verbs,
+                    &revoke.namespaces,
+                    revoke.reason.as_deref(),
+                ) {
+                    Ok(grants_touched) => Ok(CalResultPayload::Revoked {
+                        principal: revoke.principal.clone(),
+                        grants_touched,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "revoke".into(),
+                        message: format!("REVOKE failed: {e}"),
+                    }),
+                }
+            }
+            // Governance (CAL 1.3 §8.16) — executes through the attached
+            // GovernanceHost; identity comes from the bound session, never
+            // the statement. No host → Unsupported (this executor was not
+            // wired for governance).
+            CalStatement::Approve(g) | CalStatement::Reject(g) => {
+                let decision = if matches!(stmt, CalStatement::Approve(_)) {
+                    crate::governance::ReviewDecision::Approve
+                } else {
+                    crate::governance::ReviewDecision::Reject
+                };
+                let name = if decision == crate::governance::ReviewDecision::Approve {
+                    "approve"
+                } else {
+                    "reject"
+                };
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired(name));
+                };
+                match host.review(store, &g.hash, decision, &g.reason) {
+                    Ok(()) => Ok(CalResultPayload::Reviewed {
+                        hash: g.hash.clone(),
+                        decision: name.into(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: name.into(),
+                        message: format!("{} failed: {e}", name.to_uppercase()),
+                    }),
+                }
+            }
+            CalStatement::ApplyRec(g) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("apply"));
+                };
+                match host.apply(
+                    store,
+                    &g.hash,
+                    &g.reason,
+                    self.config.allow_destructive_ops,
+                ) {
+                    Ok(rollbackable) => Ok(CalResultPayload::RecApplied {
+                        hash: g.hash.clone(),
+                        rollbackable,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "apply".into(),
+                        message: format!("APPLY failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RollbackRec(g) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("rollback"));
+                };
+                match host.rollback(store, &g.hash, &g.reason) {
+                    Ok(()) => Ok(CalResultPayload::RecRolledBack { hash: g.hash.clone() }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "rollback".into(),
+                        message: format!("ROLLBACK failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::RunLoop(run) => {
+                let Some(host) = &self.governance else {
+                    return Ok(governance_unwired("run_loop"));
+                };
+                let opts = crate::governance::RunLoopOptions {
+                    full_sweep: run.full_sweep,
+                    min_new: run.min_new,
+                    if_stale_ms: run.if_stale_ms,
+                };
+                match host.run_loop(store, &opts) {
+                    Ok(report) => Ok(CalResultPayload::LoopRan { run: report }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "run_loop".into(),
+                        message: format!("RUN LOOP failed: {e}"),
+                    }),
+                }
+            }
+            CalStatement::ShowGrants(show) => {
+                match store.cal_show_grants(show.principal.as_deref()) {
+                    Ok(rows) => Ok(CalResultPayload::GrantList {
+                        grants: rows
+                            .into_iter()
+                            .map(|row| {
+                                let parsed =
+                                    dejadb_core::authz::Grant::from_object_string(&row.object)
+                                        .ok();
+                                serde_json::json!({
+                                    "principal": row.principal,
+                                    "object": row.object,
+                                    "verbs": parsed.as_ref().map(|g| g
+                                        .verbs
+                                        .iter()
+                                        .map(|v| v.as_str())
+                                        .collect::<Vec<_>>()),
+                                    "namespaces": parsed.as_ref().map(|g| g.namespaces.clone()),
+                                    "hash": row.hash,
+                                })
+                            })
+                            .collect(),
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "show_grants".into(),
+                        message: format!("SHOW GRANTS failed: {e}"),
                     }),
                 }
             }
@@ -3108,6 +3574,82 @@ impl CalExecutor {
                     "body_size": entry.body.len(),
                 })
             }
+            // The self-discovery read (CAL 1.3 §8.15): what may this
+            // principal do, per namespace. Empty grants = the fail-closed
+            // answer, stated rather than implied.
+            DescribeTarget::Principal(name) => {
+                let rows = store.cal_show_grants(Some(name)).map_err(|e| {
+                    let detail = e.to_string();
+                    if detail.contains("AUT-E") {
+                        CalError::NotAuthorized { detail, span: None }
+                    } else {
+                        CalError::InvalidQuery { detail, span: None }
+                    }
+                })?;
+                let grants: Vec<serde_json::Value> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        let g =
+                            dejadb_core::authz::Grant::from_object_string(&row.object).ok()?;
+                        Some(serde_json::json!({
+                            "verbs": g.verbs.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+                            "namespaces": g.namespaces,
+                            "hash": row.hash,
+                        }))
+                    })
+                    .collect();
+                serde_json::json!({
+                    "principal": name,
+                    "grants": grants,
+                    "note": if grants.is_empty() {
+                        "no live grants — this principal can do nothing in a bound session"
+                    } else {
+                        "rights shown are the live grant heads; owner sessions bypass grants"
+                    },
+                })
+            }
+            // The loop reads (CAL 1.3 §8.16) — delegated to the governance
+            // host; unwired surfaces say so instead of pretending.
+            DescribeTarget::Loop
+            | DescribeTarget::Analyzers
+            | DescribeTarget::Outcomes
+            | DescribeTarget::LoopPolicy => {
+                let what = match &describe.target {
+                    DescribeTarget::Loop => crate::governance::LoopInfo::Loop,
+                    DescribeTarget::Analyzers => crate::governance::LoopInfo::Analyzers,
+                    DescribeTarget::Outcomes => crate::governance::LoopInfo::Outcomes,
+                    _ => crate::governance::LoopInfo::Policy,
+                };
+                match &self.governance {
+                    None => serde_json::json!({
+                        "error": "governance is not wired on this surface — no \
+                                  GovernanceHost attached",
+                    }),
+                    Some(host) => host.describe(store, what).map_err(|e| {
+                        let detail = e.to_string();
+                        if detail.contains("AUT-E") {
+                            CalError::NotAuthorized { detail, span: None }
+                        } else {
+                            CalError::InvalidQuery { detail, span: None }
+                        }
+                    })?,
+                }
+            }
+            DescribeTarget::Stats | DescribeTarget::Integrity => {
+                let res = if matches!(&describe.target, DescribeTarget::Stats) {
+                    store.cal_stats()
+                } else {
+                    store.cal_verify()
+                };
+                res.map_err(|e| {
+                    let detail = e.to_string();
+                    if detail.contains("AUT-E") {
+                        CalError::NotAuthorized { detail, span: None }
+                    } else {
+                        CalError::InvalidQuery { detail, span: None }
+                    }
+                })?
+            }
             DescribeTarget::Grammar => serde_json::json!({
                 "grammar": "CAL/1 grammar (simplified BNF)",
                 "version": 1,
@@ -3289,6 +3831,18 @@ impl CalExecutor {
                 (None, "parallel_batch".to_string(), vec![], filters)
             }
             CalStatement::Describe(_) => (None, "introspection".to_string(), vec![], vec![]),
+            CalStatement::ReportSubject(rs) => {
+                let mut filters = vec![format!("subject: {}", rs.subject_id)];
+                if rs.text_mentions {
+                    filters.push("text_mentions".to_string());
+                }
+                (
+                    None,
+                    "subject_report".to_string(),
+                    vec!["terms_dictionary".to_string(), "fts_postings".to_string()],
+                    filters,
+                )
+            }
             CalStatement::Purge(purge) => {
                 let mut filters = vec![];
                 if let Some(age) = purge.min_age_days {
@@ -4380,6 +4934,9 @@ fn build_add_options(opts: &[AddWithOption], warnings: &mut Vec<String>) -> AddO
             AddWithOption::Sync => {
                 options.sync = Some(true);
             }
+            // Handled at the ADD arm (field stamping) — nothing for the
+            // store contract to carry.
+            AddWithOption::Occurrence => {}
         }
     }
     options
@@ -4430,6 +4987,17 @@ fn cal_value_to_json(val: &super::ast::Value) -> serde_json::Value {
     }
 }
 
+/// The payload for a governance statement on an executor no host wired.
+fn governance_unwired(statement: &str) -> CalResultPayload {
+    CalResultPayload::Unsupported {
+        statement: statement.into(),
+        message: "governance is not wired on this surface — the host attaches a \
+                  GovernanceHost (CalExecutor::with_governance) to back RUN LOOP, \
+                  APPROVE, REJECT, APPLY, ROLLBACK, and the loop DESCRIBE reads"
+            .into(),
+    }
+}
+
 /// Return the canonical statement type name as a lowercase string.
 fn statement_type_name(stmt: &CalStatement) -> String {
     match stmt {
@@ -4450,11 +5018,29 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::Revert(_) => "revert",
         CalStatement::Forget(_) => "forget",
         CalStatement::Purge(_) => "purge",
+        CalStatement::ReportSubject(_) => "report_subject",
         CalStatement::DefineTemplate(_) => "define_template",
         CalStatement::DropTemplate(_) => "drop_template",
         CalStatement::DefineQuery(_) => "define_query",
         CalStatement::DropQuery(_) => "drop_query",
         CalStatement::RunQuery(_) => "run_query",
+        CalStatement::Grant(_) => "grant",
+        CalStatement::Revoke(_) => "revoke",
+        CalStatement::ShowGrants(_) => "show_grants",
+        CalStatement::Approve(_) => "approve",
+        CalStatement::Reject(_) => "reject",
+        CalStatement::ApplyRec(_) => "apply",
+        CalStatement::RollbackRec(_) => "rollback",
+        CalStatement::RunLoop(_) => "run_loop",
+        CalStatement::Remember(_) => "remember",
+        CalStatement::EntityAt(_) => "entity_at",
+        CalStatement::RunTrace(_) => "run_trace",
+        CalStatement::RunsTouching(_) => "runs_touching",
+        CalStatement::DerivedFrom(_) => "derived_from",
+        CalStatement::ShowForks(_) => "show_forks",
+        CalStatement::Merge(_) => "merge",
+        CalStatement::Related(_) => "related",
+        CalStatement::Novelty(_) => "novelty",
     }
     .to_string()
 }
@@ -4473,21 +5059,39 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::Describe(_)
         | CalStatement::Batch(_)
         | CalStatement::Coalesce(_)
-        | CalStatement::RunQuery(_) => "read",
+        | CalStatement::RunQuery(_)
+        | CalStatement::ShowGrants(_)
+        | CalStatement::EntityAt(_)
+        | CalStatement::RunTrace(_)
+        | CalStatement::RunsTouching(_)
+        | CalStatement::DerivedFrom(_)
+        | CalStatement::ShowForks(_)
+        | CalStatement::Related(_)
+        | CalStatement::Novelty(_)
+        | CalStatement::ReportSubject(_) => "read",
 
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
         | CalStatement::Supersede(_)
         | CalStatement::SupersedeWorkflow(_)
         | CalStatement::Accumulate(_)
-        | CalStatement::Revert(_) => "write",
+        | CalStatement::Revert(_)
+        | CalStatement::Remember(_)
+        | CalStatement::Merge(_) => "write",
 
         CalStatement::Forget(_)
         | CalStatement::Purge(_)
         | CalStatement::DefineTemplate(_)
         | CalStatement::DropTemplate(_)
         | CalStatement::DefineQuery(_)
-        | CalStatement::DropQuery(_) => "admin",
+        | CalStatement::DropQuery(_)
+        | CalStatement::Grant(_)
+        | CalStatement::Revoke(_)
+        | CalStatement::Approve(_)
+        | CalStatement::Reject(_)
+        | CalStatement::ApplyRec(_)
+        | CalStatement::RollbackRec(_)
+        | CalStatement::RunLoop(_) => "admin",
     }
 }
 
@@ -4532,10 +5136,27 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::Formatted { grain_count, .. } => *grain_count,
         CalResultPayload::MultiFormatted { grain_count, .. } => *grain_count,
         CalResultPayload::Added { .. } => 1,
+        CalResultPayload::Granted { .. } => 1,
+        CalResultPayload::Revoked { .. } => 1,
+        CalResultPayload::GrantList { grants } => grants.len(),
+        CalResultPayload::LoopRan { .. } => 1,
+        CalResultPayload::Reviewed { .. } => 1,
+        CalResultPayload::RecApplied { .. } => 1,
+        CalResultPayload::RecRolledBack { .. } => 1,
+        CalResultPayload::Remembered { .. } => 1,
+        CalResultPayload::EntityAt { grain, .. } => usize::from(grain.is_some()),
+        CalResultPayload::RunTrace { .. } => 1,
+        CalResultPayload::RunsTouching { runs, .. } => runs.len(),
+        CalResultPayload::DerivedFrom { grains, .. } => grains.len(),
+        CalResultPayload::Forks { forks } => forks.len(),
+        CalResultPayload::Merged { .. } => 1,
+        CalResultPayload::RelatedEntities { entities, .. } => entities.len(),
+        CalResultPayload::NoveltyMatches { matches } => matches.len(),
         CalResultPayload::Superseded { .. } => 1,
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,
         CalResultPayload::Purged { count } => *count,
+        CalResultPayload::SubjectReport { grains, .. } => grains.len(),
         CalResultPayload::Unsupported { .. } => 0,
         CalResultPayload::TemplateDefined { .. } => 1,
         CalResultPayload::TemplateDropped { .. } => 1,

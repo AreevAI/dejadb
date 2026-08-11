@@ -20,18 +20,25 @@ normal, safe case and does not need a spec change.
 
 ## GATE 2 — keep the destructive surface narrow and gated
 
-The only destructive CAL statement is `FORGET <hash>` (single-grain tombstone),
-gated at execution by `CalExecutorConfig::allow_destructive_ops` (default on;
-`--no-destructive-ops` flips it off). Preserve the surrounding blocks:
-1. **Lexer** (`lexer.rs`): `is_destructive_keyword` hard-blocks 26 words
-   (DELETE/ERASE/INSERT/CREATE/GRANT/…); DELETE has no token at all.
+The destructive CAL statements (CAL 1.3) are `FORGET <hash>`, `FORGET SUBJECT
+"<id>" [WITH text_mentions]`, and `PURGE OLDER THAN <n><d|h|m> [TYPE t]` —
+authorization-gated by the session's grants (BECAUSE mandatory on the latter
+two, a Tier-2 audit Observation per execution), with
+`CalExecutorConfig::allow_destructive_ops` as a process-wide restrictive cap
+(`--no-destructive-ops`). Destruction takes a hash, an identity, or an age —
+**never a predicate**. Preserve the surrounding blocks:
+1. **Lexer** (`lexer.rs`): `is_destructive_keyword` hard-blocks
+   DELETE/ERASE/INSERT/CREATE/… ; DELETE has no token at all.
 2. **Parser** (`parser.rs`): `parse_statement` fast-rejects those idents with
-   CAL-E002; `FORGET <hash>` parses (`parse_forget`), but `FORGET USER/SCOPE`
-   and `PURGE` stay refused from text.
+   CAL-E002; `FORGET USER/SCOPE` stay refused from text with a pointer.
 3. **DROP** is a token but `parse_drop` accepts only DROP TEMPLATE/QUERY.
    Saved-query bodies get an extra `check_statement_read_only` pass.
-Do **not** widen this (bulk PURGE from text, user/scope erasure, new destructive
-verbs) without a design + OMS-conformance decision — that's a GATE 1 change.
+4. **Classification** has one source of truth: `dejadb_cal::classify`
+   (exhaustive, no wildcard) — a new statement variant fails its build until
+   someone decides its class.
+Do **not** widen this (predicate-shaped destruction, user/scope erasure, new
+destructive verbs) without a design + OMS-conformance decision — that's a
+GATE 1 change.
 Also preserve the lexer security invariants: **S-1** bidi-control rejection and
 **S-6** NFC normalization, both before tokenization.
 
@@ -121,9 +128,9 @@ list rather than adding another `fields` lookup.
 
 Tier-1 runtime failures (bad grain type, unresolved param) come back as
 `CalResultPayload::Unsupported` inside an **`Ok`**, not an `Err`. Check the
-payload, not just Ok/Err. FORGET/PURGE/REVERT exist in the AST/facade but are
-unreachable from text (REVERT always returns Unsupported) — AST coverage ≠
-reachable surface.
+payload, not just Ok/Err. REVERT exists in the AST/facade but always returns
+Unsupported from text, and `cal_forget_scope` is an unwired stub — AST
+coverage ≠ reachable surface.
 
 ## Verify
 

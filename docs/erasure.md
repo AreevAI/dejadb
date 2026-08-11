@@ -1,13 +1,21 @@
-# Erasure model — bulk deletion requirements and the OMS deviation
+# Erasure model — bulk deletion requirements
+
+> **Status note (2026-08-10).** This document's original "OMS deviation"
+> framing is retired: CAL 1.3 (spec draft `release/oms-v1.6`) brings both
+> bulk operations into the language as authorization-gated Tier-2
+> statements — `FORGET SUBJECT "<id>" [WITH text_mentions] BECAUSE "…"` and
+> `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<ns>"] BECAUSE "…"` — gated by
+> the session's `erase` grant and recorded as audit Observations. The
+> host-level store/binding/CLI operations below remain, now as the same
+> machinery the CAL statements call. The requirements are unchanged.
 
 DejaDB's base removal model follows OMS: a single-grain tombstone (`FORGET
-<hash>`, CAL's only destructive statement) plus memory-level erasure (delete
+<hash>`) plus memory-level erasure (delete
 the file / crypto-erase its key on the embedded backend, `DROP SCHEMA …
 CASCADE` on the postgres backend). Regulated deployments — healthcare-class
 privacy regimes with right-to-erasure and retention obligations (GDPR /
 PDPL-family) — need two operations that sit BETWEEN those granularities.
-This document is the requirement record for them and the statement of where
-they deviate from OMS.
+This document is the requirement record for them.
 
 ## Requirements
 
@@ -41,14 +49,34 @@ they deviate from OMS.
   the HOST decides what to log. The engine writes no audit grain of its own
   — an engine-written record naming the subject would re-introduce the
   reference being erased.
-- **REQ-ERASE-6 (surface discipline).** Neither operation is reachable from
-  CAL text. The CAL grammar — an OMS conformance contract — is unchanged:
-  `FORGET USER`/`FORGET SCOPE`/`PURGE` remain refused by the parser, and the
-  facade stubs (`cal_forget_user`, `cal_forget_scope`) remain unwired. Bulk
-  erasure is a host-level library/CLI capability, gated by the host (the
-  CLI demands an explicit `--yes` and honors `--no-destructive-ops`). An
-  empty subject is refused outright — with prefix matching it would select
-  everything, and an unset variable must never read as "erase all".
+
+  **The same rule binds the hosts.** CAL and the CLI both audit (they are
+  the surfaces a human or agent invokes), and their record names a
+  **fingerprint** — `sha256(identity)[..8]` hex, scheme declared in the
+  record's `subject_ref` — never the identifier. An audit grain is
+  immutable, replicates, and lands in archives, so a raw identifier there
+  survives the erasure it records, un-erasable by the subject selector
+  (which never matches `subject:<id> ns:<ns>` as a partition key). The
+  fingerprint keeps the property that matters — given a candidate identity,
+  recompute and **verify** that a record concerns that person — without
+  making the log enumerable. Human-readable references belong in BECAUSE,
+  which names a *request*, not a data subject. Hash-form `FORGET` records a
+  content address and `PURGE` records an age; neither is fingerprinted.
+  One builder (`dejadb_core::authz::audit_observation`) serves every
+  surface, so the shapes cannot drift.
+- **REQ-ERASE-6 (surface discipline).** *(Amended by CAL 1.3 — see the
+  status note above; the original "not reachable from CAL text" wording
+  described the pre-1.3 grammar.)* Destruction takes a hash, an identity,
+  or an age — **never a predicate**. In CAL both bulk operations are
+  authorization-gated Tier-2 statements (`erase` grant required, BECAUSE
+  mandatory, one audit Observation per execution); `FORGET USER`/`FORGET
+  SCOPE` stay text-refused, `DELETE`/`ERASE`/`TRUNCATE` stay lexer-blocked
+  non-tokens, and `cal_forget_scope` remains an unwired stub. On the host
+  surfaces the CLI demands an explicit `--yes`, and
+  `CalExecutorConfig::allow_destructive_ops` (`--no-destructive-ops`) stays
+  a process-wide restrictive cap over any grant. An empty subject is
+  refused outright — with prefix matching it would select everything, and
+  an unset variable must never read as "erase all".
 - **REQ-ERASE-7 (partition keys).** Hosts model composite records as
   identity-prefixed keys (`pat#visit1`, `pat:thread-2`). Identity matching
   MUST cover them: any dictionary term equal to the identity or starting
@@ -66,6 +94,23 @@ they deviate from OMS.
   and erasing every grain containing a common word is the wrong failure
   mode. For distinctive identifiers (contact codes, record numbers) it
   closes the prose-mention gap.
+- **REQ-ERASE-9 (access is the same selection as erasure).** A host MUST be
+  able to SHOW everything the identity selector matches without erasing it
+  — GDPR Art. 15 (access) and Art. 20 (portability) are answered by the
+  erasure machinery in read-only mode, over **one** selector: the report
+  and the erasure cannot diverge, because divergence would mean disclosing
+  one set and deleting another. Result: `DejaDB::subject_report(ns,
+  subject)` and `subject_bundle_with` (a portable MGB1 export), exposed as
+  CAL `REPORT SUBJECT "<id>" [WITH text_mentions]` (a **read** —
+  `read`-gated, not behind the destructive cap), `deja subject-report`
+  (`--out` JSONL, `--bundle` portable), MCP `dejadb_subject_report`, and
+  `subject_report`/`subject_bundle` in both bindings. The report writes no
+  audit grain: the audit obligation is on destruction, not access, and a
+  read that recorded the identity would re-introduce the reference
+  REQ-ERASE-5 keeps out. Preconditions are shared with erasure — an empty
+  subject is refused, and `text_mentions` without a built index is a hard
+  error, never a silent partial answer (a partial DSAR response is a
+  compliance failure, not a degraded read).
 
 ## The OMS deviation, stated plainly
 

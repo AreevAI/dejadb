@@ -105,3 +105,60 @@ pub fn vector_leg_roundtrip(b: &dyn Backend) {
         .unwrap();
     assert_eq!(m.get(&near[0].0).unwrap().get_str("object"), Some("toast with jam"));
 }
+
+/// `forget` must reclaim a tombstoned grain's CAS attachments when nothing
+/// else references them — on the origin AND on a replica replaying the
+/// tombstone. An erasure whose attachment bytes survive on the replica's
+/// disk has not honored the right to erasure.
+pub fn forget_reclaims_sole_referenced_blob(b: &dyn Backend) {
+    let attach = |uri: &str| dejadb_core::types::ContentRef {
+        uri: uri.to_string(),
+        modality: Some("audio".to_string()),
+        mime_type: Some("audio/wav".to_string()),
+        size_bytes: None,
+        checksum: None,
+        metadata: None,
+    };
+
+    let mut a = b.open_named("blobf_a");
+    let sole = a.put_blob(&[7u8; 512]).unwrap();
+    let shared = a.put_blob(&[9u8; 64]).unwrap();
+    let mut f1 = fact("ns", "alice", "said", "message one");
+    f1.common.content_refs = vec![attach(&sole), attach(&shared)];
+    let gone = a.add(&f1).unwrap();
+    let mut f2 = fact("ns", "alice", "said", "message two");
+    f2.common.content_refs = vec![attach(&shared)];
+    a.add(&f2).unwrap();
+
+    // Replicate both grains to a peer; CAS bytes travel out-of-band
+    // (bundles carry grain blobs, not attachment bytes).
+    let b1 = b.scratch().join("blobf_adds.mgb");
+    let st = a.bundle_since(0, b1.to_str().unwrap()).unwrap();
+    let mut peer = b.open_named("blobf_b");
+    peer.put_blob(&[7u8; 512]).unwrap();
+    peer.put_blob(&[9u8; 64]).unwrap();
+    peer.import_bundle(b1.to_str().unwrap()).unwrap();
+
+    // Origin: the sole-referenced attachment goes with its grain; the
+    // shared one survives (the check is targeted, not a store-wide gc).
+    a.forget(&gone).unwrap();
+    assert!(
+        a.get_blob(&sole).is_err(),
+        "sole-referenced attachment must be reclaimed with its grain"
+    );
+    assert!(
+        a.get_blob(&shared).is_ok(),
+        "attachment still referenced by a live grain must survive"
+    );
+
+    // Replica: the tombstone replay must reach the blob sidecar too.
+    let b2 = b.scratch().join("blobf_delta.mgb");
+    a.bundle_since(st.last_op_seq, b2.to_str().unwrap()).unwrap();
+    peer.import_bundle(b2.to_str().unwrap()).unwrap();
+    assert!(peer.get(&gone).is_err(), "tombstone must replay on the peer");
+    assert!(
+        peer.get_blob(&sole).is_err(),
+        "tombstone replay must reclaim the replica's sole-referenced blob"
+    );
+    assert!(peer.get_blob(&shared).is_ok());
+}

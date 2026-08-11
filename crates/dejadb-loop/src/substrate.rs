@@ -23,6 +23,7 @@
 //!    (no ns filter) enumerate via the op-log (`changes_since`), since `recent`
 //!    requires a namespace.
 
+use dejadb_cal::classify::{classify, StatementClass};
 use dejadb_cal::{parse, CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_core::format::deserialize::DeserializedGrain;
@@ -193,8 +194,14 @@ fn read_user_type(
     let mut out = Vec::new();
     for g in raw {
         let ns = grain_namespace(&g);
-        // Never surface loop-internal grains as user data.
-        if ns == LOOP_NS {
+        // Never surface loop-internal or governance grains as user data.
+        // `agent:authz` holds the file's own grant Facts and the Tier-2
+        // audit Observations; an analyzer that sees them as ordinary memory
+        // can propose tombstoning them (retention_sweep did), which locks
+        // every non-owner principal out of the file and destroys the very
+        // Art. 30 records the audit export exists to produce. Governance
+        // state is metadata about the memory, not memory.
+        if ns == LOOP_NS || ns == dejadb_core::authz::AUTHZ_NS {
             continue;
         }
         if opts.live_only && superseded.contains(&g.hash.to_hex()) {
@@ -404,7 +411,9 @@ fn execute_cal(f: &DejaDbFacade, cal: &str) -> WResult<Vec<Value>> {
         match keyword.to_ascii_uppercase().as_str() {
             "FORGET" => {
                 let h = Hash::from_hex(rest.trim()).map_err(we)?;
-                f.cal_delete(&h).map_err(we)?;
+                // A loop-applied FORGET carries its reason on the audit
+                // chain already; stamp the Tier-2 audit with the source.
+                f.cal_delete(&h, Some("deja-loop apply")).map_err(we)?;
             }
             "ADD" => {
                 let (gtype, fields) = parse_type_and_json(rest)?;
@@ -421,6 +430,18 @@ fn execute_cal(f: &DejaDbFacade, cal: &str) -> WResult<Vec<Value>> {
                 rows.push(serde_json::json!({ "hash": h.to_hex() }));
             }
             _ => {
+                // Defense in depth: the engine's destructive gate (admin +
+                // allow_destructive) runs before apply, but this executor is
+                // process-permissive — never let it run destructive text.
+                // Loop-applied destruction goes through the special-cased,
+                // Tier-2-audited arms above (FORGET today), one statement
+                // shape at a time.
+                let parsed = parse(line).map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                if classify(&parsed.statement) == StatementClass::Destructive {
+                    return Err(WErr::CalUnsupported(format!(
+                        "destructive CAL beyond FORGET <hash> is not executable through the loop substrate: {line}"
+                    )));
+                }
                 let ex = CalExecutor::new(CalExecutorConfig::default());
                 let res = ex
                     .execute(line, f)
@@ -442,13 +463,28 @@ fn validate_cal(cal: &str) -> WResult<()> {
         if line.is_empty() {
             continue;
         }
-        let (keyword, _) = split_keyword(line);
+        let (keyword, rest) = split_keyword(line);
         match keyword.to_ascii_uppercase().as_str() {
-            "ADD" | "SUPERSEDE" | "FORGET" => {}
+            "ADD" | "SUPERSEDE" => {}
+            // The loop's FORGET arm executes single-grain tombstones only —
+            // `FORGET SUBJECT "<id>"` must fail here, not at apply time.
+            "FORGET" => {
+                Hash::from_hex(rest.trim()).map_err(|_| {
+                    WErr::CalUnsupported(format!(
+                        "loop FORGET takes a single grain hash: {line}"
+                    ))
+                })?;
+            }
             _ => {
-                parse(line)
-                    .map(|_| ())
-                    .map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                let parsed = parse(line).map_err(|e| WErr::CalUnsupported(e.to_string()))?;
+                // Mirror execute_cal: destructive statements (PURGE, …) have
+                // no audited loop execution path, so they are invalid in a
+                // proposal — reject at validation, before review effort.
+                if classify(&parsed.statement) == StatementClass::Destructive {
+                    return Err(WErr::CalUnsupported(format!(
+                        "destructive CAL beyond FORGET <hash> is not executable through the loop substrate: {line}"
+                    )));
+                }
             }
         }
     }

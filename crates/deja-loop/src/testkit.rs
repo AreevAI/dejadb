@@ -56,6 +56,19 @@ impl TestSubstrate {
         )
     }
 
+    /// Add a fact at an explicit `created_at` and namespace — for
+    /// age-window analyzers (retention) where the clock IS the input.
+    pub fn add_fact_at(
+        &mut self,
+        ns: &str,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        created_ms: i64,
+    ) -> String {
+        self.push_fact(ns, subject, relation, object, created_ms, None)
+    }
+
     fn push_fact(
         &mut self,
         ns: &str,

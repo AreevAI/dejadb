@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use dejadb_core::authz::Verb;
 use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::DeserializedGrain;
 use dejadb_core::types::Grain;
@@ -132,6 +133,17 @@ pub struct DejaDbFacade {
     /// so a silently smaller set of saved queries is something the operator
     /// sees rather than discovers.
     meta_warnings: Mutex<Vec<String>>,
+    /// The session's resolved rights. Defaults to the owner session — a
+    /// local open with no principal asserted is the implicit superuser
+    /// (`root@localhost`), which is why the single-user path never meets
+    /// authorization. `with_principal` replaces it with a fail-closed
+    /// restricted set built from the file's own grant grains.
+    ///
+    /// Behind a lock so a host that serializes requests (the std server
+    /// handles one connection at a time) can rebind per request
+    /// ([`Self::bind_principal`]). Concurrent hosts bind once at open —
+    /// rebinding under concurrent CAL execution would race sessions.
+    authz: std::sync::RwLock<dejadb_core::authz::AuthzSet>,
 }
 
 impl DejaDbFacade {
@@ -150,7 +162,98 @@ impl DejaDbFacade {
             queries: Mutex::new(None),
             templates: Mutex::new(None),
             meta_warnings: Mutex::new(Vec::new()),
+            authz: std::sync::RwLock::new(dejadb_core::authz::AuthzSet::owner("user:local")),
         }
+    }
+
+    /// Bind this facade to a principal: rights become exactly what the
+    /// file's live grant grains cover (fail closed — a file with no grants
+    /// for this principal allows nothing). Grants are read once here; a
+    /// grant written later needs a rebind (the CAL `GRANT` path will
+    /// refresh this itself when it lands).
+    pub fn with_principal(self, principal: &str) -> dejadb_core::error::Result<Self> {
+        self.bind_principal(principal)?;
+        Ok(self)
+    }
+
+    /// Rebind this facade to a principal: rights become exactly what the
+    /// file's live grant grains cover right now (fail closed). For hosts
+    /// that serialize requests — the std server — this is the per-request
+    /// seam: resolve the credential, bind, handle, then [`Self::bind`]
+    /// the surface's default back.
+    pub fn bind_principal(&self, principal: &str) -> dejadb_core::error::Result<()> {
+        let grants = {
+            let mut guard = self.store.lock().unwrap();
+            guard.authz_grants(principal)?
+        };
+        self.bind(dejadb_core::authz::AuthzSet::restricted(principal, grants));
+        Ok(())
+    }
+
+    /// Install a pre-built rights set (e.g. the anonymous baseline, or the
+    /// owner default when restoring after a request).
+    pub fn bind(&self, authz: dejadb_core::authz::AuthzSet) {
+        *self.authz.write().expect("authz lock poisoned") = authz;
+    }
+
+    /// The session's resolved rights (owner unless a principal was bound).
+    pub fn authz(&self) -> dejadb_core::authz::AuthzSet {
+        self.authz.read().expect("authz lock poisoned").clone()
+    }
+
+    /// The enforcement read used by every gated method.
+    fn check_verb(&self, verb: Verb, ns: &str) -> Result<()> {
+        self.authz.read().expect("authz lock poisoned").check(verb, ns)
+    }
+
+    fn session_is_owner(&self) -> bool {
+        self.authz.read().expect("authz lock poisoned").is_owner()
+    }
+
+    fn session_principal(&self) -> String {
+        self.authz
+            .read()
+            .expect("authz lock poisoned")
+            .principal()
+            .to_string()
+    }
+
+    /// Write the Tier-2 audit Observation (CAL 1.3 §8.14): every destructive
+    /// execution records the session principal, the verb, the target, the
+    /// reason, and how many grains it removed. It is a grain — it syncs with
+    /// the file and is RECALLable — and it rides the reserved authz
+    /// namespace next to the grants. Audit records are *occurrences*, so
+    /// each carries a unique frame id: two identical erasures must stay two
+    /// records (the #66 lesson).
+    fn audit_tier2(
+        &self,
+        verb: &str,
+        target: &str,
+        because: Option<&str>,
+        count: usize,
+    ) -> Result<()> {
+        // One builder for every surface (dejadb_core::authz) so the CLI's
+        // host-level erasures and CAL's produce identical audit shapes.
+        let obs = dejadb_core::authz::audit_observation(
+            &self.session_principal(),
+            verb,
+            target,
+            because,
+            count,
+            now_epoch_ms(),
+        );
+        self.store.lock().unwrap().add(&obs).map(|_| ())
+    }
+
+    /// The namespace a JSON-built write lands in: the explicit `namespace`
+    /// field, else the session default, else `"shared"` (the store default).
+    /// This is the resource every write-verb check runs against.
+    fn write_ns<'a>(&'a self, fields: &'a serde_json::Map<String, serde_json::Value>) -> &'a str {
+        fields
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .or(self.namespace.as_deref())
+            .unwrap_or("shared")
     }
 
     /// Mount a read-only memory (an org/category replica) under an alias.
@@ -205,6 +308,7 @@ impl DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(Hash, bool)> {
+        self.check_verb(Verb::Write, self.write_ns(fields))?;
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(grain_type, fields, AddIfNovelSink { m: &mut m })
     }
@@ -274,6 +378,12 @@ impl DejaDbFacade {
         &self,
         entries: &[(String, serde_json::Map<String, serde_json::Value>)],
     ) -> Result<Vec<Hash>> {
+        // Every entry's namespace is checked before anything is written —
+        // a batch is all-or-nothing for authorization like it is for
+        // validation.
+        for (_, fields) in entries {
+            self.check_verb(Verb::Write, self.write_ns(fields))?;
+        }
         // Build every grain first so a bad entry is rejected before anything
         // is written, then hand the whole set to the store as one batch.
         let mut built: Vec<Box<dyn dejadb_store::AddableDyn>> = Vec::with_capacity(entries.len());
@@ -479,6 +589,10 @@ impl DejaDbFacade {
 }
 
 impl CalStoreFacade for DejaDbFacade {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     /// Record one assembly-budget sample into the telemetry sidecar (feeds the
     /// `budget_pressure` analyzer). Best-effort: telemetry never fails a query.
     fn note_assembly_budget(&self, overflow: bool) {
@@ -499,6 +613,8 @@ impl CalStoreFacade for DejaDbFacade {
         description: Option<&str>,
         params: &[QueryParam],
     ) -> Result<()> {
+        // Saved queries and templates are the host-config surface: admin.
+        self.check_verb(Verb::Admin, "*")?;
         let existing = self.snapshot_query(name);
         self.with_queries(|reg| reg.register(name, body, description.unwrap_or(""), params))
             .map_err(DejaDbError::Validation)?;
@@ -528,6 +644,7 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn drop_query(&self, name: &str) -> Result<()> {
+        self.check_verb(Verb::Admin, "*")?;
         // Snapshot before deleting: if the file write fails the registry has to
         // go back, or the entry is gone here and still on disk — it would
         // reappear on the next open, which reads as the drop never happening.
@@ -608,6 +725,7 @@ impl CalStoreFacade for DejaDbFacade {
         parent: Option<&str>,
         grain_types: &[String],
     ) -> Result<()> {
+        self.check_verb(Verb::Admin, "*")?;
         let existing = self.snapshot_template(name);
         self.with_templates(|reg| {
             reg.register(name, source, description.unwrap_or(""), parent)?;
@@ -648,6 +766,7 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn drop_template(&self, name: &str) -> Result<()> {
+        self.check_verb(Verb::Admin, "*")?;
         let existing = self.snapshot_template(name);
         self.with_templates(|reg| reg.delete(name))
             .map_err(|e| DejaDbError::Validation(e.to_string()))?;
@@ -733,6 +852,9 @@ impl CalStoreFacade for DejaDbFacade {
 
         // mount routing: "alias.inner" namespaces hit mounted replicas
         let requested = params.namespace.as_deref().or(self.namespace.as_deref());
+        // The read gate. A session with no namespace scope reads everything,
+        // so it needs a grant covering `*`; owner sessions pass untouched.
+        self.check_verb(Verb::Read, requested.unwrap_or("*"))?;
         let (mount_alias, ns_owned) = match requested {
             Some(full) => match full.split_once('.') {
                 Some((alias, inner)) if self.mounts.contains_key(alias) => {
@@ -1109,18 +1231,37 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn exists(&self, hash: &Hash) -> Result<bool> {
-        self.store.lock().unwrap().has(hash)
+        if self.session_is_owner() {
+            return self.store.lock().unwrap().has(hash);
+        }
+        // An existence bit is a read, and a hash names no namespace — so a
+        // restricted session resolves the grain first and answers only for
+        // namespaces its grants can read.
+        let fetched = self.store.lock().unwrap().get(hash);
+        match fetched {
+            Ok(g) => {
+                self.check_verb(Verb::Read, g.get_str("namespace").unwrap_or("shared"))?;
+                Ok(true)
+            }
+            Err(DejaDbError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn get(&self, hash: &Hash) -> Result<DeserializedGrain> {
-        self.store.lock().unwrap().get(hash)
+        let g = self.store.lock().unwrap().get(hash)?;
+        self.check_verb(Verb::Read, g.get_str("namespace").unwrap_or("shared"))?;
+        Ok(g)
     }
 
     fn count(&self) -> Result<usize> {
+        // A store-wide count spans every namespace.
+        self.check_verb(Verb::Read, "*")?;
         self.store.lock().unwrap().count()
     }
 
     fn get_history(&self, namespace: &str, subject: &str, relation: &str) -> Result<Vec<VersionEntry>> {
+        self.check_verb(Verb::Read, namespace)?;
         let entries = self.store.lock().unwrap().history(namespace, subject, relation)?;
         Ok(entries
             .into_iter()
@@ -1135,6 +1276,8 @@ impl CalStoreFacade for DejaDbFacade {
     }
 
     fn open_forks(&self) -> Result<Vec<ForkGroupInfo>> {
+        // The fork listing spans every namespace.
+        self.check_verb(Verb::Read, "*")?;
         let groups = self.with_store(|m| m.open_forks())?;
         Ok(groups
             .into_iter()
@@ -1164,6 +1307,7 @@ impl CalStoreFacade for DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Hash> {
+        self.check_verb(Verb::Write, self.write_ns(fields))?;
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(grain_type, fields, AddSink { m: &mut m })
     }
@@ -1174,6 +1318,25 @@ impl CalStoreFacade for DejaDbFacade {
         grain_type: &str,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Hash> {
+        if !self.session_is_owner() {
+            // Authorize against the TARGET's namespace, the way `cal_delete`
+            // does — that is the grain this statement actually rewrites out
+            // of live recall. `SET namespace` names where the *replacement*
+            // lands, so checking only that lets a caller supersede a grain in
+            // a namespace it holds no supersede grant on simply by naming one
+            // it does.
+            let old_ns = {
+                let g = self.store.lock().unwrap().get(old_hash)?;
+                g.get_str("namespace").unwrap_or("shared").to_string()
+            };
+            self.check_verb(Verb::Supersede, &old_ns)?;
+            // A supersession that moves the value to another namespace also
+            // writes there, so that namespace needs the grant too.
+            let new_ns = self.write_ns(fields);
+            if new_ns != old_ns {
+                self.check_verb(Verb::Supersede, new_ns)?;
+            }
+        }
         let mut m = self.store.lock().unwrap();
         build_grain_from_json(
             grain_type,
@@ -1187,8 +1350,486 @@ impl CalStoreFacade for DejaDbFacade {
 
     /// `FORGET <hash>` — tombstone a single grain by content address. Only
     /// ever hits the session store; mounts are read-only by construction.
-    /// Gated upstream by `CalExecutorConfig::allow_destructive_ops`.
-    fn cal_delete(&self, hash: &Hash) -> Result<()> {
-        self.store.lock().unwrap().forget(hash)
+    /// Capped upstream by `CalExecutorConfig::allow_destructive_ops`; the
+    /// session's `delete` grant on the grain's own namespace is the
+    /// authorization.
+    fn cal_delete(&self, hash: &Hash, because: Option<&str>) -> Result<()> {
+        if !self.session_is_owner() {
+            let ns = {
+                let g = self.store.lock().unwrap().get(hash)?;
+                g.get_str("namespace").unwrap_or("shared").to_string()
+            };
+            self.check_verb(Verb::Delete, &ns)?;
+        }
+        self.store.lock().unwrap().forget(hash)?;
+        self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
     }
+
+    /// `MERGE` — the resolved value supersedes every open tip; the merge
+    /// grain records all parents. `supersede` is the authorization (it is
+    /// a head rewrite, however principled), and the reason rides the
+    /// grain's supersession justification.
+    fn cal_merge(
+        &self,
+        subject: &str,
+        relation: &str,
+        object: &str,
+        confidence: f64,
+        because: &str,
+    ) -> Result<Hash> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Supersede, &ns)?;
+        let mut merged = dejadb_core::types::Fact::new(subject, relation, object)
+            .namespace(&ns)
+            .confidence(confidence)
+            .created_at(now_epoch_ms());
+        merged.common.supersession_justification = Some(because.to_string());
+        self.store.lock().unwrap().merge_heads(&ns, subject, relation, &mut merged)
+    }
+
+    /// `RELATED` — the bounded k-hop walk in the session namespace.
+    fn cal_related(
+        &self,
+        start: &str,
+        relations: &[&str],
+        direction: &str,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let dir = match direction {
+            "in" => dejadb_store::Direction::In,
+            "both" => dejadb_store::Direction::Both,
+            _ => dejadb_store::Direction::Out,
+        };
+        self.store
+            .lock()
+            .unwrap()
+            .related(&ns, start, relations, dir, depth.clamp(1, 4), limit.min(256))
+    }
+
+    /// `NOVELTY` — nearest existing grains; requires a host embedder.
+    fn cal_novelty(
+        &self,
+        text: &str,
+        subject: Option<&str>,
+        relation: Option<&str>,
+        k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let rows = self
+            .store
+            .lock()
+            .unwrap()
+            .nearest_semantic(&ns, subject, relation, text, k.clamp(1, 64))?;
+        Ok(rows.into_iter().map(|(h, sim)| (h.to_hex(), sim as f64)).collect())
+    }
+
+    fn cal_entity_at(
+        &self,
+        subject: &str,
+        relation: &str,
+        at_ms: i64,
+        axis: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let axis = match axis {
+            "knowledge" => dejadb_store::Axis::Knowledge,
+            _ => dejadb_store::Axis::World,
+        };
+        let g = self
+            .store
+            .lock()
+            .unwrap()
+            .entity_at(&ns, subject, relation, at_ms, axis)?;
+        Ok(g.as_ref().map(grain_json))
+    }
+
+    fn cal_run_trace(&self, run_id: &str, limit: usize) -> Result<serde_json::Value> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let mut m = self.store.lock().unwrap();
+        let recorded: Vec<_> = m.run_trace(&ns, run_id, limit)?.iter().map(grain_json).collect();
+        let produced: Vec<_> = m.run_yield(&ns, run_id, limit)?.iter().map(grain_json).collect();
+        Ok(serde_json::json!({ "recorded": recorded, "produced": produced }))
+    }
+
+    fn cal_runs_touching(&self, hash: &Hash, depth: usize) -> Result<Vec<String>> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        self.store.lock().unwrap().runs_touching(&ns, hash, depth)
+    }
+
+    fn cal_derived_from(&self, hash: &Hash) -> Result<Vec<serde_json::Value>> {
+        // Provenance spans namespaces — the read needs the wide grant.
+        self.check_verb(Verb::Read, "*")?;
+        let grains = self.store.lock().unwrap().grains_derived_from(hash)?;
+        Ok(grains.iter().map(grain_json).collect())
+    }
+
+    fn cal_stats(&self) -> Result<serde_json::Value> {
+        self.check_verb(Verb::Read, "*")?;
+        let s = self.store.lock().unwrap().stats()?;
+        Ok(serde_json::json!({
+            "grains": s.grains,
+            "current": s.current,
+            "triples": s.triples,
+            "terms": s.terms,
+            "ops": s.ops,
+            "events_indexed": s.events_indexed,
+        }))
+    }
+
+    fn cal_verify(&self) -> Result<serde_json::Value> {
+        self.check_verb(Verb::Read, "*")?;
+        let r = self.store.lock().unwrap().verify()?;
+        Ok(serde_json::json!({
+            "integrity": r.integrity,
+            "fts_notes": r.fts_notes,
+            "grains": r.grains,
+            "hash_mismatches": r.hash_mismatches,
+            "undecodable": r.undecodable,
+        }))
+    }
+
+    /// `REMEMBER` (CAL 1.3) — capture into the session namespace via the
+    /// same store path as `deja remember` and the bindings' `capture`. The
+    /// observer is the bound principal; a `write` grant is the
+    /// authorization.
+    fn cal_remember(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+        role: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Hash> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Write, &ns)?;
+        let observer = self.session_principal();
+        self.store.lock().unwrap().capture(
+            &ns,
+            content,
+            &dejadb_store::Capture {
+                observer: Some(&observer),
+                session_id,
+                role,
+                run_id,
+            },
+        )
+    }
+
+    /// `GRANT` (CAL 1.3 §8.15) — writes the grant grain: a Fact in the
+    /// reserved `agent:authz` namespace, subject = grantee, relation =
+    /// `mg:permits`, object = the canonical grant string, grantor + reason
+    /// in `context`. Authorized by `admin`. A session's own rights are
+    /// fixed at bind — a grant to the current principal applies to
+    /// sessions bound after it, like a new database connection.
+    fn cal_grant(
+        &self,
+        principal: &str,
+        verbs: &[String],
+        namespaces: &[String],
+        because: Option<&str>,
+    ) -> Result<Hash> {
+        self.check_verb(Verb::Admin, "*")?;
+        let grant = parse_grant_parts(principal, verbs, namespaces)?;
+        let mut fact = dejadb_core::types::Fact::new(
+            principal,
+            dejadb_core::authz::REL_PERMITS,
+            &grant.to_object_string(),
+        )
+        .namespace(dejadb_core::authz::AUTHZ_NS)
+        .created_at(now_epoch_ms());
+        fact.common.context = Some(serde_json::json!({
+            "grantor": self.session_principal(),
+            "because": because.unwrap_or(""),
+        }));
+        self.store.lock().unwrap().add(&fact)
+    }
+
+    /// `REVOKE` (CAL 1.3 §8.15) — retraction by supersession. Each live
+    /// grant whose namespace scope is covered by the revoke loses the
+    /// revoked verbs: reduced grants supersede in place; a grant with
+    /// nothing left is superseded by a `revoked` retraction record. A grant
+    /// with a WIDER scope than the revoke is refused by name — no silent
+    /// splitting; revoke at the grant's own scope.
+    fn cal_revoke(
+        &self,
+        principal: &str,
+        verbs: &[String],
+        namespaces: &[String],
+        because: Option<&str>,
+    ) -> Result<usize> {
+        self.check_verb(Verb::Admin, "*")?;
+        let revoke = parse_grant_parts(principal, verbs, namespaces)?;
+        let revoke_all_ns = revoke.namespaces.iter().any(|n| n == "*");
+
+        let mut m = self.store.lock().unwrap();
+        let grains = m.recall(
+            dejadb_core::authz::AUTHZ_NS,
+            principal,
+            Some(dejadb_core::authz::REL_PERMITS),
+            256,
+        )?;
+        let mut touched = 0usize;
+        for g in &grains {
+            let Some(obj) = g.get_str("object") else { continue };
+            let Ok(existing) = dejadb_core::authz::Grant::from_object_string(obj) else {
+                continue; // retraction records and junk never carry rights
+            };
+            if !existing.verbs.iter().any(|v| revoke.verbs.contains(v)) {
+                continue;
+            }
+            let covered = revoke_all_ns
+                || existing
+                    .namespaces
+                    .iter()
+                    .all(|n| revoke.namespaces.contains(n));
+            if !covered {
+                return Err(DejaDbError::Validation(format!(
+                    "grant {obj:?} for {principal} spans more namespaces than the \
+                     revoke — revoke at the grant's own scope"
+                )));
+            }
+            let remaining: Vec<_> = existing
+                .verbs
+                .iter()
+                .copied()
+                .filter(|v| !revoke.verbs.contains(v))
+                .collect();
+            let object = if remaining.is_empty() {
+                // Nothing left: a retraction record. `authz_grants` skips it
+                // (it is not a parseable grant), so it conveys no rights —
+                // and the history stays append-only.
+                "revoked".to_string()
+            } else {
+                dejadb_core::authz::Grant {
+                    verbs: remaining,
+                    namespaces: existing.namespaces.clone(),
+                }
+                .to_object_string()
+            };
+            let mut replacement = dejadb_core::types::Fact::new(
+                principal,
+                dejadb_core::authz::REL_PERMITS,
+                &object,
+            )
+            .namespace(dejadb_core::authz::AUTHZ_NS)
+            .created_at(now_epoch_ms());
+            replacement.common.context = Some(serde_json::json!({
+                "grantor": self.session_principal(),
+                "because": because.unwrap_or(""),
+                "revoked": revoke.to_object_string(),
+            }));
+            m.supersede(&g.hash, &mut replacement)?;
+            touched += 1;
+        }
+        Ok(touched)
+    }
+
+    /// `SHOW GRANTS` — the live grant rows. Reading the authz namespace
+    /// requires `read` on it (or the owner session).
+    fn cal_show_grants(&self, principal: Option<&str>) -> Result<Vec<crate::facade::GrantRow>> {
+        self.check_verb(Verb::Read, dejadb_core::authz::AUTHZ_NS)?;
+        let mut m = self.store.lock().unwrap();
+        let grains = match principal {
+            Some(p) => m.recall(
+                dejadb_core::authz::AUTHZ_NS,
+                p,
+                Some(dejadb_core::authz::REL_PERMITS),
+                256,
+            )?,
+            None => m.recent(
+                dejadb_core::authz::AUTHZ_NS,
+                Some(dejadb_core::types::GrainType::Fact),
+                1000,
+            )?,
+        };
+        let mut rows = Vec::new();
+        for g in &grains {
+            if g.get_str("relation") != Some(dejadb_core::authz::REL_PERMITS) {
+                continue;
+            }
+            let (Some(subject), Some(obj)) = (g.get_str("subject"), g.get_str("object")) else {
+                continue;
+            };
+            // Only parseable grants convey rights; retraction records and
+            // junk are history, not ACL.
+            if dejadb_core::authz::Grant::from_object_string(obj).is_err() {
+                continue;
+            }
+            rows.push(crate::facade::GrantRow {
+                principal: subject.to_string(),
+                object: obj.to_string(),
+                hash: g.hash.to_hex(),
+            });
+        }
+        Ok(rows)
+    }
+
+    /// `FORGET SUBJECT` — identity-scoped erasure in the session namespace
+    /// (CAL 1.3 §8.14): every grain referencing the identity, its partition
+    /// keys, history, and dictionary entries; `text_mentions` extends it to
+    /// indexed-text mentions. Authorized by `erase` on that namespace.
+    fn cal_forget_user(
+        &self,
+        user_id: &str,
+        text_mentions: bool,
+        because: &str,
+    ) -> Result<crate::store_types::ErasureProof> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Erase, &ns)?;
+        let report = self.store.lock().unwrap().forget_subject_with(
+            &ns,
+            user_id,
+            dejadb_store::ErasureOptions { text_mentions },
+        )?;
+        // The audit target carries a FINGERPRINT, never the identity: an
+        // immutable, replicating audit grain naming the erased subject
+        // would put the reference straight back into the file (and every
+        // bundle and archive made from it). See
+        // `dejadb_core::authz::subject_fingerprint`.
+        self.audit_tier2(
+            "erase",
+            &format!(
+                "subject:{} ns:{ns}",
+                dejadb_core::authz::subject_fingerprint(user_id)
+            ),
+            Some(because),
+            report.grains_erased,
+        )?;
+        Ok(crate::store_types::ErasureProof {
+            user_id: user_id.to_string(),
+            count: report.grains_erased as u64,
+            // Tombstone + index erasure, not key destruction — there is no
+            // key fingerprint to report on this path.
+            key_fingerprint: String::new(),
+            timestamp: now_epoch_ms(),
+            user_record_deleted: report.grains_erased > 0,
+        })
+    }
+
+    /// `REPORT SUBJECT` — the read-only DSAR selection (OMS 1.6 draft):
+    /// the SAME selector `cal_forget_user` erases with, hydrated instead.
+    /// Session-namespace-scoped like the erasure form; authorized by
+    /// `read` — it is a pure read and writes no audit grain (the audit
+    /// obligation is on destruction, not access).
+    fn cal_subject_report(
+        &self,
+        subject_id: &str,
+        text_mentions: bool,
+    ) -> Result<crate::store_types::SubjectReportResult> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let report = self.store.lock().unwrap().subject_report_with(
+            &ns,
+            subject_id,
+            dejadb_store::ErasureOptions { text_mentions },
+        )?;
+        Ok(crate::store_types::SubjectReportResult {
+            identity_names: report.identity_names,
+            grains: report.grains.iter().map(grain_json).collect(),
+        })
+    }
+
+    /// `PURGE OLDER THAN` — the retention sweep (CAL 1.3 §8.14), scoped to
+    /// one namespace (the statement's `IN`, else the session's, else
+    /// "shared" — never an implicit all-namespace sweep from CAL).
+    /// Authorized by `erase` on that namespace.
+    fn cal_purge_stale(
+        &self,
+        min_age_days: f64,
+        namespace: Option<&str>,
+        batch_limit: usize,
+        grain_type: Option<&str>,
+        because: &str,
+    ) -> Result<usize> {
+        let ns = namespace
+            .or(self.namespace.as_deref())
+            .unwrap_or("shared")
+            .to_string();
+        self.check_verb(Verb::Erase, &ns)?;
+        let gtype = match grain_type {
+            None => None,
+            Some(t) => Some(dejadb_core::types::GrainType::from_str(t).ok_or_else(|| {
+                DejaDbError::Validation(format!("unknown grain type for PURGE: {t:?}"))
+            })?),
+        };
+        let cutoff_ms = now_epoch_ms() - (min_age_days * 86_400_000.0) as i64;
+        // `LIMIT n` bounds the sweep to the oldest n matches — the operator
+        // asked for a reviewable batch, not the namespace.
+        let report = self.store.lock().unwrap().forget_older_than_capped(
+            Some(&ns),
+            cutoff_ms,
+            gtype,
+            Some(batch_limit),
+        )?;
+        self.audit_tier2(
+            "erase",
+            &format!(
+                "older_than:{min_age_days}d ns:{ns}{}",
+                grain_type.map(|t| format!(" type:{t}")).unwrap_or_default()
+            ),
+            Some(because),
+            report.grains_erased,
+        )?;
+        Ok(report.grains_erased)
+    }
+}
+
+/// Validate DCL parts into a canonical [`dejadb_core::authz::Grant`]: every
+/// verb must be in the verb registry, the principal non-empty, namespaces
+/// non-empty strings. Fail-closed — one bad part refuses the whole
+/// statement.
+fn parse_grant_parts(
+    principal: &str,
+    verbs: &[String],
+    namespaces: &[String],
+) -> Result<dejadb_core::authz::Grant> {
+    if principal.trim().is_empty() {
+        return Err(DejaDbError::Validation("empty principal".into()));
+    }
+    if verbs.is_empty() {
+        return Err(DejaDbError::Validation("no verbs named".into()));
+    }
+    let mut parsed = Vec::new();
+    for v in verbs {
+        let v = dejadb_core::authz::Verb::parse(v)?;
+        if !parsed.contains(&v) {
+            parsed.push(v);
+        }
+    }
+    let namespaces: Vec<String> = if namespaces.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        namespaces.to_vec()
+    };
+    for n in &namespaces {
+        if n.trim().is_empty() {
+            return Err(DejaDbError::Validation("empty namespace".into()));
+        }
+    }
+    Ok(dejadb_core::authz::Grant { verbs: parsed, namespaces })
+}
+
+/// The grain-as-JSON shape shared by the Wave-2 reads:
+/// `{hash, type, fields}` — the same shape the MCP tools speak.
+fn grain_json(g: &DeserializedGrain) -> serde_json::Value {
+    serde_json::json!({
+        "hash": g.hash.to_hex(),
+        "type": g.grain_type.as_str(),
+        "fields": g.fields.clone().into_iter().collect::<serde_json::Map<_, _>>(),
+    })
+}
+
+/// Wall-clock epoch ms for audit stamps and PURGE cutoffs — host-side time,
+/// deliberately outside the executor (which stays clock-free).
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

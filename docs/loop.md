@@ -56,7 +56,7 @@ deja ui --db demo.db --token-env DEJA_TOKEN   # the Deja Loop tab shows the queu
 
 ```
 capture  (tool calls, facts, events)        — record_tool_call / add / import
-  → analyze   (deterministic, typed)         — eleven analyzers over grain semantics
+  → analyze   (deterministic, typed)         — twelve analyzers over grain semantics
   → recommend (recommendation + evidence)    — dedup'd, template-rendered, cited
   → govern    (review / policy auto-apply)   — four gates, hash-chained audit
   → apply     (undoable supersession)        — scope-checked at execution
@@ -75,7 +75,10 @@ up front); every decision carries a written reason.
    metric snapshot. Analyzers cannot emit free prose.
 2. **Review** — separation of duties (`write` grants neither `review` nor
    `apply`); a **mandatory reason** (BECAUSE) on every decision; self-approval
-   is blocked against the recommendation's creating actor.
+   is blocked against the recommendation's creating actor — and, for LLM and
+   external-command findings, against the principal that triggered the run
+   that authored them (an LLM draft is authored *via* its trigger; a
+   deterministic finding is computed, so the engine stays its only creator).
 3. **Apply** — requires the `apply` scope; destructive applies additionally
    require `admin` + `allow_destructive`; every apply records its inverse.
 4. **Verify** — outcome review re-runs the stored metric after `review_after`
@@ -87,9 +90,9 @@ syncs with the file and is queryable.
 
 ## The analyzers
 
-Eleven built-in analyzers, all deterministic (T0/T1), computing over typed
-grains — never raw prose. Ten are default-on; goal stagnation is opt-in (see
-the table). The last three are **telemetry-fed** —
+Twelve built-in analyzers, all deterministic (T0/T1), computing over typed
+grains — never raw prose. Ten are default-on; goal stagnation and retention
+sweep are opt-in (see the table). Three are **telemetry-fed** —
 they read the recall-telemetry sidecar (below) and move Deja Loop from *hygiene*
 (is memory internally correct?) to *utility* (is memory used, and does it
 help?):
@@ -106,6 +109,7 @@ help?):
 | `cold_grains` *(telemetry)* | a live fact never recalled past a grace window — memory not earning its place | a retire-candidate flag (advisory; cold ≠ wrong) |
 | `coverage_gap` *(telemetry)* | a recurring recall question that keeps returning nothing — knowledge the memory should hold | a gap flag (advisory; the fix is to *add* memory) |
 | `budget_pressure` *(telemetry)* | context assembly repeatedly overflowing its token budget (fed by the ASSEMBLE allocator) | a flag: raise the budget or curate |
+| `retention_sweep` | grains older than a declared `max_age_days` (**opt-in** — a deletion policy is stated, never inferred; 0 = disabled) | one `FORGET` per over-age grain, batched per namespace (destructive, never auto-applies). The proposal names every grain it would remove, and states how many exceed the per-proposal cap rather than truncating silently. The cron equivalent is `deja retention sweep` — see [`gdpr.md`](gdpr.md) §2a |
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin
@@ -404,7 +408,7 @@ Existing write callers add `--token-env`; a token unlocks review + apply.
 
 ## Status
 
-Built and tested: the engine (eleven analyzers, lifecycle, dedup, gating,
+Built and tested: the engine (twelve analyzers, lifecycle, dedup, gating,
 auto-apply, the multi-horizon Verify gate, the optional LLM DISCOVER/ENRICH
 stages), the recall-telemetry sidecar and its three telemetry-fed analyzers,
 the DejaDB adapter, the `deja loop` CLI + `deja init` (incl. `--telemetry`

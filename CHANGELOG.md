@@ -6,8 +6,214 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **GDPR compliance pack** — the obligations a deploying org actually gets
+  audited on, made mechanical and evidenceable. New page
+  [`docs/gdpr.md`](docs/gdpr.md) maps articles to mechanisms for a DPIA,
+  and states the three deployment *requirements* (one hub per trust
+  domain, TLS proxy off-loopback, a documented archive-retention window)
+  as requirements.
+  - **DSAR access + portability (Art. 15/20).** `REPORT SUBJECT "<id>"
+    [WITH text_mentions]` in CAL, `deja subject-report` (JSONL via
+    `--out`, a portable `.mgb` via `--bundle`), MCP
+    `dejadb_subject_report` (the 14th tool), and
+    `subject_report`/`subject_bundle` in both bindings. The report and
+    `FORGET SUBJECT` run **one selector**, so what a subject-access
+    request discloses is exactly what an erasure removes — "show me
+    everything, then delete it" is two commands over one selection. The
+    report is a *read*: `read`-gated, not behind the destructive cap,
+    available on the read-only console, and it writes no audit grain.
+  - **Accountability evidence (Art. 5(2), 30, 33).** `deja audit export
+    [--since MS] [--until MS] [--out FILE]` emits the Tier-2 destruction
+    trail plus the loop's lifecycle chain as JSONL, verifying the
+    hash-chain and flagging any record whose predecessor is missing.
+    Host-level erasures (`deja forget-subject`, `purge-older-than`) now
+    write the same audit record the CAL path does, through one shared
+    builder.
+  - **Archive retention (Art. 17 reach).** `deja stream --checkpoint`
+    opens a new generation whose segment 0 is a full snapshot of the
+    already-erased store; `--retain 30d` then drops whole older
+    generations, and `deja hub --retain 30d` does the equivalent sweep for
+    a hub's segment directory. A follower whose generation ages out
+    re-baselines from the newest snapshot instead of stalling. Erasure now
+    provably reaches archives within a documented window.
+  - **Declarative retention (Art. 5(1)(e)).** `deja retention
+    set/list/clear/sweep` — policy is a `retention:<ns>` file-truth that
+    travels with the memory; declaring never deletes, `sweep --yes`
+    enforces and audits. The governed alternative is the new default-off
+    `loop.retention_sweep` analyzer (12th built-in), which routes the same
+    deletion through the review queue with a mandatory reason and names
+    every grain it would remove.
+  - **`.blobs` sidecar encryption (Art. 32).** CAS attachments are now
+    AES-256-GCM sealed under an HKDF-SHA256 subkey derived from the
+    page-cipher key (domain-separated, so a leaked blob key does not open
+    the database), with the content address bound in as associated data.
+    The `cas://sha256:` address stays the digest of the **plaintext** so
+    addresses remain stable across encrypted and plaintext stores.
+    Attachments written by older builds keep reading and migrate with
+    `deja blobs encrypt` (idempotent).
+- **Node binding parity** (register confusion #13 closed). `dejadb` on
+  npm gains the three methods Python had alone: `addBatch(grainsJson,
+  ns?)` (one write transaction, JSON hashes out), `search(query,
+  subject?, relation?, k?, ns?)` (the hybrid free-text path, erroring
+  loudly when the file has neither a text nor a vector leg), and
+  `setEmbedder(fn, model?)` — an in-process JS callback embedder bridged
+  over a threadsafe function (store embeds run on worker threads and
+  round-trip through the JS thread; deadlock-free because every store
+  call in this binding is already a worker job). The constructor gains
+  `indexText`, matching Python's `index_text` re-stamp semantics.
+- **CAL 1.3 Wave-3: fork resolution, the graph walk, and the paraphrase
+  check are in the language; the console gets a login.** `MERGE "<s>"
+  RELATION "<r>" TO "<o>" BECAUSE "…"` closes an open fork (every tip
+  superseded, parents recorded, `supersede` grant + written reason
+  required; refuses when no fork is open) — `SHOW FORKS` then `MERGE` is
+  detection and resolution in one language. `RELATED "<start>" VIA
+  "<r1,r2>" [DIRECTION out|in|both] [DEPTH n]` is the bounded entity walk;
+  `NOVELTY "<text>"` ranks the nearest existing grains (host embedder
+  required, clean refusal without). `ADD … WITH occurrence` parses and
+  warns honestly that tool occurrences are `record_tool_call`'s job (tool
+  grains are not ADD-able from text). The multi-principal console gained
+  `GET /api/whoami` plus a rail identity row — see who the session is
+  bound to, sign in with a token, sign out back to read-only anonymous.
+  The parity gate now pins 38 operations.
+- **CAL 1.3 Wave-2 reads: time, runs, and provenance are in the
+  language.** `ENTITY "<s>" RELATION "<r>" AT <epoch-ms> [AXIS
+  world|knowledge]` is the bitemporal as-of read (what was true vs what
+  was known — `SINCE`/`UNTIL` filter grains; this resolves the head at
+  T). `RUN TRACE "<run-id>"` returns both halves of the run↔memory join
+  in one statement (recorded + produced); `RUNS TOUCHING <hash>` is the
+  reverse walk; `DERIVED FROM <hash>` is reverse provenance; `SHOW
+  FORKS` lists the open multi-head contradictions first-class; and
+  `DESCRIBE STATS`/`DESCRIBE INTEGRITY` bring the store counters and the
+  content-address recheck in-language. All plain reads under the
+  session's grants (the namespace-spanning ones need `read` on `*`); the
+  parity gate now pins 35 operations.
+- **Principals reach every surface.** `deja ui --auth deja-auth.json`
+  serves the console in multi-principal mode: the credential map resolves
+  bearer/Basic tokens to principal names (env refs or sha256 — no raw
+  secrets, no policy in the file), rights come from the memory's own grant
+  grains, requests bind per-request (the guard restores the default on
+  drop, panic included), unknown or missing tokens run as `anonymous`
+  (read-only unless the file grants more), `/api/loop/run` is gated on
+  `loop.run`, and in this mode the audit actor IS the bound principal — a
+  request body cannot claim an identity. `deja cal|repl|serve
+  --as <principal> [--auth FILE]` runs a session under the file's grants
+  (fail closed), `forget-subject`/`purge-older-than --as` check `erase`
+  before touching anything, and both bindings gain `principal=` /
+  `principal` on open — the loop actor follows the bound principal.
+- **`REMEMBER` is a CAL statement.** The onboarding verb, in the language:
+  `REMEMBER "<content>" [WITH session("<id>"), role("<r>"), run("<id>")]`
+  captures an Event through the same store path as `deja remember` and the
+  bindings' `capture` — thread-indexed, run-joined, observer = the bound
+  session's principal. Requires the `write` grant. LLM fact extraction
+  stays host configuration; the statement carries no model names.
+- **The cross-surface parity gate is a test.** "Every governed operation
+  has a CAL spelling" — the truth condition behind "CAL is all you need" —
+  is now an executable table (`cal_parity_tests.rs`): 28 operations, each
+  parsed and pinned to its statement class in CI.
+- **`docs/cal-for-llms.md`** — the one-page CAL grammar card designed to
+  paste into a system prompt, because the adopter's end user is an LLM:
+  every statement family, the identity rules (AUT-E001 means ask an admin,
+  don't retry), and the boundary in the card itself.
+- **CAL 1.3 governance: the loop lifecycle is CAL.** `RUN LOOP [FULL]
+  [WITH min_new(N), if_stale("6h")]` triggers the analysis pass;
+  `APPROVE`/`REJECT`/`APPLY`/`ROLLBACK <hash> BECAUSE "…"` are the review
+  actions, with the reason as *syntax* — a parse error without it, backed
+  by the engine's own non-empty check. `DESCRIBE LOOP` is the in-language
+  `deja loop list` (health plus the pending queue with hashes);
+  `DESCRIBE ANALYZERS|OUTCOMES|POLICY` are the other reads. Identity never
+  rides the statement: the executor's `GovernanceHost` seam
+  (`dejadb_loop::LoopGovernance`, attached on the CLI, MCP, and console
+  surfaces) derives actor, scopes, and observer from the bound session, so
+  the four gates — separation of duties, the self-approval block
+  (including the run-trigger co-creator), the two-key destructive apply
+  (`loop.apply` + the session's own delete/erase), the hash-chained
+  audit — run exactly as on every other surface. Loop *policy* writes stay
+  host-only (the policy gates CAL; CAL editing it would be
+  self-licensing), governance statements refuse saved-query bodies, and an
+  executor without a host says "governance is not wired" instead of
+  pretending. Everyday node names (`approve`, `reject`, `apply`, …) still
+  work in workflow definitions.
+- **CAL 1.3 Tier-3 DCL: `GRANT`, `REVOKE`, `SHOW GRANTS`, and
+  `DESCRIBE PRINCIPAL` are CAL statements.** Access control now lives in
+  the language, SQL-style: `GRANT read, write ON caller TO
+  "agent:support-bot" WITH because("support rotation")` writes a grant
+  grain — an ordinary `mg:permits` Fact in the reserved `agent:authz`
+  namespace, carrying grantor and reason, recallable like anything else.
+  `REVOKE` is retraction-by-supersession: partial revokes supersede with
+  the reduced grant, full revokes leave a retraction record — grant
+  history is append-only, nothing is deleted; a revoke wider than a
+  grant's scope is refused by name rather than silently splitting it.
+  GRANT/REVOKE require the session's `admin` grant (owner sessions
+  included), are capped by the writes cap, never appear inside
+  saved-query bodies, and `GRANT`/`REVOKE` left the lexer blocklist —
+  while `DELETE` and all credential/key vocabulary (now incl. `TOKEN`)
+  stay blocked non-tokens forever. `SHOW GRANTS [FOR "<p>"]` and
+  `DESCRIBE PRINCIPAL "<p>"` are the read side: the live grant rows and a
+  principal's effective rights (an empty answer is stated, not implied).
+- **CAL 1.3 Tier-2 destruction: `FORGET SUBJECT` and `PURGE OLDER THAN` are
+  CAL statements.** Bulk erasure was a documented OMS deviation living only
+  on host surfaces (`deja forget-subject` / `purge-older-than`); the CAL 1.3
+  draft brings it into the language, authorization-gated. `FORGET SUBJECT
+  "<id>" [WITH text_mentions] BECAUSE "…"` erases an identity in the session
+  namespace; `PURGE OLDER THAN <n><d|h|m> [TYPE t] [IN "<ns>"] BECAUSE "…"`
+  is the retention sweep (never an implicit all-namespace sweep). BECAUSE is
+  mandatory on both (parse error without — `CAL-E018`), and
+  optional-but-recorded on `FORGET <hash>`. Destruction still takes a hash,
+  an identity, or an age — never a predicate — and `--no-destructive-ops`
+  still switches the whole surface off.
+- **Every destructive CAL execution now writes an audit Observation** in the
+  reserved `agent:authz` namespace: the session principal, the verb
+  (`delete`/`erase`), the target, the reason, and the erased count —
+  hash-addressed, replicated, and recallable
+  (`RECALL observations WHERE namespace = "agent:authz"`). Audit records
+  are occurrences, so each carries a unique frame id (the #66 lesson —
+  two identical erasures stay two records).
+- **Grants-based authorization under CAL** (the "grants, not gates" model —
+  `docs/cal-all-you-need-proposal.md`). Grants live in the memory file as
+  `mg:permits` Facts in `agent:authz`; a facade bound to a principal
+  (`with_principal`) enforces per-namespace verbs — read, write, supersede,
+  delete, erase, loop.\*, admin — at the one chokepoint every CAL surface
+  flows through, fail-closed, with `AUT-Ennn`/`CAL-E121` refusals that name
+  the missing verb. Unbound local sessions stay the implicit owner: the
+  single-user path is byte-identical to before.
+
 ### Fixed
 
+- **An erasure no longer resurrects the identity in its own audit record.**
+  A subject erasure wrote the raw identifier into the Tier-2 audit
+  Observation, which is immutable, replicates, and lands in archives — so
+  the erased subject stayed recallable from `agent:authz` forever,
+  un-erasable by the subject selector, and was copied into every bundle
+  made afterwards. An Art. 17 failure hiding inside the Art. 30 record.
+  The audit target now carries a **fingerprint** (`sha256(identity)[..8]`,
+  scheme named in the record), which is verifiable by recomputation from a
+  candidate identity — answering "prove you erased me" — but cannot be
+  mined to enumerate who was erased. Human-readable request references
+  belong in `BECAUSE`.
+- **The loop's destructive gate no longer misses `PURGE`.** A
+  recommendation was stamped destructive by a `FORGET`-only prefix check,
+  so a `PURGE OLDER THAN` in a `Proposal::Cal` — reachable through LLM
+  enrichment or `--analyzer-cmd` — classified as non-destructive *and*
+  rollbackable, skipping the admin-scope + `allow_destructive` apply gate
+  and running through an executor that permits destructive ops by default.
+  Detection now covers both statements, and the DejaDB substrate refuses
+  destructive CAL beyond the audited single-grain `FORGET` arm at both
+  validate and execute time.
+- **Tombstone replay now reclaims CAS attachments on replicas.** `forget`
+  deleted the grain's index rows but never its blobs, so a replica that
+  had imported a blob-bearing grain kept the attachment bytes on disk
+  after the subject was "erased" everywhere. Reclamation is targeted (only
+  the tombstoned grain's own, unreferenced attachments), matching the bulk
+  erasure path.
+- **Compliance-facing docs that had gone stale.** `security-model.md`
+  claimed a pushed segment "can only ever *add* grains — import never
+  deletes" (import replays tombstones, which delete); `erasure.md`
+  REQ-ERASE-6 still said bulk erasure was unreachable from CAL; and the
+  MCP `dejadb_cal` tool description — the string an LLM client reads to
+  decide what the tool can do — still said "CAL is structurally incapable
+  of deleting data". All now state the CAL 1.3 truth.
 - **A retried tool call is counted again instead of silently merging away**
   ([#66]). Making a duplicate add a no-op in 1.1.1 fixed a crash but turned it
   into a wrong answer in the same headline example: five identical
@@ -50,6 +256,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `created_at` values. Same underlying property as #66, but here dedup is
   behaving correctly and the test was the thing making a claim it had not
   arranged for.
+
+- **The trigger of an LLM loop run can no longer approve its own model's
+  output.** Every recommendation recorded its creator as `engine:<analyzer>` —
+  correct for the deterministic analyzers, whose findings are computed rather
+  than authored, but an LLM or external-command finding exists because a
+  specific principal invoked it, and that principal appeared nowhere the
+  review gate could see. So `deja loop run --model …` followed by
+  `deja loop approve` from the same actor sailed past the self-approval
+  block. Runs now record the triggering principal as co-creator on every
+  non-builtin recommendation (the CLI's `--actor`, the server request's
+  `actor`, MCP's `agent:mcp`, the bindings' handle actor), and review refuses
+  approval from the creator *or* the trigger. Deterministic findings are
+  unchanged — the engine stays their only creator, so a solo operator's
+  normal run-then-approve flow still works.
 
 [#66]: https://github.com/AreevAI/dejadb/issues/66
 [#67]: https://github.com/AreevAI/dejadb/issues/67
