@@ -285,6 +285,27 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"forgotten": h.to_hex()}).to_string())
             }
+            "dejadb_subject_report" => {
+                // The DSAR read (GDPR Art. 15/20): the erasure selector in
+                // show-me mode. Read-only — not behind allow_destructive_ops.
+                let subject = args
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .ok_or("dejadb_subject_report requires 'subject'")?;
+                let text_mentions =
+                    args.get("text_mentions").and_then(|v| v.as_bool()).unwrap_or(false);
+                let report = self
+                    .facade
+                    .cal_subject_report(subject, text_mentions)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "subject": subject,
+                    "identity_names": report.identity_names,
+                    "count": report.grains.len(),
+                    "grains": report.grains,
+                })
+                .to_string())
+            }
             "dejadb_related" => {
                 let start = args
                     .get("start")
@@ -573,10 +594,18 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "dejadb_forget",
-            "description": "Erase a grain from the hot store (tombstoned in the op-log). Host-level operation — not reachable from CAL.",
+            "description": "Erase a grain from the hot store (tombstoned in the op-log). The CAL spelling is FORGET <hash> [BECAUSE \"why\"].",
             "inputSchema": {"type": "object", "properties": {
                 "hash": s("content address (64-hex) to forget")
             }, "required": ["hash"]}
+        }),
+        json!({
+            "name": "dejadb_subject_report",
+            "description": "DSAR read (GDPR Art. 15/20): everything subject erasure WOULD remove for one identity — exact + partition keys, full history — as {hash, type, fields} grains. Read-only; the CAL spelling is REPORT SUBJECT \"<id>\" [WITH text_mentions], and the erasure mirror is FORGET SUBJECT.",
+            "inputSchema": {"type": "object", "properties": {
+                "subject": s("the identity to report on"),
+                "text_mentions": {"type": "boolean", "description": "also include grains whose indexed text mentions the identity (needs the text index)"}
+            }, "required": ["subject"]}
         }),
         json!({
             "name": "dejadb_related",

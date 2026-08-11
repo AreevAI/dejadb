@@ -232,35 +232,16 @@ impl DejaDbFacade {
         because: Option<&str>,
         count: usize,
     ) -> Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
-        let now = now_epoch_ms();
-        let principal = self.session_principal();
-        let mut obs = dejadb_core::types::Observation {
-            observer_id: principal.clone(),
-            observer_type: dejadb_core::authz::observer_kind(&principal).to_string(),
-            subject: Some(target.to_string()),
-            object: Some(verb.to_string()),
-            observer_model: None,
-            frame_id: Some(format!(
-                "tier2:{now}:{}",
-                AUDIT_SEQ.fetch_add(1, Ordering::Relaxed)
-            )),
-            sync_group: None,
-            observation_mode: None,
-            observation_scope: None,
-            compression_ratio: None,
-            common: Default::default(),
-        };
-        obs.common.namespace = Some(dejadb_core::authz::AUTHZ_NS.to_string());
-        obs.common.created_at = Some(now);
-        obs.common.context = Some(serde_json::json!({
-            "audit": "tier2",
-            "verb": verb,
-            "target": target,
-            "because": because.unwrap_or(""),
-            "grains_erased": count,
-        }));
+        // One builder for every surface (dejadb_core::authz) so the CLI's
+        // host-level erasures and CAL's produce identical audit shapes.
+        let obs = dejadb_core::authz::audit_observation(
+            &self.session_principal(),
+            verb,
+            target,
+            because,
+            count,
+            now_epoch_ms(),
+        );
         self.store.lock().unwrap().add(&obs).map(|_| ())
     }
 
@@ -1688,9 +1669,17 @@ impl CalStoreFacade for DejaDbFacade {
             user_id,
             dejadb_store::ErasureOptions { text_mentions },
         )?;
+        // The audit target carries a FINGERPRINT, never the identity: an
+        // immutable, replicating audit grain naming the erased subject
+        // would put the reference straight back into the file (and every
+        // bundle and archive made from it). See
+        // `dejadb_core::authz::subject_fingerprint`.
         self.audit_tier2(
             "erase",
-            &format!("subject:{user_id} ns:{ns}"),
+            &format!(
+                "subject:{} ns:{ns}",
+                dejadb_core::authz::subject_fingerprint(user_id)
+            ),
             Some(because),
             report.grains_erased,
         )?;
@@ -1702,6 +1691,29 @@ impl CalStoreFacade for DejaDbFacade {
             key_fingerprint: String::new(),
             timestamp: now_epoch_ms(),
             user_record_deleted: report.grains_erased > 0,
+        })
+    }
+
+    /// `REPORT SUBJECT` — the read-only DSAR selection (OMS 1.6 draft):
+    /// the SAME selector `cal_forget_user` erases with, hydrated instead.
+    /// Session-namespace-scoped like the erasure form; authorized by
+    /// `read` — it is a pure read and writes no audit grain (the audit
+    /// obligation is on destruction, not access).
+    fn cal_subject_report(
+        &self,
+        subject_id: &str,
+        text_mentions: bool,
+    ) -> Result<crate::store_types::SubjectReportResult> {
+        let ns = self.namespace.as_deref().unwrap_or("shared").to_string();
+        self.check_verb(Verb::Read, &ns)?;
+        let report = self.store.lock().unwrap().subject_report_with(
+            &ns,
+            subject_id,
+            dejadb_store::ErasureOptions { text_mentions },
+        )?;
+        Ok(crate::store_types::SubjectReportResult {
+            identity_names: report.identity_names,
+            grains: report.grains.iter().map(grain_json).collect(),
         })
     }
 

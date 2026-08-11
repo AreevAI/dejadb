@@ -49,6 +49,21 @@ This document is the requirement record for them.
   the HOST decides what to log. The engine writes no audit grain of its own
   — an engine-written record naming the subject would re-introduce the
   reference being erased.
+
+  **The same rule binds the hosts.** CAL and the CLI both audit (they are
+  the surfaces a human or agent invokes), and their record names a
+  **fingerprint** — `sha256(identity)[..8]` hex, scheme declared in the
+  record's `subject_ref` — never the identifier. An audit grain is
+  immutable, replicates, and lands in archives, so a raw identifier there
+  survives the erasure it records, un-erasable by the subject selector
+  (which never matches `subject:<id> ns:<ns>` as a partition key). The
+  fingerprint keeps the property that matters — given a candidate identity,
+  recompute and **verify** that a record concerns that person — without
+  making the log enumerable. Human-readable references belong in BECAUSE,
+  which names a *request*, not a data subject. Hash-form `FORGET` records a
+  content address and `PURGE` records an age; neither is fingerprinted.
+  One builder (`dejadb_core::authz::audit_observation`) serves every
+  surface, so the shapes cannot drift.
 - **REQ-ERASE-6 (surface discipline).** *(Amended by CAL 1.3 — see the
   status note above; the original "not reachable from CAL text" wording
   described the pre-1.3 grammar.)* Destruction takes a hash, an identity,
@@ -79,6 +94,23 @@ This document is the requirement record for them.
   and erasing every grain containing a common word is the wrong failure
   mode. For distinctive identifiers (contact codes, record numbers) it
   closes the prose-mention gap.
+- **REQ-ERASE-9 (access is the same selection as erasure).** A host MUST be
+  able to SHOW everything the identity selector matches without erasing it
+  — GDPR Art. 15 (access) and Art. 20 (portability) are answered by the
+  erasure machinery in read-only mode, over **one** selector: the report
+  and the erasure cannot diverge, because divergence would mean disclosing
+  one set and deleting another. Result: `DejaDB::subject_report(ns,
+  subject)` and `subject_bundle_with` (a portable MGB1 export), exposed as
+  CAL `REPORT SUBJECT "<id>" [WITH text_mentions]` (a **read** —
+  `read`-gated, not behind the destructive cap), `deja subject-report`
+  (`--out` JSONL, `--bundle` portable), MCP `dejadb_subject_report`, and
+  `subject_report`/`subject_bundle` in both bindings. The report writes no
+  audit grain: the audit obligation is on destruction, not access, and a
+  read that recorded the identity would re-introduce the reference
+  REQ-ERASE-5 keeps out. Preconditions are shared with erasure — an empty
+  subject is refused, and `text_mentions` without a built index is a hard
+  error, never a silent partial answer (a partial DSAR response is a
+  compliance failure, not a degraded read).
 
 ## The OMS deviation, stated plainly
 

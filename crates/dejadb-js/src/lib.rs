@@ -819,6 +819,68 @@ impl DejaDb {
         })
     }
 
+    /// DSAR read (GDPR Art. 15/20): everything `forgetSubject` WOULD erase
+    /// for one identity — exact + partition keys, full history — as
+    /// `{"identity_names": [...], "grains": [{hash, type, fields}, ...]}`.
+    /// The same selector as erasure, in show-me mode.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn subject_report(
+        &self,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: Option<bool>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let rep =
+                facade.with_store(|m| m.subject_report_with(&ns, &subject, opts)).map_err(err)?;
+            let grains: Vec<serde_json::Value> = rep
+                .grains
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "hash": g.hash.to_hex(),
+                        "type": g.grain_type.as_str(),
+                        "fields": g.fields.clone().into_iter().collect::<serde_json::Map<_, _>>(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "identity_names": rep.identity_names, "grains": grains })
+                .to_string())
+        })
+    }
+
+    /// Export the subject selection as a portable MGB1 bundle (GDPR Art. 20
+    /// portability) — importable into any OMS store. Resolves to the bundle
+    /// stats JSON.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn subject_bundle(
+        &self,
+        path: String,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: Option<bool>,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions: text_mentions.unwrap_or(false) };
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let stats = facade
+                .with_store(|m| m.subject_bundle_with(&ns, &subject, opts, &path))
+                .map_err(err)?;
+            Ok(serde_json::json!({
+                "ops": stats.ops,
+                "bytes": stats.bytes,
+                "last_op_seq": stats.last_op_seq,
+            })
+            .to_string())
+        })
+    }
+
     /// Retention sweep: erase every grain with `created_at` older than
     /// `cutoffMs` (epoch milliseconds), optionally limited to one grain type
     /// (e.g. "event") and scoped to the session namespace (or `ns`; pass

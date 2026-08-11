@@ -238,6 +238,103 @@ pub fn observer_kind(principal: &str) -> &'static str {
     "human"
 }
 
+/// A verifiable, non-disclosing reference to an erased identity, for audit
+/// targets: the first 16 hex of SHA-256 over the identity string.
+///
+/// **Why not the identity itself.** An audit grain is immutable, replicates,
+/// and lands in archives. Writing the raw identifier into it re-introduces
+/// exactly the reference the erasure just removed — the erased subject stays
+/// recallable from `agent:authz` forever, un-erasable by the subject
+/// selector (which never matches `subject:<id> ns:<ns>` as a partition key),
+/// and travels into every bundle and segment. That is a right-to-erasure
+/// failure hiding inside the accountability record.
+///
+/// A fingerprint keeps both properties: given a candidate identity anyone
+/// can recompute the digest and **verify** that a specific audit record is
+/// about that person (answering "prove you erased me"), but the log cannot
+/// be mined to enumerate who was erased. The human-readable reference — the
+/// ticket or request number — belongs in BECAUSE, which the operator
+/// controls and which names a *request*, not a data subject.
+///
+/// Truncated to 64 bits of digest: this is a correlation handle, not a
+/// security boundary (identity strings are low-entropy, so a determined
+/// attacker with a candidate list can always confirm guesses — which is the
+/// same property that makes verification work).
+pub fn subject_fingerprint(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    hex_lower(&digest[..8])
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Build the Tier-2 audit Observation for one destructive execution — the
+/// accountability record (GDPR Art. 5(2)/30) that `deja audit export`
+/// emits.
+///
+/// **One builder, every surface.** CAL destruction, the CLI's
+/// `forget-subject`/`purge-older-than`, and anything else that destroys
+/// must produce byte-identical audit shapes, or the evidence export becomes
+/// a union of dialects. Note the deliberate asymmetry with REQ-ERASE-5: the
+/// *engine* (`DejaDB::forget_subject`) still writes no audit grain of its
+/// own — a library caller owns its own logging — but the surfaces a human
+/// or agent actually invokes are hosts, and hosts audit.
+///
+/// `target` describes what was destroyed in the surface's own vocabulary:
+/// `hash:<hex>` (a content address of already-deleted content — not identity
+/// material), `subject:<fp> ns:<ns>` where `<fp>` is a
+/// [`subject_fingerprint`] (**never** the raw identity — see that function
+/// for why), or `older_than:<n>d ns:<ns>` (an age, no identity at all).
+pub fn audit_observation(
+    principal: &str,
+    verb: &str,
+    target: &str,
+    because: Option<&str>,
+    count: usize,
+    now_ms: i64,
+) -> crate::types::Observation {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Process-static: two identical erasures in the same millisecond must
+    // stay two records, not collapse into one content address.
+    static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut obs = crate::types::Observation {
+        observer_id: principal.to_string(),
+        observer_type: observer_kind(principal).to_string(),
+        subject: Some(target.to_string()),
+        object: Some(verb.to_string()),
+        observer_model: None,
+        frame_id: Some(format!(
+            "tier2:{now_ms}:{}",
+            AUDIT_SEQ.fetch_add(1, Ordering::Relaxed)
+        )),
+        sync_group: None,
+        observation_mode: None,
+        observation_scope: None,
+        compression_ratio: None,
+        common: Default::default(),
+    };
+    obs.common.namespace = Some(AUTHZ_NS.to_string());
+    obs.common.created_at = Some(now_ms);
+    obs.common.context = Some(serde_json::json!({
+        "audit": "tier2",
+        "verb": verb,
+        "target": target,
+        "because": because.unwrap_or(""),
+        "grains_erased": count,
+        // Names the scheme so a verifier knows how to recompute a subject
+        // fingerprint years later, without reading our source.
+        "subject_ref": "sha256-64/hex",
+    }));
+    obs
+}
+
 /// The host-side credential map (`deja-auth.json`): tokens → principal
 /// names, nothing else. No verbs, no namespaces, no raw secrets — a token is
 /// referenced by its SHA-256 or by the env var that holds it, so the file is

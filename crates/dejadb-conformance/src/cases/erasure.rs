@@ -164,3 +164,31 @@ pub fn retention_erases_only_older(b: &dyn Backend) {
     assert_eq!(rep3.grains_erased, 1);
     assert_eq!(m.count().unwrap(), 0);
 }
+
+/// The DSAR mirror: `subject_report` and `forget_subject` are ONE selection
+/// — the report shows exactly what erasure would remove, on every backend.
+pub fn subject_report_mirrors_erasure(b: &dyn Backend) {
+    let mut m = b.open_named("dsar");
+    m.add(&fact_at("ns", "pat", "prefers", "tea", 1_000)).unwrap();
+    m.add(&fact_at("ns", "pat#visit1", "note", "arrived late", 2_000)).unwrap();
+    m.add(&fact_at("ns", "dr_lee", "treats", "pat", 3_000)).unwrap();
+    m.add(&fact_at("ns", "patricia", "prefers", "coffee", 4_000)).unwrap();
+
+    let report = m.subject_report("ns", "pat").unwrap();
+    assert_eq!(report.grains.len(), 3, "exact + partition key + object reference");
+    assert!(report.identity_names.contains(&"pat#visit1".to_string()));
+    assert!(!report.identity_names.iter().any(|n| n == "patricia"));
+
+    let erased = m.forget_subject("ns", "pat").unwrap();
+    assert_eq!(
+        erased.grains_erased,
+        report.grains.len(),
+        "erasure must remove exactly what the report showed"
+    );
+    assert!(m.subject_report("ns", "pat").unwrap().grains.is_empty());
+    assert_eq!(
+        m.subject_report("ns", "patricia").unwrap().grains.len(),
+        1,
+        "the longer word survives both the report and the erasure"
+    );
+}

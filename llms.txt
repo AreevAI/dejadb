@@ -8,17 +8,18 @@ content-addressed (SHA-256 over each `.mg` blob): every edit is a supersession
 and every removal a tombstone, giving git-like history, forks with explicit
 merges, and provenance. Recall is hybrid — structural, BM25, and optional vector
 legs fused with Reciprocal Rank Fusion — and CAL, the query language, is
-has no bulk destruction (`DELETE`/`DROP` are not grammar tokens; the only
-destructive statement is a gated single-grain `FORGET <hash>`). DejaDB takes no
-LLM dependency: extraction and embeddings are supplied by the host. It is
-`1.0.0` — the `.mg` format, CAL syntax, and error codes are stable contracts.
+shaped so destruction takes a hash, an identity, or an age — never a predicate
+(`DELETE` is not a grammar token; the three destructive statements each need an
+authorization grant plus a recorded reason and write an audit record). DejaDB
+takes no LLM dependency: extraction and embeddings are supplied by the host.
+The `.mg` format, CAL syntax, and error codes are stable contracts.
 
 ## Docs
 
 - [README](README.md): Project overview, quickstart (CLI, Python, MCP), benchmarks, and the crate map.
-- [Architecture](ARCHITECTURE.md): The 9-crate workspace, the grain model, the store schema, hybrid recall, and the sync/forks design.
-- [CAL reference](docs/cal-reference.md): The Context Assembly Language — `RECALL`, `ASSEMBLE`, `EXISTS`, `HISTORY`, `ADD`, `SUPERSEDE`, pipelines, and the non-destructive guarantee.
-- [MCP reference](docs/mcp-reference.md): The 6 stdio MCP tools (`dejadb_recall/add/supersede/forget/remember/cal`) and how to wire them into an MCP client.
+- [Architecture](ARCHITECTURE.md): The workspace, the grain model, the store schema, hybrid recall, and the sync/forks design.
+- [CAL reference](docs/cal-reference.md): The Context Assembly Language — `RECALL`, `ASSEMBLE`, `EXISTS`, `HISTORY`, `ADD`, `SUPERSEDE`, `REPORT SUBJECT`, pipelines, and the shaped, authorization-gated destruction model.
+- [MCP reference](docs/mcp-reference.md): The 14 stdio MCP tools (`dejadb_recall/add/supersede/forget/remember/cal`, the DSAR read `dejadb_subject_report`, the graph/time reads, the run join, and the loop pair) and how to wire them into an MCP client.
 - [Migration guide](docs/migrate.md): `deja migrate` — importing from mem0 (with full edit history), Zep/Graphiti, Letta, LangMem/LangGraph, Basic Memory, or generic JSONL, with per-source export one-liners.
 - [Memory-tool backend](docs/memory-tool.md): DejaDB as the storage backend for Anthropic's client-side memory tool (`memory_20250818`) in Python, Node, and the CLI.
 - [FAQ](FAQ.md): Question-and-answer coverage of what DejaDB is, how it differs from vector DBs and RAG, grains, OMS, recall, encryption, and maturity.
@@ -26,6 +27,7 @@ LLM dependency: extraction and embeddings are supplied by the host. It is
 
 ## Operations & contributing
 
+- [GDPR](docs/gdpr.md): Obligations mapped to mechanisms for a DPIA — DSAR access/portability (`REPORT SUBJECT` / `subject-report`), erasure, audit export, archive retention, declared retention policy, and the deployment requirements and limits stated honestly.
 - [Security policy](SECURITY.md): The trust boundary, encryption-at-rest caveats, known limitations, disclosure process, and an operator hardening checklist.
 - [Contributing](CONTRIBUTING.md): DCO sign-off, the invariants you must not break, the "don't run blanket cargo fmt" rule, and the PR flow.
 - [Error codes](ERROR_CODES.md): The append-only `DOMAIN-Ennn` registry (`FMT/MEM/STO/CRY/VAL/CAL/SYS`).

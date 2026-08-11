@@ -114,6 +114,19 @@ export declare class DejaDb {
    */
   forgetSubject(subject: string, ns?: string | undefined | null, textMentions?: boolean | undefined | null): Promise<string>
   /**
+   * DSAR read (GDPR Art. 15/20): everything `forgetSubject` WOULD erase
+   * for one identity — exact + partition keys, full history — as
+   * `{"identity_names": [...], "grains": [{hash, type, fields}, ...]}`.
+   * The same selector as erasure, in show-me mode.
+   */
+  subjectReport(subject: string, ns?: string | undefined | null, textMentions?: boolean | undefined | null): Promise<string>
+  /**
+   * Export the subject selection as a portable MGB1 bundle (GDPR Art. 20
+   * portability) — importable into any OMS store. Resolves to the bundle
+   * stats JSON.
+   */
+  subjectBundle(path: string, subject: string, ns?: string | undefined | null, textMentions?: boolean | undefined | null): Promise<string>
+  /**
    * Retention sweep: erase every grain with `created_at` older than
    * `cutoffMs` (epoch milliseconds), optionally limited to one grain type
    * (e.g. "event") and scoped to the session namespace (or `ns`; pass

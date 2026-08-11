@@ -508,7 +508,7 @@ Two properties shape everything below:
 
 ```
 capture  (tool calls, facts, events)   — record_tool_call / add / import
-  → ANALYZE   deterministic, typed       — 11 analyzers over grain semantics
+  → ANALYZE   deterministic, typed       — 12 analyzers over grain semantics
   → RECOMMEND recommendation + evidence  — dedup'd, template-rendered, cited
   → GOVERN    review / policy auto-apply — the four gates, audit grains
   → APPLY     undoable supersession      — scope-checked at execution
@@ -542,12 +542,13 @@ queryable in CAL.
 
 ### 8.2 Deterministic analyzers and recall telemetry
 
-Eleven built-in analyzers (ten default-on) read typed grains, never prose:
+Twelve built-in analyzers (ten default-on) read typed grains, never prose:
 tool-failure clustering, duplicate/near-duplicate consolidation, contradiction
 resolution under functional relations, fork surfacing, staleness, skill-stall,
-goal-stagnation, and three **telemetry-fed** analyzers — cold grains, coverage
-gaps, and budget pressure — that move Deja Loop from *hygiene* (is memory
-internally correct?) to *utility* (is memory used, and does it help?). Precision
+goal-stagnation, retention sweep (opt-in — declared storage limitation routed
+through the review queue), and three **telemetry-fed** analyzers — cold grains,
+coverage gaps, and budget pressure — that move Deja Loop from *hygiene* (is
+memory internally correct?) to *utility* (is memory used, and does it help?). Precision
 is measured, not asserted: the `loop_precision` bench scores each analyzer
 against a labeled fixture and gates CI. Teams extend the set without recompiling
 via `--analyzer-cmd`: a subprocess that reads a live-grain snapshot and returns

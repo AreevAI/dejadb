@@ -8,6 +8,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **GDPR compliance pack** — the obligations a deploying org actually gets
+  audited on, made mechanical and evidenceable. New page
+  [`docs/gdpr.md`](docs/gdpr.md) maps articles to mechanisms for a DPIA,
+  and states the three deployment *requirements* (one hub per trust
+  domain, TLS proxy off-loopback, a documented archive-retention window)
+  as requirements.
+  - **DSAR access + portability (Art. 15/20).** `REPORT SUBJECT "<id>"
+    [WITH text_mentions]` in CAL, `deja subject-report` (JSONL via
+    `--out`, a portable `.mgb` via `--bundle`), MCP
+    `dejadb_subject_report` (the 14th tool), and
+    `subject_report`/`subject_bundle` in both bindings. The report and
+    `FORGET SUBJECT` run **one selector**, so what a subject-access
+    request discloses is exactly what an erasure removes — "show me
+    everything, then delete it" is two commands over one selection. The
+    report is a *read*: `read`-gated, not behind the destructive cap,
+    available on the read-only console, and it writes no audit grain.
+  - **Accountability evidence (Art. 5(2), 30, 33).** `deja audit export
+    [--since MS] [--until MS] [--out FILE]` emits the Tier-2 destruction
+    trail plus the loop's lifecycle chain as JSONL, verifying the
+    hash-chain and flagging any record whose predecessor is missing.
+    Host-level erasures (`deja forget-subject`, `purge-older-than`) now
+    write the same audit record the CAL path does, through one shared
+    builder.
+  - **Archive retention (Art. 17 reach).** `deja stream --checkpoint`
+    opens a new generation whose segment 0 is a full snapshot of the
+    already-erased store; `--retain 30d` then drops whole older
+    generations, and `deja hub --retain 30d` does the equivalent sweep for
+    a hub's segment directory. A follower whose generation ages out
+    re-baselines from the newest snapshot instead of stalling. Erasure now
+    provably reaches archives within a documented window.
+  - **Declarative retention (Art. 5(1)(e)).** `deja retention
+    set/list/clear/sweep` — policy is a `retention:<ns>` file-truth that
+    travels with the memory; declaring never deletes, `sweep --yes`
+    enforces and audits. The governed alternative is the new default-off
+    `loop.retention_sweep` analyzer (12th built-in), which routes the same
+    deletion through the review queue with a mandatory reason and names
+    every grain it would remove.
+  - **`.blobs` sidecar encryption (Art. 32).** CAS attachments are now
+    AES-256-GCM sealed under an HKDF-SHA256 subkey derived from the
+    page-cipher key (domain-separated, so a leaked blob key does not open
+    the database), with the content address bound in as associated data.
+    The `cas://sha256:` address stays the digest of the **plaintext** so
+    addresses remain stable across encrypted and plaintext stores.
+    Attachments written by older builds keep reading and migrate with
+    `deja blobs encrypt` (idempotent).
 - **Node binding parity** (register confusion #13 closed). `dejadb` on
   npm gains the three methods Python had alone: `addBatch(grainsJson,
   ns?)` (one write transaction, JSON hashes out), `search(query,
@@ -136,6 +181,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An erasure no longer resurrects the identity in its own audit record.**
+  A subject erasure wrote the raw identifier into the Tier-2 audit
+  Observation, which is immutable, replicates, and lands in archives — so
+  the erased subject stayed recallable from `agent:authz` forever,
+  un-erasable by the subject selector, and was copied into every bundle
+  made afterwards. An Art. 17 failure hiding inside the Art. 30 record.
+  The audit target now carries a **fingerprint** (`sha256(identity)[..8]`,
+  scheme named in the record), which is verifiable by recomputation from a
+  candidate identity — answering "prove you erased me" — but cannot be
+  mined to enumerate who was erased. Human-readable request references
+  belong in `BECAUSE`.
+- **The loop's destructive gate no longer misses `PURGE`.** A
+  recommendation was stamped destructive by a `FORGET`-only prefix check,
+  so a `PURGE OLDER THAN` in a `Proposal::Cal` — reachable through LLM
+  enrichment or `--analyzer-cmd` — classified as non-destructive *and*
+  rollbackable, skipping the admin-scope + `allow_destructive` apply gate
+  and running through an executor that permits destructive ops by default.
+  Detection now covers both statements, and the DejaDB substrate refuses
+  destructive CAL beyond the audited single-grain `FORGET` arm at both
+  validate and execute time.
+- **Tombstone replay now reclaims CAS attachments on replicas.** `forget`
+  deleted the grain's index rows but never its blobs, so a replica that
+  had imported a blob-bearing grain kept the attachment bytes on disk
+  after the subject was "erased" everywhere. Reclamation is targeted (only
+  the tombstoned grain's own, unreferenced attachments), matching the bulk
+  erasure path.
+- **Compliance-facing docs that had gone stale.** `security-model.md`
+  claimed a pushed segment "can only ever *add* grains — import never
+  deletes" (import replays tombstones, which delete); `erasure.md`
+  REQ-ERASE-6 still said bulk erasure was unreachable from CAL; and the
+  MCP `dejadb_cal` tool description — the string an LLM client reads to
+  decide what the tool can do — still said "CAL is structurally incapable
+  of deleting data". All now state the CAL 1.3 truth.
 - **A retried tool call is counted again instead of silently merging away**
   ([#66]). Making a duplicate add a no-op in 1.1.1 fixed a crash but turned it
   into a wrong answer in the same headline example: five identical

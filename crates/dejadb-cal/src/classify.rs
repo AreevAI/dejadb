@@ -53,6 +53,9 @@ pub fn classify(stmt: &CalStatement) -> StatementClass {
         | CalStatement::ShowForks(_)
         | CalStatement::Related(_)
         | CalStatement::Novelty(_) => StatementClass::Read,
+        // The DSAR read: the erasure selector in show-me mode — a pure
+        // read, deliberately available wherever RECALL is.
+        CalStatement::ReportSubject(_) => StatementClass::Read,
         // A merge supersedes every open tip — evolution, never removal.
         CalStatement::Merge(_) => StatementClass::Evolve,
         CalStatement::Add(_)

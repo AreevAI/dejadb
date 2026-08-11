@@ -49,6 +49,12 @@ COMMANDS:
   provenance <source-hash>            grains distilled from a source (reverse)
   forks                               open forks (>1 head for a subject+relation)
   merge    --subject S --relation R --object O   close a fork with a resolved value
+  subject-report <subject> [--ns NS] [--text-mentions] [--out FILE] [--bundle FILE]
+                                      DSAR read (GDPR Art. 15/20): everything
+                                      forget-subject WOULD erase — exact +
+                                      partition keys, history — as JSONL
+                                      (stdout or --out), and optionally a
+                                      portable .mgb bundle (--bundle)
   forget-subject <subject> [--ns NS] [--text-mentions] --yes   erase EVERY
                                       grain referencing an identity — exact +
                                       partition keys (pat, pat#visit1), history
@@ -59,6 +65,19 @@ COMMANDS:
   purge-older-than <days> [--ns NS] [--type event] --yes   retention sweep:
                                       erase grains older than N days
                                       (--ns \"\" sweeps every namespace)
+  retention <set|list|clear|sweep> [--days N] [--ns NS] [--type event]
+           [--because \"why\"] [--yes]  declarative storage limitation: the
+                                      policy is a file-truth that travels
+                                      with the memory; `set` declares,
+                                      `sweep --yes` enforces (audited)
+  blobs encrypt                       encrypt CAS attachments written before
+                                      sidecar encryption landed (needs the
+                                      memory's key; new blobs are sealed on
+                                      write). Idempotent
+  audit export [--since MS] [--until MS] [--out FILE]   accountability
+                                      evidence as JSONL: every destructive
+                                      op (who/what/why/how many) + the loop
+                                      lifecycle chain, hash-chain verified
   novelty  --text T [--subject S] [--relation R] [-k N]   nearest existing grains
                                       (paraphrase check; needs --embed-cmd)
   log      [--since OP] [--limit N]   op-log (change feed)
@@ -73,7 +92,12 @@ COMMANDS:
   reindex                             backfill + rebuild the BM25 text index
                                       (e.g. after --index-text true on a file
                                       written with indexing off)
-  stream   --to DIR [--interval-ms N] [--once]   continuous op-log shipping
+  stream   --to DIR [--interval-ms N] [--once] [--checkpoint] [--retain 30d]
+                                      continuous op-log shipping; --checkpoint
+                                      opens a new generation with a full
+                                      snapshot, --retain drops generations
+                                      older than the window (so erasure
+                                      reaches archives — see docs/gdpr.md)
   restore  --from DIR [--until-hlc T]            rebuild from stream dir (PITR)
   follow   --from DIR [--interval-ms N] [--once]  subscribe: apply new segments
                                                   (org/category distribution)
@@ -114,8 +138,10 @@ COMMANDS:
   memtool  '<COMMAND-JSON>'           Anthropic memory-tool ops on grains
   ui       [--addr HOST:PORT] [--allow-remote] [--token-env VAR] [--no-destructive-ops]  web console (default 127.0.0.1:7437)
   hub      --token-env VAR [--dir DIR] [--addr HOST:PORT] [--allow-remote]
-                                      sync hub: many apps, one shared memory
-                                      (segment push/pull; default 127.0.0.1:7438)
+           [--retain 30d]             sync hub: many apps, one shared memory
+                                      (segment push/pull; default 127.0.0.1:7438);
+                                      --retain checkpoints at startup and drops
+                                      segments older than the window
 
 Namespace defaults to \"shared\". Exit code 0 on success.
 --db is optional for one-shot commands: it falls back to $DEJADB_DB, then
@@ -124,7 +150,7 @@ Files carry their own settings (text index, entity relations, embedding
 provenance) in an internal meta table; a bare open honors them.
 --index-text true|false explicitly re-stamps the file's declaration.
 
-Principals: add --as <principal> to cal/repl/serve/forget-subject/
+Principals: add --as <principal> to cal/repl/serve/subject-report/forget-subject/
 purge-older-than to run the session under the file's grants for that
 principal (fail closed; see GRANT in docs/cal-reference.md §9). --auth FILE
 validates the principal against a credential map, and `deja ui --auth FILE`
@@ -253,6 +279,44 @@ fn apply_principal(
     let bound = facade.with_principal(&p).map_err(|e| e.to_string())?;
     eprintln!("deja: session bound to principal '{p}' (rights from the file's grants)");
     Ok(bound)
+}
+
+/// Record a Tier-2 audit Observation for a host-level erasure (GDPR
+/// Art. 5(2)/30). The CLI is a host: REQ-ERASE-5 keeps the audit grain out
+/// of the *engine* so an erasure never writes the identity back, and leaves
+/// the record to whoever invoked it — which for `deja forget-subject` /
+/// `purge-older-than` is this. Uses the same builder as the CAL path so
+/// `deja audit export` reads one shape, and the principal is `--as` when
+/// given (else the local owner session).
+///
+/// Best-effort by construction: the erasure has already committed and
+/// replicated. A failure to append the audit grain is reported loudly on
+/// stderr but must not turn an accomplished erasure into an error exit —
+/// that would tell the operator the deletion failed when it did not.
+fn write_erasure_audit(
+    m: &mut dejadb_store::DejaDB,
+    flags: &HashMap<String, String>,
+    verb: &str,
+    target: &str,
+    count: usize,
+) {
+    let principal = flag(flags, "as").unwrap_or_else(|| "local:owner".to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let because = flag(flags, "because");
+    let obs = dejadb_core::authz::audit_observation(
+        &principal,
+        verb,
+        target,
+        because.as_deref(),
+        count,
+        now,
+    );
+    if let Err(e) = m.add(&obs) {
+        eprintln!("deja: warning: erasure succeeded but its audit record failed to write: {e}");
+    }
 }
 
 /// True when a `host:port` (or bare host) names a loopback interface. Used to
@@ -873,35 +937,61 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             }
         }
         "stream" => {
-            // Litestream-shaped: snapshot + incrementing segments per
-            // generation. Cursor + generation live in the target dir, so
-            // any machine holding the dir can restore.
+            // Litestream-shaped: a full snapshot as segment 0 of each
+            // generation, then incrementing delta segments. Cursor,
+            // generation, and NEXT SEGMENT NUMBER live in the target dir,
+            // so any machine holding the dir can restore.
+            //
+            // The segment number is tracked in CURSOR rather than derived
+            // by counting directory entries: retention deletes old
+            // generations, and a counted number would regress and
+            // overwrite live segments.
             let to = need(&flags, "to")?;
             let interval: u64 = flag(&flags, "interval-ms").and_then(|v| v.parse().ok()).unwrap_or(500);
             let once = flags.contains_key("once");
+            let checkpoint = flags.contains_key("checkpoint");
+            let retain_ms = match flag(&flags, "retain") {
+                Some(v) => Some(
+                    parse_duration(&v)
+                        .ok_or_else(|| format!("--retain takes a duration like 30d, got '{v}'"))?,
+                ),
+                None => None,
+            };
             std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
             let cursor_path = format!("{to}/CURSOR");
-            let (gen_id, cursor) = match std::fs::read_to_string(&cursor_path) {
-                Ok(s) => {
-                    let mut parts = s.trim().splitn(2, ' ');
-                    let g = parts.next().unwrap_or("").to_string();
-                    let c: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    (g, c)
-                }
-                Err(_) => (String::new(), 0),
-            };
-            let (gen_id, mut cursor) = if gen_id.is_empty() {
-                // new generation: random-ish id + full snapshot as segment 0
-                let g = format!("{:016x}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64);
+            let (mut gen_id, mut cursor, mut seg) = read_stream_cursor(&cursor_path, &to);
+            // A checkpoint (explicit, or the first run in an empty dir)
+            // opens a NEW generation whose segment 0 is a full snapshot of
+            // the live — already-erased — store. That is what lets
+            // retention drop older generations without losing history:
+            // everything still reachable is in this snapshot.
+            if gen_id.is_empty() || checkpoint {
+                let g = format!(
+                    "{:016x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64
+                );
                 std::fs::create_dir_all(format!("{to}/gen-{g}")).map_err(|e| e.to_string())?;
-                (g, 0i64)
-            } else {
-                (gen_id, cursor)
-            };
-            let mut seg: u32 = std::fs::read_dir(format!("{to}/gen-{gen_id}"))
-                .map(|d| d.count() as u32)
-                .unwrap_or(0);
+                let snap = format!("{to}/gen-{g}/segment-{:08}.mgb", 0);
+                let st = m.bundle_since(0, &snap).map_err(|e| e.to_string())?;
+                gen_id = g;
+                cursor = st.last_op_seq;
+                seg = 1;
+                std::fs::write(&cursor_path, format!("{gen_id} {cursor} {seg}"))
+                    .map_err(|e| e.to_string())?;
+                eprintln!("checkpoint: full snapshot of {} ops → {snap}", st.ops);
+                if let Some(window) = retain_ms {
+                    let dropped = prune_generations(&to, &gen_id, window)?;
+                    if dropped > 0 {
+                        eprintln!(
+                            "retention: dropped {dropped} generation(s) older than the window \
+                             (their contents are in this checkpoint, minus anything erased since)"
+                        );
+                    }
+                }
+            }
             loop {
                 let ops_now = m.changes_since(cursor, 1).map_err(|e| e.to_string())?;
                 if !ops_now.is_empty() {
@@ -909,7 +999,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     let st = m.bundle_since(cursor, &seg_path).map_err(|e| e.to_string())?;
                     cursor = st.last_op_seq;
                     seg += 1;
-                    std::fs::write(&cursor_path, format!("{gen_id} {cursor}")).map_err(|e| e.to_string())?;
+                    std::fs::write(&cursor_path, format!("{gen_id} {cursor} {seg}"))
+                        .map_err(|e| e.to_string())?;
                     eprintln!("shipped {} ops → {seg_path}", st.ops);
                 }
                 if once {
@@ -950,6 +1041,21 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                         }
                         Err(_) => (String::new(), 0),
                     };
+                    // Re-baseline: the generation this follower was tracking
+                    // may have aged out under `--retain`. Its segments are
+                    // gone, but segment 0 of the CURRENT generation is a full
+                    // snapshot — so restart from there rather than stalling
+                    // forever on a missing file. Replay is idempotent, so
+                    // re-importing already-held grains is a no-op.
+                    if !fgen.is_empty()
+                        && fgen != gen_id
+                        && !std::path::Path::new(&format!("{from}/gen-{fgen}")).exists()
+                    {
+                        eprintln!(
+                            "follow: generation {fgen} has aged out of the stream dir — \
+                             re-baselining from generation {gen_id}'s snapshot"
+                        );
+                    }
                     let mut fseg = if fgen != gen_id { 0 } else { fseg };
                     loop {
                         let seg_path = format!("{from}/gen-{gen_id}/segment-{fseg:08}.mgb");
@@ -1519,6 +1625,22 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                      pass --allow-remote to accept that risk."
                 ));
             }
+            // Archive retention (GDPR Art. 17 reach — docs/gdpr.md §3). The
+            // hub imports every pushed segment into its live store, so its
+            // `.mgb` files are archive, not source of truth: a subject
+            // erased in the live store still sits in the segments that
+            // carried it. Sweeping at startup writes a fresh checkpoint
+            // from the (already-erased) store, then drops segments older
+            // than the window.
+            if let Some(v) = flag(&flags, "retain") {
+                let window = parse_duration(&v)
+                    .ok_or_else(|| format!("--retain takes a duration like 30d, got '{v}'"))?;
+                let (kept, dropped) = hub_retention_sweep(&mut m, &dir, window)?;
+                eprintln!(
+                    "deja: retention {v} — wrote a fresh checkpoint ({kept} ops), \
+                     dropped {dropped} segment(s) older than the window"
+                );
+            }
             let facade = dejadb_cal::DejaDbFacade::with_session(m, Some(ns), None);
             report_meta_warnings(&facade);
             let server = dejadb_server::UiServer::new(facade, db.clone())
@@ -1599,6 +1721,60 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 );
             }
         }
+        "subject-report" => {
+            // The DSAR read (GDPR Art. 15 access / Art. 20 portability):
+            // everything forget-subject WOULD erase — the same selector in
+            // show-me mode. JSONL to stdout (or --out), optionally plus a
+            // portable subject-scoped bundle (--bundle). Read-only: no
+            // --yes, and --as needs only the read verb.
+            let subject = positional.first().cloned().or_else(|| flag(&flags, "subject")).ok_or(
+                "usage: deja subject-report <subject> [--ns NS] [--text-mentions] \
+                 [--out FILE] [--bundle FILE]"
+                    .to_string(),
+            )?;
+            let opts = dejadb_store::ErasureOptions {
+                text_mentions: flag(&flags, "text-mentions")
+                    .map(|v| !matches!(v.as_str(), "false" | "0" | "off" | "no"))
+                    .unwrap_or(false),
+            };
+            if let Some(principal) = flag(&flags, "as") {
+                let grants = m.authz_grants(&principal).map_err(|e| e.to_string())?;
+                dejadb_core::authz::AuthzSet::restricted(&principal, grants)
+                    .check(dejadb_core::authz::Verb::Read, &ns)
+                    .map_err(|e| e.to_string())?;
+            }
+            let report = m.subject_report_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
+            let mut lines = String::new();
+            for g in &report.grains {
+                let fields: serde_json::Map<String, serde_json::Value> =
+                    g.fields.clone().into_iter().collect();
+                let row = serde_json::json!({
+                    "hash": g.hash.to_hex(),
+                    "type": g.grain_type.as_str(),
+                    "fields": fields,
+                });
+                lines.push_str(&row.to_string());
+                lines.push('\n');
+            }
+            match flag(&flags, "out") {
+                Some(path) => {
+                    std::fs::write(&path, &lines).map_err(|e| e.to_string())?;
+                    println!("wrote {} grains to {path}", report.grains.len());
+                }
+                None => print!("{lines}"),
+            }
+            if let Some(bpath) = flag(&flags, "bundle") {
+                let stats = m
+                    .subject_bundle_with(&ns, &subject, opts, &bpath)
+                    .map_err(|e| e.to_string())?;
+                eprintln!("bundle: {} records, {} bytes -> {bpath}", stats.ops, stats.bytes);
+            }
+            eprintln!(
+                "subject-report '{subject}' ns '{ns}': {} grains; matched identities: {}",
+                report.grains.len(),
+                report.identity_names.join(", ")
+            );
+        }
         "forget-subject" => {
             // Right-to-erasure for one identity: erase every grain holding a
             // structured reference to the subject (history included), its
@@ -1638,6 +1814,22 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     .map_err(|e| e.to_string())?;
             }
             let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
+            // The CLI is a host, and hosts audit (REQ-ERASE-5 leaves the
+            // record to the host precisely so the engine never writes the
+            // identity back). Same builder as the CAL path, so `deja audit
+            // export` sees one shape whichever surface erased.
+            write_erasure_audit(
+                &mut m,
+                &flags,
+                "erase",
+                // A fingerprint, never the identity — the audit grain
+                // outlives the erasure and replicates.
+                &format!(
+                    "subject:{} ns:{ns}",
+                    dejadb_core::authz::subject_fingerprint(&subject)
+                ),
+                rep.grains_erased,
+            );
             println!(
                 "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
                 rep.grains_erased, rep.terms_removed, rep.vocab_removed, rep.blobs_reclaimed
@@ -1692,6 +1884,17 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     .map_err(|e| e.to_string())?;
             }
             let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
+            write_erasure_audit(
+                &mut m,
+                &flags,
+                "erase",
+                &format!(
+                    "older_than:{days}d ns:{}{}",
+                    if ns.is_empty() { "*" } else { ns.as_str() },
+                    flag(&flags, "type").map(|t| format!(" type:{t}")).unwrap_or_default()
+                ),
+                rep.grains_erased,
+            );
             println!(
                 "erased {} grains ({} vocabulary tokens, {} blobs reclaimed)",
                 rep.grains_erased, rep.vocab_removed, rep.blobs_reclaimed
@@ -1744,9 +1947,258 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         "loop" => {
             run_loop(m, &ns, &flags, &positional)?;
         }
+        "audit" => {
+            run_audit(&mut m, &flags, &positional)?;
+        }
+        "retention" => {
+            run_retention(&mut m, &ns, &flags, &positional)?;
+        }
+        "blobs" => {
+            // `deja blobs encrypt` — migrate CAS attachments written before
+            // sidecar encryption landed (GDPR Art. 32; docs/gdpr.md §4).
+            // New attachments are sealed on write, so this is a one-time
+            // catch-up for existing files. Idempotent.
+            let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("");
+            if sub_cmd != "encrypt" {
+                return Err("usage: deja blobs encrypt --db <file> --passphrase-env VAR".into());
+            }
+            let (encrypted, already) = m.encrypt_blobs().map_err(|e| e.to_string())?;
+            println!(
+                "encrypted {encrypted} attachment(s); {already} were already encrypted"
+            );
+        }
         other => return Err(format!("unknown command '{other}' — try `deja help`")),
     }
     Ok(())
+}
+
+/// `deja retention <set|list|clear|sweep>` — declarative storage limitation
+/// (GDPR Art. 5(1)(e)).
+///
+/// Policy is a **file-truth** (`retention:<ns>` meta rows), so it travels
+/// with the memory: a copy, a sync, or a restore on another host still says
+/// "events here live 90 days". Declaring is separate from enforcing —
+/// `set` never deletes anything; `sweep` does, and demands `--yes` like
+/// every other bulk erasure. The governed alternative is the loop's
+/// `retention_sweep` analyzer, which proposes the same purge through review
+/// and audit instead of performing it.
+fn run_retention(
+    m: &mut DejaDB,
+    ns: &str,
+    flags: &HashMap<String, String>,
+    positional: &[String],
+) -> Result<(), String> {
+    let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub_cmd {
+        "set" => {
+            let days: f64 = flag(flags, "days")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| positional.get(1).and_then(|v| v.parse().ok()))
+                .ok_or_else(|| {
+                    "usage: deja retention set --days N [--ns NS] [--type event] \
+                     [--because \"why\"]"
+                        .to_string()
+                })?;
+            let policy = dejadb_store::RetentionPolicy {
+                days,
+                grain_type: flag(flags, "type"),
+                because: flag(flags, "because"),
+            };
+            m.set_retention_policy(ns, &policy).map_err(|e| e.to_string())?;
+            println!(
+                "retention policy for '{ns}': {days} days{}{}",
+                policy.grain_type.map(|t| format!(", type {t}")).unwrap_or_default(),
+                policy.because.map(|b| format!(" — {b}")).unwrap_or_default()
+            );
+            eprintln!(
+                "deja: declared, not enforced — run `deja retention sweep --yes` (cron), \
+                 or let the loop's retention_sweep analyzer propose it for review"
+            );
+        }
+        "list" => {
+            let policies = m.retention_policies().map_err(|e| e.to_string())?;
+            if policies.is_empty() {
+                println!("no retention policies declared in this memory");
+            }
+            for (pns, p) in policies {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "namespace": pns,
+                        "days": p.days,
+                        "type": p.grain_type,
+                        "because": p.because,
+                    })
+                );
+            }
+        }
+        "clear" => {
+            m.clear_retention_policy(ns).map_err(|e| e.to_string())?;
+            println!("cleared the retention policy for '{ns}'");
+        }
+        "sweep" => {
+            if flags.contains_key("no-destructive-ops") {
+                return Err(
+                    "destructive operations are disabled for this invocation \
+                     (--no-destructive-ops)"
+                        .into(),
+                );
+            }
+            let policies = m.retention_policies().map_err(|e| e.to_string())?;
+            if policies.is_empty() {
+                println!("no retention policies declared — nothing to sweep");
+                return Ok(());
+            }
+            if !flags.contains_key("yes") {
+                let plan: Vec<String> = policies
+                    .iter()
+                    .map(|(pns, p)| {
+                        format!(
+                            "  {pns}: erase grains older than {} days{}",
+                            p.days,
+                            p.grain_type.as_deref().map(|t| format!(" (type {t})")).unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "retention sweep would apply {} policy/policies:\n{}\nRe-run with --yes \
+                     to proceed.",
+                    policies.len(),
+                    plan.join("\n")
+                ));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let results = m.sweep_retention(now).map_err(|e| e.to_string())?;
+            let mut total = 0usize;
+            for (pns, days, rep) in &results {
+                total += rep.grains_erased;
+                println!(
+                    "{pns}: erased {} grains older than {days} days ({} vocabulary tokens, \
+                     {} blobs reclaimed)",
+                    rep.grains_erased, rep.vocab_removed, rep.blobs_reclaimed
+                );
+                // Audited like every other host-level erasure, one record per
+                // policy so the evidence names which rule fired — but only
+                // when something was actually erased. A destruction trail
+                // records destructions; a nightly no-op sweep would
+                // otherwise add 365 immutable, replicating grains a year per
+                // policy for zero information.
+                if rep.grains_erased > 0 {
+                    write_erasure_audit(
+                        m,
+                        flags,
+                        "erase",
+                        &format!("retention:{days}d ns:{pns}"),
+                        rep.grains_erased,
+                    );
+                }
+            }
+            println!("retention sweep: {total} grains erased across {} policies", results.len());
+        }
+        other => {
+            return Err(format!(
+                "unknown retention subcommand '{other}' — usage: deja retention \
+                 <set|list|clear|sweep>"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Checkpoint the hub's segment dir and drop segments older than the
+/// window. Returns `(ops_in_checkpoint, segments_dropped)`.
+///
+/// Order matters: the checkpoint is written FIRST, so the dir never passes
+/// through a state where old segments are gone and no snapshot has replaced
+/// them. The checkpoint is named so it sorts after ordinary pushes and is
+/// itself subject to the window on later sweeps.
+fn hub_retention_sweep(
+    m: &mut DejaDB,
+    dir: &str,
+    window_ms: i64,
+) -> Result<(usize, usize), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now();
+    let stamp = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let snap = format!("{dir}/checkpoint-{stamp:013}.mgb");
+    let st = m.bundle_since(0, &snap).map_err(|e| e.to_string())?;
+    let mut dropped = 0usize;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if path == std::path::Path::new(&snap) || path.extension().is_none_or(|x| x != "mgb") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|md| md.modified()) else { continue };
+        let age_ms = now.duration_since(modified).map(|d| d.as_millis() as i64).unwrap_or(0);
+        if age_ms > window_ms {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+            dropped += 1;
+        }
+    }
+    Ok((st.ops, dropped))
+}
+
+/// Read a stream dir's `CURSOR`: `"<gen_id> <op_seq> <next_seg>"`.
+///
+/// The third field is what keeps retention safe. Dirs written before it
+/// existed carry only two fields; for those we fall back to counting
+/// segment files, which is correct precisely because such a dir has never
+/// been pruned (counting is what pruning breaks).
+fn read_stream_cursor(cursor_path: &str, to: &str) -> (String, i64, u32) {
+    let Ok(s) = std::fs::read_to_string(cursor_path) else {
+        return (String::new(), 0, 0);
+    };
+    let mut parts = s.trim().splitn(3, ' ');
+    let gen_id = parts.next().unwrap_or("").to_string();
+    let cursor: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let seg = match parts.next().and_then(|v| v.parse::<u32>().ok()) {
+        Some(n) => n,
+        None => std::fs::read_dir(format!("{to}/gen-{gen_id}"))
+            .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "mgb")).count() as u32)
+            .unwrap_or(0),
+    };
+    (gen_id, cursor, seg)
+}
+
+/// Drop whole generations older than `window_ms`, never individual segments
+/// inside one — a hole in a live generation strands every follower at the
+/// gap, while dropping a whole generation is a re-baseline the follower
+/// handles. The current generation is always kept.
+///
+/// This is what makes the Art. 17 archive guarantee true: each generation's
+/// segment 0 is a snapshot of the already-erased store, so once the
+/// pre-erasure generations age out, the erased bytes are gone from the
+/// archive as well as the live store. See docs/gdpr.md §3.
+fn prune_generations(to: &str, current_gen: &str, window_ms: i64) -> Result<usize, String> {
+    let now = std::time::SystemTime::now();
+    let mut dropped = 0usize;
+    for entry in std::fs::read_dir(to).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || !name.starts_with("gen-") || name == format!("gen-{current_gen}") {
+            continue;
+        }
+        // Age by the NEWEST segment in the generation: a generation is only
+        // expendable once everything in it has aged out.
+        let newest = std::fs::read_dir(&path)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter_map(|f| f.metadata().ok().and_then(|md| md.modified().ok()))
+            .max();
+        let Some(newest) = newest else { continue };
+        let age_ms = now.duration_since(newest).map(|d| d.as_millis() as i64).unwrap_or(0);
+        if age_ms > window_ms {
+            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// Parse a duration like `6h` / `30m` / `2d` / `3600s` into milliseconds.
@@ -2038,6 +2490,168 @@ fn load_policy(flags: &HashMap<String, String>) -> Result<Option<Policy>, String
         }
         None => Ok(None),
     }
+}
+
+/// `deja audit export [--since MS] [--until MS] [--out FILE]` — the
+/// accountability evidence bundle (GDPR Art. 5(2)/30, and the Art. 33
+/// breach-notification input).
+///
+/// Two hash-chained trails already exist as grains; this formats them,
+/// nothing more. Tier-2 destruction Observations live in `agent:authz`
+/// (one per FORGET / FORGET SUBJECT / PURGE, from CAL or the CLI alike),
+/// and the loop's lifecycle audit rides as `loop_audit` Facts in
+/// `deja-loop`. Output is JSONL — one record per line, oldest first — so
+/// extracting a window is a pipe, not a parser.
+///
+/// **The chain is verified, not assumed.** Each loop audit record carries
+/// `derived_from = [rec_hash, previous_audit_hash]`; a record whose
+/// predecessor is absent from the export means the trail was truncated,
+/// and evidence that cannot say so is worse than none. Breaks are reported
+/// on stderr and marked on the record.
+fn run_audit(
+    m: &mut DejaDB,
+    flags: &HashMap<String, String>,
+    positional: &[String],
+) -> Result<(), String> {
+    let sub_cmd = positional.first().map(|s| s.as_str()).unwrap_or("export");
+    if sub_cmd != "export" {
+        return Err(format!(
+            "unknown audit subcommand '{sub_cmd}' — usage: deja audit export \
+             [--since MS] [--until MS] [--out FILE]"
+        ));
+    }
+    let parse_ms = |k: &str| -> Result<Option<i64>, String> {
+        match flag(flags, k) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| format!("--{k} takes epoch milliseconds, got '{v}'")),
+        }
+    };
+    let since = parse_ms("since")?;
+    let until = parse_ms("until")?;
+    let in_window = |at: i64| since.is_none_or(|s| at >= s) && until.is_none_or(|u| at <= u);
+
+    // Tier-2 destruction audit: Observations in the reserved authz namespace.
+    let mut rows: Vec<(i64, serde_json::Value)> = Vec::new();
+    let authz = m
+        .recent(
+            dejadb_core::authz::AUTHZ_NS,
+            Some(dejadb_core::types::GrainType::Observation),
+            usize::MAX / 2,
+        )
+        .map_err(|e| e.to_string())?;
+    for g in authz {
+        let ctx = g.fields.get("context").cloned().unwrap_or(serde_json::Value::Null);
+        if ctx.get("audit").and_then(|v| v.as_str()) != Some("tier2") {
+            continue;
+        }
+        let at = g.fields.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !in_window(at) {
+            continue;
+        }
+        rows.push((
+            at,
+            serde_json::json!({
+                "trail": "destruction",
+                "hash": g.hash.to_hex(),
+                "at_ms": at,
+                "principal": g.fields.get("observer_id"),
+                "observer_type": g.fields.get("observer_type"),
+                "verb": ctx.get("verb"),
+                // For subject erasures this is `subject:<fingerprint> ns:<ns>`:
+                // verify it against a candidate identity by recomputing
+                // sha256(id)[..8] in hex; it deliberately cannot be mined
+                // for who was erased. `subject_ref` names the scheme.
+                "target": ctx.get("target"),
+                "subject_ref": ctx.get("subject_ref"),
+                "because": ctx.get("because"),
+                "grains_erased": ctx.get("grains_erased"),
+            }),
+        ));
+    }
+
+    // Loop lifecycle audit: `loop_audit` Facts carrying the engine's
+    // field-map in `object`, hash-chained through `derived_from`.
+    let mut chain_prev: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut loop_rows: Vec<(i64, serde_json::Value, Option<String>)> = Vec::new();
+    let loop_grains = m
+        .recent("deja-loop", Some(dejadb_core::types::GrainType::Fact), usize::MAX / 2)
+        .map_err(|e| e.to_string())?;
+    for g in loop_grains {
+        if g.get_str("relation") != Some("loop_audit") {
+            continue;
+        }
+        let Some(body) = g.get_str("object").and_then(|o| {
+            serde_json::from_str::<serde_json::Value>(o).ok()
+        }) else {
+            continue;
+        };
+        let at = body.get("at_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !in_window(at) {
+            continue;
+        }
+        chain_prev.insert(g.hash.to_hex());
+        // derived_from = [rec_hash, previous_audit_hash?]
+        let prev = body
+            .get("derived_from")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.get(1))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        loop_rows.push((
+            at,
+            serde_json::json!({
+                "trail": "loop",
+                "hash": g.hash.to_hex(),
+                "at_ms": at,
+                "rec_hash": body.get("rec_hash"),
+                "from_status": body.get("from_status"),
+                "to_status": body.get("to_status"),
+                "actor": body.get("actor"),
+                "observer_type": body.get("observer_type"),
+                "because": body.get("because"),
+                "previous_audit": prev.clone(),
+            }),
+            prev,
+        ));
+    }
+    // Chain verification: a named predecessor absent from this export means
+    // the trail is truncated. Report it rather than emitting a clean-looking
+    // file.
+    let mut breaks = 0usize;
+    for (at, mut row, prev) in loop_rows {
+        if let Some(p) = prev {
+            if !chain_prev.contains(&p) {
+                breaks += 1;
+                row["chain_break"] = serde_json::json!(true);
+            }
+        }
+        rows.push((at, row));
+    }
+
+    rows.sort_by_key(|(at, _)| *at);
+    let mut out = String::new();
+    for (_, row) in &rows {
+        out.push_str(&row.to_string());
+        out.push('\n');
+    }
+    match flag(flags, "out") {
+        Some(path) => {
+            std::fs::write(&path, &out).map_err(|e| e.to_string())?;
+            println!("wrote {} audit records to {path}", rows.len());
+        }
+        None => print!("{out}"),
+    }
+    if breaks > 0 {
+        eprintln!(
+            "deja: warning: {breaks} loop audit record(s) name a predecessor absent from this \
+             export — the chain is truncated (widen --since, or the trail was tampered with)"
+        );
+    }
+    eprintln!("audit export: {} records", rows.len());
+    Ok(())
 }
 
 /// `deja loop <run|list|show|approve|reject|apply|rollback|analyzers|policy|status>`.

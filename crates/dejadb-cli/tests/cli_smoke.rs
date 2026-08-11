@@ -245,7 +245,12 @@ fn boolean_flag_does_not_swallow_short_db_flag() {
         !err.contains("using default memory"),
         "-d was swallowed by --once; deja fell back to the default file: {err}"
     );
-    assert!(err.contains("shipped"), "expected ops shipped from {db}: {err}");
+    // The first run into an empty dir opens a generation with a full
+    // snapshot, so the proof that `-d` landed is the snapshot's op count.
+    assert!(
+        err.contains("checkpoint: full snapshot of 1 ops"),
+        "expected the grain from {db} in the snapshot: {err}"
+    );
 }
 
 /// Regression (#16): opening an encrypted memory without the passphrase used
@@ -498,4 +503,301 @@ fn remember_run_id_is_readable_by_run_trace() {
     let (ok, out, _) = deja(&["run-trace", "--db", db, "--ns", "ops", "--run-id", "nope"]);
     assert!(ok);
     assert!(out.contains("no grains recorded"), "{out}");
+}
+
+/// The DSAR flow through the binary: subject-report shows exactly what
+/// forget-subject then erases, and the --bundle export imports elsewhere.
+#[test]
+fn cli_subject_report_then_erase() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("dsar.db");
+    let db = db.to_str().unwrap();
+    let bundle = dir.path().join("pat.mgb");
+    let bundle = bundle.to_str().unwrap();
+
+    for (s, r, o) in
+        [("pat", "prefers", "tea"), ("pat#visit1", "note", "late"), ("mary", "prefers", "juice")]
+    {
+        let (ok, _, err) = deja(&[
+            "add", "--db", db, "--ns", "caller", "--subject", s, "--relation", r, "--object", o,
+        ]);
+        assert!(ok, "add failed: {err}");
+    }
+
+    // The report: two JSONL grains, mary excluded, bundle written.
+    let (ok, out, err) =
+        deja(&["subject-report", "pat", "--db", db, "--ns", "caller", "--bundle", bundle]);
+    assert!(ok, "subject-report failed: {err}");
+    let rows: Vec<serde_json::Value> =
+        out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 2, "exact + partition key: {out}");
+    assert!(rows.iter().all(|r| r["fields"]["subject"] != "mary"), "{out}");
+    assert!(err.contains("2 grains"), "summary on stderr: {err}");
+    assert!(err.contains("pat#visit1"), "matched identities listed: {err}");
+
+    // The bundle imports into a fresh memory — Art. 20 portability.
+    let db2 = dir.path().join("portable.db");
+    let db2 = db2.to_str().unwrap();
+    let (ok, _, err) = deja(&["import", "--db", db2, "--bundle", bundle]);
+    assert!(ok, "import failed: {err}");
+    let (ok, out, _) = deja(&["stats", "--db", db2]);
+    assert!(ok);
+    assert!(out.contains("\"grains\": 2") || out.contains("grains: 2"), "{out}");
+
+    // Then the erasure removes exactly what the report showed.
+    let (ok, out, err) =
+        deja(&["forget-subject", "pat", "--db", db, "--ns", "caller", "--yes"]);
+    assert!(ok, "forget-subject failed: {err}");
+    assert!(out.contains("erased 2 grains"), "{out}");
+    let (ok, out, _) = deja(&["subject-report", "pat", "--db", db, "--ns", "caller"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "", "nothing left to report");
+}
+
+/// Host-level erasure is audited like the CAL path, and `audit export`
+/// emits the evidence as JSONL.
+#[test]
+fn cli_audit_export_covers_host_erasure() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("audit.db");
+    let db = db.to_str().unwrap();
+
+    for (s, r, o) in [("pat", "prefers", "tea"), ("mary", "prefers", "juice")] {
+        let (ok, _, err) = deja(&[
+            "add", "--db", db, "--ns", "caller", "--subject", s, "--relation", r, "--object", o,
+        ]);
+        assert!(ok, "add failed: {err}");
+    }
+
+    // Nothing destructive yet → an empty (but well-formed) export.
+    let (ok, out, err) = deja(&["audit", "export", "--db", db]);
+    assert!(ok, "audit export failed: {err}");
+    assert_eq!(out.trim(), "");
+    assert!(err.contains("0 records"), "{err}");
+
+    // A host-level erasure must leave an audit record — the CLI is a host.
+    let (ok, _, err) = deja(&[
+        "forget-subject", "pat", "--db", db, "--ns", "caller", "--yes", "--because",
+        "gdpr request 42",
+    ]);
+    assert!(ok, "forget-subject failed: {err}");
+
+    let (ok, out, _) = deja(&["audit", "export", "--db", db]);
+    assert!(ok);
+    let rows: Vec<serde_json::Value> =
+        out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 1, "one destructive op, one audit record: {out}");
+    assert_eq!(rows[0]["trail"], "destruction");
+    assert_eq!(rows[0]["verb"], "erase");
+    // A fingerprint, not the identity — the audit record must not resurrect
+    // what the erasure removed. Verifiable by recomputation.
+    let fp = dejadb_core::authz::subject_fingerprint("pat");
+    assert_eq!(rows[0]["target"], format!("subject:{fp} ns:caller"));
+    assert!(!out.contains("pat "), "the erased identity must not appear in evidence: {out}");
+    assert_eq!(rows[0]["because"], "gdpr request 42");
+    assert_eq!(rows[0]["grains_erased"], 1);
+
+    // --since windows the export by epoch ms.
+    let at = rows[0]["at_ms"].as_i64().unwrap();
+    let (ok, out, _) =
+        deja(&["audit", "export", "--db", db, "--since", &(at + 1).to_string()]);
+    assert!(ok);
+    assert_eq!(out.trim(), "", "a window after the event excludes it");
+
+    // --out writes the file instead of stdout.
+    let path = dir.path().join("evidence.jsonl");
+    let path = path.to_str().unwrap();
+    let (ok, out, _) = deja(&["audit", "export", "--db", db, "--out", path]);
+    assert!(ok);
+    assert!(out.contains("wrote 1 audit records"), "{out}");
+    assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+}
+
+/// Archive retention: a checkpoint snapshots the already-erased live store
+/// into a fresh generation, and `--retain` drops the older generations that
+/// still hold the pre-erasure bytes. This is the Art. 17 archive
+/// guarantee — asserted by grepping the archive for the erased identity.
+#[test]
+fn cli_stream_checkpoint_and_retention_reach_archives() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("s.db");
+    let db = db.to_str().unwrap();
+    let arc = dir.path().join("archive");
+    let arc = arc.to_str().unwrap();
+
+    let add = |s: &str, o: &str| {
+        let (ok, _, err) = deja(&[
+            "add", "--db", db, "--ns", "caller", "--subject", s, "--relation", "prefers",
+            "--object", o,
+        ]);
+        assert!(ok, "add failed: {err}");
+    };
+    add("wellumbrix", "tea"); // a distinctive identity we can grep for
+    add("mary", "juice");
+
+    // First stream run opens generation 1 with a full snapshot.
+    let (ok, _, err) = deja(&["stream", "--db", db, "--to", arc, "--once"]);
+    assert!(ok, "stream failed: {err}");
+    let cursor = std::fs::read_to_string(format!("{arc}/CURSOR")).unwrap();
+    let gen1 = cursor.split(' ').next().unwrap().to_string();
+    assert_eq!(cursor.split(' ').count(), 3, "CURSOR tracks the next segment: {cursor}");
+    assert!(
+        std::path::Path::new(&format!("{arc}/gen-{gen1}/segment-00000000.mgb")).exists(),
+        "segment 0 of a generation is the full snapshot"
+    );
+    assert!(archive_contains(arc, "wellumbrix"), "the archive holds the identity's bytes");
+
+    // Erase, then checkpoint into a NEW generation with a huge window so
+    // the old generation is deliberately kept: the erased bytes must still
+    // be findable, proving the grep is a real probe.
+    let (ok, _, err) =
+        deja(&["forget-subject", "wellumbrix", "--db", db, "--ns", "caller", "--yes"]);
+    assert!(ok, "forget-subject failed: {err}");
+    let (ok, _, err) =
+        deja(&["stream", "--db", db, "--to", arc, "--once", "--checkpoint", "--retain", "30d"]);
+    assert!(ok, "checkpoint failed: {err}");
+    let gen2 = std::fs::read_to_string(format!("{arc}/CURSOR"))
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_ne!(gen1, gen2, "a checkpoint opens a new generation");
+    assert!(
+        !archive_contains(&format!("{arc}/gen-{gen2}"), "wellumbrix"),
+        "the new generation is snapshotted from the erased store"
+    );
+    assert!(
+        archive_contains(&format!("{arc}/gen-{gen1}"), "wellumbrix"),
+        "the pre-erasure generation still holds it until the window expires"
+    );
+
+    // Now expire the window (0s = everything older than now) — the old
+    // generation goes, and with it the last copy of the erased identity.
+    let (ok, _, err) =
+        deja(&["stream", "--db", db, "--to", arc, "--once", "--checkpoint", "--retain", "0s"]);
+    assert!(ok, "retention sweep failed: {err}");
+    assert!(
+        !std::path::Path::new(&format!("{arc}/gen-{gen1}")).exists(),
+        "generations older than the window are dropped whole"
+    );
+    assert!(
+        !archive_contains(arc, "wellumbrix"),
+        "erasure has reached the archive — the Art. 17 guarantee"
+    );
+    // Mary survives all of it.
+    assert!(archive_contains(arc, "mary"), "retention must not lose live data");
+
+    // And the retained archive still restores the surviving store.
+    let db2 = dir.path().join("restored.db");
+    let db2 = db2.to_str().unwrap();
+    let (ok, out, err) = deja(&["restore", "--db", db2, "--from", arc]);
+    assert!(ok, "restore failed: {err}");
+    assert!(out.contains("restored"), "{out}");
+    let (ok, out, _) = deja(&["recall", "--db", db2, "--ns", "caller", "--subject", "mary"]);
+    assert!(ok);
+    assert!(out.contains("juice"), "restored store keeps live data: {out}");
+}
+
+/// True if any `.mgb` file under `path` contains `needle` as raw bytes.
+fn archive_contains(path: &str, needle: &str) -> bool {
+    fn walk(p: &std::path::Path, needle: &[u8], found: &mut bool) {
+        if *found {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(p) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, needle, found);
+            } else if path.extension().is_some_and(|x| x == "mgb") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if bytes.windows(needle.len()).any(|w| w == needle) {
+                        *found = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let mut found = false;
+    walk(std::path::Path::new(path), needle.as_bytes(), &mut found);
+    found
+}
+
+/// Declarative retention: policy is a file-truth that travels with the
+/// memory, declaring never deletes, and the sweep is audited.
+#[test]
+fn cli_retention_declares_then_enforces() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("r.db");
+    let db = db.to_str().unwrap();
+
+    let (ok, _, err) = deja(&[
+        "add", "--db", db, "--ns", "caller", "--subject", "keep", "--relation", "r",
+        "--object", "v",
+    ]);
+    assert!(ok, "add failed: {err}");
+
+    // Declaring is inert.
+    let (ok, out, err) = deja(&[
+        "retention", "set", "--db", db, "--ns", "caller", "--days", "30", "--because",
+        "support tickets age out",
+    ]);
+    assert!(ok, "retention set failed: {err}");
+    assert!(out.contains("30 days"), "{out}");
+    assert!(err.contains("declared, not enforced"), "{err}");
+    let (ok, out, _) = deja(&["recall", "--db", db, "--ns", "caller", "--subject", "keep"]);
+    assert!(ok);
+    assert!(out.contains("keep"), "declaring a policy must not delete: {out}");
+
+    // The policy is readable back — it lives in the file.
+    let (ok, out, _) = deja(&["retention", "list", "--db", db]);
+    assert!(ok);
+    let row: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(row["namespace"], "caller");
+    assert_eq!(row["days"], 30.0);
+    assert_eq!(row["because"], "support tickets age out");
+
+    // A sweep without --yes refuses and explains what it would do.
+    let (ok, _, err) = deja(&["retention", "sweep", "--db", db]);
+    assert!(!ok, "bulk erasure must demand --yes");
+    assert!(err.contains("older than 30 days"), "{err}");
+
+    // Nothing is old enough yet, so the sweep is a no-op — and the grain lives.
+    let (ok, out, err) = deja(&["retention", "sweep", "--db", db, "--yes"]);
+    assert!(ok, "sweep failed: {err}");
+    assert!(out.contains("0 grains erased"), "{out}");
+    let (ok, out, _) = deja(&["recall", "--db", db, "--ns", "caller", "--subject", "keep"]);
+    assert!(ok);
+    assert!(out.contains("keep"));
+    // A no-op sweep writes no audit grain: the trail records destructions,
+    // not the fact that a cron ran.
+    let (ok, out, _) = deja(&["audit", "export", "--db", db]);
+    assert!(ok);
+    assert_eq!(out.trim(), "", "a sweep that erased nothing must not audit: {out}");
+
+    // A zero-day policy makes everything overdue; the sweep erases and audits.
+    let (ok, _, err) =
+        deja(&["retention", "set", "--db", db, "--ns", "caller", "--days", "0"]);
+    assert!(ok, "{err}");
+    let (ok, out, err) = deja(&["retention", "sweep", "--db", db, "--yes"]);
+    assert!(ok, "sweep failed: {err}");
+    assert!(out.contains("1 grains erased"), "{out}");
+    let (ok, out, _) = deja(&["audit", "export", "--db", db]);
+    assert!(ok);
+    let rows: Vec<serde_json::Value> =
+        out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 1, "the sweep is audited: {out}");
+    assert!(
+        rows[0]["target"].as_str().unwrap().starts_with("retention:"),
+        "the evidence names the rule that fired: {out}"
+    );
+
+    // clear removes the declaration.
+    let (ok, _, _) = deja(&["retention", "clear", "--db", db, "--ns", "caller"]);
+    assert!(ok);
+    let (ok, out, _) = deja(&["retention", "list", "--db", db]);
+    assert!(ok);
+    assert!(out.contains("no retention policies"), "{out}");
 }

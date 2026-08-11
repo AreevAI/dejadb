@@ -152,6 +152,10 @@ pub enum CalStatement {
     #[serde(alias = "REVERT", alias = "Revert")]
     Revert(RevertStmt),
 
+    /// `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only DSAR
+    /// mirror of `FORGET SUBJECT` (OMS 1.6 draft).
+    ReportSubject(ReportSubjectStmt),
+
     // ── Tier 2: Destructive statements (gated by allow_destructive_ops) ─
     /// `FORGET <hash>` / `FORGET SUBJECT "<id>"`
     Forget(ForgetStmt),
@@ -836,6 +840,28 @@ pub struct PurgeStmt {
     /// The recorded reason (BECAUSE). Mandatory from text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip)]
+    pub span: Option<Span>,
+}
+
+// ---------------------------------------------------------------------------
+// REPORT SUBJECT (read-only DSAR)
+// ---------------------------------------------------------------------------
+
+/// `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only DSAR
+/// selection (OMS 1.6 draft): everything `FORGET SUBJECT` would erase for
+/// one identity — exact + partition keys, full history — hydrated instead
+/// of erased (GDPR Art. 15 access / Art. 20 portability). A pure read:
+/// classifies `Read`, needs the `read` grant only, and is available on the
+/// token-less read-only console.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportSubjectStmt {
+    /// The identity to report on.
+    pub subject_id: String,
+    /// `WITH text_mentions` — extend the selection to grains whose indexed
+    /// text mentions the identity (search symmetry with the erasure form).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_mentions: bool,
     #[serde(skip)]
     pub span: Option<Span>,
 }

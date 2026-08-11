@@ -300,6 +300,36 @@ DESCRIBE INTEGRITY
   paraphrase check — nearest existing grains to a candidate text; it needs
   a host-installed embedder and refuses cleanly without one.
 
+#### `REPORT SUBJECT` — the DSAR read (OMS 1.6 draft)
+
+```
+REPORT SUBJECT "<id>" [WITH text_mentions]
+```
+
+```sql
+REPORT SUBJECT "pat"
+REPORT SUBJECT "pat" WITH text_mentions
+```
+
+Everything `FORGET SUBJECT` would erase for one identity — the exact
+subject, its partition-style keys (`pat`, `pat#visit1` — never `patricia`),
+and the full history — hydrated instead of erased: the GDPR Art. 15
+(access) / Art. 20 (portability) answer. `WITH text_mentions` extends the
+selection to grains whose indexed text mentions the identity, with the same
+hard precondition as the erasure form (the text index must be on and fully
+built — never a silent partial answer).
+
+The report and the erasure run **one selector**, so "show me everything,
+then delete it" is this statement followed by `FORGET SUBJECT` over exactly
+the same set. A pure read: session-namespace-scoped, gated by the `read`
+grant only, available on the token-less read-only console, and it writes no
+audit grain — the audit obligation is on destruction, not access. The
+result carries `identity_names` (every matched dictionary string) and
+`grains` (`{hash, type, fields}`). Host spellings: `deja subject-report`
+(with `--out`/`--bundle` for JSONL and portable-bundle export), MCP
+`dejadb_subject_report`, Python `subject_report`/`subject_bundle`, Node
+`subjectReport`/`subjectBundle`.
+
 ### 3.2 Write statements (append-only)
 
 Every write requires a `REASON` (or `BECAUSE`) clause — the provenance of a
@@ -691,6 +721,10 @@ PURGE OLDER THAN <n><d|h|m> [TYPE <grain-type>] [IN "<namespace>"] BECAUSE "<why
 `agent:authz` namespace — the session principal, the verb, the target, the
 reason, and the erased count — recallable like any grain:
 `RECALL observations WHERE namespace = "agent:authz"`.
+
+The read-only mirror of `FORGET SUBJECT` is [`REPORT SUBJECT`](#report-
+subject--the-dsar-read-oms-16-draft) — the same selector in show-me mode,
+for DSAR access/portability before (or without) erasure.
 
 Defense in depth, unchanged in spirit:
 

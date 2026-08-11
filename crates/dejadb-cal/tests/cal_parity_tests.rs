@@ -28,6 +28,9 @@ fn every_governed_operation_has_a_cal_spelling() {
         ("supersede", format!(r#"SUPERSEDE {H} SET object = "x" BECAUSE "t""#), Evolve),
         ("revert", format!(r#"REVERT {H} BECAUSE "t""#), Evolve),
         ("remember", r#"REMEMBER "the caller prefers email" WITH session("s1"), role("user"), run("r1")"#.into(), Evolve),
+        // ── the DSAR read (GDPR Art. 15/20 — the erasure selector in
+        //    show-me mode; OMS 1.6 draft) ───────────────────────────────
+        ("subject-report", r#"REPORT SUBJECT "pat" WITH text_mentions"#.into(), Read),
         // ── destruction (Tier 2) ──────────────────────────────────────
         ("forget", format!(r#"FORGET {H} BECAUSE "t""#), Destructive),
         ("forget-subject", r#"FORGET SUBJECT "pat" WITH text_mentions BECAUSE "gdpr""#.into(), Destructive),

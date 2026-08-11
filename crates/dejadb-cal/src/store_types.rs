@@ -1581,6 +1581,15 @@ impl Default for LlmRerankConfig { fn default() -> Self { LlmRerankConfig { cand
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ErasureProof { pub user_id: String, pub count: u64, pub key_fingerprint: String, pub timestamp: i64, pub user_record_deleted: bool }
 
+/// `REPORT SUBJECT` result — the read-only DSAR selection: the matched
+/// identity strings (exact + partition keys) and the matched grains as
+/// `{hash, type, fields}` JSON, full history included.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SubjectReportResult {
+    pub identity_names: Vec<String>,
+    pub grains: Vec<serde_json::Value>,
+}
+
 /// Token/cost usage of one LLM rerank call (stub — reranking lands in M4).
 #[derive(Debug, Clone)]
 pub struct InferenceUsage {

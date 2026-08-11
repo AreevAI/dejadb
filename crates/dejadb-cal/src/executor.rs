@@ -325,6 +325,13 @@ pub enum CalResultPayload {
     Forgotten { target: String, count: u64 },
     /// Result of `PURGE STALE` (Tier 2).
     Purged { count: usize },
+    /// Result of `REPORT SUBJECT` — the read-only DSAR selection: the
+    /// matched identity strings and grains (`{hash, type, fields}`).
+    SubjectReport {
+        subject: String,
+        identity_names: Vec<String>,
+        grains: Vec<serde_json::Value>,
+    },
     /// Returned for Tier 1/2 statements (S-2) or genuinely unsupported paths.
     Unsupported { statement: String, message: String },
 }
@@ -1569,6 +1576,23 @@ impl CalExecutor {
                     Err(e) => Ok(CalResultPayload::Unsupported {
                         statement: "purge".into(),
                         message: format!("PURGE failed: {e}"),
+                    }),
+                }
+            }
+
+            // REPORT SUBJECT — the read-only DSAR selection (OMS 1.6
+            // draft): a pure read under the session's `read` grant, no
+            // destructive gate and no BECAUSE.
+            CalStatement::ReportSubject(rs) => {
+                match store.cal_subject_report(&rs.subject_id, rs.text_mentions) {
+                    Ok(report) => Ok(CalResultPayload::SubjectReport {
+                        subject: rs.subject_id.clone(),
+                        identity_names: report.identity_names,
+                        grains: report.grains,
+                    }),
+                    Err(e) => Ok(CalResultPayload::Unsupported {
+                        statement: "report_subject".into(),
+                        message: format!("REPORT SUBJECT failed: {e}"),
                     }),
                 }
             }
@@ -3800,6 +3824,18 @@ impl CalExecutor {
                 (None, "parallel_batch".to_string(), vec![], filters)
             }
             CalStatement::Describe(_) => (None, "introspection".to_string(), vec![], vec![]),
+            CalStatement::ReportSubject(rs) => {
+                let mut filters = vec![format!("subject: {}", rs.subject_id)];
+                if rs.text_mentions {
+                    filters.push("text_mentions".to_string());
+                }
+                (
+                    None,
+                    "subject_report".to_string(),
+                    vec!["terms_dictionary".to_string(), "fts_postings".to_string()],
+                    filters,
+                )
+            }
             CalStatement::Purge(purge) => {
                 let mut filters = vec![];
                 if let Some(age) = purge.min_age_days {
@@ -4975,6 +5011,7 @@ fn statement_type_name(stmt: &CalStatement) -> String {
         CalStatement::Revert(_) => "revert",
         CalStatement::Forget(_) => "forget",
         CalStatement::Purge(_) => "purge",
+        CalStatement::ReportSubject(_) => "report_subject",
         CalStatement::DefineTemplate(_) => "define_template",
         CalStatement::DropTemplate(_) => "drop_template",
         CalStatement::DefineQuery(_) => "define_query",
@@ -5023,7 +5060,8 @@ fn required_scope_for_statement(stmt: &CalStatement) -> &'static str {
         | CalStatement::DerivedFrom(_)
         | CalStatement::ShowForks(_)
         | CalStatement::Related(_)
-        | CalStatement::Novelty(_) => "read",
+        | CalStatement::Novelty(_)
+        | CalStatement::ReportSubject(_) => "read",
 
         CalStatement::Add(_)
         | CalStatement::AddWorkflow(_)
@@ -5111,6 +5149,7 @@ fn count_payload_results(payload: &CalResultPayload) -> usize {
         CalResultPayload::Accumulated { .. } => 1,
         CalResultPayload::Forgotten { .. } => 1,
         CalResultPayload::Purged { count } => *count,
+        CalResultPayload::SubjectReport { grains, .. } => grains.len(),
         CalResultPayload::Unsupported { .. } => 0,
         CalResultPayload::TemplateDefined { .. } => 1,
         CalResultPayload::TemplateDropped { .. } => 1,

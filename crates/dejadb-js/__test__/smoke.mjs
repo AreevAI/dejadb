@@ -682,3 +682,29 @@ test('indexText on the constructor is a deliberate re-stamp', async () => {
   )
   on.close()
 })
+
+test('subjectReport mirrors erasure and subjectBundle is portable', async () => {
+  // The DSAR read (GDPR Art. 15/20): the erasure selector in show-me mode.
+  const m = makeDb()
+  await m.addFact('pat', 'prefers', 'tea')
+  await m.addFact('pat#visit1', 'note', 'arrived late')
+  await m.addFact('mary', 'prefers', 'juice')
+
+  const report = JSON.parse(await m.subjectReport('pat'))
+  assert.equal(report.grains.length, 2, 'exact + partition key, never mary')
+  assert.ok(report.identity_names.includes('pat#visit1'))
+  for (const g of report.grains) {
+    assert.equal(g.hash.length, HEX64)
+    assert.notEqual(g.fields.subject, 'mary')
+  }
+
+  const bundle = join(mkdtempSync(join(tmpdir(), 'dejadb-js-')), 'pat.mgb')
+  const stats = JSON.parse(await m.subjectBundle(bundle, 'pat'))
+  assert.equal(stats.ops, 2)
+
+  // Erasure removes exactly what the report showed.
+  const erased = JSON.parse(await m.forgetSubject('pat'))
+  assert.equal(erased.grains_erased, report.grains.length)
+  assert.deepEqual(JSON.parse(await m.subjectReport('pat')).grains, [])
+  await m.close()
+})

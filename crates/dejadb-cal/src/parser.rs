@@ -40,8 +40,8 @@ use super::ast::{
 use super::ast::{
     DefineQueryStmt, DerivedFromStmt, DropQueryStmt, EntityAtStmt, ForgetStmt, ForgetTarget,
     GovernanceStmt, GrantStmt, MergeStmt, NoveltyStmt, PurgeStmt, QueryParam, RelatedStmt,
-    RememberStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, RunTraceStmt, RunsTouchingStmt,
-    ShowForksStmt, ShowGrantsStmt, TemplateSectionSources,
+    RememberStmt, ReportSubjectStmt, RevokeStmt, RunLoopStmt, RunQueryStmt, RunTraceStmt,
+    RunsTouchingStmt, ShowForksStmt, ShowGrantsStmt, TemplateSectionSources,
 };
 use super::errors::{CalError, CalResult, CalWarning, Span};
 use super::lexer::{is_destructive_keyword, Lexer, SectionBody, SpannedToken, Token};
@@ -201,7 +201,8 @@ pub(crate) fn check_read_only_statement(stmt: &CalStatement, span: &Span) -> Cal
         | CalStatement::DerivedFrom(_)
         | CalStatement::ShowForks(_)
         | CalStatement::Related(_)
-        | CalStatement::Novelty(_) => Ok(()),
+        | CalStatement::Novelty(_)
+        | CalStatement::ReportSubject(_) => Ok(()),
         CalStatement::Merge(_) => write("MERGE"),
         CalStatement::Forget(_) => write("FORGET"),
         CalStatement::Purge(_) => write("PURGE"),
@@ -1332,6 +1333,12 @@ impl Parser {
                 token: Token::Purge,
                 ..
             }) => self.parse_purge(),
+            // REPORT SUBJECT — the read-only DSAR selection (OMS 1.6
+            // draft): the erasure selector in show-me mode.
+            Some(SpannedToken {
+                token: Token::Report,
+                ..
+            }) => self.parse_report_subject(),
             // Governance (CAL 1.3 §8.16): the loop lifecycle in the
             // language, BECAUSE as syntax.
             Some(SpannedToken {
@@ -5295,6 +5302,73 @@ impl Parser {
             target: ForgetTarget::Hash { hash },
             reason,
             text_mentions: false,
+            span: Some(Span::new(
+                span_start.start,
+                span_end.end,
+                span_start.line,
+                span_start.col,
+            )),
+        }))
+    }
+
+    /// Parse `REPORT SUBJECT "<id>" [WITH text_mentions]` — the read-only
+    /// DSAR selection (OMS 1.6 draft). No BECAUSE: it is a pure read, and
+    /// reads don't carry reasons.
+    fn parse_report_subject(&mut self) -> CalResult<CalStatement> {
+        let span_start = self.current_span();
+        self.expect_exact(&Token::Report)?;
+        match self.peek() {
+            Some(SpannedToken { token: Token::Ident(word), .. })
+                if word.eq_ignore_ascii_case("SUBJECT") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(CalError::UnexpectedToken {
+                    expected: "SUBJECT".into(),
+                    found: other
+                        .map(|t| t.token.description())
+                        .unwrap_or_else(|| "end of input".into()),
+                    span: other.map(|t| t.span),
+                    suggestion: Some(
+                        "the DSAR read is spelled REPORT SUBJECT \"<id>\" \
+                         [WITH text_mentions]"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        let subject_id = self.parse_string_literal()?;
+        let mut text_mentions = false;
+        if self.at_exact(&Token::With) {
+            self.advance();
+            match self.peek() {
+                Some(SpannedToken { token: Token::Ident(opt), .. })
+                    if opt.eq_ignore_ascii_case("text_mentions") =>
+                {
+                    self.advance();
+                    text_mentions = true;
+                }
+                other => {
+                    return Err(CalError::UnexpectedToken {
+                        expected: "text_mentions".into(),
+                        found: other
+                            .map(|t| t.token.description())
+                            .unwrap_or_else(|| "end of input".into()),
+                        span: other.map(|t| t.span),
+                        suggestion: Some(
+                            "REPORT SUBJECT supports exactly one option: \
+                             WITH text_mentions"
+                                .into(),
+                        ),
+                    });
+                }
+            }
+        }
+        let span_end = self.prev_span();
+        Ok(CalStatement::ReportSubject(ReportSubjectStmt {
+            subject_id,
+            text_mentions,
             span: Some(Span::new(
                 span_start.start,
                 span_end.end,

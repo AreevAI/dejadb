@@ -51,7 +51,7 @@ per line to stdout. It handles these methods:
 |---|---|
 | `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
 | `ping` | Returns an empty result |
-| `tools/list` | Returns the thirteen tool definitions (with input schemas) |
+| `tools/list` | Returns the fourteen tool definitions (with input schemas) |
 | `tools/call` | Invokes a tool by `name` with `arguments` |
 
 Conventions:
@@ -98,7 +98,7 @@ multi-tenant host gives an agent a session it must not escape.
 
 ---
 
-## The thirteen tools
+## The fourteen tools
 
 ### `dejadb_recall`
 
@@ -165,6 +165,26 @@ server's destructive-ops flag (on by default — disable with
 | `hash` | string | **yes** | Content address (64-hex) to forget |
 
 Returns `{ "forgotten": "<hash>" }`.
+
+### `dejadb_subject_report`
+
+The DSAR read (GDPR Art. 15 access / Art. 20 portability): everything
+`FORGET SUBJECT` **would** erase for one identity — the exact subject, its
+partition-style keys (`pat`, `pat#visit1` — never `patricia`), and the full
+history — hydrated instead of erased. Read-only: it is **not** behind the
+destructive-ops flag, needs only the session's `read` grant, and writes no
+audit grain (the audit obligation is on destruction, not access). The CAL
+spelling is `REPORT SUBJECT "<id>" [WITH text_mentions]`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `subject` | string | **yes** | The identity to report on |
+| `text_mentions` | boolean | no | Also include grains whose indexed text mentions the identity (needs the text index on and fully built) |
+
+Returns `{ "subject", "identity_names": [...], "count", "grains": [{hash, type, fields}, ...] }`.
+
+The report and `FORGET SUBJECT` run one selector, so "show me everything,
+then delete it" is two calls over exactly the same set.
 
 ### `dejadb_remember`
 

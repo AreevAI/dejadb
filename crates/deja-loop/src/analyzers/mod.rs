@@ -1,4 +1,4 @@
-//! The six default built-in analyzers (proposal §8). Each computes over
+//! The built-in analyzers (proposal §8). Each computes over
 //! declared grain semantics — never raw prose — so the deterministic layer
 //! works with zero models. All produce *pending* drafts; the engine stamps
 //! identity/origin and runs the governance gates.
@@ -11,6 +11,7 @@ pub mod duplicate_sweep;
 pub mod fork_surfacing;
 pub mod goal_stagnation;
 pub mod outcome_review;
+pub mod retention_sweep;
 pub mod skill_stall;
 pub mod staleness;
 pub mod tool_failure;

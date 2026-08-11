@@ -525,6 +525,10 @@ pub enum Token {
     #[token("PURGE", ignore(ascii_case))]
     Purge,
 
+    /// `REPORT SUBJECT` — the read-only DSAR selection (OMS 1.6 draft).
+    #[token("REPORT", ignore(ascii_case))]
+    Report,
+
     #[token("SET", ignore(ascii_case))]
     Set,
 
@@ -967,6 +971,7 @@ impl Token {
             Token::Rollback => "ROLLBACK".into(),
             Token::Forget => "FORGET".into(),
             Token::Purge => "PURGE".into(),
+            Token::Report => "REPORT".into(),
             Token::Set => "SET".into(),
             Token::Reason => "REASON".into(),
             Token::Because => "BECAUSE".into(),
@@ -1075,6 +1080,7 @@ impl Token {
                 | Token::Revert
                 | Token::Forget
                 | Token::Purge
+                | Token::Report
                 | Token::Drop
                 | Token::Run
         )

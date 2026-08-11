@@ -690,6 +690,64 @@ impl DejaDB {
         .to_string())
     }
 
+    /// DSAR read (GDPR Art. 15/20): everything `forget_subject` WOULD erase
+    /// for one identity — exact + partition keys, full history — as
+    /// `{"identity_names": [...], "grains": [{hash, type, fields}, ...]}`.
+    /// The same selector as erasure, in show-me mode.
+    #[pyo3(signature = (subject, ns = None, text_mentions = false))]
+    fn subject_report(
+        &self,
+        py: Python<'_>,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions };
+        let rep = py
+            .detach(|| self.facade.with_store(|m| m.subject_report_with(&ns, &subject, opts)))
+            .map_err(err)?;
+        let grains: Vec<serde_json::Value> = rep
+            .grains
+            .iter()
+            .map(|g| {
+                json!({
+                    "hash": g.hash.to_hex(),
+                    "type": g.grain_type.as_str(),
+                    "fields": g.fields.clone().into_iter().collect::<serde_json::Map<_, _>>(),
+                })
+            })
+            .collect();
+        Ok(json!({ "identity_names": rep.identity_names, "grains": grains }).to_string())
+    }
+
+    /// Export the subject selection as a portable MGB1 bundle (GDPR Art. 20
+    /// portability) — importable into any OMS store. Returns the bundle
+    /// stats JSON.
+    #[pyo3(signature = (path, subject, ns = None, text_mentions = false))]
+    fn subject_bundle(
+        &self,
+        py: Python<'_>,
+        path: String,
+        subject: String,
+        ns: Option<String>,
+        text_mentions: bool,
+    ) -> PyResult<String> {
+        let ns = ns.unwrap_or_else(|| self.ns.clone());
+        let opts = dejadb_store::ErasureOptions { text_mentions };
+        let stats = py
+            .detach(|| {
+                self.facade.with_store(|m| m.subject_bundle_with(&ns, &subject, opts, &path))
+            })
+            .map_err(err)?;
+        Ok(json!({
+            "ops": stats.ops,
+            "bytes": stats.bytes,
+            "last_op_seq": stats.last_op_seq,
+        })
+        .to_string())
+    }
+
     /// Retention sweep: erase every grain with `created_at` older than
     /// `cutoff_ms` (epoch milliseconds), optionally limited to one grain
     /// type (e.g. "event") and scoped to the session namespace (or `ns`;

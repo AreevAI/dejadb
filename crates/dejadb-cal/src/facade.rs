@@ -247,6 +247,20 @@ pub trait CalStoreFacade: Send + Sync {
         ))
     }
 
+    /// `REPORT SUBJECT` — the read-only DSAR selection: everything
+    /// `cal_forget_user` would erase, hydrated instead of erased. Maps to
+    /// `DejaDB::subject_report_with()`. A read (gated by the `read` grant),
+    /// not a destructive op.
+    fn cal_subject_report(
+        &self,
+        _subject_id: &str,
+        _text_mentions: bool,
+    ) -> Result<crate::store_types::SubjectReportResult> {
+        Err(dejadb_core::error::DejaDbError::Internal(
+            "subject report not available on this facade".into(),
+        ))
+    }
+
     /// Concrete-type escape hatch for host layers that sit above this
     /// crate (the governance seam): a `GovernanceHost` receives the store
     /// as `&dyn CalStoreFacade` and needs the concrete facade back to
@@ -532,6 +546,8 @@ impl Default for CalCapabilities {
                 "REVERT".into(),
                 "FORGET".into(),
                 "PURGE".into(),
+                // The read-only DSAR selection (OMS 1.6 draft).
+                "REPORT".into(),
                 "DROP".into(),
                 // Saved queries and custom templates persist in the file's
                 // host metadata, so the engine can honestly claim them.
@@ -949,7 +965,9 @@ mod tests {
         let caps = CalCapabilities::default();
         assert_eq!(caps.cal_version, 1);
         assert_eq!(caps.conformance_level, 2);
-        assert_eq!(caps.supported_statements.len(), 17);
+        assert_eq!(caps.supported_statements.len(), 18);
+        // The DSAR read joined in the GDPR compliance pack (OMS 1.6 draft).
+        assert!(caps.supported_statements.contains(&"REPORT".to_string()));
         assert!(caps.supported_statements.contains(&"RECALL".to_string()));
         // Saved queries and templates persist in the file's host metadata.
         assert!(caps.supported_statements.contains(&"DEFINE".to_string()));
