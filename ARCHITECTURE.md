@@ -550,7 +550,9 @@ through the review queue), and three **telemetry-fed** analyzers — cold grains
 coverage gaps, and budget pressure — that move Deja Loop from *hygiene* (is
 memory internally correct?) to *utility* (is memory used, and does it help?). Precision
 is measured, not asserted: the `loop_precision` bench scores each analyzer
-against a labeled fixture and gates CI. Teams extend the set without recompiling
+against a labeled fixture and fails below its floor when explicitly run. It is
+not a CI workflow step; the reusable metric arithmetic and loop/golden tests
+are covered by `cargo test --workspace`. Teams extend the set without recompiling
 via `--analyzer-cmd`: a subprocess that reads a live-grain snapshot and returns
 advisory findings, at trust class `command` (auto-apply `never`) — it surfaces,
 never mutates. `deja loop reflect` re-runs every analyzer over the whole

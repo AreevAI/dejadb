@@ -108,7 +108,7 @@ question.
 `pip/npm/cargo install dejadb`; `deja migrate` imports from mem0 (with real
 supersession history), LangGraph/LangMem, Letta (+archival), Zep/Graphiti,
 basic-memory, generic JSONL, and OpenAI-style tool logs — idempotent, so
-re-running is safe; the MCP server (14 tools) and the Anthropic memory-tool
+re-running is safe; the MCP server (16 tools) and the Anthropic memory-tool
 adapter plug into stacks we'll never see; the Hermes provider slots into an
 existing Hermes install with two commands.
 

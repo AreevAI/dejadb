@@ -137,3 +137,28 @@ fn full_mode_keeps_a_recall_log() {
     assert!(!m.telemetry_access_stats(None).unwrap().is_empty());
     assert!(sidecar_path(&dir).exists());
 }
+
+#[test]
+fn full_mode_joins_recalls_to_runs_without_splitting_intent_rollups() {
+    let dir = TempDir::new().unwrap();
+    let mut m = open(&dir, TelemetryMode::Full);
+    m.add(&fact("caller", "alice", "prefers", "window seat")).unwrap();
+    m.set_run_id(Some("run-a"));
+    m.recall_hybrid("caller", None, None, Some("window seat"), 16, None)
+        .unwrap();
+    m.set_run_id(Some("run-b"));
+    m.recall_hybrid("caller", None, None, Some("window seat"), 16, None)
+        .unwrap();
+    m.set_run_id(None);
+
+    let all = m.telemetry_recall_log(None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all.iter().filter_map(|row| row.run_id.as_deref()).collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["run-a", "run-b"])
+    );
+    assert_eq!(m.telemetry_recall_log(Some("run-a")).unwrap().len(), 1);
+    let stats = m.telemetry_query_stats(Some("caller")).unwrap();
+    assert_eq!(stats.len(), 1, "run_id must not enter the query intent key");
+    assert_eq!(stats[0].run_count, 2);
+}

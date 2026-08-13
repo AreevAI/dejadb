@@ -51,7 +51,7 @@ per line to stdout. It handles these methods:
 |---|---|
 | `initialize` | Returns `protocolVersion`, `capabilities.tools`, and `serverInfo` |
 | `ping` | Returns an empty result |
-| `tools/list` | Returns the fourteen tool definitions (with input schemas) |
+| `tools/list` | Returns the sixteen tool definitions (with input schemas) |
 | `tools/call` | Invokes a tool by `name` with `arguments` |
 
 Conventions:
@@ -98,7 +98,7 @@ multi-tenant host gives an agent a session it must not escape.
 
 ---
 
-## The fourteen tools
+## The sixteen tools
 
 ### `dejadb_recall`
 
@@ -111,6 +111,7 @@ grains newest-first.
 | `relation` | string | no | Optional relation filter, e.g. `"prefers"` |
 | `namespace` | string | no | Defaults to the session namespace |
 | `k` | integer | no | Max results (default 16) |
+| `run_id` | string | no | Ambient trajectory run id recorded on recall telemetry |
 
 Returns a JSON array of `{ hash, type, fields }` objects.
 
@@ -362,6 +363,34 @@ The typical `mcpServers` config block:
   }
 }
 ```
+
+### `dejadb_record_tool_call`
+
+Record one tool invocation as a trajectory Tool grain, keeping JSON arguments
+separate from the result and preserving failures and provider call ids.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `tool_name` | string | **yes** | Tool/function name |
+| `result` | string | **yes** | Tool result text or JSON string |
+| `input` | any JSON | no | Tool arguments |
+| `is_error` | boolean | no | Whether the invocation failed (default `false`) |
+| `thread` | string | no | Session/thread id |
+| `call_id` | string | no | Provider call id; synthesized when absent |
+| `namespace` | string | no | Defaults to the session namespace |
+
+### `dejadb_run_manifest`
+
+Persist a reproducible run configuration as a content-addressed State grain
+plus the run-to-config Fact link. The `config` object should pin the model
+build/adapter/quantization/runtime, sampling parameters, prompt, and tools.
+This tool is unavailable in a namespace-locked MCP session because its records
+live in reserved namespace `agent:harness`.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `run_id` | string | **yes** | Run identifier used by trajectory grains |
+| `config` | object | **yes** | Reproducible run configuration |
 
 Only the stdio (`--mcp`) transport is available; the server refuses any other
 `serve` transport. Because the server inherits the trust boundary of the process

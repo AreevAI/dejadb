@@ -234,6 +234,7 @@ mod tests {
     fn never_proposes_erasing_governance_state() {
         let mut sub = TestSubstrate::new();
         sub.add_fact_at("agent:authz", "user:bot", "mg:permits", "read ON *", DAY);
+        sub.add_fact_at("agent:harness", "run:r1", "mg:harness", "config", DAY);
         sub.add_fact_at("caller", "old", "note", "ancient", DAY);
         let drafts = sub.analyze_with(
             &RetentionSweep::new(),
@@ -242,7 +243,11 @@ mod tests {
         );
         assert_eq!(drafts.len(), 1, "only the user namespace: {drafts:?}");
         let Proposal::Cal { cal } = &drafts[0].proposal else { panic!("expected CAL") };
-        assert_eq!(cal.lines().count(), 1, "the grant grain is not named: {cal}");
+        assert_eq!(
+            cal.lines().count(),
+            1,
+            "reserved grant and harness grains are not named: {cal}"
+        );
     }
 
     #[test]

@@ -53,6 +53,13 @@ fn mcp_round_trip() {
         // leaves it believing the option worked (#68).
         rpc(11, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
             "query": "RECALL facts WHERE subject = \"alice\" WITH score_breakdown"}})),
+        rpc(12, "tools/call", serde_json::json!({"name": "dejadb_record_tool_call", "arguments": {
+            "tool_name": "stripe_refund", "input": {"amount": 42}, "result": "rate limited",
+            "is_error": true, "thread": "call-1", "call_id": "toolu_mcp"}})),
+        rpc(13, "tools/call", serde_json::json!({"name": "dejadb_cal", "arguments": {
+            "query": "RECALL tools WHERE tool_call_id = \"toolu_mcp\""}})),
+        rpc(14, "tools/call", serde_json::json!({"name": "dejadb_run_manifest", "arguments": {
+            "run_id": "run-a", "config": {"model": {"base": "test"}, "sampling": {"seed": 7}}}})),
     ];
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -67,18 +74,20 @@ fn mcp_round_trip() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 11 requests (the notification gets no response)
-    assert_eq!(lines.len(), 11, "one response per request");
+    // 14 requests (the notification gets no response)
+    assert_eq!(lines.len(), 14, "one response per request");
 
     let by_id = |id: u64| lines.iter().find(|v| v["id"] == id).unwrap();
 
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "dejadb");
     let tools = by_id(2)["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 16);
     assert!(
         tools.iter().any(|t| t["name"] == "dejadb_subject_report"),
         "the DSAR read joined in the GDPR compliance pack"
     );
+    assert!(tools.iter().any(|t| t["name"] == "dejadb_record_tool_call"));
+    assert!(tools.iter().any(|t| t["name"] == "dejadb_run_manifest"));
 
     // add returned a hash
     let add_text = by_id(3)["result"]["content"][0]["text"].as_str().unwrap();
@@ -131,6 +140,15 @@ fn mcp_round_trip() {
         Some(1),
         "the remembered turn must be in its run: {trace}"
     );
+
+    let tool_text = by_id(13)["result"]["content"][0]["text"].as_str().unwrap();
+    let tool: serde_json::Value = serde_json::from_str(tool_text).unwrap();
+    assert_eq!(tool["grains"][0]["fields"]["input"]["amount"], 42);
+
+    let manifest_text = by_id(14)["result"]["content"][0]["text"].as_str().unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(manifest_text).unwrap();
+    assert_eq!(manifest["config_hash"].as_str().map(str::len), Some(64));
+    assert_eq!(manifest["link_hash"].as_str().map(str::len), Some(64));
 }
 
 /// `--lock-ns` pins the session: a caller-supplied `namespace` in tool

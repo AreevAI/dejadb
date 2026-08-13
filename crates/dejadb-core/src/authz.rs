@@ -23,6 +23,8 @@ use std::fmt;
 /// (§12.6) is the source of truth for this name — it follows the spec's
 /// `agent:identity` / `agent:recommendations` reserved-namespace precedent.
 pub const AUTHZ_NS: &str = "agent:authz";
+/// Reserved namespace for reproducible run and assembly manifests.
+pub const HARNESS_NS: &str = "agent:harness";
 /// Relation carried by a grant grain (OMS `PERMISSION` category).
 pub const REL_PERMITS: &str = "mg:permits";
 

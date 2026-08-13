@@ -19,8 +19,8 @@ use crate::recommendation::{
 };
 use crate::substrate::{Capabilities, OmsSubstrate, ReadOpts, SubstrateRead};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeSet;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The namespace the loop's own grains (recommendations, audit) live in.
 pub const LOOP_NS: &str = "deja-loop";
@@ -165,6 +165,14 @@ pub struct Engine {
     ground_llm: Option<Box<dyn crate::llm::LlmBackend>>,
 }
 
+struct AnalysisPass {
+    survivors: Vec<Recommendation>,
+    proposed: u64,
+    deduped: u64,
+    analyzers_run: Vec<String>,
+    analyzers_skipped: Vec<AnalyzerSkip>,
+}
+
 impl Engine {
     /// An engine with the default built-ins and a default (fully closed)
     /// policy — nothing auto-applies, no LLM.
@@ -223,6 +231,40 @@ impl Engine {
         &self.analyzers
     }
 
+    /// Run the exact production analysis/validation path without Phase 0
+    /// measurement or Phase 3 persistence. The immutable substrate borrow is
+    /// the replay safety boundary: recommendations, audit grains, state,
+    /// cooldowns, outcomes, and the op-log cannot be changed here.
+    ///
+    /// `overrides` is keyed by full analyzer id and overlays the file's stored
+    /// parameter map. Unknown keys fail closed through `resolve_params` and
+    /// surface as an analyzer skip, exactly as in a production run.
+    pub fn analyze_only<S: OmsSubstrate>(
+        &self,
+        sub: &S,
+        opts: &RunOptions,
+        overrides: &BTreeMap<String, Map<String, Value>>,
+        now_ms: i64,
+    ) -> Result<Vec<Recommendation>> {
+        let persisted = LoopPersisted::from_value(sub.load_state()?)?;
+        let analysis_watermark = if opts.full_sweep {
+            None
+        } else {
+            persisted.state.watermark_ms
+        };
+        Ok(self
+            .analysis_pass(
+                sub,
+                &persisted,
+                opts,
+                overrides,
+                analysis_watermark,
+                now_ms,
+                &[],
+            )?
+            .survivors)
+    }
+
     /// Run one analysis pass. Idempotent under `dedup_key`; the watermark is
     /// advanced at the end, so a crashed run simply re-runs.
     pub fn run<S: OmsSubstrate>(
@@ -248,138 +290,21 @@ impl Engine {
         // Verify gate). Records a measured outcome per due recommendation.
         let outcome_inputs = measure_outcomes(sub, &mut persisted, now_ms)?;
 
-        // Existing live dedup keys (pending/approved) to suppress re-proposals.
-        let existing = existing_dedup_keys(sub, &persisted)?;
-
-        // Phase 1 (shared borrow): run each enabled analyzer.
-        let mut analyzers_run = Vec::new();
-        let mut analyzers_skipped = Vec::new();
-        let mut candidates: Vec<Recommendation> = Vec::new();
-        let caps = sub.capabilities();
-
-        for analyzer in &self.analyzers {
-            let m = analyzer.manifest();
-            let cfg = persisted.config.get(&m.id);
-            let enabled = cfg.and_then(|c| c.enabled).unwrap_or(m.default_on);
-            if !enabled {
-                analyzers_skipped.push(AnalyzerSkip {
-                    id: m.id.clone(),
-                    reason: "disabled".into(),
-                });
-                continue;
-            }
-            if self.policy.denies(m.family()) {
-                analyzers_skipped.push(AnalyzerSkip {
-                    id: m.id.clone(),
-                    reason: "denied by host policy".into(),
-                });
-                continue;
-            }
-            if let Some(missing) = missing_capability(m, caps) {
-                analyzers_skipped.push(AnalyzerSkip {
-                    id: m.id.clone(),
-                    reason: format!("missing capability: {missing}"),
-                });
-                continue;
-            }
-            let overrides = cfg.map(|c| c.params.clone()).unwrap_or_default();
-            let params = match m.resolve_params(&overrides) {
-                Ok(p) => p,
-                Err(e) => {
-                    analyzers_skipped.push(AnalyzerSkip {
-                        id: m.id.clone(),
-                        reason: e.to_string(),
-                    });
-                    continue;
-                }
-            };
-            let ns_owned = cfg.map(|c| c.namespaces.clone()).unwrap_or_default();
-            let ns_slice: &[String] = if ns_owned.is_empty() {
-                &opts.namespaces
-            } else {
-                &ns_owned
-            };
-
-            let reader: &dyn SubstrateRead = &*sub;
-            let ctx = AnalyzeCtx::new(
-                reader,
-                &params,
-                ns_slice,
-                analysis_watermark,
-                now_ms,
-                &outcome_inputs,
-            );
-            match analyzer.analyze(&ctx) {
-                Ok(drafts) => {
-                    analyzers_run.push(m.id.clone());
-                    for d in drafts {
-                        match stamp(m, &params, d, now_ms) {
-                            Ok(rec) => candidates.push(rec),
-                            Err(e) => analyzers_skipped.push(AnalyzerSkip {
-                                id: m.id.clone(),
-                                reason: e.to_string(),
-                            }),
-                        }
-                    }
-                }
-                Err(e) => analyzers_skipped.push(AnalyzerSkip {
-                    id: m.id.clone(),
-                    reason: e.to_string(),
-                }),
-            }
-        }
-
-        // DISCOVER (§9, optional): the LLM proposes additional cited drafts,
-        // stamped origin=llm (never auto-apply). Identity when no backend; a
-        // failed/garbled call drops the contribution, never the run.
-        if self.llm.is_some() {
-            let discovered =
-                self.discover(&*sub, &candidates, analysis_watermark, &opts.namespaces, now_ms);
-            candidates.extend(discovered);
-        }
-
-        // Phase 2: validate/dedup. The dedup_key (family+target+action)
-        // collapses TRUE duplicates (e.g. the same finding across two runs) but
-        // deliberately keeps distinct-family findings on one entity — an entity
-        // can have a contradiction AND a staleness AND an llm-found semantic
-        // issue at once. Novelty of llm findings vs determinism is a semantic
-        // judgement, steered at DISCOVER ("find what determinism misses") and
-        // settled by human review — not an entity-level drop here (too coarse).
-        let proposed = candidates.len() as u64;
-        let mut seen = BTreeSet::new();
-        let mut survivors = Vec::new();
-        for c in candidates {
-            // Effective floor = the stricter of the file config and host policy.
-            let family = crate::manifest::analyzer_family(&c.analyzer);
-            let floor = [severity_floor_for(&persisted, &c.analyzer), self.policy.severity_floor(family)]
-                .into_iter()
-                .flatten()
-                .max();
-            if let Some(floor) = floor {
-                if c.severity < floor {
-                    continue;
-                }
-            }
-            if !seen.insert(c.dedup_key.clone()) {
-                continue; // within-run duplicate
-            }
-            if existing.contains(&c.dedup_key) {
-                continue; // already queued live
-            }
-            if let Some(&until) = persisted.cooldowns.get(&c.dedup_key) {
-                if now_ms < until {
-                    continue; // rejected recently
-                }
-            }
-            survivors.push(c);
-        }
-        let deduped = proposed - survivors.len() as u64;
-
-        // ENRICH (§9, optional): the LLM adds a whitelisted guidance note to
-        // deterministic survivors. The engine-templated summary is untouched.
-        if self.llm.is_some() {
-            self.enrich(&mut survivors);
-        }
+        let AnalysisPass {
+            survivors,
+            proposed,
+            deduped,
+            analyzers_run,
+            analyzers_skipped,
+        } = self.analysis_pass(
+            &*sub,
+            &persisted,
+            opts,
+            &BTreeMap::new(),
+            analysis_watermark,
+            now_ms,
+            &outcome_inputs,
+        )?;
 
         // Phase 3 (needs &mut): store survivors + propose audit, then
         // auto-apply the ones the host policy grants (all gates in §6.3).
@@ -436,6 +361,155 @@ impl Engine {
             deduped,
             stored,
             auto_applied,
+            analyzers_run,
+            analyzers_skipped,
+        })
+    }
+
+    /// Shared Phase 1–2 implementation for production and replay. Cooldowns
+    /// and the live recommendation queue are honored in both modes; only the
+    /// production caller proceeds into the mutating Phase 3 below.
+    #[allow(clippy::too_many_arguments)]
+    fn analysis_pass<S: OmsSubstrate>(
+        &self,
+        sub: &S,
+        persisted: &LoopPersisted,
+        opts: &RunOptions,
+        external_overrides: &BTreeMap<String, Map<String, Value>>,
+        analysis_watermark: Option<i64>,
+        now_ms: i64,
+        outcome_inputs: &[OutcomeInput],
+    ) -> Result<AnalysisPass> {
+        let existing = existing_dedup_keys(sub, persisted)?;
+        let mut analyzers_run = Vec::new();
+        let mut analyzers_skipped = Vec::new();
+        let mut candidates: Vec<Recommendation> = Vec::new();
+        let caps = sub.capabilities();
+
+        for analyzer in &self.analyzers {
+            let m = analyzer.manifest();
+            let cfg = persisted.config.get(&m.id);
+            let enabled = cfg.and_then(|c| c.enabled).unwrap_or(m.default_on);
+            if !enabled {
+                analyzers_skipped.push(AnalyzerSkip {
+                    id: m.id.clone(),
+                    reason: "disabled".into(),
+                });
+                continue;
+            }
+            if self.policy.denies(m.family()) {
+                analyzers_skipped.push(AnalyzerSkip {
+                    id: m.id.clone(),
+                    reason: "denied by host policy".into(),
+                });
+                continue;
+            }
+            if let Some(missing) = missing_capability(m, caps) {
+                analyzers_skipped.push(AnalyzerSkip {
+                    id: m.id.clone(),
+                    reason: format!("missing capability: {missing}"),
+                });
+                continue;
+            }
+            let mut param_overrides = cfg.map(|c| c.params.clone()).unwrap_or_default();
+            if let Some(extra) = external_overrides.get(&m.id) {
+                for (key, value) in extra {
+                    param_overrides.insert(key.clone(), value.clone());
+                }
+            }
+            let params = match m.resolve_params(&param_overrides) {
+                Ok(p) => p,
+                Err(e) => {
+                    analyzers_skipped.push(AnalyzerSkip {
+                        id: m.id.clone(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let ns_owned = cfg.map(|c| c.namespaces.clone()).unwrap_or_default();
+            let ns_slice: &[String] = if ns_owned.is_empty() {
+                &opts.namespaces
+            } else {
+                &ns_owned
+            };
+            let reader: &dyn SubstrateRead = sub;
+            let ctx = AnalyzeCtx::new(
+                reader,
+                &params,
+                ns_slice,
+                analysis_watermark,
+                now_ms,
+                outcome_inputs,
+            );
+            match analyzer.analyze(&ctx) {
+                Ok(drafts) => {
+                    analyzers_run.push(m.id.clone());
+                    for draft in drafts {
+                        match stamp(m, &params, draft, now_ms) {
+                            Ok(rec) => candidates.push(rec),
+                            Err(e) => analyzers_skipped.push(AnalyzerSkip {
+                                id: m.id.clone(),
+                                reason: e.to_string(),
+                            }),
+                        }
+                    }
+                }
+                Err(e) => analyzers_skipped.push(AnalyzerSkip {
+                    id: m.id.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        }
+
+        if self.llm.is_some() {
+            candidates.extend(self.discover(
+                sub,
+                &candidates,
+                analysis_watermark,
+                &opts.namespaces,
+                now_ms,
+            ));
+        }
+
+        let proposed = candidates.len() as u64;
+        let mut seen = BTreeSet::new();
+        let mut survivors = Vec::new();
+        for candidate in candidates {
+            let family = crate::manifest::analyzer_family(&candidate.analyzer);
+            let floor = [
+                severity_floor_for(persisted, &candidate.analyzer),
+                self.policy.severity_floor(family),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            if floor.is_some_and(|floor| candidate.severity < floor) {
+                continue;
+            }
+            if !seen.insert(candidate.dedup_key.clone()) {
+                continue;
+            }
+            if existing.contains(&candidate.dedup_key) {
+                continue;
+            }
+            if persisted
+                .cooldowns
+                .get(&candidate.dedup_key)
+                .is_some_and(|until| now_ms < *until)
+            {
+                continue;
+            }
+            survivors.push(candidate);
+        }
+        let deduped = proposed - survivors.len() as u64;
+        if self.llm.is_some() {
+            self.enrich(&mut survivors);
+        }
+        Ok(AnalysisPass {
+            survivors,
+            proposed,
+            deduped,
             analyzers_run,
             analyzers_skipped,
         })
@@ -999,9 +1073,38 @@ impl Engine {
                     }
                 }
             }
-            // Doc/host targets are applied in the host's world (§12.3); the
-            // engine records mark-applied without a store write.
-            Proposal::Edit { .. } | Proposal::Data { .. } => {}
+            // The engine has no executable Edit primitive. Marking this
+            // Applied used to be a lie (and rollback had no inverse).
+            Proposal::Edit { .. } => {
+                return Err(Error::InvalidProposal(
+                    "Edit proposals require a host executor and cannot be applied by the engine"
+                        .into(),
+                ));
+            }
+            Proposal::Data { data } => {
+                // OutcomeReview is the one executable Data shape: its
+                // `revert_of` points at an earlier applied recommendation.
+                // Reuse the ordinary rollback path so the created hashes are
+                // really retracted and the original lifecycle/audit advances.
+                let revert_of = data.get("revert_of").and_then(Value::as_str).ok_or_else(|| {
+                    Error::InvalidProposal(
+                        "Data proposals are advisory unless they carry a valid revert_of"
+                            .into(),
+                    )
+                })?;
+                self.rollback(
+                    sub,
+                    revert_of,
+                    actor,
+                    observer,
+                    scopes,
+                    &because,
+                    now_ms,
+                )?;
+                // rollback stored a newer lifecycle state; merge this apply
+                // into that state rather than overwriting the rollback.
+                p = LoopPersisted::from_value(sub.load_state()?)?;
+            }
         }
 
         let applied = AppliedRecord {
@@ -1659,7 +1762,7 @@ fn stamp(
     };
     let rollbackable = match &d.proposal {
         Proposal::Cal { .. } => !destructive,
-        Proposal::Edit { .. } => true,
+        Proposal::Edit { .. } => false,
         Proposal::Data { .. } => false,
     };
     let mut evidence = d.evidence;

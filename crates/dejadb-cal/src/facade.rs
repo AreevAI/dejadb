@@ -30,6 +30,19 @@ use crate::store_types::VersionEntry;
 use dejadb_core::error::{Hash, Result};
 use dejadb_core::format::deserialize::DeserializedGrain;
 
+/// Durable evidence for one sampled ASSEMBLE operation. The concrete DejaDB
+/// facade stores it as an Observation in `agent:harness`; mock/foreign stores
+/// may ignore it through the trait's default implementation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AssemblyManifest {
+    pub query: serde_json::Value,
+    pub included_hashes: Vec<String>,
+    pub rendered_sha256: String,
+    pub budget: serde_json::Value,
+    pub dropped_hashes: Vec<String>,
+    pub sources: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // RerankType — which reranker to use for post-merge ASSEMBLE reranking
 // ---------------------------------------------------------------------------
@@ -158,6 +171,10 @@ pub trait CalStoreFacade: Send + Sync {
     /// (telemetry §8): did this ASSEMBLE have to drop grains to fit its token
     /// budget? Default no-op — only a telemetry-backed store overrides it.
     fn note_assembly_budget(&self, _overflow: bool) {}
+
+    /// Persist one sampled assembly manifest. Best-effort by contract: an
+    /// observability write must never turn a successful read into an error.
+    fn note_assembly_manifest(&self, _manifest: &AssemblyManifest) {}
 
     // ── Template management (FR-003) ─────────────────────────────────────
 

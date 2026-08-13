@@ -113,9 +113,9 @@ def test_loop_doc_block_leaves_two_recommendations(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     db = dejadb.DejaDB("loopdoc.db", actor="user:me")
     for _ in range(5):
-        db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+        db.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', is_error=True)
     for _ in range(2):
-        db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
+        db.record_tool_call("stripe_refund", None, '{"ok":true}', is_error=False)
     db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
     db.add_fact("acme", "deploy_target", "eu-west-1", 0.9)
     db.loop_run()

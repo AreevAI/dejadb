@@ -23,7 +23,9 @@ use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::{deserialize_blob, DeserializedGrain};
 use dejadb_core::format::serialize::serialize_grain;
 use dejadb_core::types::Grain;
-use dejadb_core::types::{step_action_node, step_action_relation, STEP_ACTION_PREFIX};
+use dejadb_core::types::{
+    step_action_node, step_action_relation, Observation, RelatedTo, STEP_ACTION_PREFIX,
+};
 use turso::Value;
 use zeroize::Zeroize;
 
@@ -212,6 +214,21 @@ pub struct ErasureReport {
     pub vocab_removed: usize,
     /// CAS blobs reclaimed because only erased grains referenced them.
     pub blobs_reclaimed: usize,
+    /// Content addresses erased by this transaction. Hashes carry no identity
+    /// material and let hosts mark derived corpora/checkpoints stale exactly.
+    pub erased_hashes: Vec<String>,
+}
+
+/// One governed corpus export registry entry, reconstructed from its immutable
+/// Observation grain and `related_to` source edges.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CorpusExportRegistry {
+    pub manifest_hash: String,
+    pub export_id: String,
+    pub destination: String,
+    pub exported_at_ms: i64,
+    pub subject_fingerprints: Vec<String>,
+    pub source_hashes: Vec<String>,
 }
 
 /// Result of [`DejaDB::subject_report`] — the read-only DSAR mirror of
@@ -989,6 +1006,15 @@ fn vec_to_json(v: &[f32]) -> String {
 }
 
 fn now_ms() -> i64 {
+    // Simulation/replay seam shared with `dejadb-loop`. It pins HLC wall
+    // inputs, supersession timestamps, and the missing-created_at index
+    // fallback. A malformed override is fatal by design: silently falling
+    // back to wall time would make a supposedly deterministic replay lie.
+    if let Ok(value) = std::env::var("DEJA_LOOP_NOW_MS") {
+        return value.trim().parse().unwrap_or_else(|_| {
+            panic!("DEJA_LOOP_NOW_MS is set but not epoch milliseconds: {value:?}")
+        });
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1303,6 +1329,9 @@ pub struct DejaDB {
     /// Recall-telemetry sidecar (`<file>.telemetry.db`). `None` when the host
     /// left telemetry `Off` — the recall path then does nothing extra.
     telemetry: Option<Telemetry>,
+    /// Host-scoped trajectory identifier copied into full recall telemetry.
+    /// It is never persisted as a file truth and never changes rollup keys.
+    ambient_run_id: Option<String>,
     /// This process's claim on the memory file, released on drop. `None` on
     /// the Postgres backend, which admits multiple concurrent writers per
     /// memory by design and arbitrates them with an in-schema counters row.
@@ -1602,6 +1631,7 @@ impl DejaDB {
             blob_store,
             blob_key,
             telemetry,
+            ambient_run_id: None,
             _file_guard: file_guard,
         };
 
@@ -1716,6 +1746,13 @@ impl DejaDB {
             }
         }
         self.embedder = Some(e);
+    }
+
+    /// Set the host's ambient trajectory identifier for subsequent recalls.
+    /// Passing `None` clears it. This affects telemetry only; it is neither a
+    /// persisted file truth nor part of the recall-intent rollup key.
+    pub fn set_run_id(&mut self, run_id: Option<&str>) {
+        self.ambient_run_id = run_id.filter(|id| !id.is_empty()).map(str::to_string);
     }
 
     /// Install a cross-encoder reranker (Tier-2). Opt-in per query via
@@ -2246,7 +2283,10 @@ impl DejaDB {
             s = Some(self.term_id(sj)?);
             p = Some(self.term_id(rl)?);
             o = Some(self.term_id(ob)?);
-            osp = self.entity_rels.contains(rl.as_str());
+            // Harness links are content-address joins by definition: callers
+            // need both run -> config and config -> runs even on files whose
+            // older entity-relations declaration predates this reserved edge.
+            osp = rl == "mg:harness" || self.entity_rels.contains(rl.as_str());
         }
         let session = match &gv.session {
             Some(x) => Some(self.term_id(x)?),
@@ -3838,6 +3878,12 @@ impl DejaDB {
         match r {
             Ok(mut out) => {
                 self.db.commit()?;
+                out.report.erased_hashes = out
+                    .hashes
+                    .iter()
+                    .filter_map(|bytes| Hash::try_from_bytes(bytes).ok())
+                    .map(|hash| hash.to_hex())
+                    .collect();
                 self.fts_docs = (self.fts_docs - out.docs).max(0);
                 self.fts_total_len = (self.fts_total_len - out.len_sum).max(0);
                 if !out.scrubbed_terms.is_empty() {
@@ -3978,6 +4024,18 @@ impl DejaDB {
         self.telemetry_flush()?;
         match self.telemetry.as_ref() {
             Some(tel) => tel.query_stats(ns),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Full-mode per-recall telemetry, optionally scoped to a trajectory id.
+    pub fn telemetry_recall_log(
+        &mut self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<RecallLogEntry>> {
+        self.telemetry_flush()?;
+        match self.telemetry.as_ref() {
+            Some(tel) => tel.recall_log(run_id),
             None => Ok(Vec::new()),
         }
     }
@@ -4924,9 +4982,11 @@ impl DejaDB {
         out: &[DeserializedGrain],
         start: std::time::Instant,
     ) {
+        let run_id = self.ambient_run_id.clone();
         if let Some(tel) = self.telemetry.as_mut() {
             tel.record(RecallEvent {
                 ts_ms: now_ms(),
+                run_id,
                 ns: ns.to_string(),
                 subject: subject.map(str::to_string),
                 relation: relation.map(str::to_string),
@@ -5534,6 +5594,148 @@ impl DejaDB {
             }
         }
         Ok(report)
+    }
+
+    /// Record a governed corpus export as an immutable Observation in the
+    /// reserved harness namespace. Source linkage is expressed exclusively as
+    /// reverse-indexable `related_to` edges; identities never enter the grain,
+    /// only their stable fingerprints.
+    pub fn record_corpus_export(
+        &mut self,
+        selector: &str,
+        destination: &str,
+        exported_at_ms: i64,
+        subject_fingerprints: &[String],
+        source_hashes: &[String],
+    ) -> Result<Hash> {
+        use sha2::{Digest, Sha256};
+
+        let mut fingerprints = subject_fingerprints.to_vec();
+        fingerprints.sort();
+        fingerprints.dedup();
+        let mut sources = source_hashes.to_vec();
+        sources.sort();
+        sources.dedup();
+        let mut id_material = selector.as_bytes().to_vec();
+        id_material.extend_from_slice(destination.as_bytes());
+        id_material.extend_from_slice(&exported_at_ms.to_le_bytes());
+        for hash in &sources {
+            id_material.extend_from_slice(hash.as_bytes());
+        }
+        let export_id = format!("export:{}", hex::encode(&Sha256::digest(id_material)[..12]));
+        let mut observation = Observation::new("deja:corpus", "corpus_export")
+            .subject(&export_id)
+            .object("openai_chat_jsonl")
+            .created_at(exported_at_ms);
+        observation.common.namespace = Some(authz::HARNESS_NS.to_string());
+        observation.common.context = Some(serde_json::json!({
+            "corpus_export": true,
+            "selector": selector,
+            "destination": destination,
+            "exported_at_ms": exported_at_ms,
+            "subject_fingerprints": fingerprints,
+            "source_count": sources.len(),
+            "registry_status": "active",
+        }));
+        observation.common.related_to = sources
+            .iter()
+            .map(|hash| RelatedTo {
+                hash: hash.clone(),
+                relation_type: "mg:corpus_source".to_string(),
+                weight: None,
+            })
+            .collect();
+        self.add(&observation)
+    }
+
+    /// Reconstruct the export registry from grains. This deliberately reads no
+    /// `meta` rows: registry entries must replicate in ordinary bundles.
+    pub fn corpus_exports(&mut self) -> Result<Vec<CorpusExportRegistry>> {
+        let mut exports = Vec::new();
+        for grain in self.recent(authz::HARNESS_NS, None, 1_000_000)? {
+            if grain.grain_type != dejadb_core::types::GrainType::Observation {
+                continue;
+            }
+            let Some(context) = grain.fields.get("context").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            if context.get("corpus_export").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            let export_id = grain.get_str("subject").unwrap_or_default().to_string();
+            let destination = context
+                .get("destination")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let exported_at_ms = context
+                .get("exported_at_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(|| grain.get_i64("created_at").unwrap_or(0));
+            let mut subject_fingerprints: Vec<String> = context
+                .get("subject_fingerprints")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            subject_fingerprints.sort();
+            subject_fingerprints.dedup();
+            let mut source_hashes: Vec<String> = grain
+                .fields
+                .get("related_to")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|link| {
+                    link.get("relation_type").and_then(|v| v.as_str())
+                        == Some("mg:corpus_source")
+                })
+                .filter_map(|link| link.get("hash").and_then(|v| v.as_str()).map(str::to_string))
+                .collect();
+            source_hashes.sort();
+            source_hashes.dedup();
+            exports.push(CorpusExportRegistry {
+                manifest_hash: grain.hash.to_hex(),
+                export_id,
+                destination,
+                exported_at_ms,
+                subject_fingerprints,
+                source_hashes,
+            });
+        }
+        exports.sort_by(|a, b| {
+            b.exported_at_ms
+                .cmp(&a.exported_at_ms)
+                .then_with(|| a.manifest_hash.cmp(&b.manifest_hash))
+        });
+        Ok(exports)
+    }
+
+    /// Registry entries that contain a subject fingerprint.
+    pub fn corpus_exports_touching_subject(
+        &mut self,
+        subject: &str,
+    ) -> Result<Vec<CorpusExportRegistry>> {
+        let fingerprint = authz::subject_fingerprint(subject);
+        Ok(self
+            .corpus_exports()?
+            .into_iter()
+            .filter(|entry| entry.subject_fingerprints.contains(&fingerprint))
+            .collect())
+    }
+
+    /// Registry entries derived from at least one of the supplied hashes.
+    pub fn corpus_exports_touching_hashes(
+        &mut self,
+        hashes: &[String],
+    ) -> Result<Vec<CorpusExportRegistry>> {
+        let targets: HashSet<&str> = hashes.iter().map(String::as_str).collect();
+        Ok(self
+            .corpus_exports()?
+            .into_iter()
+            .filter(|entry| entry.source_hashes.iter().any(|h| targets.contains(h.as_str())))
+            .collect())
     }
 
     /// Store statistics (CLI `stats`).
@@ -6179,7 +6381,9 @@ pub mod migrate;
 pub mod telemetry;
 
 pub use asyncdb::AsyncDejaDB;
-pub use telemetry::{AccessStat, BudgetStat, QueryStat, RecallEvent, Telemetry, TelemetryMode};
+pub use telemetry::{
+    AccessStat, BudgetStat, QueryStat, RecallEvent, RecallLogEntry, Telemetry, TelemetryMode,
+};
 
 /// The insert body of an add — the grain row, triples/osp, entity_latest, head
 /// collapse+insert, thread index, embedding, and the OP_ADD op-log row — WITHOUT

@@ -23,43 +23,12 @@
 
 use serde_json::{json, Map, Value};
 use deja_loop::{Engine, GrainRecord, LlmBackend, ReferenceSubstrate, RunOptions};
+use dejadb_bench::{effective_reliability as score, Reliability, Verdict};
 
 // Kept small so the over-generated drafts (one per subject, pos+neg) fit under
 // the engine's per-run MAX_LLM_DRAFTS cap without truncation.
 const N: usize = 3; // planted positives (and decoys)
 const NOW: i64 = 2_000_000_000_000;
-
-/// A human-style label for a surfaced (or abstained) finding.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Verdict {
-    UsefulCorrect,
-    Wrong,
-}
-
-/// The Effective-Reliability report.
-struct Reliability {
-    surfaced: usize,
-    useful_correct: usize,
-    wrong: usize,
-    er: f64,
-    precision: f64,
-    recall: f64,
-    spurious_rate: f64, // wrong / surfaced
-}
-
-/// Score a set of surfaced-finding verdicts. `positives` is how many planted
-/// issues exist; ER divides the net (useful-correct − wrong) by that, so both
-/// a miss (recall) and a false positive (wrong) pull it down.
-fn score(verdicts: &[Verdict], positives: usize) -> Reliability {
-    let surfaced = verdicts.len();
-    let useful_correct = verdicts.iter().filter(|v| **v == Verdict::UsefulCorrect).count();
-    let wrong = verdicts.iter().filter(|v| **v == Verdict::Wrong).count();
-    let er = (useful_correct as f64 - wrong as f64) / positives.max(1) as f64;
-    let precision = if surfaced > 0 { useful_correct as f64 / surfaced as f64 } else { 1.0 };
-    let recall = useful_correct as f64 / positives.max(1) as f64;
-    let spurious_rate = if surfaced > 0 { wrong as f64 / surfaced as f64 } else { 0.0 };
-    Reliability { surfaced, useful_correct, wrong, er, precision, recall, spurious_rate }
-}
 
 /// A deterministic reference reviewer (a stand-in for a real model; see the
 /// module docs). Over-generates at DISCOVER; grounds everything that cites real
@@ -244,43 +213,5 @@ fn main() {
             rep.spurious_rate, rep.recall
         );
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn er_subtracts_for_wrong() {
-        // 4 useful, 1 wrong, 5 planted → ER = (4 − 1)/5 = 0.6.
-        let v = [
-            Verdict::UsefulCorrect,
-            Verdict::UsefulCorrect,
-            Verdict::UsefulCorrect,
-            Verdict::UsefulCorrect,
-            Verdict::Wrong,
-        ];
-        let r = score(&v, 5);
-        assert!((r.er - 0.6).abs() < 1e-9, "er {}", r.er);
-        assert!((r.precision - 0.8).abs() < 1e-9);
-        assert!((r.recall - 0.8).abs() < 1e-9);
-        assert!((r.spurious_rate - 0.2).abs() < 1e-9);
-    }
-
-    #[test]
-    fn er_can_go_negative_when_mostly_wrong() {
-        // 1 useful, 3 wrong, 4 planted → (1 − 3)/4 = −0.5. Over-generation is
-        // punished below zero — the point of the metric.
-        let v = [Verdict::UsefulCorrect, Verdict::Wrong, Verdict::Wrong, Verdict::Wrong];
-        let r = score(&v, 4);
-        assert!((r.er + 0.5).abs() < 1e-9, "er {}", r.er);
-    }
-
-    #[test]
-    fn perfect_abstention_scores_zero_not_negative() {
-        let r = score(&[], 3);
-        assert_eq!(r.er, 0.0);
-        assert_eq!(r.surfaced, 0);
     }
 }

@@ -43,6 +43,7 @@ fn identical_tool_calls_are_distinct_occurrences() {
                 .record_tool_call(
                     "caller",
                     "stripe_refund",
+                    None,
                     r#"{"error":"rate_limited"}"#,
                     true,
                     None,
@@ -54,7 +55,7 @@ fn identical_tool_calls_are_distinct_occurrences() {
     }
     for _ in 0..2 {
         facade
-            .record_tool_call("caller", "stripe_refund", r#"{"ok":true}"#, false, None, None)
+            .record_tool_call("caller", "stripe_refund", None, r#"{"ok":true}"#, false, None, None)
             .unwrap();
     }
 
@@ -103,10 +104,18 @@ fn a_supplied_call_id_is_stored_and_queryable() {
     let (_d, facade) = open_temp();
 
     facade
-        .record_tool_call("caller", "stripe_refund", "boom", true, None, Some("call_a1"))
+        .record_tool_call(
+            "caller",
+            "stripe_refund",
+            Some(r#"{"amount":42,"currency":"USD"}"#),
+            "boom",
+            true,
+            None,
+            Some("call_a1"),
+        )
         .unwrap();
     facade
-        .record_tool_call("caller", "stripe_refund", "boom", true, None, Some("call_a2"))
+        .record_tool_call("caller", "stripe_refund", None, "boom", true, None, Some("call_a2"))
         .unwrap();
 
     let ex = dejadb_cal::CalExecutor::new(dejadb_cal::CalExecutorConfig::default());
@@ -122,6 +131,7 @@ fn a_supplied_call_id_is_stored_and_queryable() {
         Some(1),
         "the supplied id must be stored and filterable, got: {payload}"
     );
+    assert_eq!(payload["grains"][0]["fields"]["input"]["amount"], 42);
 }
 
 /// The end-to-end claim the docs make: five failures out of seven calls
@@ -137,6 +147,7 @@ fn the_documented_proof_block_yields_a_recommendation() {
             .record_tool_call(
                 "caller",
                 "stripe_refund",
+                None,
                 r#"{"error":"rate_limited"}"#,
                 true,
                 None,
@@ -146,7 +157,7 @@ fn the_documented_proof_block_yields_a_recommendation() {
     }
     for _ in 0..2 {
         facade
-            .record_tool_call("caller", "stripe_refund", r#"{"ok":true}"#, false, None, None)
+            .record_tool_call("caller", "stripe_refund", None, r#"{"ok":true}"#, false, None, None)
             .unwrap();
     }
 

@@ -18,6 +18,11 @@ export declare class DejaDb {
    */
   openWarnings(): Promise<string>
   /**
+   * Set the host-scoped run identifier copied into subsequent recall
+   * telemetry. Pass null to clear it; it is never a file truth.
+   */
+  setRunId(runId?: string | undefined | null): void
+  /**
    * Install a command embedder (same contract as the CLI's --embed-cmd):
    * the command gets the text on stdin and must print a JSON array of
    * numbers. Probed once here to learn the dimension. Enables the vector
@@ -235,7 +240,9 @@ export declare class DejaDb {
    * occurrence, which is what makes a tool that failed five times read as
    * five failures; recording is append-only, never de-duplicating.
    */
-  recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null, callId?: string | undefined | null): Promise<string>
+  recordToolCall(name: string, input: string | undefined | null, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null, callId?: string | undefined | null): Promise<string>
+  /** Persist a content-addressed harness config and the run -> config link. */
+  recordRunManifest(runId: string, config: string): Promise<string>
   /**
    * Run one analysis pass. Bare it never gates. `fullSweep` re-analyzes
    * the whole memory (`deja loop reflect` semantics); `policy` is a path

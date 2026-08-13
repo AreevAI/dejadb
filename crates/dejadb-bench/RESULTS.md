@@ -408,8 +408,9 @@ should flag) and N=6 decoys (look-alikes it must not), then runs the real
 engine over the in-memory reference substrate and classifies every proposed
 recommendation by its deterministic summary. On this clean fixture a correct
 analyzer scores precision 1.00 (never fires on a decoy); the bin exits
-non-zero if a default-on analyzer drops below 0.90, so it also guards against
-regressions in CI.
+non-zero if a default-on analyzer drops below 0.90. This is an explicit fixture
+gate, not a CI workflow step; ordinary CI runs the shared metric unit tests and
+the engine's deterministic/golden tests through `cargo test --workspace`.
 
 | analyzer | proposed | TP | FP | precision | recall |
 |---|---|---|---|---|---|
@@ -452,7 +453,8 @@ precision.
 | with verifier (GROUND → VERIFY → ROUTE) | 3 | 3 | 0 | **+1.00** | 1.00 | 1.00 | 0.00 |
 
 The verifier lifts ER from +0.00 to +1.00 on this corpus by filtering the
-decoys; CI guards spurious = 0 and recall ≥ 0.9. This is the **machinery
+decoys; the explicit binary guards spurious = 0 and recall ≥ 0.9, while CI
+unit-tests the shared scorer. This is the **machinery
 number** (mock backend, reference corpus) — it proves the pre-queue filter
 discriminates, not what a given model scores in the field. A live model can be
 scored with `DEJA_LOOP_EVAL_MODEL` (see `loop_reflection.rs`); the live

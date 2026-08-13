@@ -58,7 +58,7 @@ def test_facts_and_recs_are_plain_dicts(tmp_path):
     assert show_facts(db, "acme") == rows
 
     for i in range(4):
-        db.record_tool_call("tool", f"boom {i}", is_error=True, thread="s")
+        db.record_tool_call("tool", None, f"boom {i}", is_error=True, thread="s")
     db.loop_run(full_sweep=True)
     pending = recs(db)
     assert pending and pending[0]["analyzer"].startswith("loop.tool_failure")
@@ -76,7 +76,7 @@ def test_days_later_sets_and_restores_clock_pin(tmp_path):
 def test_verify_checkpoint_via_days_later(tmp_path, capsys):
     db = fresh(str(tmp_path / "h.db"), ns="t")
     for i in range(4):
-        db.record_tool_call("tool", f"boom {i}", is_error=True, thread="s")
+        db.record_tool_call("tool", None, f"boom {i}", is_error=True, thread="s")
     db.loop_run(full_sweep=True)
     db.apply_recommendation(recs(db)[0]["hash"], because="test")
     with days_later(2):

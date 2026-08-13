@@ -26,8 +26,8 @@ import dejadb, json
 db = dejadb.DejaDB("proof.db", actor="user:me")   # actor labels the audit chain
 
 # tool-failure clustering: 5 failures + 2 successes for one tool
-for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
-for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
+for _ in range(5): db.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", None, '{"ok":true}', is_error=False)
 
 # contradiction sweep: two live values under a functional relation
 db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
@@ -113,8 +113,10 @@ help?):
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin
-loop_precision` scores each analyzer against a labeled fixture and gates
-CI at 0.90. On the current fixture the seven default-on analyzers it covers —
+loop_precision` scores each analyzer against a labeled fixture and exits
+non-zero below 0.90 when invoked. The binary is an explicit evaluation command,
+not a workflow step; reusable metric arithmetic plus the loop/golden tests run
+under `cargo test --workspace`. On the current fixture the seven default-on analyzers it covers —
 contradiction, duplicate, staleness, tool-failure, skill-stall, **cold-grains,
 and coverage-gap** — each score **1.00** precision and recall; `fork_surfacing`
 and `outcome_review` need concurrent heads / applied history, and
@@ -140,6 +142,8 @@ can see memory *utility*, not just internal consistency.
   **never syncs** (the hub carries the memory file only), **rebuildable** —
   losing it costs evidence detail, never state. `FORGET` synchronously scrubs
   it. Modes: `off` | `aggregate` (rollups) | `full` (+ a per-recall ring log).
+  A host-scoped `run_id` may be attached to full rows for trajectory joins; it
+  is deliberately excluded from intent-rollup keys.
 
 The console **Sessions** view visualizes it; `GET /api/loop/telemetry` serves it.
 
@@ -230,7 +234,7 @@ Same methods in both (scalars in, JSON strings out):
 
 ```python
 db = dejadb.DejaDB("agent.db", actor="user:alice")
-db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42",
+db.record_tool_call("stripe_refund", args_json, result_json, is_error=True, thread="sess-42",
                     call_id="toolu_01A")   # the provider's tool_call_id, if you have it
 db.loop_run(min_new=20, min_new_errors=3, if_stale="6h")   # gated; bare call never gates
 db.loop_run(full_sweep=True)                 # the `reflect` semantics: whole memory

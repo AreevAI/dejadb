@@ -2,12 +2,14 @@
 //!
 //! Thin shell over dejadb-store + dejadb-cal. One memory = one file.
 
+mod corpus;
+
 use std::collections::HashMap;
 use std::process::ExitCode;
 
 use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::error::Hash;
-use dejadb_core::types::{Fact, Grain, Tool};
+use dejadb_core::types::{ContentBlock, Event, Fact, Grain, TokenUsage, Tool};
 use dejadb_store::{Axis, DejaDB, Direction};
 use dejadb_loop::{now_ms, DejaDbSubstrate};
 use deja_loop::{Decision, Engine, ObserverType, Policy, RecStatus, RunOptions, ScopeSet, Severity};
@@ -41,9 +43,15 @@ COMMANDS:
   add      <subject> <relation> <object>       store a fact (positional)
            [--subject S --relation R --object O] [--ns NS] [--confidence C]
            [--idempotent]   no-op if this exact value is already the head
+  record-tool-call --name NAME [--input JSON] --result TEXT [--is-error]
+           [--thread ID] [--call-id ID] [--ns NS]   append one tool invocation
+  run-manifest --run-id ID --config JSON   persist a reproducible harness
+           configuration and its run link in agent:harness
   recall   <subject> | --subject S   [--relation R] [--ns NS] [-k N]
            [--render sml|toon|markdown|plain|json] [--budget TOKENS]
   cal      <QUERY> [--ns NS]          execute a CAL statement
+  corpus   --select '<READ CAL>' [--out FILE]   stream governed OpenAI chat
+                                      JSONL and record its provenance registry
   search   --query TEXT [--subject S] [-k N]   hybrid recall (BM25 + structural, RRF)
   history  --subject S --relation R [--ns NS]
   provenance <source-hash>            grains distilled from a source (reverse)
@@ -149,6 +157,8 @@ Namespace defaults to \"shared\". Exit code 0 on success.
 Files carry their own settings (text index, entity relations, embedding
 provenance) in an internal meta table; a bare open honors them.
 --index-text true|false explicitly re-stamps the file's declaration.
+--assembly-manifest-sample-rate 0..1 samples ASSEMBLE provenance into
+agent:harness (host-only, default 0/off).
 
 Principals: add --as <principal> to cal/repl/serve/subject-report/forget-subject/
 purge-older-than to run the session under the file's grants for that
@@ -168,6 +178,19 @@ written by add/remember/migrate.";
 
 fn flag(args: &HashMap<String, String>, k: &str) -> Option<String> {
     args.get(k).cloned()
+}
+
+fn assembly_manifest_sample_rate(flags: &HashMap<String, String>) -> Result<f64, String> {
+    let Some(raw) = flag(flags, "assembly-manifest-sample-rate") else {
+        return Ok(0.0);
+    };
+    let rate: f64 = raw
+        .parse()
+        .map_err(|_| "--assembly-manifest-sample-rate must be a number from 0 to 1".to_string())?;
+    if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+        return Err("--assembly-manifest-sample-rate must be from 0 to 1".into());
+    }
+    Ok(rate)
 }
 
 /// Map a short flag to its long name. Terse aliases for what you type on every
@@ -299,6 +322,7 @@ fn write_erasure_audit(
     verb: &str,
     target: &str,
     count: usize,
+    stale_exports: &[dejadb_store::CorpusExportRegistry],
 ) {
     let principal = flag(flags, "as").unwrap_or_else(|| "local:owner".to_string());
     let now = std::time::SystemTime::now()
@@ -306,7 +330,7 @@ fn write_erasure_audit(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let because = flag(flags, "because");
-    let obs = dejadb_core::authz::audit_observation(
+    let mut obs = dejadb_core::authz::audit_observation(
         &principal,
         verb,
         target,
@@ -314,9 +338,46 @@ fn write_erasure_audit(
         count,
         now,
     );
+    if !stale_exports.is_empty() {
+        let mut context = obs
+            .common
+            .context
+            .take()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        context.insert(
+            "stale_corpora".into(),
+            serde_json::to_value(stale_exports).unwrap_or_else(|_| serde_json::json!([])),
+        );
+        obs.common.context = Some(serde_json::Value::Object(context));
+        for export in stale_exports {
+            eprintln!(
+                "deja: corpus {} at {} is stale and must be retired or re-derived",
+                export.export_id, export.destination
+            );
+        }
+    }
     if let Err(e) = m.add(&obs) {
         eprintln!("deja: warning: erasure succeeded but its audit record failed to write: {e}");
     }
+}
+
+fn exports_touching_erased_hashes(
+    exports: &[dejadb_store::CorpusExportRegistry],
+    erased_hashes: &[String],
+) -> Vec<dejadb_store::CorpusExportRegistry> {
+    let erased: std::collections::HashSet<&str> =
+        erased_hashes.iter().map(String::as_str).collect();
+    exports
+        .iter()
+        .filter(|export| {
+            export
+                .source_hashes
+                .iter()
+                .any(|hash| erased.contains(hash.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// True when a `host:port` (or bare host) names a loopback interface. Used to
@@ -390,18 +451,20 @@ fn parse_args(rest: &[String]) -> (HashMap<String, String>, Vec<String>) {
     (flags, positional)
 }
 
-/// Render a Claude Code transcript message's `content` into a single string
-/// for capture, preserving the tool signal a coding agent learns from: not
-/// just assistant/user prose but which tools ran (`tool_use`) and how they
-/// turned out (`tool_result`, flagged when `is_error`). Bodies are truncated
-/// so a single huge tool output can't balloon the stored Event.
-fn render_transcript_content(content: &serde_json::Value) -> String {
-    fn truncate(s: &str, max: usize) -> String {
+/// Map one Claude Code transcript message onto OMS Event content blocks.
+/// Tool-result bodies are bounded so a single command cannot exceed the grain
+/// size cap; every elision is explicit and records the original byte length.
+fn transcript_content_blocks(
+    content: &serde_json::Value,
+    turn: usize,
+) -> (String, Vec<ContentBlock>, Vec<serde_json::Value>) {
+    const TOOL_RESULT_CHARS: usize = 32 * 1024;
+
+    fn truncate(s: &str, max: usize) -> (String, bool) {
         if s.chars().count() <= max {
-            s.to_string()
+            (s.to_string(), false)
         } else {
-            let head: String = s.chars().take(max).collect();
-            format!("{head}… [{}+ chars truncated]", s.chars().count() - max)
+            (s.chars().take(max).collect(), true)
         }
     }
     fn tool_result_body(content: &serde_json::Value) -> String {
@@ -416,31 +479,94 @@ fn render_transcript_content(content: &serde_json::Value) -> String {
             _ => String::new(),
         }
     }
-    match content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b["type"].as_str() {
-                Some("text") => b["text"].as_str().map(str::to_string),
-                Some("tool_use") => {
-                    let name = b["name"].as_str().unwrap_or("tool");
-                    Some(format!("[tool_use {name}] {}", truncate(&b["input"].to_string(), 500)))
-                }
-                Some("tool_result") => {
-                    let flag = if b["is_error"].as_bool().unwrap_or(false) {
-                        " ERROR"
-                    } else {
-                        ""
-                    };
-                    Some(format!("[tool_result{flag}] {}", truncate(&tool_result_body(&b["content"]), 800)))
-                }
-                // Bare `{text: ...}` blocks with no `type` (older transcripts).
-                _ => b["text"].as_str().map(str::to_string),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+    let input_blocks: Vec<&serde_json::Value> = match content {
+        serde_json::Value::String(_) => Vec::new(),
+        serde_json::Value::Array(blocks) => blocks.iter().collect(),
+        _ => Vec::new(),
+    };
+    if let serde_json::Value::String(s) = content {
+        return (
+            s.clone(),
+            vec![ContentBlock::Text { text: s.clone() }],
+            Vec::new(),
+        );
     }
+
+    let mut rendered = Vec::new();
+    let mut typed = Vec::new();
+    let mut elisions = Vec::new();
+    for (block_index, b) in input_blocks.into_iter().enumerate() {
+        match b["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = b["text"].as_str() {
+                    rendered.push(text.to_string());
+                    typed.push(ContentBlock::Text { text: text.to_string() });
+                }
+            }
+            Some("tool_use") => {
+                let name = b["name"].as_str().unwrap_or("tool").to_string();
+                let id = b["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("synthetic:{turn}:{block_index}"));
+                let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                rendered.push(format!("[tool_use {name}] {input}"));
+                typed.push(ContentBlock::ToolUse { id, name, input });
+            }
+            Some("tool_result") => {
+                let original = tool_result_body(&b["content"]);
+                let original_bytes = original.len();
+                let (body, elided) = truncate(&original, TOOL_RESULT_CHARS);
+                let is_error = b.get("is_error").and_then(serde_json::Value::as_bool);
+                let flag = if is_error == Some(true) { " ERROR" } else { "" };
+                rendered.push(format!("[tool_result{flag}] {body}"));
+                typed.push(ContentBlock::ToolResult {
+                    tool_use_id: b["tool_use_id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("synthetic:{turn}:{block_index}")),
+                    content: body,
+                    is_error,
+                });
+                if elided {
+                    elisions.push(serde_json::json!({
+                        "block_index": block_index,
+                        "kind": "tool_result",
+                        "original_bytes": original_bytes,
+                        "kept_chars": TOOL_RESULT_CHARS,
+                    }));
+                }
+            }
+            // Bare `{text: ...}` blocks occur in older transcripts.
+            _ => {
+                if let Some(text) = b["text"].as_str() {
+                    rendered.push(text.to_string());
+                    typed.push(ContentBlock::Text { text: text.to_string() });
+                }
+            }
+        }
+    }
+    (rendered.join("\n"), typed, elisions)
+}
+
+fn transcript_token_usage(message: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = message.get("usage")?.as_object()?;
+    let u32_field = |primary: &str, alias: &str| {
+        usage
+            .get(primary)
+            .or_else(|| usage.get(alias))
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    Some(TokenUsage {
+        input_tokens: u32_field("input_tokens", "input").unwrap_or(0),
+        output_tokens: u32_field("output_tokens", "output").unwrap_or(0),
+        cache_read_tokens: u32_field("cache_read_tokens", "cache_read_input_tokens"),
+        cache_creation_tokens: u32_field(
+            "cache_creation_tokens",
+            "cache_creation_input_tokens",
+        ),
+    })
 }
 
 /// Dispatch one `deja migrate --from <src>` run. Every source is file-based
@@ -494,14 +620,31 @@ fn run_migrate(
                 }
                 let v: serde_json::Value = serde_json::from_str(line)
                     .map_err(|e| format!("{file}:{}: bad JSON: {e}", i + 1))?;
-                for (name, content, is_err) in extract_tool_records(&v) {
-                    let mut t = Tool::new(&name).is_error(is_err);
-                    if !content.is_empty() {
-                        t = t.content(&content);
+                for record in extract_tool_records(&v) {
+                    let mut tool = Tool::new(&record.name)
+                        .is_error(record.is_error)
+                        // Unknown source time is pinned, not replaced with the
+                        // import wall clock, so rerunning the same import can
+                        // actually deduplicate it.
+                        .created_at(record.created_at.unwrap_or(0));
+                    if let Some(input) = record.input {
+                        tool = tool.input(input);
                     }
-                    let t = t.namespace(ns);
-                    m.add(&t).map_err(|e| e.to_string())?;
-                    rep.added += 1;
+                    if !record.content.is_empty() {
+                        tool = tool.content(&record.content);
+                    }
+                    if let Some(call_id) = record.call_id {
+                        tool = tool.tool_call_id(&call_id);
+                    }
+                    let tool = tool.namespace(ns);
+                    let (_, hash) = dejadb_core::format::serialize::serialize_grain(&tool)
+                        .map_err(|e| e.to_string())?;
+                    if m.get(&hash).is_ok() {
+                        rep.skipped += 1;
+                    } else {
+                        m.add(&tool).map_err(|e| e.to_string())?;
+                        rep.added += 1;
+                    }
                 }
             }
             Ok(rep)
@@ -556,14 +699,32 @@ fn run_migrate(
     rep.map_err(|e| e.to_string())
 }
 
-/// Extract `(tool_name, content, is_error)` records from one tool-log JSONL
+#[derive(Debug, Clone, PartialEq)]
+struct ImportedToolRecord {
+    name: String,
+    input: Option<serde_json::Value>,
+    content: String,
+    is_error: bool,
+    call_id: Option<String>,
+    created_at: Option<i64>,
+}
+
+/// Extract typed tool records from one tool-log JSONL
 /// line: a direct `{tool_name, content, is_error}` record, an OpenAI
 /// `role:"tool"` result, or an assistant message carrying a `tool_calls` array.
-fn extract_tool_records(v: &serde_json::Value) -> Vec<(String, String, bool)> {
+fn extract_tool_records(v: &serde_json::Value) -> Vec<ImportedToolRecord> {
     let stringify = |x: &serde_json::Value| match x {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     };
+    let created_at = v
+        .get("created_at")
+        .or_else(|| v.get("timestamp"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+        });
     // Assistant message with a tool_calls array: one record per call.
     if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
         return calls
@@ -574,12 +735,32 @@ fn extract_tool_records(v: &serde_json::Value) -> Vec<(String, String, bool)> {
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .or_else(|| c.get("name").and_then(|n| n.as_str()))?;
-                let args = c
+                let input = c
                     .get("function")
                     .and_then(|f| f.get("arguments"))
-                    .map(&stringify)
-                    .unwrap_or_default();
-                Some((name.to_string(), args, false))
+                    .or_else(|| c.get("input"))
+                    .map(|value| match value {
+                        serde_json::Value::String(raw) => serde_json::from_str(raw)
+                            .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+                        other => other.clone(),
+                    });
+                let is_error = c
+                    .get("is_error")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or_else(|| c.get("error").is_some());
+                let call_id = c
+                    .get("id")
+                    .or_else(|| c.get("tool_call_id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string);
+                Some(ImportedToolRecord {
+                    name: name.to_string(),
+                    input,
+                    content: String::new(),
+                    is_error,
+                    call_id,
+                    created_at,
+                })
             })
             .collect();
     }
@@ -601,7 +782,25 @@ fn extract_tool_records(v: &serde_json::Value) -> Vec<(String, String, bool)> {
                 .get("is_error")
                 .and_then(|e| e.as_bool())
                 .unwrap_or_else(|| v.get("error").is_some());
-            vec![(name.to_string(), content, is_error)]
+            let input = v.get("input").or_else(|| v.get("arguments")).map(|value| match value {
+                serde_json::Value::String(raw) => serde_json::from_str(raw)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.clone())),
+                other => other.clone(),
+            });
+            let call_id = v
+                .get("tool_call_id")
+                .or_else(|| v.get("call_id"))
+                .or_else(|| v.get("id"))
+                .and_then(|id| id.as_str())
+                .map(str::to_string);
+            vec![ImportedToolRecord {
+                name: name.to_string(),
+                input,
+                content,
+                is_error,
+                call_id,
+                created_at,
+            }]
         }
         None => Vec::new(),
     }
@@ -741,6 +940,10 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
     for w in m.open_warnings() {
         eprintln!("deja: warning: {w}");
     }
+    // Host-scoped trajectory context for recall telemetry. The same flag is
+    // also consumed by run-manifest/run-trace commands; it is not a file
+    // declaration.
+    m.set_run_id(flag(&flags, "run-id").as_deref());
 
     // Optional host-supplied embedder: --embed-cmd 'CMD' spawns CMD per embed
     // (text on stdin, JSON array of numbers on stdout). Enables the vector
@@ -804,6 +1007,52 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 let h = m.add(&f).map_err(|e| e.to_string())?;
                 println!("{h}");
             }
+        }
+        "record-tool-call" => {
+            let name = flag(&flags, "name")
+                .or_else(|| positional.first().cloned())
+                .ok_or_else(|| "usage: deja record-tool-call --name NAME --result TEXT [--input JSON] [--is-error] [--thread ID] [--call-id ID]".to_string())?;
+            let result = flag(&flags, "result")
+                .or_else(|| positional.get(1).cloned())
+                .ok_or_else(|| "record-tool-call requires --result TEXT".to_string())?;
+            let input = flag(&flags, "input");
+            let is_error = flag(&flags, "is-error")
+                .map(|v| !matches!(v.as_str(), "false" | "0" | "off" | "no"))
+                .unwrap_or(false);
+            let facade = DejaDbFacade::with_session(m, Some(ns.clone()), None);
+            let facade = apply_principal(facade, &flags)?;
+            let hash = facade
+                .record_tool_call(
+                    &ns,
+                    &name,
+                    input.as_deref(),
+                    &result,
+                    is_error,
+                    flag(&flags, "thread").as_deref(),
+                    flag(&flags, "call-id").as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+            println!("{hash}");
+        }
+        "run-manifest" => {
+            let run_id = flag(&flags, "run-id")
+                .or_else(|| positional.first().cloned())
+                .ok_or_else(|| "run-manifest requires --run-id ID".to_string())?;
+            let config = flag(&flags, "config")
+                .ok_or_else(|| "run-manifest requires --config JSON".to_string())?;
+            let facade = DejaDbFacade::with_session(m, Some(ns), None);
+            let facade = apply_principal(facade, &flags)?;
+            let (config_hash, link_hash) = facade
+                .record_run_manifest(&run_id, &config)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "config_hash": config_hash.to_hex(),
+                    "link_hash": link_hash.to_hex(),
+                })
+            );
         }
         "recall" => {
             // Positional `deja recall <subject>`, or --subject S.
@@ -896,6 +1145,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let facade = apply_principal(facade, &flags)?;
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
+                assembly_manifest_sample_rate: assembly_manifest_sample_rate(&flags)?,
                 ..CalExecutorConfig::default()
             })
             .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new()));
@@ -905,6 +1155,71 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             for w in res.warnings {
                 eprintln!("warning: {w}");
             }
+        }
+        "corpus" => {
+            use dejadb_cal::classify::{classify, StatementClass};
+            use dejadb_cal::executor::CalResultPayload;
+            use std::io::BufWriter;
+
+            let selector = flag(&flags, "select")
+                .or_else(|| positional.first().cloned())
+                .ok_or_else(|| {
+                    "usage: deja corpus --select '<READ CAL>' [--out FILE]".to_string()
+                })?;
+            let parsed = dejadb_cal::parse(&selector).map_err(|e| e.to_string())?;
+            if classify(&parsed.statement) != StatementClass::Read {
+                return Err("corpus selector must classify as a read-only CAL statement".into());
+            }
+            let facade = DejaDbFacade::with_session(m, Some(ns), None);
+            report_meta_warnings(&facade);
+            let facade = apply_principal(facade, &flags)?;
+            let ex = CalExecutor::new(CalExecutorConfig {
+                allow_destructive_ops: false,
+                ..CalExecutorConfig::default()
+            });
+            let result = ex.execute(&selector, &facade).map_err(|e| e.to_string())?;
+            let grains = match result.result {
+                CalResultPayload::Grains { grains, .. }
+                | CalResultPayload::Assembled { grains, .. }
+                | CalResultPayload::Formatted { grains, .. }
+                | CalResultPayload::MultiFormatted { grains, .. } => grains,
+                other => {
+                    return Err(format!(
+                        "corpus selector must return grains, got {}",
+                        serde_json::to_value(other)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                            .unwrap_or_else(|| "non-grain result".into())
+                    ));
+                }
+            };
+            let destination = flag(&flags, "out").unwrap_or_else(|| "stdout".to_string());
+            let summary = if destination == "stdout" {
+                let stdout = std::io::stdout();
+                corpus::write_jsonl(grains, BufWriter::new(stdout.lock()))?
+            } else {
+                let file = std::fs::File::create(&destination)
+                    .map_err(|e| format!("{destination}: {e}"))?;
+                corpus::write_jsonl(grains, BufWriter::new(file))?
+            };
+            let exported_at = now_ms();
+            let manifest = facade
+                .with_store(|store| {
+                    store.record_corpus_export(
+                        &selector,
+                        &destination,
+                        exported_at,
+                        &summary.subject_fingerprints,
+                        &summary.source_hashes,
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "corpus export: {} row(s), {} source grain(s), manifest {}",
+                summary.rows,
+                summary.source_hashes.len(),
+                manifest
+            );
         }
         "history" => {
             let s = need(&flags, "subject")?;
@@ -1275,7 +1590,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 }
             }
             let facade = apply_principal(facade, &flags)?;
-            let mut server = dejadb_mcp::McpServer::new(facade, None);
+            let mut server = dejadb_mcp::McpServer::new(facade, None)
+                .assembly_manifest_sample_rate(assembly_manifest_sample_rate(&flags)?);
             if flags.contains_key("no-destructive-ops") {
                 server = server.allow_destructive_ops(false);
                 eprintln!("deja: destructive operations disabled (read-only session)");
@@ -1295,8 +1611,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
         }
         "capture-stop" => {
             // Claude Code Stop-hook: JSON on stdin with session_id +
-            // transcript_path. Store the last user/assistant exchange as
-            // Event grains (thread-indexed by session).
+            // transcript_path. Store every ordered turn as a typed Event.
             use std::io::Read as IoRead;
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).map_err(|e| e.to_string())?;
@@ -1307,37 +1622,50 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .as_str()
                 .ok_or("hook json missing transcript_path")?;
             let transcript = std::fs::read_to_string(tpath).map_err(|e| e.to_string())?;
-            let mut last: std::collections::HashMap<String, String> = Default::default();
-            for line in transcript.lines() {
+            let mut parent: Option<String> = None;
+            let mut stored = 0;
+            for (turn, line) in transcript.lines().enumerate() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-                let role = v["message"]["role"].as_str().unwrap_or("");
-                if role != "user" && role != "assistant" {
+                let message = &v["message"];
+                let Some(role) = message["role"].as_str() else { continue };
+                let Some(role) = dejadb_core::types::Role::from_str(role) else {
+                    continue;
+                };
+                let (text, blocks, elisions) =
+                    transcript_content_blocks(&message["content"], turn);
+                if text.trim().is_empty() && blocks.is_empty() {
                     continue;
                 }
-                // Capture the tool signal too (tool_use / tool_result +
-                // is_error), not just prose — that is where a coding agent's
-                // "which fix worked / failed review" actually lives.
-                let text = render_transcript_content(&v["message"]["content"]);
-                if !text.trim().is_empty() {
-                    last.insert(role.to_string(), text);
+                let mut event = Event::new(&text)
+                    .namespace(&ns)
+                    .session(session.clone())
+                    .role(role)
+                    .content_blocks(blocks);
+                if let Some(p) = parent.clone() {
+                    event = event.parent_message(p);
                 }
-            }
-            let mut stored = 0;
-            for role in ["user", "assistant"] {
-                if let Some(text) = last.get(role) {
-                    // Same write path as `deja remember` and the MCP tool, so
-                    // a captured turn is the same grain however it arrived.
-                    let meta = dejadb_store::Capture {
-                        observer: None,
-                        session_id: Some(session.as_str()),
-                        role: Some(role),
-                        // A hook capture is not a run; `deja remember --run-id`
-                        // is where a caller names one.
-                        run_id: None,
-                    };
-                    m.capture(&ns, text, &meta).map_err(|e| e.to_string())?;
-                    stored += 1;
+                if let Some(model) = message["model"].as_str().or_else(|| v["model"].as_str()) {
+                    event = event.model(model.to_string());
                 }
+                if let Some(stop) = message["stop_reason"]
+                    .as_str()
+                    .or_else(|| v["stop_reason"].as_str())
+                {
+                    event = event.stop_reason(stop.to_string());
+                }
+                if let Some(usage) = transcript_token_usage(message) {
+                    event = event.token_usage(usage);
+                }
+                if !elisions.is_empty() {
+                    event
+                        .common
+                        .extra_fields
+                        .insert("elisions".into(), serde_json::Value::Array(elisions));
+                }
+                // A hook capture is not a run; run_id deliberately stays None.
+                let hash = m.add(&event).map_err(|e| e.to_string())?;
+                parent = Some(hash.to_hex());
+                stored += 1;
             }
             println!("captured {stored} events for session {session}");
         }
@@ -1447,6 +1775,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let facade = apply_principal(facade, &flags)?;
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: !flags.contains_key("no-destructive-ops"),
+                assembly_manifest_sample_rate: assembly_manifest_sample_rate(&flags)?,
                 ..CalExecutorConfig::default()
             })
             .with_governance(std::sync::Arc::new(dejadb_loop::LoopGovernance::new()));
@@ -1815,6 +2144,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     .map_err(|e| e.to_string())?;
             }
             let rep = m.forget_subject_with(&ns, &subject, opts).map_err(|e| e.to_string())?;
+            let stale_exports = m
+                .corpus_exports_touching_subject(&subject)
+                .unwrap_or_else(|e| {
+                    eprintln!("deja: warning: could not consult corpus registry: {e}");
+                    Vec::new()
+                });
             // The CLI is a host, and hosts audit (REQ-ERASE-5 leaves the
             // record to the host precisely so the engine never writes the
             // identity back). Same builder as the CAL path, so `deja audit
@@ -1830,6 +2165,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     dejadb_core::authz::subject_fingerprint(&subject)
                 ),
                 rep.grains_erased,
+                &stale_exports,
             );
             println!(
                 "erased {} grains ({} dictionary entries, {} vocabulary tokens, {} blobs reclaimed)",
@@ -1884,7 +2220,12 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     .check(dejadb_core::authz::Verb::Erase, ns_opt.unwrap_or("*"))
                     .map_err(|e| e.to_string())?;
             }
+            let exports = m.corpus_exports().unwrap_or_else(|e| {
+                eprintln!("deja: warning: could not consult corpus registry: {e}");
+                Vec::new()
+            });
             let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
+            let stale_exports = exports_touching_erased_hashes(&exports, &rep.erased_hashes);
             write_erasure_audit(
                 &mut m,
                 &flags,
@@ -1895,6 +2236,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                     flag(&flags, "type").map(|t| format!(" type:{t}")).unwrap_or_default()
                 ),
                 rep.grains_erased,
+                &stale_exports,
             );
             println!(
                 "erased {} grains ({} vocabulary tokens, {} blobs reclaimed)",
@@ -2072,6 +2414,10 @@ fn run_retention(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let exports = m.corpus_exports().unwrap_or_else(|e| {
+                eprintln!("deja: warning: could not consult corpus registry: {e}");
+                Vec::new()
+            });
             let results = m.sweep_retention(now).map_err(|e| e.to_string())?;
             let mut total = 0usize;
             for (pns, days, rep) in &results {
@@ -2088,12 +2434,15 @@ fn run_retention(
                 // otherwise add 365 immutable, replicating grains a year per
                 // policy for zero information.
                 if rep.grains_erased > 0 {
+                    let stale_exports =
+                        exports_touching_erased_hashes(&exports, &rep.erased_hashes);
                     write_erasure_audit(
                         m,
                         flags,
                         "erase",
                         &format!("retention:{days}d ns:{pns}"),
                         rep.grains_erased,
+                        &stale_exports,
                     );
                 }
             }
@@ -2569,6 +2918,7 @@ fn run_audit(
                 "subject_ref": ctx.get("subject_ref"),
                 "because": ctx.get("because"),
                 "grains_erased": ctx.get("grains_erased"),
+                "stale_corpora": ctx.get("stale_corpora"),
             }),
         ));
     }
@@ -3066,5 +3416,27 @@ mod tests {
         let (flags, _) = args(&["--mcp", "--no-destructive-ops"]);
         assert_eq!(flags.get("mcp").map(String::as_str), Some("true"));
         assert_eq!(flags.get("no-destructive-ops").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn openai_tool_import_preserves_arguments_error_and_call_id() {
+        let rows = extract_tool_records(&serde_json::json!({
+            "created_at": 42,
+            "tool_calls": [{
+                "id": "call-7",
+                "is_error": true,
+                "function": {
+                    "name": "charge",
+                    "arguments": "{\"amount\":42}"
+                }
+            }]
+        }));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "charge");
+        assert_eq!(rows[0].input, Some(serde_json::json!({"amount": 42})));
+        assert!(rows[0].content.is_empty(), "arguments are not a result");
+        assert!(rows[0].is_error);
+        assert_eq!(rows[0].call_id.as_deref(), Some("call-7"));
+        assert_eq!(rows[0].created_at, Some(42));
     }
 }

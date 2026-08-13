@@ -144,14 +144,23 @@ test('recordToolCall records occurrences, not values', async () => {
   const m = makeDb()
   // Byte-identical retries must each survive as their own grain, or the
   // tool-failure analyzer has nothing to count (#66).
-  for (let i = 0; i < 3; i++) await m.recordToolCall('stripe_refund', 'rate_limited', true)
+  for (let i = 0; i < 3; i++) await m.recordToolCall('stripe_refund', null, 'rate_limited', true)
   const n = JSON.parse(await m.cal('RECALL tools WHERE tool_name = "stripe_refund" | COUNT'))
   assert.equal(n.count, 3, 'three retries are three occurrences')
 
   // A host-supplied call id lands on the grain and is filterable.
-  await m.recordToolCall('stripe_refund', 'rate_limited', true, null, 'call_xyz')
+  await m.recordToolCall('stripe_refund', '{"amount":42}', 'rate_limited', true, null, 'call_xyz')
   const byId = JSON.parse(await m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
   assert.equal(byId.grains.length, 1)
+  assert.equal(byId.grains[0].fields.input.amount, 42)
+
+  const manifest = JSON.parse(await m.recordRunManifest(
+    'run-js', '{"model":{"base":"test"},"sampling":{"seed":7}}'))
+  assert.equal(manifest.config_hash.length, 64)
+  assert.equal(manifest.link_hash.length, 64)
+  m.setRunId('run-js')
+  await m.recall('acct')
+  m.setRunId(null)
 })
 
 test('cal COUNT pipeline', async () => {
@@ -355,9 +364,9 @@ test('loop: record tool calls, run, review, apply', async () => {
   // collapse to a single grain (#66). This loop used to jitter its payloads to
   // work around that.
   for (let i = 0; i < 4; i++) {
-    await m.recordToolCall('stripe_refund', 'rate_limited 429', true)
+    await m.recordToolCall('stripe_refund', null, 'rate_limited 429', true)
   }
-  await m.recordToolCall('stripe_refund', 'ok', false)
+  await m.recordToolCall('stripe_refund', null, 'ok', false)
 
   const run = JSON.parse(await m.loopRun())
   assert.equal(run.outcome, 'ran')

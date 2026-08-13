@@ -10,6 +10,56 @@
 use dejadb_core::types::{Fact, Grain};
 use dejadb_store::{AddableDyn, DejaDB};
 
+/// Human/reference verdict for one surfaced finding. Abstention is represented
+/// by the absence of a verdict, so it scores zero rather than as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    UsefulCorrect,
+    Wrong,
+}
+
+/// Effective-Reliability report shared by offline harnesses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reliability {
+    pub surfaced: usize,
+    pub useful_correct: usize,
+    pub wrong: usize,
+    pub er: f64,
+    pub precision: f64,
+    pub recall: f64,
+    pub spurious_rate: f64,
+}
+
+/// Score surfaced findings against the number of planted/known positives.
+/// Wrong confident findings subtract; abstention contributes zero.
+pub fn effective_reliability(verdicts: &[Verdict], positives: usize) -> Reliability {
+    let surfaced = verdicts.len();
+    let useful_correct = verdicts.iter().filter(|v| **v == Verdict::UsefulCorrect).count();
+    let wrong = verdicts.iter().filter(|v| **v == Verdict::Wrong).count();
+    let denominator = positives.max(1) as f64;
+    let er = (useful_correct as f64 - wrong as f64) / denominator;
+    let precision = if surfaced > 0 {
+        useful_correct as f64 / surfaced as f64
+    } else {
+        1.0
+    };
+    let recall = useful_correct as f64 / denominator;
+    let spurious_rate = if surfaced > 0 {
+        wrong as f64 / surfaced as f64
+    } else {
+        0.0
+    };
+    Reliability {
+        surfaced,
+        useful_correct,
+        wrong,
+        er,
+        precision,
+        recall,
+        spurious_rate,
+    }
+}
+
 pub const RELS: [&str; 6] = ["prefers", "lives_in", "speaks", "allergic_to", "reports_to", "status"];
 
 /// Deterministic xorshift so every engine/surface sees the identical
@@ -81,4 +131,44 @@ pub fn dejadb_bin() -> std::path::PathBuf {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
         });
     target.join("release/deja")
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+
+    #[test]
+    fn er_subtracts_for_wrong() {
+        let verdicts = [
+            Verdict::UsefulCorrect,
+            Verdict::UsefulCorrect,
+            Verdict::UsefulCorrect,
+            Verdict::UsefulCorrect,
+            Verdict::Wrong,
+        ];
+        let report = effective_reliability(&verdicts, 5);
+        assert!((report.er - 0.6).abs() < 1e-9);
+        assert!((report.precision - 0.8).abs() < 1e-9);
+        assert!((report.recall - 0.8).abs() < 1e-9);
+        assert!((report.spurious_rate - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn er_can_go_negative_when_mostly_wrong() {
+        let verdicts = [
+            Verdict::UsefulCorrect,
+            Verdict::Wrong,
+            Verdict::Wrong,
+            Verdict::Wrong,
+        ];
+        let report = effective_reliability(&verdicts, 4);
+        assert!((report.er + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn perfect_abstention_scores_zero_not_negative() {
+        let report = effective_reliability(&[], 3);
+        assert_eq!(report.er, 0.0);
+        assert_eq!(report.surfaced, 0);
+    }
 }
