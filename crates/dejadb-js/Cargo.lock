@@ -637,7 +637,7 @@ checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "deja-loop"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-cal"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "dejadb-core",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-context"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "dejadb-cal",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-core"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "hex",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-js"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "deja-loop",
  "dejadb-cal",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-llm"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "deja-loop",
  "serde",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-loop"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "deja-loop",
  "dejadb-cal",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "dejadb-store"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",

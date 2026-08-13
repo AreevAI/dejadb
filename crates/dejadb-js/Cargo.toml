@@ -1,6 +1,6 @@
 [package]
 name = "dejadb-js"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["MindGryd Software Private Limited"]
@@ -21,13 +21,13 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-dejadb-core = { path = "../dejadb-core", version = "1.1.1" }
+dejadb-core = { path = "../dejadb-core", version = "1.2.0" }
 # The postgres backend ships ON in the binding: it is a server-side surface,
 # and `new DejaDb("postgres://…?schema=<name>")` must work from a stock
 # `npm install dejadb`. The dependency-light default stays with the CLI/store.
-dejadb-store = { path = "../dejadb-store", version = "1.1.1", features = ["postgres"] }
-dejadb-cal = { path = "../dejadb-cal", version = "1.1.1" }
-dejadb-context = { path = "../dejadb-context", version = "1.1.1" }
+dejadb-store = { path = "../dejadb-store", version = "1.2.0", features = ["postgres"] }
+dejadb-cal = { path = "../dejadb-cal", version = "1.2.0" }
+dejadb-context = { path = "../dejadb-context", version = "1.2.0" }
 deja-loop = { path = "../deja-loop" }
 dejadb-loop = { path = "../dejadb-loop" }
 dejadb-llm = { path = "../dejadb-llm" }

@@ -13,11 +13,11 @@ keywords = ["mcp", "memory", "ai-agents", "llm", "protocol"]
 categories = ["api-bindings"]
 
 [dependencies]
-dejadb-core = { path = "../dejadb-core", version = "1.1.1" }
-dejadb-store = { path = "../dejadb-store", version = "1.1.1" }
-dejadb-cal = { path = "../dejadb-cal", version = "1.1.1" }
-deja-loop = { path = "../deja-loop", version = "1.1.1" }
-dejadb-loop = { path = "../dejadb-loop", version = "1.1.1" }
+dejadb-core = { path = "../dejadb-core", version = "1.2.0" }
+dejadb-store = { path = "../dejadb-store", version = "1.2.0" }
+dejadb-cal = { path = "../dejadb-cal", version = "1.2.0" }
+deja-loop = { path = "../deja-loop", version = "1.2.0" }
+dejadb-loop = { path = "../dejadb-loop", version = "1.2.0" }
 serde_json = "1"
 
 [dev-dependencies]
