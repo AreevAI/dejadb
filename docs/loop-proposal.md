@@ -318,7 +318,7 @@ closes the governed loop:
 db = dejadb.DejaDB("support-agent.db", actor="user:alice")
 
 # in the agent's tool loop — one line per call; thread groups a session
-db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42")
+db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42", input=args_json)
 
 # at session end — gated so it no-ops cheaply off the file-truth watermark
 health = db.loop_run(min_new=20, min_new_errors=3, if_stale="6h")
@@ -1257,7 +1257,7 @@ claim the mechanism.
 | Surface | What you get | Status |
 |---|---|---|
 | **Rust** (facade) | Full engine + `register()` for linked analyzers | facade ships today; engine API new |
-| **Python / Node** | `DejaDB(path, actor=…)`; `db.loop_run([min_new, min_new_errors, if_stale])` (ungated when bare); `db.recommendations(filter)`; `db.apply_recommendation(id, because=…)` (audited approve+apply); `db.dismiss_recommendation(id, why)`; **`db.record_tool_call(name, result, is_error, thread=…)`** | new methods, both bindings, existing scalars-in/JSON-out convention; governance semantics §6.6 |
+| **Python / Node** | `DejaDB(path, actor=…)`; `db.loop_run([min_new, min_new_errors, if_stale])` (ungated when bare); `db.recommendations(filter)`; `db.apply_recommendation(id, because=…)` (audited approve+apply); `db.dismiss_recommendation(id, why)`; **`db.record_tool_call(name, result, is_error, thread=…, input=input_json)`** | new methods, both bindings, existing scalars-in/JSON-out convention; governance semantics §6.6 |
 | **CLI** | the `deja loop` namespace (status, `run`, queue verbs, analyzer config) + `deja init` | new verbs |
 | **Claude Code** | 3-hook loop: UserPromptSubmit recall-hook (gains `--with-loop`), Stop capture-stop, SessionEnd `deja loop run --min-new 20 --min-new-errors 3 --quiet` | two hooks ship today; third is a new printed line |
 | **MCP** | `dejadb_loop`, `dejadb_recommendations` (+ the existing 6 tools); supervisor pattern (§4.3) | new tools |

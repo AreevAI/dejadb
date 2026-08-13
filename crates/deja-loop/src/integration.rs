@@ -3,11 +3,102 @@
 //! destructive gate, scopes, and the self-approval block. Compiled only under
 //! `cfg(test)`.
 
-use crate::engine::{Decision, Engine, RunOptions, RunOutcome, Scope, ScopeSet, SkipReason};
+use crate::engine::{Decision, Engine, RunOptions, RunOutcome, Scope, ScopeSet, SkipReason, LOOP_NS};
 use crate::error::Error;
 use crate::policy::Policy;
-use crate::recommendation::{ObserverType, RecStatus};
+use crate::recommendation::{ObserverType, RecStatus, Recommendation};
 use crate::testkit::TestSubstrate;
+
+struct CountingSubstrate<'a> {
+    inner: &'a mut crate::reference::ReferenceSubstrate,
+    effect_calls: usize,
+    unpinned_specs: usize,
+}
+
+impl CountingSubstrate<'_> {
+    fn note_spec(&mut self, spec: &crate::substrate::GrainSpec) {
+        self.effect_calls += 1;
+        if !spec.fields.contains_key("created_at_ms") && !spec.fields.contains_key("at_ms") {
+            self.unpinned_specs += 1;
+        }
+    }
+}
+
+impl crate::substrate::SubstrateRead for CountingSubstrate<'_> {
+    fn capabilities(&self) -> crate::substrate::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn grains_of_type(
+        &self,
+        grain_type: &str,
+        namespace: Option<&str>,
+        opts: crate::substrate::ReadOpts,
+    ) -> crate::error::Result<Vec<crate::model::GrainRecord>> {
+        self.inner.grains_of_type(grain_type, namespace, opts)
+    }
+
+    fn grain(&self, hash: &str) -> crate::error::Result<Option<crate::model::GrainRecord>> {
+        self.inner.grain(hash)
+    }
+
+    fn heads(
+        &self,
+        namespace: Option<&str>,
+    ) -> crate::error::Result<Vec<crate::substrate::HeadGroup>> {
+        self.inner.heads(namespace)
+    }
+
+    fn telemetry(
+        &self,
+        namespace: Option<&str>,
+    ) -> crate::error::Result<Option<crate::substrate::TelemetryView>> {
+        self.inner.telemetry(namespace)
+    }
+}
+
+impl crate::substrate::OmsSubstrate for CountingSubstrate<'_> {
+    fn put_grain(
+        &mut self,
+        spec: &crate::substrate::GrainSpec,
+    ) -> crate::error::Result<String> {
+        self.note_spec(spec);
+        self.inner.put_grain(spec)
+    }
+
+    fn supersede(
+        &mut self,
+        target_hash: &str,
+        spec: &crate::substrate::GrainSpec,
+        justification: &str,
+    ) -> crate::error::Result<String> {
+        self.note_spec(spec);
+        self.inner.supersede(target_hash, spec, justification)
+    }
+
+    fn retract(&mut self, hash: &str, reason: &str) -> crate::error::Result<()> {
+        self.effect_calls += 1;
+        self.inner.retract(hash, reason)
+    }
+
+    fn execute_cal(&mut self, cal: &str) -> crate::error::Result<Vec<serde_json::Value>> {
+        self.effect_calls += 1;
+        self.inner.execute_cal(cal)
+    }
+
+    fn validate_cal(&self, cal: &str) -> crate::error::Result<()> {
+        self.inner.validate_cal(cal)
+    }
+
+    fn load_state(&self) -> crate::error::Result<serde_json::Value> {
+        self.inner.load_state()
+    }
+
+    fn store_state(&mut self, state: &serde_json::Value) -> crate::error::Result<()> {
+        self.effect_calls += 1;
+        self.inner.store_state(state)
+    }
+}
 
 fn seed_all(sub: &mut TestSubstrate) {
     // exact-duplicate facts
@@ -47,6 +138,126 @@ fn run_proposes_across_analyzers_and_is_idempotent() {
         .unwrap();
     assert!(r2.ran());
     assert_eq!(r2.stored, 0, "no re-proposals");
+}
+
+#[test]
+fn analyze_only_is_side_effect_free_and_matches_production_decisions() {
+    use crate::substrate::{OmsSubstrate, ReadOpts, SubstrateRead};
+    use std::collections::BTreeMap;
+
+    let mut sub = TestSubstrate::new();
+    seed_all(&mut sub);
+    let e = Engine::with_builtins();
+    let opts = RunOptions::default();
+    let now = 10_000;
+    let mut counted = CountingSubstrate {
+        inner: &mut sub.inner,
+        effect_calls: 0,
+        unpinned_specs: 0,
+    };
+    let state_before = counted.load_state().unwrap();
+    let count_before: usize = [
+        "fact",
+        "event",
+        "tool",
+        "observation",
+        "recommendation",
+        "audit",
+    ]
+    .iter()
+    .map(|ty| {
+        counted
+            .grains_of_type(
+                ty,
+                None,
+                ReadOpts {
+                    live_only: false,
+                    since_ms: None,
+                },
+            )
+            .unwrap()
+            .len()
+    })
+    .sum();
+
+    let replay = e
+        .analyze_only(&counted, &opts, &BTreeMap::new(), now)
+        .unwrap();
+    assert_eq!(counted.effect_calls, 0, "replay must invoke no effect executor");
+    assert_eq!(counted.load_state().unwrap(), state_before, "state is immutable");
+    let count_after: usize = [
+        "fact",
+        "event",
+        "tool",
+        "observation",
+        "recommendation",
+        "audit",
+    ]
+    .iter()
+    .map(|ty| {
+        counted
+            .grains_of_type(
+                ty,
+                None,
+                ReadOpts {
+                    live_only: false,
+                    since_ms: None,
+                },
+            )
+            .unwrap()
+            .len()
+    })
+    .sum();
+    assert_eq!(count_after, count_before, "analysis must append no grains or audit rows");
+
+    e.run(&mut counted, &opts, now).unwrap();
+    assert!(counted.effect_calls > 0, "production control must exercise effects");
+    assert_eq!(counted.unpinned_specs, 0, "engine writes must carry an injected clock");
+    let stored = counted
+        .grains_of_type(
+            crate::model::grain_type::RECOMMENDATION,
+            Some(LOOP_NS),
+            ReadOpts {
+                live_only: false,
+                since_ms: None,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|g| Recommendation::from_fields(&g.hash, &g.fields).unwrap())
+        .collect::<Vec<_>>();
+    let replay_values: Vec<_> = replay
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    let stored_values: Vec<_> = stored
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    assert_eq!(replay_values, stored_values, "replay preserves production decision order");
+}
+
+#[test]
+fn analyze_only_overrides_are_validated_and_applied() {
+    use std::collections::BTreeMap;
+
+    let mut sub = TestSubstrate::new();
+    for _ in 0..5 {
+        sub.add_tool_call("stripe_refund", true, "rate_limited 429");
+    }
+    let e = Engine::with_builtins();
+    let baseline = e
+        .analyze_only(&sub.inner, &RunOptions::default(), &BTreeMap::new(), 10_000)
+        .unwrap();
+    assert!(baseline.iter().any(|r| r.analyzer.starts_with("loop.tool_failure")));
+
+    let mut params = serde_json::Map::new();
+    params.insert("min_count".into(), serde_json::json!(10));
+    let overrides = BTreeMap::from([("loop.tool_failure/1".to_string(), params)]);
+    let replay = e
+        .analyze_only(&sub.inner, &RunOptions::default(), &overrides, 10_000)
+        .unwrap();
+    assert!(replay.iter().all(|r| !r.analyzer.starts_with("loop.tool_failure")));
 }
 
 /// A canned LLM backend keyed by op (discover / ground / verify / enrich) so a
@@ -1074,6 +1285,58 @@ fn outcome_time_series_catches_a_late_regression() {
             .iter()
             .any(|r| r.analyzer.starts_with("loop.outcome_review")),
         "a revert is proposed once the regression appears"
+    );
+
+    // The regression recommendation is not merely an audit transition: apply
+    // it and prove the original lesson grain is retracted through the same
+    // rollback path as a direct human rollback.
+    use crate::substrate::{ReadOpts, SubstrateRead};
+    let lesson = sub
+        .inner
+        .grains_of_type("fact", Some("test"), ReadOpts::default())
+        .unwrap()
+        .into_iter()
+        .find(|g| {
+            g.fields.get("subject").and_then(serde_json::Value::as_str)
+                == Some("stripe_refund")
+                && g.fields.get("relation").and_then(serde_json::Value::as_str)
+                    == Some("fails_with")
+        })
+        .expect("applied lesson grain");
+    let revert = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.analyzer.starts_with("loop.outcome_review"))
+        .expect("revert recommendation");
+    let scopes = ScopeSet::all();
+    e.review(
+        &mut sub.inner,
+        &revert.hash,
+        Decision::Approve,
+        "user:a",
+        ObserverType::Human,
+        &scopes,
+        "regression confirmed",
+        t + 31 * DAY + 1,
+    )
+    .unwrap();
+    e.apply(
+        &mut sub.inner,
+        &revert.hash,
+        "user:a",
+        ObserverType::Human,
+        &scopes,
+        "revert regressed lesson",
+        false,
+        t + 31 * DAY + 2,
+    )
+    .unwrap();
+    assert_eq!(status_of(&e, &sub, &hash), RecStatus::RolledBack);
+    assert_eq!(status_of(&e, &sub, &revert.hash), RecStatus::Applied);
+    assert!(
+        !sub.inner.grain(&lesson.hash).unwrap().unwrap().is_live(),
+        "the lesson created by the original apply must be retracted"
     );
 }
 

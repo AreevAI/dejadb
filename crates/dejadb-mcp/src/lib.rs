@@ -39,6 +39,7 @@ pub struct McpServer {
     /// Absent → the closed default (nothing auto-applies). Host config, set at
     /// process start, never controllable by the MCP client.
     loop_policy: Option<deja_loop::Policy>,
+    assembly_manifest_sample_rate: f64,
 }
 
 impl McpServer {
@@ -56,6 +57,7 @@ impl McpServer {
             allow_destructive_ops: true,
             locked_ns: None,
             loop_policy: None,
+            assembly_manifest_sample_rate: 0.0,
         }
     }
 
@@ -65,6 +67,13 @@ impl McpServer {
     pub fn with_loop_policy(mut self, policy: deja_loop::Policy) -> Self {
         self.loop_policy = Some(policy);
         // The CAL surface's governance host honors the same policy.
+        self.rebuild_executor();
+        self
+    }
+
+    /// Set the host-only sampling fraction for durable ASSEMBLE manifests.
+    pub fn assembly_manifest_sample_rate(mut self, rate: f64) -> Self {
+        self.assembly_manifest_sample_rate = rate.clamp(0.0, 1.0);
         self.rebuild_executor();
         self
     }
@@ -85,6 +94,7 @@ impl McpServer {
         self.executor = CalExecutor::new(CalExecutorConfig {
             allow_destructive_ops: self.allow_destructive_ops,
             namespace_override: self.locked_ns.clone(),
+            assembly_manifest_sample_rate: self.assembly_manifest_sample_rate,
             ..CalExecutorConfig::default()
         })
         .with_governance(std::sync::Arc::new(match &self.loop_policy {
@@ -214,7 +224,13 @@ impl McpServer {
                 p.limit = Some(
                     args.get("k").and_then(|v| v.as_u64()).unwrap_or(16) as usize
                 );
-                let hits = self.facade.recall(&p).map_err(|e| e.to_string())?;
+                let run_id = args.get("run_id").and_then(|v| v.as_str());
+                self.facade.with_store(|m| m.set_run_id(run_id));
+                let recalled = self.facade.recall(&p);
+                // Ambient context must not leak into the next JSON-RPC call,
+                // including when this recall failed.
+                self.facade.with_store(|m| m.set_run_id(None));
+                let hits = recalled.map_err(|e| e.to_string())?;
                 let out: Vec<Value> = hits
                     .iter()
                     .map(|h| {
@@ -420,6 +436,57 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 Ok(json!({"hash": h.to_hex(), "runs": runs}).to_string())
             }
+            "dejadb_record_tool_call" => {
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .ok_or("dejadb_record_tool_call requires 'tool_name'")?;
+                let result = args
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .ok_or("dejadb_record_tool_call requires string 'result'")?;
+                let input = args.get("input").map(|v| v.to_string());
+                let hash = self
+                    .facade
+                    .record_tool_call(
+                        self.ns(args),
+                        tool_name,
+                        input.as_deref(),
+                        result,
+                        args.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                        args.get("thread").and_then(Value::as_str),
+                        args.get("call_id").and_then(Value::as_str),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"hash": hash.to_hex()}).to_string())
+            }
+            "dejadb_run_manifest" => {
+                if self.locked_ns.is_some() {
+                    return Err(
+                        "dejadb_run_manifest is unavailable in a namespace-locked MCP session"
+                            .into(),
+                    );
+                }
+                let run_id = args
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or("dejadb_run_manifest requires 'run_id'")?;
+                let config = args
+                    .get("config")
+                    .and_then(Value::as_object)
+                    .ok_or("dejadb_run_manifest requires object 'config'")?;
+                let config = serde_json::Value::Object(config.clone()).to_string();
+                let (config_hash, link_hash) = self
+                    .facade
+                    .record_run_manifest(run_id, &config)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "run_id": run_id,
+                    "config_hash": config_hash.to_hex(),
+                    "link_hash": link_hash.to_hex(),
+                })
+                .to_string())
+            }
             "dejadb_remember" => {
                 // Stores the raw content as an Event through `DejaDB::capture`
                 // — the same write path as `deja remember`, the bindings, and
@@ -570,7 +637,8 @@ fn tool_defs() -> Vec<Value> {
                 "subject": s("entity to recall about, e.g. 'caller:john'"),
                 "relation": s("optional relation filter, e.g. 'prefers'"),
                 "namespace": s("optional namespace (defaults to session namespace)"),
-                "k": {"type": "integer", "description": "max results (default 16)"}
+                "k": {"type": "integer", "description": "max results (default 16)"},
+                "run_id": s("host trajectory id for recall telemetry")
             }, "required": ["subject"]}
         }),
         json!({
@@ -659,6 +727,27 @@ fn tool_defs() -> Vec<Value> {
                 "depth": {"type": "integer", "description": "provenance hops to walk, max 8 (default 4)"},
                 "namespace": s("optional namespace")
             }, "required": ["hash"]}
+        }),
+        json!({
+            "name": "dejadb_record_tool_call",
+            "description": "Record one tool invocation as a trajectory Tool grain, including its JSON arguments, result, error status, thread and provider call id.",
+            "inputSchema": {"type": "object", "properties": {
+                "tool_name": s("tool/function name"),
+                "input": {"description": "tool arguments as any JSON value"},
+                "result": s("tool result text or JSON string"),
+                "is_error": {"type": "boolean", "description": "whether the invocation failed (default false)"},
+                "thread": s("optional session/thread id"),
+                "call_id": s("optional provider tool-call id; synthesized when absent"),
+                "namespace": s("optional namespace")
+            }, "required": ["tool_name", "result"]}
+        }),
+        json!({
+            "name": "dejadb_run_manifest",
+            "description": "Persist a reproducible run configuration as a content-addressed State plus the run-to-config provenance link.",
+            "inputSchema": {"type": "object", "properties": {
+                "run_id": s("run identifier used by trajectory grains"),
+                "config": {"type": "object", "description": "pinned model/build/adapter/quantization/runtime, sampling parameters, system prompt and tool catalogue"}
+            }, "required": ["run_id", "config"]}
         }),
         json!({
             "name": "dejadb_remember",

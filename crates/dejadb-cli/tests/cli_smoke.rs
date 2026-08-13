@@ -91,6 +91,47 @@ fn cli_end_to_end() {
     assert!(!err.is_empty());
 }
 
+#[test]
+fn record_tool_call_cli_keeps_json_arguments() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("tools.db");
+    let db = db.to_str().unwrap();
+    let (ok, hash, err) = deja(&[
+        "record-tool-call",
+        "--db", db,
+        "--ns", "ops",
+        "--name", "stripe_refund",
+        "--input", r#"{"amount":42}"#,
+        "--result", "rate limited",
+        "--is-error",
+        "--call-id", "toolu_cli",
+    ]);
+    assert!(ok, "record-tool-call failed: {err}");
+    assert_eq!(hash.trim().len(), 64);
+
+    let (ok, out, err) = deja(&[
+        "cal",
+        r#"RECALL tools WHERE tool_call_id = "toolu_cli""#,
+        "--db", db,
+        "--ns", "ops",
+    ]);
+    assert!(ok, "tool recall failed: {err}");
+    let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(payload["grains"][0]["fields"]["input"]["amount"], 42);
+    assert_eq!(payload["grains"][0]["fields"]["is_error"], true);
+
+    let (ok, out, err) = deja(&[
+        "run-manifest",
+        "--db", db,
+        "--run-id", "run-cli",
+        "--config", r#"{"model":{"base":"test"},"sampling":{"seed":7}}"#,
+    ]);
+    assert!(ok, "run-manifest failed: {err}");
+    let manifest: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(manifest["config_hash"].as_str().map(str::len), Some(64));
+    assert_eq!(manifest["link_hash"].as_str().map(str::len), Some(64));
+}
+
 /// Ergonomics: positional `add <s> <r> <o>` + `-d`, and recall resolving the
 /// memory file from `$DEJADB_DB` when no --db/-d is given.
 #[test]
@@ -107,7 +148,7 @@ fn version_flag_prints_crate_version() {
 }
 
 #[test]
-fn capture_stop_keeps_tool_outcomes() {
+fn capture_stop_keeps_the_ordered_typed_transcript() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("code.db");
     let db = db.to_str().unwrap();
@@ -120,9 +161,9 @@ fn capture_stop_keeps_tool_outcomes() {
         &transcript,
         [
             r#"{"message":{"role":"user","content":[{"type":"text","text":"fix the flaky test"}]}}"#,
-            r#"{"message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test flaky"}}]}}"#,
-            r#"{"message":{"role":"user","content":[{"type":"tool_result","is_error":true,"content":"assertion failed: shared tempdir race"}]}}"#,
-            r#"{"message":{"role":"assistant","content":[{"type":"text","text":"Root cause: tests share a tempdir."}]}}"#,
+            r#"{"message":{"role":"assistant","model":"claude-test","stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":3},"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test flaky"}}]}}"#,
+            r#"{"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"assertion failed: shared tempdir race"}]}}"#,
+            r#"{"message":{"role":"assistant","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":8},"content":[{"type":"text","text":"Root cause: tests share a tempdir."}]}}"#,
         ]
         .join("\n"),
     )
@@ -144,6 +185,32 @@ fn capture_stop_keeps_tool_outcomes() {
     child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "capture-stop failed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("captured 4 events"));
+
+    // Stop receives the cumulative transcript. Growing it and invoking the
+    // hook again must append only the two new turns, not replay the first four.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(
+        br#"
+{"message":{"role":"user","content":"please apply the fix"}}
+{"message":{"role":"assistant","content":"Fixed and verified."}}
+"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+        .args(["capture-stop", "--db", db, "--ns", "code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn second capture-stop");
+    child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "second capture-stop failed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("captured 2 events"));
 
     // The captured events must carry the tool outcome, flagged as an error.
     let recall = Command::new(env!("CARGO_BIN_EXE_deja"))
@@ -153,6 +220,102 @@ fn capture_stop_keeps_tool_outcomes() {
     let text = String::from_utf8_lossy(&recall.stdout);
     assert!(text.contains("tool_result ERROR"), "tool error signal missing: {text}");
     assert!(text.contains("shared tempdir race"), "tool output body missing: {text}");
+    let payload: serde_json::Value = serde_json::from_slice(&recall.stdout).unwrap();
+    let grains = payload["grains"].as_array().unwrap();
+    assert_eq!(grains.len(), 6, "the cumulative transcript must not replay: {payload}");
+    assert_eq!(
+        grains
+            .iter()
+            .filter(|g| g["fields"]["parent_message_id"].is_string())
+            .count(),
+        5,
+        "every turn after the first must be threaded"
+    );
+    let tool_use = grains
+        .iter()
+        .find(|g| g["fields"]["stop_reason"] == "tool_use")
+        .expect("typed assistant tool-use event");
+    assert_eq!(tool_use["fields"]["model_id"], "claude-test");
+    assert_eq!(tool_use["fields"]["token_usage"]["input_tokens"], 12);
+    assert_eq!(tool_use["fields"]["content_blocks"][0]["type"], "tool_use");
+
+    // Phase-C corpus export consumes the existing CAL selector, emits OpenAI
+    // chat JSONL with step masking, and records an export-manifest grain.
+    let corpus = dir.path().join("train.jsonl");
+    let (ok, _, err) = deja(&[
+        "corpus",
+        "--db",
+        db,
+        "--ns",
+        "code",
+        "--select",
+        r#"RECALL events WHERE session_id = "sess-1""#,
+        "--out",
+        corpus.to_str().unwrap(),
+    ]);
+    assert!(ok, "corpus export failed: {err}");
+    assert!(err.contains("manifest"), "manifest receipt missing: {err}");
+    let row: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&corpus).unwrap().trim()).unwrap();
+    assert_eq!(row["messages"].as_array().unwrap().len(), 6);
+    assert!(row["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("tempdir")));
+    assert!(row["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["quality"] == "failed" && s["loss_weight"] == 0.0));
+
+    let (ok, _, err) = deja(&[
+        "corpus",
+        "--db",
+        db,
+        "--select",
+        r#"ADD fact SET subject = "x" SET relation = "y" SET object = "z" REASON "no""#,
+    ]);
+    assert!(!ok, "a write selector must be refused");
+    assert!(err.contains("read-only"), "unclear selector refusal: {err}");
+}
+
+#[test]
+fn corpus_registry_requires_harness_write_grant() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("corpus-auth.db");
+    let out = dir.path().join("train.jsonl");
+    let db = db.to_str().unwrap();
+    let out = out.to_str().unwrap();
+    let (ok, _, err) = deja(&[
+        "add", "alice", "prefers", "tea", "--db", db, "--ns", "caller",
+    ]);
+    assert!(ok, "seed failed: {err}");
+    let (ok, _, err) = deja(&[
+        "add", "agent:reader", "mg:permits", "read ON caller", "--db", db,
+        "--ns", "agent:authz",
+    ]);
+    assert!(ok, "grant failed: {err}");
+
+    let args = [
+        "corpus", "--db", db, "--ns", "caller", "--as", "agent:reader",
+        "--select", "RECALL facts", "--out", out,
+    ];
+    let (ok, _, err) = deja(&args);
+    assert!(!ok, "read-only principal must not write the registry");
+    assert!(err.contains("write") && err.contains("agent:harness"), "{err}");
+    assert!(!std::path::Path::new(out).exists(), "denial must precede output creation");
+
+    let (ok, _, err) = deja(&[
+        "add", "agent:exporter", "mg:permits",
+        "read,write ON caller,agent:harness", "--db", db, "--ns", "agent:authz",
+    ]);
+    assert!(ok, "export grant failed: {err}");
+    let (ok, _, err) = deja(&[
+        "corpus", "--db", db, "--ns", "caller", "--as", "agent:exporter",
+        "--select", "RECALL facts", "--out", out, "--recipient", "trainer:v1",
+    ]);
+    assert!(ok, "authorized export failed: {err}");
 }
 
 /// `recall-hook --with-loop` closes the loop: pending recommendations ride
@@ -611,6 +774,57 @@ fn cli_audit_export_covers_host_erasure() {
     assert!(ok);
     assert!(out.contains("wrote 1 audit records"), "{out}");
     assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn erasure_audit_names_stale_corpus_exports() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("corpus-audit.db");
+    let corpus = dir.path().join("training.jsonl");
+    let db = db.to_str().unwrap();
+    let corpus = corpus.to_str().unwrap();
+
+    let (ok, _, err) = deja(&[
+        "add", "--db", db, "--ns", "caller", "--subject", "pat", "--relation",
+        "prefers", "--object", "tea",
+    ]);
+    assert!(ok, "add failed: {err}");
+    let (ok, _, err) = deja(&[
+        "corpus",
+        "--db",
+        db,
+        "--ns",
+        "caller",
+        "--select",
+        r#"RECALL facts WHERE subject = "pat""#,
+        "--out",
+        corpus,
+        "--recipient",
+        "trainer:model-v2",
+    ]);
+    assert!(ok, "corpus export failed: {err}");
+
+    let (ok, _, err) = deja(&[
+        "forget-subject",
+        "pat",
+        "--db",
+        db,
+        "--ns",
+        "caller",
+        "--yes",
+    ]);
+    assert!(ok, "forget-subject failed: {err}");
+    assert!(err.contains("is stale and must be retired or re-derived"), "{err}");
+    assert!(err.contains("for recipient trainer:model-v2"), "{err}");
+
+    let (ok, out, err) = deja(&["audit", "export", "--db", db]);
+    assert!(ok, "audit export failed: {err}");
+    let row: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let stale = row["stale_corpora"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "{row}");
+    assert_eq!(stale[0]["destination"], corpus);
+    assert_eq!(stale[0]["recipient"], "trainer:model-v2");
+    assert!(stale[0]["export_id"].as_str().unwrap().starts_with("export:"));
 }
 
 /// Archive retention: a checkpoint snapshots the already-erased live store

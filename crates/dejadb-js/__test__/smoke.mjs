@@ -149,9 +149,18 @@ test('recordToolCall records occurrences, not values', async () => {
   assert.equal(n.count, 3, 'three retries are three occurrences')
 
   // A host-supplied call id lands on the grain and is filterable.
-  await m.recordToolCall('stripe_refund', 'rate_limited', true, null, 'call_xyz')
+  await m.recordToolCall('stripe_refund', 'rate_limited', true, null, 'call_xyz', '{"amount":42}')
   const byId = JSON.parse(await m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
   assert.equal(byId.grains.length, 1)
+  assert.equal(byId.grains[0].fields.input.amount, 42)
+
+  const manifest = JSON.parse(await m.recordRunManifest(
+    'run-js', '{"model":{"base":"test"},"sampling":{"seed":7}}'))
+  assert.equal(manifest.config_hash.length, 64)
+  assert.equal(manifest.link_hash.length, 64)
+  m.setRunId('run-js')
+  await m.recall('acct')
+  m.setRunId(null)
 })
 
 test('cal COUNT pipeline', async () => {

@@ -419,6 +419,15 @@ impl DejaDb {
         })
     }
 
+    /// Set the host-scoped run identifier copied into subsequent recall
+    /// telemetry. Pass null to clear it; it is never a file truth.
+    #[napi]
+    pub fn set_run_id(&self, run_id: Option<String>) -> napi::Result<()> {
+        let facade = take_facade(&self.facade)?;
+        facade.with_store(|m| m.set_run_id(run_id.as_deref()));
+        Ok(())
+    }
+
     /// Install a command embedder (same contract as the CLI's --embed-cmd):
     /// the command gets the text on stdin and must print a JSON array of
     /// numbers. Probed once here to learn the dimension. Enables the vector
@@ -1393,6 +1402,7 @@ impl DejaDb {
         is_error: Option<bool>,
         thread: Option<String>,
         call_id: Option<String>,
+        input: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         let ns = self.ns.clone();
@@ -1402,6 +1412,7 @@ impl DejaDb {
                 .record_tool_call(
                     &ns,
                     &name,
+                    input.as_deref(),
                     &result,
                     is_error.unwrap_or(false),
                     thread.as_deref(),
@@ -1409,6 +1420,27 @@ impl DejaDb {
                 )
                 .map_err(err)?
                 .to_hex())
+        })
+    }
+
+    /// Persist a content-addressed harness config and the run -> config link.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn record_run_manifest(
+        &self,
+        run_id: String,
+        config: String,
+    ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
+        let slot = self.facade.clone();
+        StringJob::spawn(move || {
+            let facade = take_facade(&slot)?;
+            let (config_hash, link_hash) = facade
+                .record_run_manifest(&run_id, &config)
+                .map_err(err)?;
+            Ok(json!({
+                "config_hash": config_hash.to_hex(),
+                "link_hash": link_hash.to_hex(),
+            })
+            .to_string())
         })
     }
 

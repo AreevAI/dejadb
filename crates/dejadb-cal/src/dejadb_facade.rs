@@ -12,12 +12,13 @@ use std::sync::Mutex;
 use dejadb_core::authz::Verb;
 use dejadb_core::error::{Hash, DejaDbError, Result};
 use dejadb_core::format::deserialize::DeserializedGrain;
-use dejadb_core::types::Grain;
+use dejadb_core::format::serialize::serialize_grain;
+use dejadb_core::types::{Fact, Grain, Observation, RelatedTo, State};
 use dejadb_store::DejaDB;
 
 use crate::ast::QueryParam;
 use crate::errors::CalError;
-use crate::facade::{CalStoreFacade, TemplateInfo};
+use crate::facade::{AssemblyManifest, CalStoreFacade, TemplateInfo};
 use crate::json_build::{build_grain_from_json, GrainSink};
 use crate::queries::{PersistedQuery, QueryEntry, QueryListEntry, QueryRegistry};
 use crate::store_types::{
@@ -231,10 +232,11 @@ impl DejaDbFacade {
         target: &str,
         because: Option<&str>,
         count: usize,
+        stale_exports: &[dejadb_store::CorpusExportRegistry],
     ) -> Result<()> {
         // One builder for every surface (dejadb_core::authz) so the CLI's
         // host-level erasures and CAL's produce identical audit shapes.
-        let obs = dejadb_core::authz::audit_observation(
+        let mut obs = dejadb_core::authz::audit_observation(
             &self.session_principal(),
             verb,
             target,
@@ -242,6 +244,19 @@ impl DejaDbFacade {
             count,
             now_epoch_ms(),
         );
+        if !stale_exports.is_empty() {
+            let mut context = obs
+                .common
+                .context
+                .take()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            context.insert(
+                "stale_corpora".into(),
+                serde_json::to_value(stale_exports).unwrap_or_else(|_| serde_json::json!([])),
+            );
+            obs.common.context = Some(serde_json::Value::Object(context));
+        }
         self.store.lock().unwrap().add(&obs).map(|_| ())
     }
 
@@ -300,6 +315,36 @@ impl DejaDbFacade {
         f(&mut guard)
     }
 
+    /// Preflight the governed-corpus registry write. Exporting reads the
+    /// selected namespaces, but recording its immutable lineage additionally
+    /// requires `write ON agent:harness`.
+    pub fn authorize_corpus_export(&self) -> Result<()> {
+        self.check_verb(Verb::Write, dejadb_core::authz::HARNESS_NS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_corpus_export(
+        &self,
+        selector: &str,
+        destination: &str,
+        recipient: Option<&str>,
+        exported_at_ms: i64,
+        subject_fingerprints: &[String],
+        source_hashes: &[String],
+    ) -> Result<Hash> {
+        self.authorize_corpus_export()?;
+        self.with_store(|store| {
+            store.record_corpus_export(
+                selector,
+                destination,
+                recipient,
+                exported_at_ms,
+                subject_fingerprints,
+                source_hashes,
+            )
+        })
+    }
+
     /// Value-level idempotent add (see [`DejaDB::add_if_novel`]). Returns the
     /// grain hash and whether a new grain was written (`false` = the value was
     /// already the current head). Bindings expose this as an `idempotent` flag.
@@ -329,17 +374,21 @@ impl DejaDbFacade {
     ///
     /// `call_id` is the host's invocation id (an LLM `tool_call_id`), stored as
     /// the grain's `tool_call_id` and queryable as such — the correlation key
-    /// back to the provider transcript. Absent one, [`occurrence_id`] mints a
+    /// back to the provider transcript. Absent one, `occurrence_id` mints a
     /// synthetic id.
     ///
     /// It is not a de-duplication key: replaying the same `call_id` later writes
     /// a second grain, since `created_at` is part of the content address too.
     /// Recording is append-only, and a host replaying a tool log owns not
     /// replaying it twice.
+    // This signature is mirrored by the CLI, MCP, Python, and Node surfaces;
+    // grouping fields would make those scalar-in APIs diverge.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tool_call(
         &self,
         ns: &str,
         tool_name: &str,
+        input: Option<&str>,
         result: &str,
         is_error: bool,
         thread: Option<&str>,
@@ -347,6 +396,14 @@ impl DejaDbFacade {
     ) -> Result<Hash> {
         let mut fields = serde_json::Map::new();
         fields.insert("tool_name".into(), serde_json::json!(tool_name));
+        if let Some(input) = input {
+            let input = serde_json::from_str(input).map_err(|e| {
+                DejaDbError::Validation(format!(
+                    "record_tool_call input must be valid JSON: {e}"
+                ))
+            })?;
+            fields.insert("input".into(), input);
+        }
         fields.insert("content".into(), serde_json::json!(result));
         fields.insert("is_error".into(), serde_json::json!(is_error));
         fields.insert("namespace".into(), serde_json::json!(ns));
@@ -361,6 +418,41 @@ impl DejaDbFacade {
             }),
         );
         self.cal_add("tool", &fields)
+    }
+
+    /// Record the immutable configuration for a run and link the run id to it.
+    /// The State is timestamped at epoch zero deliberately: it is a value-level
+    /// configuration artifact, so identical JSON must have one content address
+    /// even when observed by different runs at different wall-clock times.
+    pub fn record_run_manifest(&self, run_id: &str, config_json: &str) -> Result<(Hash, Hash)> {
+        self.check_verb(Verb::Write, dejadb_core::authz::HARNESS_NS)?;
+        if run_id.trim().is_empty() {
+            return Err(DejaDbError::Validation(
+                "record_run_manifest requires a non-empty run_id".into(),
+            ));
+        }
+        let config: serde_json::Value = serde_json::from_str(config_json).map_err(|e| {
+            DejaDbError::Validation(format!("run manifest config must be valid JSON: {e}"))
+        })?;
+        if !config.is_object() {
+            return Err(DejaDbError::Validation(
+                "run manifest config must be a JSON object".into(),
+            ));
+        }
+
+        let state = State::new(config)
+            .namespace(dejadb_core::authz::HARNESS_NS)
+            .created_at(0);
+        let (_, config_hash) = serialize_grain(&state)?;
+        let link = Fact::new(
+            &format!("run:{run_id}"),
+            "mg:harness",
+            &config_hash.to_hex(),
+        )
+        .namespace(dejadb_core::authz::HARNESS_NS);
+        let mut store = self.store.lock().unwrap();
+        let hashes = store.add_batch(&[&state, &link])?;
+        Ok((hashes[0], hashes[1]))
     }
 
     /// Add many grains in one store transaction. Each entry is the same
@@ -597,6 +689,44 @@ impl CalStoreFacade for DejaDbFacade {
     /// `budget_pressure` analyzer). Best-effort: telemetry never fails a query.
     fn note_assembly_budget(&self, overflow: bool) {
         let _ = self.with_store(|m| m.telemetry_note_budget(overflow));
+    }
+
+    fn note_assembly_manifest(&self, manifest: &AssemblyManifest) {
+        // A read-only principal must not acquire a write through telemetry.
+        if !self
+            .authz()
+            .allows(Verb::Write, dejadb_core::authz::HARNESS_NS)
+        {
+            return;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        let mut obs = Observation::new("dejadb:assemble", "system")
+            .namespace(dejadb_core::authz::HARNESS_NS)
+            .subject(&manifest.rendered_sha256)
+            .object("assembly_manifest")
+            .created_at(now);
+        obs.frame_id = Some(format!(
+            "assembly:{now}:{}",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        obs.common.extra_fields.insert(
+            "manifest".into(),
+            serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+        );
+        obs.common.related_to = manifest
+            .included_hashes
+            .iter()
+            .map(|hash| RelatedTo {
+                hash: hash.clone(),
+                relation_type: "mg:assembly_input".into(),
+                weight: None,
+            })
+            .collect();
+        // Off the recall measurement and best-effort: a manifest failure does
+        // not change the successful ASSEMBLE result.
+        let _ = self.with_store(|m| m.add(&obs));
     }
 
     // ── CAL host metadata: saved queries and custom templates ───────────
@@ -1362,7 +1492,7 @@ impl CalStoreFacade for DejaDbFacade {
             self.check_verb(Verb::Delete, &ns)?;
         }
         self.store.lock().unwrap().forget(hash)?;
-        self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1)
+        self.audit_tier2("delete", &format!("hash:{}", hash.to_hex()), because, 1, &[])
     }
 
     /// `MERGE` — the resolved value supersedes every open tip; the merge
@@ -1687,6 +1817,12 @@ impl CalStoreFacade for DejaDbFacade {
             user_id,
             dejadb_store::ErasureOptions { text_mentions },
         )?;
+        let stale_exports = self
+            .store
+            .lock()
+            .unwrap()
+            .corpus_exports_touching_subject(user_id)
+            .unwrap_or_default();
         // The audit target carries a FINGERPRINT, never the identity: an
         // immutable, replicating audit grain naming the erased subject
         // would put the reference straight back into the file (and every
@@ -1700,6 +1836,7 @@ impl CalStoreFacade for DejaDbFacade {
             ),
             Some(because),
             report.grains_erased,
+            &stale_exports,
         )?;
         Ok(crate::store_types::ErasureProof {
             user_id: user_id.to_string(),
@@ -1761,12 +1898,15 @@ impl CalStoreFacade for DejaDbFacade {
         let cutoff_ms = now_epoch_ms() - (min_age_days * 86_400_000.0) as i64;
         // `LIMIT n` bounds the sweep to the oldest n matches — the operator
         // asked for a reviewable batch, not the namespace.
+        let exports = self.store.lock().unwrap().corpus_exports().unwrap_or_default();
         let report = self.store.lock().unwrap().forget_older_than_capped(
             Some(&ns),
             cutoff_ms,
             gtype,
             Some(batch_limit),
         )?;
+        let stale_exports =
+            dejadb_store::exports_touching_hashes(&exports, &report.erased_hashes);
         self.audit_tier2(
             "erase",
             &format!(
@@ -1775,6 +1915,7 @@ impl CalStoreFacade for DejaDbFacade {
             ),
             Some(because),
             report.grains_erased,
+            &stale_exports,
         )?;
         Ok(report.grains_erased)
     }

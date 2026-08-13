@@ -250,7 +250,10 @@ What that buys you:
   never recalled (`cold_grains`), questions that keep coming back empty
   (`coverage_gap`), context budgets overflowing (`budget_pressure`).
   Precision is measured, not asserted: 1.00 on the labeled fixture,
-  CI-gated at 0.90 (`cargo run -p dejadb-bench --bin loop_precision`).
+  with a 0.90 failure floor when the fixture runner is invoked
+  (`cargo run -p dejadb-bench --bin loop_precision`). The reusable Effective
+  Reliability arithmetic and loop correctness tests run in ordinary CI; the
+  fixture binary itself is an explicit evaluation command.
 - **Nothing changes behind your back.** Four gates — propose → review →
   apply → verify — with separation of duties, a **mandatory reason** on every
   decision, a hash-chained audit grain per transition, and a stored inverse
@@ -268,6 +271,25 @@ What that buys you:
   **independent verifier** (the proposer never grades itself) before it
   reaches the queue, and `origin = llm` can never auto-apply. "Nothing to
   report" is a first-class answer, so it doesn't invent findings to look busy.
+
+### Reproducible trajectories and governed corpora
+
+The trajectory path keeps the typed evidence needed to replay or train from a
+run: `record-tool-call` stores JSON arguments separately from results,
+`capture-stop` preserves every ordered chat/content block, `run-manifest`
+binds a run to a content-addressed configuration, and sampled ASSEMBLE
+manifests record the exact included/dropped hashes plus the rendered digest.
+Set `--run-id` to join full-mode recall telemetry to the same trajectory.
+
+`deja corpus --select '<READ CAL>' [--out train.jsonl] [--recipient ID]` reuses CAL as the
+authorized selector and streams OpenAI chat JSONL with tool definitions,
+step-level loss weights/quality labels, elision records, and trace/model/policy/
+subject-fingerprint bindings. Each export writes a replicating manifest grain
+whose `related_to` edges name every source hash; `--recipient` records the
+downstream trainer/model owner that must act on a stale-export notice. Later identity or retention
+erasure reports which exported corpora are stale and must be retired or
+re-derived; this is auditable suppression/re-derivation, not a claim that a
+subject has been removed from model weights.
 - **It runs where you already run things — no daemon.** A cheap, idempotent
   command with watermark gates (`--min-new`, `--if-stale`): a Claude Code
   `SessionEnd` hook, cron, CI (`deja loop list --fail-on high` exits 2 —
@@ -511,7 +533,7 @@ with a projection for current Pi hardware:
 | [`docs/loop.md`](docs/loop.md) | Deja Loop — governed self-improvement (analyzers, four gates, policy, CLI/bindings/MCP/API) |
 | [`docs/loop-reflection.md`](docs/loop-reflection.md) | The reflection engine — how LLM proposals are grounded, verified, and measured |
 | [`docs/cal-reference.md`](docs/cal-reference.md) | The CAL query language reference |
-| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 14 tools |
+| [`docs/mcp-reference.md`](docs/mcp-reference.md) | The MCP server + its 16 tools |
 | [`docs/migrate.md`](docs/migrate.md) | Importing from mem0, Zep, Letta, LangMem, Basic Memory, JSONL |
 | [`docs/memory-tool.md`](docs/memory-tool.md) | The Anthropic memory-tool backend (Python / Node / CLI) |
 | [`docs/cookbook.md`](docs/cookbook.md) | Task-oriented recipes |

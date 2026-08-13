@@ -159,9 +159,20 @@ def test_record_tool_call_records_occurrences(tmp_path):
     assert n["count"] == 5
 
     # A host-supplied call id lands on the grain and is filterable.
-    m.record_tool_call("stripe_refund", "boom", True, call_id="call_xyz")
+    m.record_tool_call(
+        "stripe_refund", "boom", True, call_id="call_xyz", input='{"amount":42}'
+    )
     by_id = json.loads(m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
     assert len(by_id["grains"]) == 1
+    assert by_id["grains"][0]["fields"]["input"]["amount"] == 42
+
+    manifest = json.loads(m.record_run_manifest(
+        "run-py", '{"model":{"base":"test"},"sampling":{"seed":7}}'))
+    assert len(manifest["config_hash"]) == 64
+    assert len(manifest["link_hash"]) == 64
+    m.set_run_id("run-py")
+    m.recall("acct")
+    m.set_run_id(None)
 
 
 def test_add_explains_engine_authored_types(tmp_path):

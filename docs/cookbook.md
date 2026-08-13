@@ -711,6 +711,34 @@ Full obligation map, deployment requirements, and honest limits:
 
 ---
 
+## 14. Capture a reproducible run and export a governed corpus
+
+Bind the host configuration and recall telemetry to one run id, then export
+only the transcript selected by read-only CAL:
+
+```bash
+deja run-manifest --db agent.db --run-id eval-42 \
+  --config '{"model":{"base":"model:v1"},"policy":{"version":"p3"},"seed":7}'
+
+# Use --run-id eval-42 on recall/search/CAL invocations whose full telemetry
+# rows should join to this trajectory.
+deja corpus --db agent.db --ns caller \
+  --select 'RECALL events WHERE session_id = "session-42"' \
+  --out train.jsonl --recipient trainer:model-v2
+```
+
+The JSONL row uses OpenAI chat messages and a top-level `tools` list. DejaDB
+also emits step quality/loss weights, observation elisions, and the binding to
+source hashes, model/policy versions, trace, and data-subject fingerprints.
+The export receipt is an immutable grain in `agent:harness` (and therefore
+requires `write ON agent:harness` in addition to the selector's read grant); its
+`mg:corpus_source` links make every input reverse-traversable and let later
+subject or retention erasure identify stale corpus files. Those files must be
+retired or re-derived—the receipt is not an unlearning claim about model
+weights.
+
+---
+
 ## See also
 
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — how DejaDB is built

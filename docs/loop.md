@@ -81,6 +81,8 @@ up front); every decision carries a written reason.
    deterministic finding is computed, so the engine stays its only creator).
 3. **Apply** — requires the `apply` scope; destructive applies additionally
    require `admin` + `allow_destructive`; every apply records its inverse.
+   Advisory Edit/Data findings have no executable engine primitive: make the
+   change in the host, then dismiss the recommendation to close its lifecycle.
 4. **Verify** — outcome review re-runs the stored metric after `review_after`
    and proposes a revert on regression.
 
@@ -113,13 +115,20 @@ help?):
 | `outcome_review` | an applied recommendation past `review_after` that regressed | a revert |
 
 Precision is measured, never asserted: `cargo run -p dejadb-bench --bin
-loop_precision` scores each analyzer against a labeled fixture and gates
-CI at 0.90. On the current fixture the seven default-on analyzers it covers —
+loop_precision` scores each analyzer against a labeled fixture and exits
+non-zero below 0.90 when invoked. The binary is an explicit evaluation command,
+not a workflow step; reusable metric arithmetic plus the loop/golden tests run
+under `cargo test --workspace`. On the current fixture the seven default-on analyzers it covers —
 contradiction, duplicate, staleness, tool-failure, skill-stall, **cold-grains,
 and coverage-gap** — each score **1.00** precision and recall; `fork_surfacing`
 and `outcome_review` need concurrent heads / applied history, and
 `budget_pressure` is a global signal, so those three are covered by the crate
 tests instead. See `crates/dejadb-bench/RESULTS.md` for the table.
+
+Both ASSEMBLE paths feed budget telemetry. Multi-source assemblies allocate
+token budgets; the legacy single-source path interprets the numeric limit as a
+grain count and reports `budget.unit = "grains"`. In either case, dropping any
+candidate records an overflow sample for `budget_pressure`.
 
 ## Recall telemetry (the utility signal)
 
@@ -140,6 +149,8 @@ can see memory *utility*, not just internal consistency.
   **never syncs** (the hub carries the memory file only), **rebuildable** —
   losing it costs evidence detail, never state. `FORGET` synchronously scrubs
   it. Modes: `off` | `aggregate` (rollups) | `full` (+ a per-recall ring log).
+  A host-scoped `run_id` may be attached to full rows for trajectory joins; it
+  is deliberately excluded from intent-rollup keys.
 
 The console **Sessions** view visualizes it; `GET /api/loop/telemetry` serves it.
 
@@ -231,7 +242,7 @@ Same methods in both (scalars in, JSON strings out):
 ```python
 db = dejadb.DejaDB("agent.db", actor="user:alice")
 db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42",
-                    call_id="toolu_01A")   # the provider's tool_call_id, if you have it
+                    call_id="toolu_01A", input=args_json)
 db.loop_run(min_new=20, min_new_errors=3, if_stale="6h")   # gated; bare call never gates
 db.loop_run(full_sweep=True)                 # the `reflect` semantics: whole memory
 db.loop_run(policy="loop-policy.json")     # host policy file — the only auto-apply path

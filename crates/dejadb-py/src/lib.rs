@@ -331,6 +331,13 @@ impl DejaDB {
         serde_json::to_string(&w).map_err(err)
     }
 
+    /// Set the host-scoped run identifier copied into subsequent recall
+    /// telemetry. Pass `None` to clear it; it is never a file truth.
+    #[pyo3(signature = (run_id = None))]
+    fn set_run_id(&self, py: Python<'_>, run_id: Option<String>) {
+        py.detach(|| self.facade.with_store(|m| m.set_run_id(run_id.as_deref())));
+    }
+
     /// Install an embedding callback: `embed(text: str) -> list[float]`.
     /// Probed once here to learn the dimension (recorded as the file's
     /// embedding provenance). Enables the vector recall leg; grains added
@@ -1235,7 +1242,8 @@ impl DejaDB {
     /// transcript. Omitted, one is synthesized. Either way each call is its own
     /// occurrence, which is what makes a tool that failed five times read as
     /// five failures; recording is append-only, never de-duplicating.
-    #[pyo3(signature = (name, result, is_error = false, thread = None, call_id = None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, result, is_error = false, thread = None, call_id = None, input = None))]
     fn record_tool_call(
         &self,
         py: Python<'_>,
@@ -1244,12 +1252,14 @@ impl DejaDB {
         is_error: bool,
         thread: Option<String>,
         call_id: Option<String>,
+        input: Option<String>,
     ) -> PyResult<String> {
         py.detach(|| {
             self.facade
                 .record_tool_call(
                     &self.ns,
                     &name,
+                    input.as_deref(),
                     &result,
                     is_error,
                     thread.as_deref(),
@@ -1258,6 +1268,22 @@ impl DejaDB {
                 .map(|h| h.to_hex())
         })
         .map_err(err)
+    }
+
+    /// Persist a content-addressed harness config and the run -> config link.
+    /// `config` is a JSON object containing the pinned model/runtime, sampling
+    /// parameters, system prompt and tool catalogue. Returns both hashes.
+    fn record_run_manifest(
+        &self,
+        py: Python<'_>,
+        run_id: String,
+        config: String,
+    ) -> PyResult<String> {
+        py.detach(|| self.facade.record_run_manifest(&run_id, &config))
+            .map(|(config, link)| {
+                json!({"config_hash": config.to_hex(), "link_hash": link.to_hex()}).to_string()
+            })
+            .map_err(err)
     }
 
     /// Run one analysis pass. Bare (all args `None`) it never gates — an

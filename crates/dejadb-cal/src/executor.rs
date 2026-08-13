@@ -32,7 +32,7 @@ use super::ast::{
     SetOpStmt, Source, Value, WithOption,
 };
 use super::errors::{CalError, Span};
-use super::facade::CalStoreFacade;
+use super::facade::{AssemblyManifest, CalStoreFacade};
 use crate::store_types::{AddOptions, DiversityConfig, RecallParams};
 use dejadb_core::error::{DejaDbError, Hash};
 
@@ -89,6 +89,9 @@ pub struct CalExecutorConfig {
     /// (tokens_allocated, tokens_used) from the `sources` array.
     /// Default: `false`.  (S-09)
     pub redact_budget_metadata: bool,
+    /// Fraction of ASSEMBLE operations whose provenance manifest is stored in
+    /// `agent:harness`. Host-only and never persisted; 0.0 (default) is off.
+    pub assembly_manifest_sample_rate: f64,
     /// Caller's JWT scopes for identity-based access control.
     /// When non-empty, the executor checks the required scope for each statement
     /// type before execution. Empty = no enforcement (CLI, tests).
@@ -112,6 +115,7 @@ impl Default for CalExecutorConfig {
             namespace_override: None,
             user_id_override: None,
             redact_budget_metadata: false,
+            assembly_manifest_sample_rate: 0.0,
             caller_scopes: vec![],
             max_cal_queries: None,
             max_cal_templates: None,
@@ -4238,6 +4242,68 @@ impl CalExecutor {
     // ASSEMBLE
     // -----------------------------------------------------------------------
 
+    fn sample_assembly_manifest(&self) -> bool {
+        let rate = self.config.assembly_manifest_sample_rate.clamp(0.0, 1.0);
+        if rate <= 0.0 {
+            return false;
+        }
+        if rate >= 1.0 {
+            return true;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(0);
+        // Golden-ratio stepping distributes samples without pulling a random
+        // generator into the dependency-light CAL crate.
+        let n = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let bucket = n.wrapping_mul(0x9e3779b97f4a7c15) % 1_000_000;
+        bucket < (rate * 1_000_000.0) as u64
+    }
+
+    // Keeping every measured value explicit makes the call site an auditable
+    // inventory of what the manifest commits to; this is internal and sampled.
+    #[allow(clippy::too_many_arguments)]
+    fn record_assembly_manifest(
+        &self,
+        assemble: &AssembleStmt,
+        store: &dyn CalStoreFacade,
+        candidates: Vec<String>,
+        included: Vec<String>,
+        payload: &CalResultPayload,
+        budget: serde_json::Value,
+        sources: serde_json::Value,
+    ) {
+        if !self.sample_assembly_manifest() {
+            return;
+        }
+        let included_set: std::collections::HashSet<&str> =
+            included.iter().map(String::as_str).collect();
+        let dropped_hashes = candidates
+            .into_iter()
+            .filter(|h| !included_set.contains(h.as_str()))
+            .collect();
+        let rendered = match payload {
+            CalResultPayload::Formatted { text, .. } => text.as_bytes().to_vec(),
+            CalResultPayload::MultiFormatted { formats, .. } => {
+                let sorted: std::collections::BTreeMap<&str, &str> = formats
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                serde_json::to_vec(&sorted).unwrap_or_default()
+            }
+            _ => serde_json::to_vec(payload).unwrap_or_default(),
+        };
+        let mut digest = Sha256::new();
+        digest.update(&rendered);
+        store.note_assembly_manifest(&AssemblyManifest {
+            query: serde_json::to_value(assemble).unwrap_or(serde_json::Value::Null),
+            included_hashes: included,
+            rendered_sha256: hex::encode(digest.finalize()),
+            budget,
+            dropped_hashes,
+            sources,
+        });
+    }
+
     fn execute_assemble(
         &self,
         assemble: &AssembleStmt,
@@ -4284,6 +4350,34 @@ impl CalExecutor {
         if assemble.sources.is_some() {
             let engine = super::assemble::AssembleEngine::new(self);
             let result = engine.execute(assemble, store, query, exec_warnings)?;
+            let (candidates, source_snapshot, budget_snapshot) = match &result {
+                CalResultPayload::Assembled {
+                    grains,
+                    sources,
+                    total_tokens,
+                    budget_limit,
+                    ..
+                } => {
+                    let mut all = Vec::new();
+                    let mut offset = 0usize;
+                    for source in sources {
+                        let end = (offset + source.grain_count).min(grains.len());
+                        all.extend(grains[offset..end].iter().map(|g| g.hash.clone()));
+                        all.extend(source.omitted.iter().map(|g| g.hash.clone()));
+                        offset = end;
+                    }
+                    (
+                        all,
+                        serde_json::to_value(sources).unwrap_or(serde_json::Value::Null),
+                        serde_json::json!({
+                            "limit": budget_limit,
+                            "unit": "tokens",
+                            "used": total_tokens,
+                        }),
+                    )
+                }
+                _ => (Vec::new(), serde_json::Value::Null, serde_json::Value::Null),
+            };
 
             // ── Post-merge WITH options ────────────────────────────────
             //
@@ -4305,9 +4399,16 @@ impl CalExecutor {
                 result
             };
 
+            let included = match &result {
+                CalResultPayload::Assembled { grains, .. } => {
+                    grains.iter().map(|g| g.hash.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+
             // Apply FORMAT clause to multi-source results (same as single-source path).
-            if assemble.format.is_some() {
-                return apply_format_clause(
+            let result = if assemble.format.is_some() {
+                apply_format_clause(
                     result,
                     &assemble.format,
                     None,
@@ -4321,8 +4422,19 @@ impl CalExecutor {
                         assemble.for_whom.as_deref().unwrap_or(""),
                     )),
                     exec_warnings,
-                );
-            }
+                )?
+            } else {
+                result
+            };
+            self.record_assembly_manifest(
+                assemble,
+                store,
+                candidates,
+                included,
+                &result,
+                budget_snapshot,
+                source_snapshot,
+            );
             return Ok(result);
         }
 
@@ -4428,6 +4540,7 @@ impl CalExecutor {
         // Keep what the budget cut: a template's `ELEMENT_OMIT` section is how
         // an assembly accounts for what it left out, and that has to work the
         // same whether there is one source or several.
+        let candidates: Vec<String> = grains.iter().map(|g| g.hash.clone()).collect();
         let (grains, omitted) = if let Some(ref budget) = assemble.budget {
             let mut grains = grains;
             let limit = budget.tokens as usize;
@@ -4440,12 +4553,24 @@ impl CalExecutor {
         } else {
             (grains, Vec::new())
         };
+        store.note_assembly_budget(!omitted.is_empty());
+        let included: Vec<String> = grains.iter().map(|g| g.hash.clone()).collect();
+        let budget_snapshot = serde_json::json!({
+            "limit": assemble.budget.as_ref().map(|b| b.tokens),
+            "unit": "grains",
+            "used": grains.len(),
+        });
+        let source_snapshot = serde_json::json!([{
+            "label": "",
+            "grain_count": grains.len(),
+            "dropped_count": omitted.len(),
+        }]);
 
         // ── WI-1.1: ASSEMBLE FORMAT clause ───────────────────────────────
         //
         // If a FORMAT clause is present, render the grains into the
         // specified format and return a Formatted/MultiFormatted payload.
-        if let Some(ref clause) = assemble.format {
+        let result = if let Some(ref clause) = assemble.format {
             // One source, but still an assembly: `assembly.*`, `budget.*` and
             // `source.*` must resolve here exactly as they do on the
             // multi-source path. Rendering with an empty plan is what silently
@@ -4476,7 +4601,7 @@ impl CalExecutor {
                 assembly: Some(&ctx),
                 sources: Some(&sources),
             };
-            return apply_format_clause_to_grains(
+            apply_format_clause_to_grains(
                 &grains,
                 clause,
                 None,
@@ -4484,14 +4609,24 @@ impl CalExecutor {
                 store,
                 &plan,
                 exec_warnings,
-            );
-        }
-
-        let count = grains.len();
-        Ok(CalResultPayload::Grains {
-            grains,
-            total_available: Some(count),
-        })
+            )?
+        } else {
+            let count = grains.len();
+            CalResultPayload::Grains {
+                grains,
+                total_available: Some(count),
+            }
+        };
+        self.record_assembly_manifest(
+            assemble,
+            store,
+            candidates,
+            included,
+            &result,
+            budget_snapshot,
+            source_snapshot,
+        );
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------

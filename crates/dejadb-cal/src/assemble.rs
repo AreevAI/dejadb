@@ -208,12 +208,17 @@ impl<'a> AssembleEngine<'a> {
 
         // 3. Cap total grains at MAX_GRAINS_POST_DEDUP (S-05).
         let total_grain_count: usize = source_results.iter().map(|(_, g)| g.len()).sum();
+        let mut capped_omitted: HashMap<String, Vec<CalGrainResult>> = HashMap::new();
         let source_results = if total_grain_count > MAX_GRAINS_POST_DEDUP {
             warnings.push(format!(
                 "Post-dedup grain count ({}) exceeds cap ({}); truncating",
                 total_grain_count, MAX_GRAINS_POST_DEDUP
             ));
-            self.cap_grains(source_results, MAX_GRAINS_POST_DEDUP)
+            self.cap_grains(
+                source_results,
+                MAX_GRAINS_POST_DEDUP,
+                &mut capped_omitted,
+            )
         } else {
             source_results
         };
@@ -262,8 +267,13 @@ impl<'a> AssembleEngine<'a> {
             // copy of an assembly's whole result set for the life of the query
             // — which is the opposite of what a budget is for.
             let (keep, tokens_used) = self.budget_prefix(&grains, effective_allocation);
-            let omitted = grains.split_off(keep);
-            dropped += omitted.len();
+            let budget_omitted = grains.split_off(keep);
+            dropped += budget_omitted.len();
+            let mut omitted = budget_omitted;
+            if let Some(cap_tail) = capped_omitted.remove(&label) {
+                dropped += cap_tail.len();
+                omitted.extend(cap_tail);
+            }
             remaining_budget = remaining_budget.saturating_sub(tokens_used);
 
             meta.push(SourceMeta {
@@ -511,6 +521,7 @@ impl<'a> AssembleEngine<'a> {
         &self,
         source_results: Vec<(String, Vec<CalGrainResult>)>,
         max_total: usize,
+        omitted: &mut HashMap<String, Vec<CalGrainResult>>,
     ) -> Vec<(String, Vec<CalGrainResult>)> {
         let total: usize = source_results.iter().map(|(_, g)| g.len()).sum();
         if total <= max_total {
@@ -519,11 +530,15 @@ impl<'a> AssembleEngine<'a> {
 
         source_results
             .into_iter()
-            .map(|(label, grains)| {
+            .map(|(label, mut grains)| {
                 let proportion =
                     (grains.len() as f64 / total as f64 * max_total as f64).ceil() as usize;
                 let cap = proportion.max(1).min(grains.len());
-                (label, grains.into_iter().take(cap).collect())
+                let tail = grains.split_off(cap);
+                if !tail.is_empty() {
+                    omitted.insert(label.clone(), tail);
+                }
+                (label, grains)
             })
             .collect()
     }

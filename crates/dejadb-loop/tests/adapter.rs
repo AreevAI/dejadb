@@ -2,9 +2,11 @@
 //! `.db`: grain round-trip, liveness, state persistence, and the full
 //! run → review → apply loop through `deja_loop::Engine`.
 
+use dejadb_cal::DejaDbFacade;
+use dejadb_core::authz::{AuthzSet, Grant, Verb};
 use dejadb_core::types::{Fact, Grain, Tool};
 use dejadb_store::DejaDB;
-use dejadb_loop::DejaDbSubstrate;
+use dejadb_loop::{BorrowedSubstrate, DejaDbSubstrate};
 use deja_loop::{
     Decision, Engine, ObserverType, OmsSubstrate, ReadOpts, RecStatus, RunOptions, ScopeSet,
     SubstrateRead,
@@ -96,6 +98,80 @@ fn user_facts_are_readable_and_live_filtered() {
         !objs.contains(&"Ann".to_string()),
         "superseded grain filtered out via derived_from"
     );
+}
+
+#[test]
+fn substrate_reads_respect_namespace_grants() {
+    let (_d, mut store) = open_temp();
+    let allowed = store
+        .add(&Fact::new("visible", "kind", "allowed").namespace("allowed"))
+        .unwrap();
+    let denied = store
+        .add(&Fact::new("secret", "kind", "denied").namespace("denied"))
+        .unwrap();
+    let facade = DejaDbFacade::with_session(store, Some("deja-loop".into()), None);
+    facade.bind(AuthzSet::restricted(
+        "agent:scoped",
+        vec![Grant {
+            verbs: vec![Verb::Read, Verb::LoopRun],
+            namespaces: vec!["allowed".into(), "deja-loop".into()],
+        }],
+    ));
+    let sub = BorrowedSubstrate::new(&facade);
+
+    let all = sub
+        .grains_of_type("fact", None, ReadOpts::default())
+        .unwrap();
+    assert!(all.iter().any(|g| g.hash == allowed.to_hex()));
+    assert!(!all.iter().any(|g| g.hash == denied.to_hex()));
+    assert!(sub
+        .grains_of_type("fact", Some("denied"), ReadOpts::default())
+        .is_err());
+    assert!(sub.grain(&denied.to_hex()).is_err());
+}
+
+#[test]
+fn agent_reserved_namespaces_are_not_analyzer_input() {
+    let (_d, mut store) = open_temp();
+    store
+        .add(
+            &Fact::new("run:r1", "mg:harness", "config")
+                .namespace(dejadb_core::authz::HARNESS_NS),
+        )
+        .unwrap();
+    store
+        .add(&Fact::new("visible", "kind", "user-data").namespace("caller"))
+        .unwrap();
+    let sub = DejaDbSubstrate::new(store, None);
+    let facts = sub
+        .grains_of_type("fact", None, ReadOpts::default())
+        .unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].namespace, "caller");
+}
+
+#[test]
+fn replay_analysis_leaves_real_journal_unchanged() {
+    let (_d, mut store) = open_temp();
+    seed(&mut store);
+    let before = store.stats().unwrap();
+    let sub = DejaDbSubstrate::new(store, None);
+    let engine = Engine::with_builtins();
+
+    let decisions = engine
+        .analyze_only(
+            &sub,
+            &RunOptions::default(),
+            &std::collections::BTreeMap::new(),
+            NOW,
+        )
+        .unwrap();
+    assert!(!decisions.is_empty(), "the fixture must exercise the analyzers");
+
+    let mut store = sub.into_store();
+    let after = store.stats().unwrap();
+    assert_eq!(after.ops, before.ops, "replay must not append to the op-log");
+    assert_eq!(after.grains, before.grains, "replay must not append grains");
 }
 
 #[test]

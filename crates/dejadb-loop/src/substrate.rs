@@ -27,6 +27,7 @@ use dejadb_cal::classify::{classify, StatementClass};
 use dejadb_cal::{parse, CalExecutor, CalExecutorConfig, CalStoreFacade, DejaDbFacade};
 use dejadb_core::error::{DejaDbError, Hash};
 use dejadb_core::format::deserialize::DeserializedGrain;
+use dejadb_core::authz::Verb;
 use dejadb_core::types::{Fact, Grain, GrainType};
 use dejadb_store::{DejaDB, TelemetryMode, OP_FORGET};
 use serde_json::{Map, Value};
@@ -47,6 +48,14 @@ const MAX_SCAN: usize = 1_000_000;
 
 fn we(e: DejaDbError) -> WErr {
     WErr::Substrate(e.to_string())
+}
+
+fn require_read(f: &DejaDbFacade, ns: &str) -> WResult<()> {
+    f.authz().check(Verb::Read, ns).map_err(we)
+}
+
+fn may_read(f: &DejaDbFacade, ns: &str) -> bool {
+    f.authz().allows(Verb::Read, ns)
 }
 
 /// A DejaDB-backed substrate that owns its facade (CLI path).
@@ -158,6 +167,10 @@ impl_substrate!(BorrowedSubstrate<'_>);
 // --- operations (free functions over &DejaDbFacade) ---
 
 fn recent_ns(f: &DejaDbFacade, ns: &str, gt: GrainType) -> WResult<Vec<DeserializedGrain>> {
+    // An explicitly requested namespace is a capability assertion. Deny it
+    // loudly; silently returning an empty set would misreport authorization
+    // failure as "the analyzer found no data".
+    require_read(f, ns)?;
     f.with_store(|m| m.recent(ns, Some(gt), MAX_SCAN))
         .map_err(we)
 }
@@ -172,7 +185,7 @@ fn all_grains(f: &DejaDbFacade, gt: GrainType) -> WResult<Vec<DeserializedGrain>
             continue;
         }
         if let Ok(g) = f.with_store(|m| m.get(&op.hash)) {
-            if g.grain_type == gt {
+            if g.grain_type == gt && may_read(f, &grain_namespace(&g)) {
                 out.push(g);
             }
         }
@@ -201,7 +214,7 @@ fn read_user_type(
         // every non-owner principal out of the file and destroys the very
         // Art. 30 records the audit export exists to produce. Governance
         // state is metadata about the memory, not memory.
-        if ns == LOOP_NS || ns == dejadb_core::authz::AUTHZ_NS {
+        if ns == LOOP_NS || ns.starts_with("agent:") {
             continue;
         }
         if opts.live_only && superseded.contains(&g.hash.to_hex()) {
@@ -266,16 +279,28 @@ fn telemetry(f: &DejaDbFacade, namespace: Option<&str>) -> WResult<Option<Teleme
     if f.with_store(|m| m.telemetry_mode()) == TelemetryMode::Off {
         return Ok(None);
     }
+    if let Some(ns) = namespace {
+        require_read(f, ns)?;
+    }
     let access = f.with_store(|m| m.telemetry_access_stats(namespace)).map_err(we)?;
     let queries = f.with_store(|m| m.telemetry_query_stats(namespace)).map_err(we)?;
-    let budget = f.with_store(|m| m.telemetry_budget_stats()).map_err(we)?;
+    // Budget telemetry has no namespace column. It is only safe to expose to
+    // a session that may read the whole memory; namespace-scoped sessions
+    // still receive their filtered access/query rollups below.
+    let budget = if may_read(f, "*") {
+        f.with_store(|m| m.telemetry_budget_stats()).map_err(we)?
+    } else {
+        Default::default()
+    };
     Ok(Some(TelemetryView {
         access: access
             .into_iter()
+            .filter(|a| may_read(f, &a.ns))
             .map(|a| GrainAccess { hash: a.hash, recall_count: a.recall_count, last_ms: a.last_ms })
             .collect(),
         queries: queries
             .into_iter()
+            .filter(|q| may_read(f, &q.ns))
             .map(|q| QueryUsage {
                 sample: q.sample,
                 run_count: q.run_count,
@@ -328,7 +353,9 @@ fn grain(f: &DejaDbFacade, hash: &str) -> WResult<Option<GrainRecord>> {
             }
         }
     }
-    Ok(Some(map_user_grain(&g, grain_namespace(&g), created)))
+    let ns = grain_namespace(&g);
+    require_read(f, &ns)?;
+    Ok(Some(map_user_grain(&g, ns, created)))
 }
 
 fn heads(f: &DejaDbFacade, namespace: Option<&str>) -> WResult<Vec<HeadGroup>> {
@@ -336,6 +363,7 @@ fn heads(f: &DejaDbFacade, namespace: Option<&str>) -> WResult<Vec<HeadGroup>> {
     Ok(forks
         .into_iter()
         .filter(|fg| fg.namespace != LOOP_NS)
+        .filter(|fg| may_read(f, &fg.namespace))
         .filter(|fg| namespace.is_none_or(|ns| fg.namespace == ns))
         .map(|fg| HeadGroup {
             entity: format!("{}/{}", fg.subject, fg.relation),

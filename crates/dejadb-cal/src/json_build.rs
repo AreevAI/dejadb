@@ -107,7 +107,19 @@ fn unbuildable_type_message(grain_type: &str) -> String {
 fn type_known_fields(grain_type: &str) -> &'static [&'static str] {
     match grain_type {
         "fact" => &["subject", "relation", "object"],
-        "event" => &["content", "subject", "object", "run_id"],
+        "event" => &[
+            "content",
+            "subject",
+            "object",
+            "role",
+            "session_id",
+            "parent_message_id",
+            "content_blocks",
+            "model_id",
+            "stop_reason",
+            "token_usage",
+            "run_id",
+        ],
         "state" => &["data", "context_data", "plan", "history"],
         // `name`/`status` are deliberately absent: OMS §8.4 has no such Workflow
         // fields, so they fall through to `extra_fields` and serialize verbatim at
@@ -459,6 +471,13 @@ const ADD_JSON_KNOWN_FIELDS: &[&str] = &[
         "history",
         // Event (OMS §8.2) — consumed by the typed builder, so it must not also
         // be swept into `common.context`.
+        "role",
+        "session_id",
+        "parent_message_id",
+        "content_blocks",
+        "model_id",
+        "stop_reason",
+        "token_usage",
         "run_id",
         "tool_name",
         "tool_call_id",
@@ -661,6 +680,30 @@ pub fn build_grain_from_json<S: GrainSink>(
                 let mut ev = Event::new(&content);
                 if let Some(s) = get_str("subject") { ev = ev.subject(&s); }
                 if let Some(o) = get_str("object") { ev = ev.object(&o); }
+                if let Some(role) = get_str("role") {
+                    let role = Role::from_str(&role).ok_or_else(|| {
+                        DejaDbError::Validation(format!(
+                            "event 'role' must be user, assistant, system, or tool, got {role:?}"
+                        ))
+                    })?;
+                    ev = ev.role(role);
+                }
+                if let Some(s) = get_str("session_id") { ev = ev.session(s); }
+                if let Some(p) = get_str("parent_message_id") { ev = ev.parent_message(p); }
+                if let Some(cb) = fields.get("content_blocks") {
+                    let blocks = serde_json::from_value(cb.clone()).map_err(|e| {
+                        DejaDbError::Validation(format!("event 'content_blocks' invalid: {e}"))
+                    })?;
+                    ev = ev.content_blocks(blocks);
+                }
+                if let Some(m) = get_str("model_id") { ev = ev.model(m); }
+                if let Some(s) = get_str("stop_reason") { ev = ev.stop_reason(s); }
+                if let Some(tu) = fields.get("token_usage") {
+                    let usage = serde_json::from_value(tu.clone()).map_err(|e| {
+                        DejaDbError::Validation(format!("event 'token_usage' invalid: {e}"))
+                    })?;
+                    ev = ev.token_usage(usage);
+                }
                 // OMS §8.2 `run_id` (wire key `rid`). Without this it fell through
                 // to `extra_fields` *and* `common.context`, so it was written twice
                 // and never under its spec key.
@@ -997,5 +1040,94 @@ mod tests {
             build_grain_from_json("tool", &fields, Capture).unwrap(),
             Some("call_abc".to_string()),
         );
+    }
+
+    #[test]
+    fn event_json_reaches_every_typed_slot() {
+        let fields = json!({
+            "content": "calling search",
+            "role": "assistant",
+            "session_id": "sess-1",
+            "parent_message_id": "msg-0",
+            "content_blocks": [{
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "search",
+                "input": {"q": "DejaDB"}
+            }],
+            "model_id": "model/build",
+            "stop_reason": "tool_use",
+            "token_usage": {
+                "input_tokens": 12,
+                "output_tokens": 4,
+                "cache_read_tokens": 3
+            },
+            "run_id": "run-1"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        struct Capture;
+        impl GrainSink for Capture {
+            type Out = Event;
+            fn consume<G: Grain + Clone + 'static>(self, grain: &G) -> Result<Self::Out> {
+                let any = grain as &dyn std::any::Any;
+                any.downcast_ref::<Event>()
+                    .cloned()
+                    .ok_or_else(|| DejaDbError::Internal("expected event".into()))
+            }
+        }
+
+        let event = build_grain_from_json("event", &fields, Capture).unwrap();
+        assert_eq!(event.role, Some(Role::Assistant));
+        assert_eq!(event.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(event.parent_message_id.as_deref(), Some("msg-0"));
+        assert_eq!(event.model_id.as_deref(), Some("model/build"));
+        assert_eq!(event.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(event.run_id.as_deref(), Some("run-1"));
+        assert_eq!(event.content_blocks.as_ref().unwrap().len(), 1);
+        assert_eq!(event.token_usage.unwrap().input_tokens, 12);
+        assert!(event.common.extra_fields.is_empty());
+    }
+
+    #[test]
+    fn malformed_typed_event_payloads_are_rejected() {
+        for (field, value) in [
+            ("content_blocks", json!({"type": "text", "text": "not an array"})),
+            ("token_usage", json!({"input_tokens": "many", "output_tokens": 1})),
+        ] {
+            let mut fields = json!({"content": "x"}).as_object().unwrap().clone();
+            fields.insert(field.into(), value);
+            let err = build_grain_from_json("event", &fields, NullSink).unwrap_err();
+            assert!(err.to_string().contains(field), "{err}");
+        }
+    }
+
+    #[test]
+    fn common_and_type_specific_field_sets_are_disjoint() {
+        for gt in ALL_TYPES {
+            for field in type_known_fields(gt) {
+                assert!(
+                    !COMMON_KNOWN_FIELDS.contains(field),
+                    "{gt}.{field} is both common and type-specific; routing would be ambiguous"
+                );
+            }
+        }
+        let unique: std::collections::HashSet<_> = ADD_JSON_KNOWN_FIELDS.iter().collect();
+        assert_eq!(unique.len(), ADD_JSON_KNOWN_FIELDS.len(), "duplicate ADD JSON key");
+        for field in [
+            "role",
+            "session_id",
+            "parent_message_id",
+            "content_blocks",
+            "model_id",
+            "stop_reason",
+            "token_usage",
+        ] {
+            assert!(type_known_fields("event").contains(&field));
+            assert!(ADD_JSON_KNOWN_FIELDS.contains(&field));
+            assert!(!COMMON_KNOWN_FIELDS.contains(&field));
+        }
     }
 }

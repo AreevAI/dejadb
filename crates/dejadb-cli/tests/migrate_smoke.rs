@@ -148,3 +148,92 @@ fn reindex_after_index_text_flip() {
     assert!(ok);
     assert!(out.contains("matcha"), "{out}");
 }
+
+#[test]
+fn openai_tool_log_round_trips_typed_calls_and_dedups() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("tools.db");
+    let log = dir.path().join("tools.jsonl");
+    std::fs::write(
+        &log,
+        [
+            r#"{"created_at":100,"tool_calls":[{"id":"call-1","is_error":true,"function":{"name":"charge","arguments":"{\"amount\":42}"}}]}"#,
+            r#"{"created_at":101,"tool_calls":[{"id":"call-2","is_error":true,"function":{"name":"charge","arguments":"{\"amount\":42}"}}]}"#,
+            r#"{"created_at":102,"role":"tool","name":"charge","tool_call_id":"call-1","content":"declined","is_error":true}"#,
+            r#"{"tool_name":"retry","content":"timeout","is_error":true}"#,
+            r#"{"tool_name":"retry","content":"timeout","is_error":true}"#,
+            r#"{"tool_name":"retry","content":"timeout","is_error":true}"#,
+            r#"{"tool_name":"retry","content":"timeout","is_error":true}"#,
+            r#"{"tool_name":"retry","content":"timeout","is_error":true}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let args = [
+        "migrate",
+        "--from",
+        "openai-tools",
+        "--file",
+        log.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--ns",
+        "ops",
+    ];
+    let (ok, out, err) = deja(&args);
+    assert!(ok, "tool migration failed: {err}");
+    let report: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(report["added"], 8);
+
+    let (ok, out, err) = deja(&[
+        "cal",
+        r#"RECALL tools WHERE tool_name = "charge""#,
+        "--db",
+        db.to_str().unwrap(),
+        "--ns",
+        "ops",
+    ]);
+    assert!(ok, "recall imported tools failed: {err}");
+    let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let grains = payload["grains"].as_array().unwrap();
+    assert_eq!(grains.len(), 3, "retries with distinct call ids must survive");
+    assert_eq!(
+        grains
+            .iter()
+            .find(|g| g["fields"]["tool_call_id"] == "call-2")
+            .unwrap()["fields"]["input"]["amount"],
+        42
+    );
+    assert!(grains.iter().all(|g| g["fields"]["is_error"] == true));
+    assert!(
+        grains.iter().any(|g| g["fields"]["tool_content"] == "declined"),
+        "imported fields: {grains:?}"
+    );
+    assert!(grains
+        .iter()
+        .filter(|g| g["fields"]["input"]["amount"] == 42)
+        .all(|g| g["fields"].get("content").is_none()), "arguments are never result content");
+
+    let (ok, out, err) = deja(&[
+        "cal", r#"RECALL tools WHERE tool_name = "retry""#, "--db",
+        db.to_str().unwrap(), "--ns", "ops",
+    ]);
+    assert!(ok, "recall imported retries failed: {err}");
+    let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let retries = payload["grains"].as_array().unwrap();
+    assert_eq!(retries.len(), 5, "identical log lines are distinct occurrences");
+    let mut ids: Vec<&str> = retries
+        .iter()
+        .filter_map(|g| g["fields"]["tool_call_id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 5, "synthetic import ids must distinguish retries");
+
+    let (ok, out, err) = deja(&args);
+    assert!(ok, "repeat tool migration failed: {err}");
+    let report: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(report["added"], 0);
+    assert_eq!(report["skipped"], 8);
+}
