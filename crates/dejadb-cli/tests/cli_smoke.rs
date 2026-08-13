@@ -263,11 +263,27 @@ fn capture_stop_keeps_the_ordered_typed_transcript() {
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("tempdir")));
-    assert!(row["steps"]
-        .as_array()
-        .unwrap()
+    // Step masking must reach the *call*, not just the environment's reply.
+    // A tool_result is weighted 0.0 whether or not it errored, so asserting on
+    // one proves nothing — the earlier form of this test passed with the
+    // masking deleted.
+    let steps = row["steps"].as_array().unwrap();
+    let failed_call = steps
         .iter()
-        .any(|s| s["quality"] == "failed" && s["loss_weight"] == 0.0));
+        .find(|s| s["kind"] == "tool_call" && s["tool_call_id"] == "toolu_1")
+        .expect("the assistant's tool call must appear as a step");
+    assert_eq!(
+        failed_call["loss_weight"], 0.0,
+        "a tool call whose result errored must be masked out of the loss: {failed_call}"
+    );
+    assert_eq!(failed_call["quality"], "failed");
+    // …and masking is targeted: the assistant's prose is still a training target.
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["kind"] == "text" && s["loss_weight"] == 1.0),
+        "masking must not zero the whole trajectory: {steps:?}"
+    );
 
     let (ok, _, err) = deja(&[
         "corpus",
@@ -1014,4 +1030,162 @@ fn cli_retention_declares_then_enforces() {
     let (ok, out, _) = deja(&["retention", "list", "--db", db]);
     assert!(ok);
     assert!(out.contains("no retention policies"), "{out}");
+}
+
+/// A positional watermark counted every grain in the `(namespace, session)`
+/// thread, so anything else writing there — `deja remember --session-id`, a
+/// binding, a second hook — silently consumed the count and skipped that many
+/// real turns. Identity now comes from the content address, so a foreign writer
+/// is irrelevant.
+#[test]
+fn capture_stop_is_idempotent_even_when_another_writer_shares_the_thread() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("shared.db");
+    let db = db.to_str().unwrap();
+    let transcript = dir.path().join("t.jsonl");
+
+    let write_hook = |transcript: &std::path::Path| {
+        serde_json::json!({
+            "session_id": "sess-shared",
+            "transcript_path": transcript.to_str().unwrap(),
+        })
+        .to_string()
+    };
+    let run_capture = |hook: &str| -> String {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+            .args(["capture-stop", "--db", db, "--ns", "code"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn capture-stop");
+        child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "capture-stop failed");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    std::fs::write(
+        &transcript,
+        [
+            r#"{"timestamp":"2026-08-14T10:00:00Z","message":{"role":"user","content":"first"}}"#,
+            r#"{"timestamp":"2026-08-14T10:00:01Z","message":{"role":"assistant","content":"ack"}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let hook = write_hook(&transcript);
+    assert!(run_capture(&hook).contains("captured 2 events"));
+
+    // A different writer lands three grains in the very same thread.
+    for note in ["side note one", "side note two", "side note three"] {
+        let status = Command::new(env!("CARGO_BIN_EXE_deja"))
+            .args([
+                "remember", "--content", note, "--db", db, "--ns", "code",
+                "--session-id", "sess-shared", "--role", "user", "--facts", "[]",
+            ])
+            .status()
+            .expect("spawn remember");
+        assert!(status.success(), "remember failed");
+    }
+
+    // Grow the transcript by two turns and fire the hook again.
+    let mut file = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+    file.write_all(
+        br#"
+{"timestamp":"2026-08-14T10:00:02Z","message":{"role":"user","content":"second"}}
+{"timestamp":"2026-08-14T10:00:03Z","message":{"role":"assistant","content":"done"}}
+"#,
+    )
+    .unwrap();
+
+    let out = run_capture(&hook);
+    assert!(
+        out.contains("captured 2 events"),
+        "the two new turns must still be captured despite three foreign grains \
+         in the thread; got {out:?}"
+    );
+    assert!(
+        out.contains("(2 already stored)"),
+        "the first two turns must dedupe by content address, not be re-added; got {out:?}"
+    );
+
+    // Firing again with an unchanged transcript stores nothing at all.
+    let out = run_capture(&hook);
+    assert!(out.contains("captured 0 events"), "replay must be a no-op; got {out:?}");
+    assert!(out.contains("(4 already stored)"), "got {out:?}");
+}
+
+/// Two corpus fields were emitted structurally but were always empty: the
+/// reader looked for elisions under `context.elisions` while the writer put
+/// them at the top level, and nothing in the workspace ever produced a policy
+/// version. Both are now end-to-end.
+#[test]
+fn corpus_reports_elisions_and_policy_binding() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("elide.db");
+    let db = db.to_str().unwrap();
+
+    // A tool result past the 32 KiB elision threshold.
+    let huge = "x".repeat(40 * 1024);
+    let transcript = dir.path().join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        [
+            r#"{"message":{"role":"user","content":[{"type":"text","text":"dump the log"}]}}"#.to_string(),
+            r#"{"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"cat big.log"}}]}}"#.to_string(),
+            format!(
+                r#"{{"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_9","content":"{huge}"}}]}}}}"#
+            ),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let hook = serde_json::json!({
+        "session_id": "sess-e",
+        "transcript_path": transcript.to_str().unwrap(),
+    })
+    .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+        .args([
+            "capture-stop", "--db", db, "--ns", "code",
+            "--policy-version", "policy-2026-08",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn capture-stop");
+    child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+
+    let corpus = dir.path().join("train.jsonl");
+    let (ok, _, err) = deja(&[
+        "corpus", "--db", db, "--ns", "code",
+        "--select", r#"RECALL events WHERE session_id = "sess-e""#,
+        "--out", corpus.to_str().unwrap(),
+    ]);
+    assert!(ok, "corpus export failed: {err}");
+    let row: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&corpus).unwrap().trim()).unwrap();
+
+    let elisions = row["observation_elisions"].as_array().unwrap();
+    assert_eq!(
+        elisions.len(),
+        1,
+        "a truncated observation must be declared, not silently trained on: {row}"
+    );
+    assert_eq!(elisions[0]["detail"]["kind"], "tool_result");
+    assert_eq!(
+        elisions[0]["detail"]["original_bytes"].as_u64().unwrap(),
+        40 * 1024,
+        "the pre-truncation size is what makes the elision auditable"
+    );
+
+    assert_eq!(
+        row["binding"]["policy_versions"],
+        serde_json::json!(["policy-2026-08"]),
+        "the governance regime that produced the turn must reach the row: {row}"
+    );
 }

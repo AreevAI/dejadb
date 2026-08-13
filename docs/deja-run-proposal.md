@@ -1,7 +1,20 @@
 # `deja run` — an agent runtime whose execution history is memory
 
-**Status:** proposal. Nothing built. Written 2026-08-07, after the graph-engineering
-audit (PR #56) landed the substrate this would sit on.
+**Status:** proposal, **partially superseded**. Nothing built. Written
+2026-08-07, after the graph-engineering audit (PR #56) landed the substrate this
+would sit on.
+
+> **Read [`deja-adaptive-agents-proposal.md`](deja-adaptive-agents-proposal.md)
+> (2026-08-11) first.** A substrate audit against the code corrected three things
+> here: §2's "mostly assembly" holds for persistence but not for execution (five
+> of its cells are inert scaffolding with no callers anywhere in the workspace);
+> §6.2's "`dejadb-llm` plugs in here" is wrong, since that crate cannot carry a
+> `tools` array or parse `tool_calls` and needs a new trait; and §7's Phase-1
+> gate as worded passes vacuously — the replaced gate is effect suppression plus
+> decision equivalence plus journal immutability. §4's recommendation of
+> deterministic replay survives and is now load-bearing for more than this
+> document. The runtime also moves later in the plan: replay, not the runtime,
+> is the keystone.
 
 ---
 

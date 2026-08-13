@@ -132,7 +132,21 @@ fn sampled_assembly_persists_order_digest_budget_and_drops() {
     // other candidate as dropped.
     assert_eq!(manifest["dropped_hashes"].as_array().map(Vec::len), Some(1));
     assert_eq!(manifest["included_hashes"].as_array().map(Vec::len), Some(1));
-    assert_eq!(manifest["query"]["topic"], "prompt");
+
+    // The statement is proven by digest, never retained. This manifest is an
+    // immutable Observation that replicates and lives in `agent:harness`, which
+    // the subject selector does not reach — so a literal identity here would
+    // survive FORGET SUBJECT and stay invisible to REPORT SUBJECT.
+    let query_sha256 = manifest["query_sha256"]
+        .as_str()
+        .expect("manifest records a query digest");
+    assert_eq!(query_sha256.len(), 64, "expected a sha256 hex digest");
+    assert!(manifest.get("query").is_none(), "the raw statement must not be stored");
+    let serialized = serde_json::to_string(&observations[0].fields).unwrap();
+    assert!(
+        !serialized.contains("alice"),
+        "the assembled subject leaked into a durable manifest: {serialized}"
+    );
 }
 
 #[test]

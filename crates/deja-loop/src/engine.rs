@@ -1022,6 +1022,7 @@ impl Engine {
                 "destructive apply requires admin scope + allow_destructive".into(),
             ));
         }
+        ensure_executable(&rec.proposal)?;
         Ok(())
     }
 
@@ -1076,24 +1077,17 @@ impl Engine {
             // The engine has no executable Edit primitive. Marking this
             // Applied used to be a lie (and rollback had no inverse).
             Proposal::Edit { .. } => {
-                return Err(Error::InvalidProposal(
-                    "This recommendation is advisory: the engine cannot execute this edit. Make \
-                     the change in the host, then dismiss the recommendation."
-                        .into(),
-                ));
+                return Err(Error::InvalidProposal(ADVISORY_EDIT.into()));
             }
             Proposal::Data { data } => {
                 // OutcomeReview is the one executable Data shape: its
                 // `revert_of` points at an earlier applied recommendation.
                 // Reuse the ordinary rollback path so the created hashes are
                 // really retracted and the original lifecycle/audit advances.
-                let revert_of = data.get("revert_of").and_then(Value::as_str).ok_or_else(|| {
-                    Error::InvalidProposal(
-                        "This finding is advisory: the engine cannot execute it. Act on its \
-                         guidance, then dismiss it (unless it carries a valid revert_of)."
-                            .into(),
-                    )
-                })?;
+                let revert_of = data
+                    .get("revert_of")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::InvalidProposal(ADVISORY_DATA.into()))?;
                 self.rollback(
                     sub,
                     revert_of,
@@ -1919,4 +1913,44 @@ fn load_rec<S: SubstrateRead>(sub: &S, rec_hash: &str) -> Result<Recommendation>
         .grain(rec_hash)?
         .ok_or_else(|| Error::NotFound(rec_hash.into()))?;
     Recommendation::from_fields(rec_hash, &g.fields)
+}
+
+/// The refusal an advisory `Edit` earns. The engine has no executable edit
+/// primitive; the change belongs in the host.
+const ADVISORY_EDIT: &str = "This recommendation is advisory: the engine cannot execute this edit. \
+     Make the change in the host. Dismiss it with REJECT … BECAUSE while it is still pending, or \
+     approve it to acknowledge it and let it expire.";
+
+/// The refusal an advisory `Data` finding earns — every `Data` shape except
+/// `outcome_review`'s revert, which carries `revert_of`.
+const ADVISORY_DATA: &str = "This finding is advisory: the engine cannot execute it. Act on its \
+     guidance. Dismiss it with REJECT … BECAUSE while it is still pending, or approve it to \
+     acknowledge it and let it expire.";
+
+/// Whether [`Engine::apply`] can execute this proposal at all.
+///
+/// One source of truth, shared by [`Engine::preflight_apply`] and
+/// [`Engine::apply`] so the two can never disagree.
+///
+/// Deliberately **not** consulted on approve. An advisory finding is a `Flag`:
+/// approving it means "yes, this is real", which is the whole workflow for the
+/// LLM path and the telemetry analyzers. What must not happen is a caller being
+/// walked into an approval and *then* refused — which is exactly what the fused
+/// approve-and-apply path in the bindings did, leaving the recommendation in
+/// `approved`, whose only exits are `applied` and `expired`. Preflight asks
+/// first, so that path now refuses before it commits anything.
+pub(crate) fn ensure_executable(proposal: &Proposal) -> Result<()> {
+    match proposal {
+        Proposal::Cal { .. } => Ok(()),
+        Proposal::Edit { .. } => Err(Error::InvalidProposal(ADVISORY_EDIT.into())),
+        // `outcome_review` is the one executable Data shape: `revert_of` names
+        // an earlier applied recommendation to roll back.
+        Proposal::Data { data } => {
+            if data.get("revert_of").and_then(Value::as_str).is_some() {
+                Ok(())
+            } else {
+                Err(Error::InvalidProposal(ADVISORY_DATA.into()))
+            }
+        }
+    }
 }

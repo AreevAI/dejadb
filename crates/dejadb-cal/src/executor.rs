@@ -4294,8 +4294,17 @@ impl CalExecutor {
         };
         let mut digest = Sha256::new();
         digest.update(&rendered);
+        // Digest the statement, never store it: an ASSEMBLE routinely names its
+        // subject, and this manifest is immutable, replicating, and sits in a
+        // namespace the erasure selector does not reach.
+        let mut query_digest = Sha256::new();
+        query_digest.update(
+            serde_json::to_vec(assemble)
+                .unwrap_or_default()
+                .as_slice(),
+        );
         store.note_assembly_manifest(&AssemblyManifest {
-            query: serde_json::to_value(assemble).unwrap_or(serde_json::Value::Null),
+            query_sha256: hex::encode(query_digest.finalize()),
             included_hashes: included,
             rendered_sha256: hex::encode(digest.finalize()),
             budget,

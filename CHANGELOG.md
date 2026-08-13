@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Trajectory capture, replay, and the governed corpus (phases A–C).** DejaDB
+  records what an agent *did*, not just what it remembered.
+  - **A typed turn.** `content_blocks`, `model_id`, `stop_reason`,
+    `token_usage`, `parent_message_id`, `role` and `session_id` now reach their
+    typed `Event` slots from every host surface — MCP `dejadb_add`, `deja add`,
+    and both bindings. `record_tool_call` gained `input`, so a tool call's
+    arguments are recorded rather than lost, and it gained the two surfaces it
+    lacked: `deja record-tool-call` and MCP `dejadb_record_tool_call`.
+    `capture-stop` stores the whole transcript as ordered, threaded turns
+    instead of the last two messages flattened to strings, declaring any
+    truncated observation rather than silently shortening it.
+  - **The harness is data.** `deja run-manifest` / MCP `dejadb_run_manifest`
+    record the model, build, sampling parameters and tool catalogue behind a run
+    as a content-addressed `State` grain in `agent:harness`, with an indexed
+    `Fact` joining `run:<id>` to it — so identical configurations collapse to
+    one grain and "every run on this config" is a query. `--run-id` and
+    `set_run_id` join recall telemetry to the same trajectory. Sampled
+    assembly manifests (off by default) record which grains actually reached the
+    model's window.
+  - **Replay.** `Engine::analyze_only` re-runs the analyzers against the
+    immutable past with overridden parameters, taking `&S` so the type system
+    forbids it writing anything, sharing one body with the production path so
+    the two provably agree.
+  - **`deja corpus`** exports OpenAI chat-completions JSONL from an existing CAL
+    `RECALL`, streaming rather than buffering, with step-level loss masking, and
+    records a replicating export manifest whose provenance edges reach the
+    source grains. `FORGET SUBJECT` and the retention sweep consult that
+    registry and name which corpora — and therefore which trained artifacts —
+    an erasure has made stale.
+
 - **GDPR compliance pack** — the obligations a deploying org actually gets
   audited on, made mechanical and evidenceable. New page
   [`docs/gdpr.md`](docs/gdpr.md) maps articles to mechanisms for a DPIA,
@@ -256,6 +286,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `created_at` values. Same underlying property as #66, but here dedup is
   behaving correctly and the test was the thing making a claim it had not
   arranged for.
+
+- **An identity could survive erasure inside an assembly manifest.** A sampled
+  ASSEMBLE stored the whole statement, so `ASSEMBLE … WHERE subject = "john"`
+  wrote that identity verbatim into an immutable, replicating Observation in
+  `agent:harness` — a namespace the subject selector does not reach, so it never
+  appeared in `REPORT SUBJECT` and survived `FORGET SUBJECT`. The manifest now
+  records `query_sha256`, proving which statement ran without retaining its
+  text, the same rule and the same reason as the corpus manifest's
+  `selector_sha256`.
+
+- **Applying an advisory recommendation could strand it.** Every `Data`
+  proposal except `outcome_review`'s revert is advisory, and the fused
+  approve-and-apply path in the bindings approved first and refused second —
+  leaving the recommendation in `approved`, whose only exits are `applied` and
+  `expired`. `preflight_apply` now asks the same question `apply` will, through
+  one shared check, so the refusal lands while the finding is still `pending`
+  and dismissible. Approving an advisory finding remains legal: a `Flag` is
+  acknowledged, not executed.
+
+- **A second writer in a session could make `capture-stop` skip real turns.**
+  The hook treated the count of grains in the `(namespace, session)` thread as a
+  watermark, so anything else writing there — `deja remember --session-id`, a
+  binding, another hook — consumed the count and silently dropped that many
+  turns. A turn is now identified by its own content address, with `created_at`
+  pinned from the transcript, making a rerun idempotent by construction rather
+  than by arithmetic.
+
+- **The corpus did not mask the step it was supposed to mask.** A tool call
+  whose result came back an error kept full loss weight; only the environment's
+  reply was zeroed, which it is regardless. The call and its result arrive in
+  different events, so the correlation now runs once the session is whole.
+  Training on a failed run wholesale underperforms training on successes alone;
+  masking only the harmful steps beats both.
+
+- **Two corpus fields were structurally emitted and always empty.**
+  `observation_elisions` read `context.elisions` while `capture-stop` wrote
+  `elisions` at the top level, and no code anywhere produced a policy version.
+  The reader now accepts both spellings, and `capture-stop --policy-version`
+  stamps the governance regime in force, so `binding.policy_versions` states
+  which regime produced a training row.
 
 - **Phase A-C review hardening.** Repeated cumulative `capture-stop` hooks now
   append only unseen turns; tool-log imports synthesize stable per-record call

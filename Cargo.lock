@@ -658,6 +658,7 @@ dependencies = [
 name = "dejadb"
 version = "1.1.1"
 dependencies = [
+ "chrono",
  "deja-loop",
  "dejadb-cal",
  "dejadb-context",

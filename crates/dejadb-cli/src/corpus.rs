@@ -105,6 +105,43 @@ fn ordered_events<'a>(events: &[&'a CalGrainResult]) -> Vec<&'a CalGrainResult> 
     ordered
 }
 
+/// Zero the loss weight of every tool call whose result came back an error.
+///
+/// This is the step-level masking the corpus exists to provide. Training on a
+/// failed run wholesale measurably underperforms training on its successes
+/// alone; masking only the harmful steps beats both. The harmful step is the
+/// model's *call*, not the environment's reply — and the two arrive in
+/// different events, so the correlation can only run once the session is whole.
+fn mask_failed_tool_calls(steps: &mut [Value]) {
+    let failed: BTreeSet<String> = steps
+        .iter()
+        .filter(|s| s.get("kind").and_then(Value::as_str) == Some("tool_result"))
+        .filter(|s| s.get("quality").and_then(Value::as_str) == Some("failed"))
+        .filter_map(|s| s.get("tool_call_id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    for step in steps.iter_mut() {
+        if step.get("kind").and_then(Value::as_str) != Some("tool_call") {
+            continue;
+        }
+        let matched = step
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| failed.contains(id));
+        if !matched {
+            continue;
+        }
+        if let Some(obj) = step.as_object_mut() {
+            obj.insert("quality".into(), json!("failed"));
+            obj.insert("loss_weight".into(), json!(0.0));
+        }
+    }
+}
+
 fn quality(grain: &CalGrainResult, block_error: bool) -> (&'static str, f64) {
     if block_error {
         return ("failed", 0.0);
@@ -125,9 +162,16 @@ fn push_event_messages(
     let Some(role) = str_field(event, "role") else {
         return; // occurrence Event, not a chat turn
     };
-    if let Some(items) = field(event, "context")
-        .and_then(Value::as_object)
-        .and_then(|c| c.get("elisions"))
+    // `capture-stop` records elisions as a top-level extra field; accept the
+    // nested spelling too so a host that puts them in `context` still reports
+    // them. Reading only `context.elisions` silently emitted an empty list for
+    // every corpus this engine produced.
+    if let Some(items) = field(event, "elisions")
+        .or_else(|| {
+            field(event, "context")
+                .and_then(Value::as_object)
+                .and_then(|c| c.get("elisions"))
+        })
         .and_then(Value::as_array)
     {
         for item in items {
@@ -186,6 +230,10 @@ fn push_event_messages(
                     "message_index": messages.len(),
                     "segment": segment,
                     "kind": "tool_call",
+                    // Carried so the failing result can find this step: the
+                    // result arrives in a later event, so the harmful call can
+                    // only be masked after the whole session is walked.
+                    "tool_call_id": id,
                     "quality": label,
                     "loss_weight": if role == "assistant" { base } else { 0.0 },
                 }));
@@ -220,7 +268,11 @@ fn push_event_messages(
             "message_index": message_index,
             "segment": segment,
             "kind": "tool_result",
+            "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
             "quality": label,
+            // An environment observation is never a training target, error or
+            // not. The signal a failure carries belongs on the *call* that
+            // caused it — see `mask_failed_tool_calls`.
             "loss_weight": 0.0,
         }));
     }
@@ -274,6 +326,7 @@ pub fn write_jsonl<W: Write>(
         if messages.is_empty() {
             continue;
         }
+        mask_failed_tool_calls(&mut steps);
         let loss_steps: Vec<Value> = steps
             .iter()
             .filter_map(|step| {
