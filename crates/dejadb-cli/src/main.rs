@@ -50,7 +50,8 @@ COMMANDS:
   recall   <subject> | --subject S   [--relation R] [--ns NS] [-k N]
            [--render sml|toon|markdown|plain|json] [--budget TOKENS]
   cal      <QUERY> [--ns NS]          execute a CAL statement
-  corpus   --select '<READ CAL>' [--out FILE]   stream governed OpenAI chat
+  corpus   --select '<READ CAL>' [--out FILE] [--recipient ID]
+                                      stream governed OpenAI chat
                                       JSONL and record its provenance registry
   search   --query TEXT [--subject S] [-k N]   hybrid recall (BM25 + structural, RRF)
   history  --subject S --relation R [--ns NS]
@@ -351,33 +352,20 @@ fn write_erasure_audit(
         );
         obs.common.context = Some(serde_json::Value::Object(context));
         for export in stale_exports {
+            let recipient = export
+                .recipient
+                .as_deref()
+                .map(|id| format!(" for recipient {id}"))
+                .unwrap_or_default();
             eprintln!(
-                "deja: corpus {} at {} is stale and must be retired or re-derived",
-                export.export_id, export.destination
+                "deja: corpus {} at {}{} is stale and must be retired or re-derived",
+                export.export_id, export.destination, recipient
             );
         }
     }
     if let Err(e) = m.add(&obs) {
         eprintln!("deja: warning: erasure succeeded but its audit record failed to write: {e}");
     }
-}
-
-fn exports_touching_erased_hashes(
-    exports: &[dejadb_store::CorpusExportRegistry],
-    erased_hashes: &[String],
-) -> Vec<dejadb_store::CorpusExportRegistry> {
-    let erased: std::collections::HashSet<&str> =
-        erased_hashes.iter().map(String::as_str).collect();
-    exports
-        .iter()
-        .filter(|export| {
-            export
-                .source_hashes
-                .iter()
-                .any(|hash| erased.contains(hash.as_str()))
-        })
-        .cloned()
-        .collect()
 }
 
 /// True when a `host:port` (or bare host) names a loopback interface. Used to
@@ -620,7 +608,17 @@ fn run_migrate(
                 }
                 let v: serde_json::Value = serde_json::from_str(line)
                     .map_err(|e| format!("{file}:{}: bad JSON: {e}", i + 1))?;
-                for record in extract_tool_records(&v) {
+                for (record_index, record) in extract_tool_records(&v).into_iter().enumerate() {
+                    use sha2::{Digest, Sha256};
+                    let synthetic_call_id = || {
+                        let mut digest = Sha256::new();
+                        digest.update(file.as_bytes());
+                        digest.update([0]);
+                        digest.update(line.as_bytes());
+                        digest.update((i as u64).to_le_bytes());
+                        digest.update((record_index as u64).to_le_bytes());
+                        format!("import:{}", &hex::encode(digest.finalize())[..24])
+                    };
                     let mut tool = Tool::new(&record.name)
                         .is_error(record.is_error)
                         // Unknown source time is pinned, not replaced with the
@@ -633,9 +631,10 @@ fn run_migrate(
                     if !record.content.is_empty() {
                         tool = tool.content(&record.content);
                     }
-                    if let Some(call_id) = record.call_id {
-                        tool = tool.tool_call_id(&call_id);
-                    }
+                    // The per-record digest is stable across reruns but
+                    // distinguishes identical retries on separate lines.
+                    let call_id = record.call_id.unwrap_or_else(synthetic_call_id);
+                    tool = tool.tool_call_id(&call_id);
                     let tool = tool.namespace(ns);
                     let (_, hash) = dejadb_core::format::serialize::serialize_grain(&tool)
                         .map_err(|e| e.to_string())?;
@@ -1164,7 +1163,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let selector = flag(&flags, "select")
                 .or_else(|| positional.first().cloned())
                 .ok_or_else(|| {
-                    "usage: deja corpus --select '<READ CAL>' [--out FILE]".to_string()
+                    "usage: deja corpus --select '<READ CAL>' [--out FILE] [--recipient ID]"
+                        .to_string()
                 })?;
             let parsed = dejadb_cal::parse(&selector).map_err(|e| e.to_string())?;
             if classify(&parsed.statement) != StatementClass::Read {
@@ -1173,6 +1173,9 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             let facade = DejaDbFacade::with_session(m, Some(ns), None);
             report_meta_warnings(&facade);
             let facade = apply_principal(facade, &flags)?;
+            // The selector's read grant and the immutable registry write are
+            // separate capabilities. Fail before creating an output file.
+            facade.authorize_corpus_export().map_err(|e| e.to_string())?;
             let ex = CalExecutor::new(CalExecutorConfig {
                 allow_destructive_ops: false,
                 ..CalExecutorConfig::default()
@@ -1194,6 +1197,7 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 }
             };
             let destination = flag(&flags, "out").unwrap_or_else(|| "stdout".to_string());
+            let recipient = flag(&flags, "recipient");
             let summary = if destination == "stdout" {
                 let stdout = std::io::stdout();
                 corpus::write_jsonl(grains, BufWriter::new(stdout.lock()))?
@@ -1204,15 +1208,14 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
             };
             let exported_at = now_ms();
             let manifest = facade
-                .with_store(|store| {
-                    store.record_corpus_export(
-                        &selector,
-                        &destination,
-                        exported_at,
-                        &summary.subject_fingerprints,
-                        &summary.source_hashes,
-                    )
-                })
+                .record_corpus_export(
+                    &selector,
+                    &destination,
+                    recipient.as_deref(),
+                    exported_at,
+                    &summary.subject_fingerprints,
+                    &summary.source_hashes,
+                )
                 .map_err(|e| e.to_string())?;
             eprintln!(
                 "corpus export: {} row(s), {} source grain(s), manifest {}",
@@ -1622,7 +1625,15 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .as_str()
                 .ok_or("hook json missing transcript_path")?;
             let transcript = std::fs::read_to_string(tpath).map_err(|e| e.to_string())?;
-            let mut parent: Option<String> = None;
+            // Claude's Stop hook points at the cumulative transcript. Treat
+            // the existing thread as a durable prefix watermark so repeated
+            // hooks append only newly observed turns.
+            let existing = m
+                .thread_tail(&ns, &session, i64::MAX as usize)
+                .map_err(|e| e.to_string())?;
+            let already_captured = existing.len();
+            let mut parent = existing.last().map(|grain| grain.hash.to_hex());
+            let mut capturable_turn = 0usize;
             let mut stored = 0;
             for (turn, line) in transcript.lines().enumerate() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
@@ -1636,6 +1647,11 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 if text.trim().is_empty() && blocks.is_empty() {
                     continue;
                 }
+                if capturable_turn < already_captured {
+                    capturable_turn += 1;
+                    continue;
+                }
+                capturable_turn += 1;
                 let mut event = Event::new(&text)
                     .namespace(&ns)
                     .session(session.clone())
@@ -2225,7 +2241,8 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 Vec::new()
             });
             let rep = m.forget_older_than(ns_opt, cutoff, gt).map_err(|e| e.to_string())?;
-            let stale_exports = exports_touching_erased_hashes(&exports, &rep.erased_hashes);
+            let stale_exports =
+                dejadb_store::exports_touching_hashes(&exports, &rep.erased_hashes);
             write_erasure_audit(
                 &mut m,
                 &flags,
@@ -2435,7 +2452,7 @@ fn run_retention(
                 // policy for zero information.
                 if rep.grains_erased > 0 {
                     let stale_exports =
-                        exports_touching_erased_hashes(&exports, &rep.erased_hashes);
+                        dejadb_store::exports_touching_hashes(&exports, &rep.erased_hashes);
                     write_erasure_audit(
                         m,
                         flags,

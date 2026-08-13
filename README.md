@@ -232,8 +232,8 @@ no agent and no waiting:
 ```python
 import dejadb, json
 db = dejadb.DejaDB("proof.db", actor="user:me")
-for _ in range(5): db.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', is_error=True)
-for _ in range(2): db.record_tool_call("stripe_refund", None, '{"ok":true}', is_error=False)
+for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
 db.loop_run()                                             # deterministic; never gated when bare
 for r in json.loads(db.recommendations('{"status":"pending"}')): print(r["severity"], r["summary"])
 # → high  Tool "stripe_refund" failed 5 times (71% of calls): rate_limited
@@ -281,11 +281,12 @@ binds a run to a content-addressed configuration, and sampled ASSEMBLE
 manifests record the exact included/dropped hashes plus the rendered digest.
 Set `--run-id` to join full-mode recall telemetry to the same trajectory.
 
-`deja corpus --select '<READ CAL>' [--out train.jsonl]` reuses CAL as the
+`deja corpus --select '<READ CAL>' [--out train.jsonl] [--recipient ID]` reuses CAL as the
 authorized selector and streams OpenAI chat JSONL with tool definitions,
 step-level loss weights/quality labels, elision records, and trace/model/policy/
 subject-fingerprint bindings. Each export writes a replicating manifest grain
-whose `related_to` edges name every source hash. Later identity or retention
+whose `related_to` edges name every source hash; `--recipient` records the
+downstream trainer/model owner that must act on a stale-export notice. Later identity or retention
 erasure reports which exported corpora are stale and must be retired or
 re-derived; this is auditable suppression/re-derivation, not a claim that a
 subject has been removed from model weights.

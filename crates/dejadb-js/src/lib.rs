@@ -1398,11 +1398,11 @@ impl DejaDb {
     pub fn record_tool_call(
         &self,
         name: String,
-        input: Option<String>,
         result: String,
         is_error: Option<bool>,
         thread: Option<String>,
         call_id: Option<String>,
+        input: Option<String>,
     ) -> napi::bindgen_prelude::AsyncTask<StringJob> {
         let slot = self.facade.clone();
         let ns = self.ns.clone();

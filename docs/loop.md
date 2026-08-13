@@ -26,8 +26,8 @@ import dejadb, json
 db = dejadb.DejaDB("proof.db", actor="user:me")   # actor labels the audit chain
 
 # tool-failure clustering: 5 failures + 2 successes for one tool
-for _ in range(5): db.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', is_error=True)
-for _ in range(2): db.record_tool_call("stripe_refund", None, '{"ok":true}', is_error=False)
+for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
 
 # contradiction sweep: two live values under a functional relation
 db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
@@ -81,6 +81,8 @@ up front); every decision carries a written reason.
    deterministic finding is computed, so the engine stays its only creator).
 3. **Apply** — requires the `apply` scope; destructive applies additionally
    require `admin` + `allow_destructive`; every apply records its inverse.
+   Advisory Edit/Data findings have no executable engine primitive: make the
+   change in the host, then dismiss the recommendation to close its lifecycle.
 4. **Verify** — outcome review re-runs the stored metric after `review_after`
    and proposes a revert on regression.
 
@@ -122,6 +124,11 @@ and coverage-gap** — each score **1.00** precision and recall; `fork_surfacing
 and `outcome_review` need concurrent heads / applied history, and
 `budget_pressure` is a global signal, so those three are covered by the crate
 tests instead. See `crates/dejadb-bench/RESULTS.md` for the table.
+
+Both ASSEMBLE paths feed budget telemetry. Multi-source assemblies allocate
+token budgets; the legacy single-source path interprets the numeric limit as a
+grain count and reports `budget.unit = "grains"`. In either case, dropping any
+candidate records an overflow sample for `budget_pressure`.
 
 ## Recall telemetry (the utility signal)
 
@@ -234,8 +241,8 @@ Same methods in both (scalars in, JSON strings out):
 
 ```python
 db = dejadb.DejaDB("agent.db", actor="user:alice")
-db.record_tool_call("stripe_refund", args_json, result_json, is_error=True, thread="sess-42",
-                    call_id="toolu_01A")   # the provider's tool_call_id, if you have it
+db.record_tool_call("stripe_refund", result_json, is_error=True, thread="sess-42",
+                    call_id="toolu_01A", input=args_json)
 db.loop_run(min_new=20, min_new_errors=3, if_stale="6h")   # gated; bare call never gates
 db.loop_run(full_sweep=True)                 # the `reflect` semantics: whole memory
 db.loop_run(policy="loop-policy.json")     # host policy file — the only auto-apply path

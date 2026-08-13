@@ -187,6 +187,31 @@ fn capture_stop_keeps_the_ordered_typed_transcript() {
     assert!(out.status.success(), "capture-stop failed");
     assert!(String::from_utf8_lossy(&out.stdout).contains("captured 4 events"));
 
+    // Stop receives the cumulative transcript. Growing it and invoking the
+    // hook again must append only the two new turns, not replay the first four.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(
+        br#"
+{"message":{"role":"user","content":"please apply the fix"}}
+{"message":{"role":"assistant","content":"Fixed and verified."}}
+"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deja"))
+        .args(["capture-stop", "--db", db, "--ns", "code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn second capture-stop");
+    child.stdin.as_mut().unwrap().write_all(hook.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "second capture-stop failed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("captured 2 events"));
+
     // The captured events must carry the tool outcome, flagged as an error.
     let recall = Command::new(env!("CARGO_BIN_EXE_deja"))
         .args(["cal", "RECALL events RECENT 10", "--db", db, "--ns", "code"])
@@ -197,13 +222,13 @@ fn capture_stop_keeps_the_ordered_typed_transcript() {
     assert!(text.contains("shared tempdir race"), "tool output body missing: {text}");
     let payload: serde_json::Value = serde_json::from_slice(&recall.stdout).unwrap();
     let grains = payload["grains"].as_array().unwrap();
-    assert_eq!(grains.len(), 4, "the whole transcript must survive: {payload}");
+    assert_eq!(grains.len(), 6, "the cumulative transcript must not replay: {payload}");
     assert_eq!(
         grains
             .iter()
             .filter(|g| g["fields"]["parent_message_id"].is_string())
             .count(),
-        3,
+        5,
         "every turn after the first must be threaded"
     );
     let tool_use = grains
@@ -232,7 +257,7 @@ fn capture_stop_keeps_the_ordered_typed_transcript() {
     assert!(err.contains("manifest"), "manifest receipt missing: {err}");
     let row: serde_json::Value =
         serde_json::from_str(std::fs::read_to_string(&corpus).unwrap().trim()).unwrap();
-    assert_eq!(row["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(row["messages"].as_array().unwrap().len(), 6);
     assert!(row["messages"]
         .as_array()
         .unwrap()
@@ -253,6 +278,44 @@ fn capture_stop_keeps_the_ordered_typed_transcript() {
     ]);
     assert!(!ok, "a write selector must be refused");
     assert!(err.contains("read-only"), "unclear selector refusal: {err}");
+}
+
+#[test]
+fn corpus_registry_requires_harness_write_grant() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("corpus-auth.db");
+    let out = dir.path().join("train.jsonl");
+    let db = db.to_str().unwrap();
+    let out = out.to_str().unwrap();
+    let (ok, _, err) = deja(&[
+        "add", "alice", "prefers", "tea", "--db", db, "--ns", "caller",
+    ]);
+    assert!(ok, "seed failed: {err}");
+    let (ok, _, err) = deja(&[
+        "add", "agent:reader", "mg:permits", "read ON caller", "--db", db,
+        "--ns", "agent:authz",
+    ]);
+    assert!(ok, "grant failed: {err}");
+
+    let args = [
+        "corpus", "--db", db, "--ns", "caller", "--as", "agent:reader",
+        "--select", "RECALL facts", "--out", out,
+    ];
+    let (ok, _, err) = deja(&args);
+    assert!(!ok, "read-only principal must not write the registry");
+    assert!(err.contains("write") && err.contains("agent:harness"), "{err}");
+    assert!(!std::path::Path::new(out).exists(), "denial must precede output creation");
+
+    let (ok, _, err) = deja(&[
+        "add", "agent:exporter", "mg:permits",
+        "read,write ON caller,agent:harness", "--db", db, "--ns", "agent:authz",
+    ]);
+    assert!(ok, "export grant failed: {err}");
+    let (ok, _, err) = deja(&[
+        "corpus", "--db", db, "--ns", "caller", "--as", "agent:exporter",
+        "--select", "RECALL facts", "--out", out, "--recipient", "trainer:v1",
+    ]);
+    assert!(ok, "authorized export failed: {err}");
 }
 
 /// `recall-hook --with-loop` closes the loop: pending recommendations ride
@@ -736,6 +799,8 @@ fn erasure_audit_names_stale_corpus_exports() {
         r#"RECALL facts WHERE subject = "pat""#,
         "--out",
         corpus,
+        "--recipient",
+        "trainer:model-v2",
     ]);
     assert!(ok, "corpus export failed: {err}");
 
@@ -750,6 +815,7 @@ fn erasure_audit_names_stale_corpus_exports() {
     ]);
     assert!(ok, "forget-subject failed: {err}");
     assert!(err.contains("is stale and must be retired or re-derived"), "{err}");
+    assert!(err.contains("for recipient trainer:model-v2"), "{err}");
 
     let (ok, out, err) = deja(&["audit", "export", "--db", db]);
     assert!(ok, "audit export failed: {err}");
@@ -757,6 +823,7 @@ fn erasure_audit_names_stale_corpus_exports() {
     let stale = row["stale_corpora"].as_array().unwrap();
     assert_eq!(stale.len(), 1, "{row}");
     assert_eq!(stale[0]["destination"], corpus);
+    assert_eq!(stale[0]["recipient"], "trainer:model-v2");
     assert!(stale[0]["export_id"].as_str().unwrap().starts_with("export:"));
 }
 

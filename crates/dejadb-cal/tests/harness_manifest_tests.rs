@@ -1,7 +1,7 @@
 use dejadb_cal::{CalExecutor, CalExecutorConfig, DejaDbFacade};
 use dejadb_core::authz::HARNESS_NS;
 use dejadb_core::types::{Fact, Grain, GrainType};
-use dejadb_store::DejaDB;
+use dejadb_store::{DejaDB, DejaDbOptions, TelemetryMode};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -55,6 +55,35 @@ fn run_manifest_rejects_non_object_config() {
     let facade = DejaDbFacade::with_session(store, Some("caller".into()), None);
     let err = facade.record_run_manifest("run-a", "[]").unwrap_err();
     assert!(err.to_string().contains("JSON object"), "{err}");
+}
+
+#[test]
+fn single_source_assembly_records_budget_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = DejaDB::open_with(
+        dir.path().join("budget.db").to_str().unwrap(),
+        DejaDbOptions { telemetry: TelemetryMode::Aggregate, ..Default::default() },
+    )
+    .unwrap();
+    let facade = DejaDbFacade::with_session(store, Some("caller".into()), None);
+    let ex = CalExecutor::new(CalExecutorConfig::default());
+    for object in ["tea", "coffee"] {
+        ex.execute(
+            &format!(
+                r#"ADD fact SET subject = "alice" SET relation = "prefers" SET object = "{object}" REASON "seed""#
+            ),
+            &facade,
+        )
+        .unwrap();
+    }
+    ex.execute(
+        r#"ASSEMBLE "brief" FROM (RECALL facts WHERE subject = "alice") BUDGET 1 tokens"#,
+        &facade,
+    )
+    .unwrap();
+    let budget = facade.with_store(|m| m.telemetry_budget_stats()).unwrap();
+    assert_eq!(budget.sample_count, 1);
+    assert_eq!(budget.overflow_count, 1);
 }
 
 #[test]

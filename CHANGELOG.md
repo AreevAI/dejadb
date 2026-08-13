@@ -257,6 +257,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behaving correctly and the test was the thing making a claim it had not
   arranged for.
 
+- **Phase A-C review hardening.** Repeated cumulative `capture-stop` hooks now
+  append only unseen turns; tool-log imports synthesize stable per-record call
+  ids so identical retries survive without duplicating on re-import; Python and
+  Node retain the compatible `record_tool_call(name, result, ...)` positional
+  contract while accepting `input` as a trailing option. Governed corpus
+  manifests store a selector digest instead of identity-bearing CAL, require
+  `write ON agent:harness`, record an optional downstream recipient, retain
+  trace-scoped subject fingerprints, and use a replicated sparse index rather
+  than a bounded full-store scan. Single-source ASSEMBLE overflow now has an
+  explicit telemetry regression gate and is documented as grain-budgeted.
+
+- **Advisory loop findings now explain their workflow.** Applying a non-
+  executable Edit/Data recommendation tells the operator to act in the host
+  and dismiss it, instead of ending at an implementation-shaped error.
+
 - **The trigger of an LLM loop run can no longer approve its own model's
   output.** Every recommendation recorded its creator as `engine:<analyzer>` —
   correct for the deterministic analyzers, whose findings are computed rather

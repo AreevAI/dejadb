@@ -226,9 +226,30 @@ pub struct CorpusExportRegistry {
     pub manifest_hash: String,
     pub export_id: String,
     pub destination: String,
+    pub recipient: Option<String>,
     pub exported_at_ms: i64,
     pub subject_fingerprints: Vec<String>,
     pub source_hashes: Vec<String>,
+}
+
+/// Pure registry predicate shared by the store and host surfaces that must
+/// inspect a pre-erasure snapshot.
+pub fn exports_touching_hashes(
+    exports: &[CorpusExportRegistry],
+    hashes: &[String],
+) -> Vec<CorpusExportRegistry> {
+    let hashes: std::collections::HashSet<&str> =
+        hashes.iter().map(String::as_str).collect();
+    exports
+        .iter()
+        .filter(|export| {
+            export
+                .source_hashes
+                .iter()
+                .any(|hash| hashes.contains(hash.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Result of [`DejaDB::subject_report`] — the read-only DSAR mirror of
@@ -744,7 +765,7 @@ const LINK_INDEX_KEY: &str = "link_index";
 
 /// Bumped when a change to what the link indexes contain requires a rebuild of
 /// files stamped with an earlier value.
-const LINK_INDEX_VERSION: &str = "1";
+const LINK_INDEX_VERSION: &str = "2";
 
 /// Open options.
 pub struct DejaDbOptions {
@@ -842,6 +863,11 @@ const SCHEMA: &[&str] = &[
     // repeat across many grains, so this one *is* dictionary-encoded.
     "CREATE TABLE IF NOT EXISTS run_idx(ns INTEGER, run INTEGER, seq INTEGER)",
     "CREATE INDEX IF NOT EXISTS idx_run ON run_idx(ns, run, seq)",
+    // Sparse, replicated registry index. `agent:harness` also carries sampled
+    // assembly manifests and run configs, so finding corpus exports by scanning
+    // that namespace becomes unbounded. The grain remains the source of truth;
+    // this table is rebuilt from its canonical body on bundle import.
+    "CREATE TABLE IF NOT EXISTS corpus_idx(seq INTEGER PRIMARY KEY)",
 ];
 
 fn pi(x: i64) -> Value {
@@ -1092,6 +1118,7 @@ struct GrainPrep {
     run: Option<i64>,
     /// Raw 32-byte `derived_from` parent address, for reverse provenance.
     parent: Option<Vec<u8>>,
+    corpus_export: bool,
 }
 
 /// Extracted index-relevant fields of a grain about to be stored.
@@ -1111,6 +1138,7 @@ struct GrainView {
     run: Option<String>,
     /// `derived_from` — this grain's provenance parent, if any.
     parent: Option<String>,
+    corpus_export: bool,
 }
 
 fn extract_view(view: &DeserializedGrain) -> GrainView {
@@ -1126,6 +1154,13 @@ fn extract_view(view: &DeserializedGrain) -> GrainView {
         gtype: view.grain_type as u8,
         run: view.get_str("run_id").map(str::to_string),
         parent: view.get_str("derived_from").map(str::to_string),
+        corpus_export: view.grain_type == dejadb_core::types::GrainType::Observation
+            && view
+                .fields
+                .get("context")
+                .and_then(|value| value.get("corpus_export"))
+                .and_then(|value| value.as_bool())
+                == Some(true),
         links: view
             .fields
             .get("related_to")
@@ -2353,6 +2388,7 @@ impl DejaDB {
             links,
             run,
             parent,
+            corpus_export: gv.corpus_export,
         })
     }
 
@@ -2481,7 +2517,8 @@ impl DejaDB {
 
     /// Backfill the secondary indexes that were added after this file may have
     /// been written: reverse provenance (`prov_idx`), run correlation
-    /// (`run_idx`), and the `related_to` cross-link triples.
+    /// (`run_idx`), governed corpus manifests (`corpus_idx`), and the
+    /// `related_to` cross-link triples.
     ///
     /// Returns the number of index rows written. Idempotent — the tables are
     /// cleared first, so running it twice is not double-counting. Reads every
@@ -2513,6 +2550,7 @@ impl DejaDB {
             ns: i64,
             run: Option<i64>,
             parent: Option<Vec<u8>>,
+            corpus_export: bool,
             links: Vec<(i64, i64, i64)>,
         }
         // One transaction for delete + corpus read + plan + writes,
@@ -2524,6 +2562,7 @@ impl DejaDB {
             self.db.reserve_write(0, 0, 0, now_ms() << 16, 0)?;
             self.db.execute("DELETE FROM prov_idx", vec![])?;
             self.db.execute("DELETE FROM run_idx", vec![])?;
+            self.db.execute("DELETE FROM corpus_idx", vec![])?;
             let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
             for row in self
                 .db
@@ -2564,7 +2603,14 @@ impl DejaDB {
                         }
                     }
                 }
-                plan.push(Row { seq: *seq, ns: *ns, run, parent, links });
+                plan.push(Row {
+                    seq: *seq,
+                    ns: *ns,
+                    run,
+                    parent,
+                    corpus_export: gv.corpus_export,
+                    links,
+                });
             }
 
             let mut n = 0usize;
@@ -2580,6 +2626,13 @@ impl DejaDB {
                     self.db.execute(
                         "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
                         vec![pi(r.ns), pb(p.clone()), pi(r.seq)],
+                    )?;
+                    n += 1;
+                }
+                if r.corpus_export {
+                    self.db.execute(
+                        "INSERT INTO corpus_idx(seq) VALUES (?1)",
+                        vec![pi(r.seq)],
                     )?;
                     n += 1;
                 }
@@ -3150,6 +3203,7 @@ impl DejaDB {
             // grain's parent or run.
             dbr.execute("DELETE FROM prov_idx WHERE seq=?1", vec![pi(seq)])?;
             dbr.execute("DELETE FROM run_idx WHERE seq=?1", vec![pi(seq)])?;
+            dbr.execute("DELETE FROM corpus_idx WHERE seq=?1", vec![pi(seq)])?;
             // Postings too, or a forgotten grain's words keep answering
             // free-text recall — a tombstone that leaves the text findable
             // is not a tombstone.
@@ -3751,8 +3805,17 @@ impl DejaDB {
             term_candidates.dedup();
             let mut affected_keys: Vec<(i64, i64, i64)> = Vec::new();
             for (i, t) in targets.iter().enumerate() {
-                for table in
-                    ["triples", "osp", "embeddings", "thread_idx", "prov_idx", "run_idx", "fts_post", "fts_doc"]
+                for table in [
+                    "triples",
+                    "osp",
+                    "embeddings",
+                    "thread_idx",
+                    "prov_idx",
+                    "run_idx",
+                    "corpus_idx",
+                    "fts_post",
+                    "fts_doc",
+                ]
                 {
                     self.db
                         .execute(&format!("DELETE FROM {table} WHERE seq=?1"), vec![pi(t.seq)])?;
@@ -5604,6 +5667,7 @@ impl DejaDB {
         &mut self,
         selector: &str,
         destination: &str,
+        recipient: Option<&str>,
         exported_at_ms: i64,
         subject_fingerprints: &[String],
         source_hashes: &[String],
@@ -5618,11 +5682,15 @@ impl DejaDB {
         sources.dedup();
         let mut id_material = selector.as_bytes().to_vec();
         id_material.extend_from_slice(destination.as_bytes());
+        if let Some(recipient) = recipient {
+            id_material.extend_from_slice(recipient.as_bytes());
+        }
         id_material.extend_from_slice(&exported_at_ms.to_le_bytes());
         for hash in &sources {
             id_material.extend_from_slice(hash.as_bytes());
         }
         let export_id = format!("export:{}", hex::encode(&Sha256::digest(id_material)[..12]));
+        let selector_digest = hex::encode(Sha256::digest(selector.as_bytes()));
         let mut observation = Observation::new("deja:corpus", "corpus_export")
             .subject(&export_id)
             .object("openai_chat_jsonl")
@@ -5630,8 +5698,14 @@ impl DejaDB {
         observation.common.namespace = Some(authz::HARNESS_NS.to_string());
         observation.common.context = Some(serde_json::json!({
             "corpus_export": true,
-            "selector": selector,
+            // Raw CAL routinely contains the subject being exported. Keeping
+            // it in an immutable replicating manifest would re-introduce that
+            // identity after erasure; the digest proves the exact selector
+            // without retaining its text.
+            "selector_sha256": selector_digest,
+            "selector_kind": "cal_read",
             "destination": destination,
+            "recipient": recipient,
             "exported_at_ms": exported_at_ms,
             "subject_fingerprints": fingerprints,
             "source_count": sources.len(),
@@ -5652,10 +5726,12 @@ impl DejaDB {
     /// `meta` rows: registry entries must replicate in ordinary bundles.
     pub fn corpus_exports(&mut self) -> Result<Vec<CorpusExportRegistry>> {
         let mut exports = Vec::new();
-        for grain in self.recent(authz::HARNESS_NS, None, 1_000_000)? {
-            if grain.grain_type != dejadb_core::types::GrainType::Observation {
-                continue;
-            }
+        let rows = self.db.query(
+            "SELECT g.blob FROM corpus_idx ci JOIN grains g ON g.seq=ci.seq ORDER BY g.seq DESC",
+            vec![],
+        )?;
+        for blob in rows.iter().filter_map(|row| row.blob(0)) {
+            let grain = deserialize_blob(&blob)?;
             let Some(context) = grain.fields.get("context").and_then(|v| v.as_object()) else {
                 continue;
             };
@@ -5668,6 +5744,10 @@ impl DejaDB {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let recipient = context
+                .get("recipient")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let exported_at_ms = context
                 .get("exported_at_ms")
                 .and_then(|v| v.as_i64())
@@ -5699,6 +5779,7 @@ impl DejaDB {
                 manifest_hash: grain.hash.to_hex(),
                 export_id,
                 destination,
+                recipient,
                 exported_at_ms,
                 subject_fingerprints,
                 source_hashes,
@@ -5730,12 +5811,7 @@ impl DejaDB {
         &mut self,
         hashes: &[String],
     ) -> Result<Vec<CorpusExportRegistry>> {
-        let targets: HashSet<&str> = hashes.iter().map(String::as_str).collect();
-        Ok(self
-            .corpus_exports()?
-            .into_iter()
-            .filter(|entry| entry.source_hashes.iter().any(|h| targets.contains(h.as_str())))
-            .collect())
+        Ok(exports_touching_hashes(&self.corpus_exports()?, hashes))
     }
 
     /// Store statistics (CLI `stats`).
@@ -6126,6 +6202,9 @@ impl DejaDB {
                     vec![pi(pr.ns_id), pi(run), pi(seq)],
                 )?;
             }
+            if pr.corpus_export {
+                dbr.execute("INSERT INTO corpus_idx(seq) VALUES (?1)", vec![pi(seq)])?;
+            }
             if let Some(ref parent) = pr.parent {
                 dbr.execute(
                     "INSERT INTO prov_idx(ns,parent,seq) VALUES (?1,?2,?3)",
@@ -6503,6 +6582,9 @@ fn insert_prepped(
                 "INSERT INTO run_idx(ns,run,seq) VALUES (?1,?2,?3)",
                 vec![pi(pr.ns_id), pi(run), pi(seq)],
             )?;
+        }
+        if pr.corpus_export {
+            db.execute_hot("INSERT INTO corpus_idx(seq) VALUES (?1)", vec![pi(seq)])?;
         }
         if let Some(ref parent) = pr.parent {
             db.execute_hot(

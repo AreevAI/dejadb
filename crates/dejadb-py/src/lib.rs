@@ -1243,16 +1243,16 @@ impl DejaDB {
     /// occurrence, which is what makes a tool that failed five times read as
     /// five failures; recording is append-only, never de-duplicating.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input, result, is_error = false, thread = None, call_id = None))]
+    #[pyo3(signature = (name, result, is_error = false, thread = None, call_id = None, input = None))]
     fn record_tool_call(
         &self,
         py: Python<'_>,
         name: String,
-        input: Option<String>,
         result: String,
         is_error: bool,
         thread: Option<String>,
         call_id: Option<String>,
+        input: Option<String>,
     ) -> PyResult<String> {
         py.detach(|| {
             self.facade

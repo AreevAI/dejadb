@@ -167,6 +167,9 @@ impl_substrate!(BorrowedSubstrate<'_>);
 // --- operations (free functions over &DejaDbFacade) ---
 
 fn recent_ns(f: &DejaDbFacade, ns: &str, gt: GrainType) -> WResult<Vec<DeserializedGrain>> {
+    // An explicitly requested namespace is a capability assertion. Deny it
+    // loudly; silently returning an empty set would misreport authorization
+    // failure as "the analyzer found no data".
     require_read(f, ns)?;
     f.with_store(|m| m.recent(ns, Some(gt), MAX_SCAN))
         .map_err(we)

@@ -98,6 +98,7 @@ pub(crate) const PG_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_prov ON prov_idx(ns, parent, seq)",
     "CREATE TABLE IF NOT EXISTS run_idx(ns bigint, run bigint, seq bigint)",
     "CREATE INDEX IF NOT EXISTS idx_run ON run_idx(ns, run, seq)",
+    "CREATE TABLE IF NOT EXISTS corpus_idx(seq bigint PRIMARY KEY)",
     // Replaces the `.blobs` filesystem sidecar: same CAS semantics, rows
     // keyed by the raw 32-byte content hash.
     "CREATE TABLE IF NOT EXISTS blobs(hash bytea PRIMARY KEY, body bytea NOT NULL)",

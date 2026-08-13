@@ -615,8 +615,8 @@ model calls**. The 60-second proof needs no agent:
 ```python
 import dejadb, json
 db = dejadb.DejaDB("proof.db", actor="user:me")
-for _ in range(5): db.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', is_error=True)
-for _ in range(2): db.record_tool_call("stripe_refund", None, '{"ok":true}', is_error=False)
+for _ in range(5): db.record_tool_call("stripe_refund", '{"error":"rate_limited"}', is_error=True)
+for _ in range(2): db.record_tool_call("stripe_refund", '{"ok":true}', is_error=False)
 db.add_fact("acme", "deploy_target", "us-east-1", 0.9)
 db.add_fact("acme", "deploy_target", "eu-west-1", 0.9)     # a contradiction
 
@@ -724,13 +724,14 @@ deja run-manifest --db agent.db --run-id eval-42 \
 # rows should join to this trajectory.
 deja corpus --db agent.db --ns caller \
   --select 'RECALL events WHERE session_id = "session-42"' \
-  --out train.jsonl
+  --out train.jsonl --recipient trainer:model-v2
 ```
 
 The JSONL row uses OpenAI chat messages and a top-level `tools` list. DejaDB
 also emits step quality/loss weights, observation elisions, and the binding to
 source hashes, model/policy versions, trace, and data-subject fingerprints.
-The export receipt is an immutable grain in `agent:harness`; its
+The export receipt is an immutable grain in `agent:harness` (and therefore
+requires `write ON agent:harness` in addition to the selector's read grant); its
 `mg:corpus_source` links make every input reverse-traversable and let later
 subject or retention erasure identify stale corpus files. Those files must be
 retired or re-derived—the receipt is not an unlearning claim about model

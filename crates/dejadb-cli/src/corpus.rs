@@ -22,17 +22,13 @@ fn str_field<'a>(grain: &'a CalGrainResult, name: &str) -> Option<&'a str> {
     field(grain, name)?.as_str()
 }
 
-fn subject_fingerprints(grains: &[CalGrainResult]) -> Vec<String> {
+fn subject_fingerprints<'a>(grains: impl IntoIterator<Item = &'a CalGrainResult>) -> Vec<String> {
     let mut out = BTreeSet::new();
     for grain in grains {
-        for name in [
-            "user_id",
-            "subject",
-            "subject_id",
-            "data_subject",
-            "session_id",
-            "run_id",
-        ] {
+        // Session/run ids identify trajectories, not people. They already ride
+        // in `binding.trace`; treating them as subjects makes erasure reports
+        // stale unrelated corpora when an identifier happens to collide.
+        for name in ["user_id", "subject", "subject_id", "data_subject"] {
             if let Some(value) = str_field(grain, name).filter(|s| !s.trim().is_empty()) {
                 out.insert(dejadb_core::authz::subject_fingerprint(value));
             }
@@ -254,6 +250,7 @@ pub fn write_jsonl<W: Write>(
     let mut rows = 0;
     for (trace, events) in groups {
         let events = ordered_events(&events);
+        let row_fingerprints = subject_fingerprints(events.iter().copied());
         let mut messages = Vec::new();
         let mut steps = Vec::new();
         let mut elisions = Vec::new();
@@ -297,7 +294,7 @@ pub fn write_jsonl<W: Write>(
                 "trace": trace,
                 "agent_versions": models.into_iter().collect::<Vec<_>>(),
                 "policy_versions": policies.into_iter().collect::<Vec<_>>(),
-                "data_subject_fingerprints": fingerprints.clone(),
+                "data_subject_fingerprints": row_fingerprints,
                 "source_hashes": trace_sources,
             },
         });
@@ -363,10 +360,36 @@ mod tests {
             .iter()
             .any(|s| s["quality"] == "failed" && s["loss_weight"] == 0.0));
         let fingerprints = row["binding"]["data_subject_fingerprints"].as_array().unwrap();
-        assert_eq!(fingerprints.len(), 2);
+        assert_eq!(fingerprints.len(), 1);
         assert!(fingerprints.contains(&json!(dejadb_core::authz::subject_fingerprint(
             "person:7"
         ))));
-        assert!(fingerprints.contains(&json!(dejadb_core::authz::subject_fingerprint("s1"))));
+    }
+
+    #[test]
+    fn row_subject_bindings_are_trace_scoped() {
+        let mut alice = event("a", "user", json!([{"type":"text","text":"a"}]));
+        alice.fields["session_id"] = json!("alice-session");
+        alice.fields["subject"] = json!("alice");
+        let mut bob = event("b", "user", json!([{"type":"text","text":"b"}]));
+        bob.fields["session_id"] = json!("bob-session");
+        bob.fields["subject"] = json!("bob");
+        let mut out = Vec::new();
+        let summary = write_jsonl(vec![alice, bob], &mut out).unwrap();
+        assert_eq!(summary.subject_fingerprints.len(), 2, "registry keeps the union");
+        let rows: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let trace = row["binding"]["trace"].as_str().unwrap();
+            let expected = if trace == "alice-session" { "alice" } else { "bob" };
+            assert_eq!(
+                row["binding"]["data_subject_fingerprints"],
+                json!([dejadb_core::authz::subject_fingerprint(expected)])
+            );
+        }
     }
 }

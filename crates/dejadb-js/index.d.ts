@@ -240,7 +240,7 @@ export declare class DejaDb {
    * occurrence, which is what makes a tool that failed five times read as
    * five failures; recording is append-only, never de-duplicating.
    */
-  recordToolCall(name: string, input: string | undefined | null, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null, callId?: string | undefined | null): Promise<string>
+  recordToolCall(name: string, result: string, isError?: boolean | undefined | null, thread?: string | undefined | null, callId?: string | undefined | null, input?: string | undefined | null): Promise<string>
   /** Persist a content-addressed harness config and the run -> config link. */
   recordRunManifest(runId: string, config: string): Promise<string>
   /**

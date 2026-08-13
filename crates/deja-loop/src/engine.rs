@@ -1077,7 +1077,8 @@ impl Engine {
             // Applied used to be a lie (and rollback had no inverse).
             Proposal::Edit { .. } => {
                 return Err(Error::InvalidProposal(
-                    "Edit proposals require a host executor and cannot be applied by the engine"
+                    "This recommendation is advisory: the engine cannot execute this edit. Make \
+                     the change in the host, then dismiss the recommendation."
                         .into(),
                 ));
             }
@@ -1088,7 +1089,8 @@ impl Engine {
                 // really retracted and the original lifecycle/audit advances.
                 let revert_of = data.get("revert_of").and_then(Value::as_str).ok_or_else(|| {
                     Error::InvalidProposal(
-                        "Data proposals are advisory unless they carry a valid revert_of"
+                        "This finding is advisory: the engine cannot execute it. Act on its \
+                         guidance, then dismiss it (unless it carries a valid revert_of)."
                             .into(),
                     )
                 })?;

@@ -153,13 +153,15 @@ def test_record_tool_call_records_occurrences(tmp_path):
     """Identical retries are distinct occurrences, not one grain (#66)."""
     m = make_db(tmp_path)
     for _ in range(5):
-        m.record_tool_call("stripe_refund", None, '{"error":"rate_limited"}', True)
+        m.record_tool_call("stripe_refund", '{"error":"rate_limited"}', True)
 
     n = json.loads(m.cal('RECALL tools WHERE tool_name = "stripe_refund" | COUNT'))
     assert n["count"] == 5
 
     # A host-supplied call id lands on the grain and is filterable.
-    m.record_tool_call("stripe_refund", '{"amount":42}', "boom", True, call_id="call_xyz")
+    m.record_tool_call(
+        "stripe_refund", "boom", True, call_id="call_xyz", input='{"amount":42}'
+    )
     by_id = json.loads(m.cal('RECALL tools WHERE tool_call_id = "call_xyz"'))
     assert len(by_id["grains"]) == 1
     assert by_id["grains"][0]["fields"]["input"]["amount"] == 42
@@ -522,8 +524,8 @@ def test_loop_loop_rollback_and_outcomes(tmp_path):
     # a retry is a countable occurrence, so `record_tool_call` gives each call
     # its own identity and all four survive.
     for _ in range(4):
-        m.record_tool_call("stripe_refund", None, "rate_limited 429", True)
-    m.record_tool_call("stripe_refund", None, "ok", False)
+        m.record_tool_call("stripe_refund", "rate_limited 429", True)
+    m.record_tool_call("stripe_refund", "ok", False)
 
     run = json.loads(m.loop_run())
     assert run["outcome"] == "ran"

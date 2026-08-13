@@ -315,6 +315,36 @@ impl DejaDbFacade {
         f(&mut guard)
     }
 
+    /// Preflight the governed-corpus registry write. Exporting reads the
+    /// selected namespaces, but recording its immutable lineage additionally
+    /// requires `write ON agent:harness`.
+    pub fn authorize_corpus_export(&self) -> Result<()> {
+        self.check_verb(Verb::Write, dejadb_core::authz::HARNESS_NS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_corpus_export(
+        &self,
+        selector: &str,
+        destination: &str,
+        recipient: Option<&str>,
+        exported_at_ms: i64,
+        subject_fingerprints: &[String],
+        source_hashes: &[String],
+    ) -> Result<Hash> {
+        self.authorize_corpus_export()?;
+        self.with_store(|store| {
+            store.record_corpus_export(
+                selector,
+                destination,
+                recipient,
+                exported_at_ms,
+                subject_fingerprints,
+                source_hashes,
+            )
+        })
+    }
+
     /// Value-level idempotent add (see [`DejaDB::add_if_novel`]). Returns the
     /// grain hash and whether a new grain was written (`false` = the value was
     /// already the current head). Bindings expose this as an `idempotent` flag.
@@ -1875,17 +1905,8 @@ impl CalStoreFacade for DejaDbFacade {
             gtype,
             Some(batch_limit),
         )?;
-        let erased: std::collections::HashSet<&str> =
-            report.erased_hashes.iter().map(String::as_str).collect();
-        let stale_exports: Vec<_> = exports
-            .into_iter()
-            .filter(|export| {
-                export
-                    .source_hashes
-                    .iter()
-                    .any(|hash| erased.contains(hash.as_str()))
-            })
-            .collect();
+        let stale_exports =
+            dejadb_store::exports_touching_hashes(&exports, &report.erased_hashes);
         self.audit_tier2(
             "erase",
             &format!(

@@ -1114,5 +1114,20 @@ mod tests {
                 );
             }
         }
+        let unique: std::collections::HashSet<_> = ADD_JSON_KNOWN_FIELDS.iter().collect();
+        assert_eq!(unique.len(), ADD_JSON_KNOWN_FIELDS.len(), "duplicate ADD JSON key");
+        for field in [
+            "role",
+            "session_id",
+            "parent_message_id",
+            "content_blocks",
+            "model_id",
+            "stop_reason",
+            "token_usage",
+        ] {
+            assert!(type_known_fields("event").contains(&field));
+            assert!(ADD_JSON_KNOWN_FIELDS.contains(&field));
+            assert!(!COMMON_KNOWN_FIELDS.contains(&field));
+        }
     }
 }
