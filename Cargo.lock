@@ -658,6 +658,7 @@ dependencies = [
 name = "dejadb"
 version = "1.1.1"
 dependencies = [
+ "chrono",
  "deja-loop",
  "dejadb-cal",
  "dejadb-context",
@@ -700,7 +701,7 @@ dependencies = [
  "dejadb-store",
  "hex",
  "logos",
- "lru 0.18.0",
+ "lru 0.18.2",
  "parking_lot",
  "regex",
  "serde",
@@ -1704,9 +1705,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.0"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
  "hashbrown 0.17.1",
 ]

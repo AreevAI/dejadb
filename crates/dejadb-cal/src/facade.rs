@@ -35,7 +35,17 @@ use dejadb_core::format::deserialize::DeserializedGrain;
 /// may ignore it through the trait's default implementation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AssemblyManifest {
-    pub query: serde_json::Value,
+    /// SHA-256 over the canonical JSON of the ASSEMBLE statement, **not** the
+    /// statement itself.
+    ///
+    /// An ASSEMBLE routinely names the subject it is assembling for
+    /// (`… WHERE subject = "john"`). This manifest is an immutable Observation
+    /// that replicates, and it lives in a reserved namespace the subject
+    /// selector does not reach — so retaining the text would re-introduce an
+    /// identity that `FORGET SUBJECT` cannot erase and `REPORT SUBJECT` cannot
+    /// disclose. The digest proves which statement ran without keeping it.
+    /// Same rule, same reason as the corpus manifest's `selector_sha256`.
+    pub query_sha256: String,
     pub included_hashes: Vec<String>,
     pub rendered_sha256: String,
     pub budget: serde_json::Value,

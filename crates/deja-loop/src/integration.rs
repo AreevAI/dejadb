@@ -1570,3 +1570,97 @@ fn rejection_cooldown_doubles() {
     reject_at(&mut sub, t1);
     assert_eq!(cooldown(&sub, &dk) - t1, 14 * DAY, "second rejection doubles to 14d");
 }
+
+#[test]
+fn advisory_findings_are_refused_by_preflight_not_after_approval() {
+    use crate::engine::ensure_executable;
+    use crate::model::Origin;
+    use crate::recommendation::Proposal;
+    use serde_json::{json, Map};
+
+    // The shared gate, pinned directly: exactly one Data shape is executable.
+    assert!(ensure_executable(&Proposal::Cal { cal: "ADD fact …".into() }).is_ok());
+    assert!(matches!(
+        ensure_executable(&Proposal::Edit {
+            format: "md".into(),
+            base_digest: "d".into(),
+            diff: "-a\n+b".into(),
+        }),
+        Err(Error::InvalidProposal(_))
+    ));
+    let mut advisory = Map::new();
+    advisory.insert("note".into(), json!("go look at this"));
+    assert!(matches!(
+        ensure_executable(&Proposal::Data { data: advisory }),
+        Err(Error::InvalidProposal(_))
+    ));
+    let mut revert = Map::new();
+    revert.insert("revert_of".into(), json!("abc123"));
+    assert!(ensure_executable(&Proposal::Data { data: revert }).is_ok());
+
+    // End to end: an LLM finding is advisory, and preflight refuses it *before*
+    // the fused approve-and-apply path commits an approval it cannot undo.
+    let mut sub = TestSubstrate::new();
+    let h1 = sub.add_fact("acme", "deploy_target", "us-east-1");
+    let _h2 = sub.add_fact("acme", "deploy_target", "eu-west-1");
+    let discover = format!(
+        r#"{{"recommendations":[
+          {{"summary":"prod region is ambiguous","target":"entity:test/acme","guidance":"pick one","evidence":["{h1}"],"confidence":0.9}}
+        ]}}"#
+    );
+    let e = Engine::with_builtins().with_llm(Box::new(MockLlm {
+        discover,
+        ground: r#"{"results":[{"id":0,"supported":true,"reason":"entailed"}]}"#.into(),
+        verify: r#"{"results":[{"id":0,"keep":true,"confidence":0.88,"reason":"real"}]}"#.into(),
+        enrich: r#"{"notes":[]}"#.into(),
+    }));
+    e.run(&mut sub.inner, &RunOptions::default(), 10_000).unwrap();
+
+    let llm = e
+        .recommendations(&sub.inner, Some(RecStatus::Pending))
+        .unwrap()
+        .into_iter()
+        .find(|r| matches!(r.origin, Origin::Llm { .. }))
+        .expect("an llm-origin recommendation");
+
+    let refused = e.preflight_apply(&sub.inner, &llm.hash, &ScopeSet::all(), true);
+    assert!(
+        matches!(refused, Err(Error::InvalidProposal(_))),
+        "preflight must refuse an advisory finding, got {refused:?}"
+    );
+    assert_eq!(
+        status_of(&e, &sub, &llm.hash),
+        RecStatus::Pending,
+        "a refused preflight must leave the finding dismissible"
+    );
+
+    // Approving it stays legal — a Flag is acknowledged, not executed.
+    e.review(
+        &mut sub.inner,
+        &llm.hash,
+        Decision::Approve,
+        "user:reviewer",
+        ObserverType::Human,
+        &ScopeSet::all(),
+        "real issue, handling it in the host",
+        11_000,
+    )
+    .expect("acknowledging an advisory finding is legal");
+
+    // But applying it still refuses, with guidance rather than a bare error.
+    match e.apply(
+        &mut sub.inner,
+        &llm.hash,
+        "user:reviewer",
+        ObserverType::Human,
+        &ScopeSet::all(),
+        "try to apply",
+        true,
+        12_000,
+    ) {
+        Err(Error::InvalidProposal(msg)) => {
+            assert!(msg.contains("advisory"), "message should explain, got {msg:?}")
+        }
+        other => panic!("expected an advisory refusal, got {other:?}"),
+    }
+}

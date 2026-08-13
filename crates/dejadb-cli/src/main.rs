@@ -537,6 +537,28 @@ fn transcript_content_blocks(
     (rendered.join("\n"), typed, elisions)
 }
 
+/// The turn's own timestamp in epoch milliseconds, if the transcript carries
+/// one — epoch integers, numeric strings, or the ISO-8601 form Claude Code
+/// writes.
+///
+/// `capture-stop` pins `created_at` from this so a turn's content address is
+/// stable across hook firings. Without a stable stamp the cumulative transcript
+/// re-hashes every turn on every firing, and the dedup that makes the capture
+/// idempotent stops working.
+fn transcript_turn_ms(record: &serde_json::Value) -> Option<i64> {
+    let value = record.get("timestamp").or_else(|| record.get("created_at"))?;
+    if let Some(ms) = value.as_i64() {
+        return Some(ms);
+    }
+    let text = value.as_str()?;
+    if let Ok(ms) = text.parse::<i64>() {
+        return Some(ms);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 fn transcript_token_usage(message: &serde_json::Value) -> Option<TokenUsage> {
     let usage = message.get("usage")?.as_object()?;
     let u32_field = |primary: &str, alias: &str| {
@@ -1625,16 +1647,20 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 .as_str()
                 .ok_or("hook json missing transcript_path")?;
             let transcript = std::fs::read_to_string(tpath).map_err(|e| e.to_string())?;
-            // Claude's Stop hook points at the cumulative transcript. Treat
-            // the existing thread as a durable prefix watermark so repeated
-            // hooks append only newly observed turns.
-            let existing = m
-                .thread_tail(&ns, &session, i64::MAX as usize)
-                .map_err(|e| e.to_string())?;
-            let already_captured = existing.len();
-            let mut parent = existing.last().map(|grain| grain.hash.to_hex());
-            let mut capturable_turn = 0usize;
+            // Claude's Stop hook points at the cumulative transcript, so every
+            // firing re-reads turns already captured. Identify a turn by its
+            // own content address rather than by its position in the thread: a
+            // positional watermark counts grains any other writer put in the
+            // same `(namespace, session)` — `deja remember --session-id`, a
+            // binding, a second hook — and every foreign grain silently skips a
+            // real turn. Re-adding a stored grain is already a free no-op, so
+            // pinning `created_at` from the transcript makes the whole chain a
+            // pure function of the transcript and the rerun idempotent by
+            // construction.
+            let policy_version = flag(&flags, "policy-version");
+            let mut parent: Option<String> = None;
             let mut stored = 0;
+            let mut skipped = 0;
             for (turn, line) in transcript.lines().enumerate() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 let message = &v["message"];
@@ -1647,14 +1673,14 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                 if text.trim().is_empty() && blocks.is_empty() {
                     continue;
                 }
-                if capturable_turn < already_captured {
-                    capturable_turn += 1;
-                    continue;
-                }
-                capturable_turn += 1;
                 let mut event = Event::new(&text)
                     .namespace(&ns)
                     .session(session.clone())
+                    // Deterministic stamp: the transcript's own time when it
+                    // has one, else the turn's position. Never the wall clock —
+                    // that would re-hash every turn on every hook firing and
+                    // defeat the dedup this relies on.
+                    .created_at(transcript_turn_ms(&v).unwrap_or(turn as i64))
                     .role(role)
                     .content_blocks(blocks);
                 if let Some(p) = parent.clone() {
@@ -1678,12 +1704,27 @@ Nothing was written — apply the snippet yourself (or rerun with your own paths
                         .extra_fields
                         .insert("elisions".into(), serde_json::Value::Array(elisions));
                 }
+                // The policy in force when the turn happened. `deja corpus`
+                // reports it under `binding.policy_versions`, which is how a
+                // training row states which governance regime produced it —
+                // without a producer that binding was always empty.
+                if let Some(policy) = policy_version.as_deref() {
+                    event.common.context = Some(serde_json::json!({
+                        "policy_version": policy,
+                    }));
+                }
                 // A hook capture is not a run; run_id deliberately stays None.
-                let hash = m.add(&event).map_err(|e| e.to_string())?;
+                let (_, hash) = dejadb_core::format::serialize::serialize_grain(&event)
+                    .map_err(|e| e.to_string())?;
+                if m.get(&hash).is_ok() {
+                    skipped += 1;
+                } else {
+                    m.add(&event).map_err(|e| e.to_string())?;
+                    stored += 1;
+                }
                 parent = Some(hash.to_hex());
-                stored += 1;
             }
-            println!("captured {stored} events for session {session}");
+            println!("captured {stored} events for session {session} ({skipped} already stored)");
         }
         "recall-hook" => {
             // Claude Code UserPromptSubmit hook: read the hook JSON on stdin,
