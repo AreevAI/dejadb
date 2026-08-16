@@ -1,5 +1,14 @@
 # DejaDB
 
+> ⚠️ **This project has moved — DejaDB is now [Areev](https://github.com/AreevAI/areev).**
+> Same engine, same `.mg` file format, new name. This repository is archived at
+> v1.2.0 and receives no further development; all new work, issues, and releases
+> happen in [AreevAI/areev](https://github.com/AreevAI/areev). Install the
+> successor as `areev` from
+> [crates.io](https://crates.io/crates/areev) ·
+> [PyPI](https://pypi.org/project/areev/) ·
+> [npm](https://www.npmjs.com/package/areev).
+
 > English · [中文](README.zh-CN.md)
 
 **The embedded memory engine for AI agents** — memory that doesn't rot, stays

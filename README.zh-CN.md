@@ -1,5 +1,13 @@
 # DejaDB
 
+> ⚠️ **项目已迁移 —— DejaDB 现在是 [Areev](https://github.com/AreevAI/areev)。**
+> 同一个引擎、同一个 `.mg` 文件格式，只是换了名字。本仓库归档于 v1.2.0，
+> 不再继续开发；新的开发、issue 与发布都在
+> [AreevAI/areev](https://github.com/AreevAI/areev)。请从
+> [crates.io](https://crates.io/crates/areev) ·
+> [PyPI](https://pypi.org/project/areev/) ·
+> [npm](https://www.npmjs.com/package/areev) 安装后继版 `areev`。
+
 > 中文 · [English](README.md)
 
 **面向 AI 智能体的嵌入式记忆引擎** —— 不腐化、不过期、每条事实都能证明来源的记忆。
