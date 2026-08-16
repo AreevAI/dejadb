@@ -6,7 +6,7 @@
 > [AreevAI/areev](https://github.com/AreevAI/areev)。请从
 > [crates.io](https://crates.io/crates/areev) ·
 > [PyPI](https://pypi.org/project/areev/) ·
-> [npm](https://www.npmjs.com/package/areev) 安装后继版 `areev`。
+> [npm](https://www.npmjs.com/package/@areev/areev) 安装后继版 `areev`。
 
 > 中文 · [English](README.md)
 

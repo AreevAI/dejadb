@@ -7,7 +7,7 @@
 > successor as `areev` from
 > [crates.io](https://crates.io/crates/areev) ·
 > [PyPI](https://pypi.org/project/areev/) ·
-> [npm](https://www.npmjs.com/package/areev).
+> [npm](https://www.npmjs.com/package/@areev/areev).
 
 > English · [中文](README.zh-CN.md)
 
